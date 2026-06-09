@@ -38,4 +38,8 @@ export type { RpcDomain } from "./src/rpc/domain";
 export { RpcAccessDeniedError } from "./src/rpc/errors";
 export type { TypedClient } from "./src/rpc/typed-client";
 export type { WorkflowDomain } from "./src/workflow/domain";
-export { WorkflowAccessDeniedError } from "./src/workflow/errors";
+export {
+	WorkflowAccessDeniedError,
+	WorkflowNotFoundError,
+	WorkflowTerminalError,
+} from "./src/workflow/errors";
