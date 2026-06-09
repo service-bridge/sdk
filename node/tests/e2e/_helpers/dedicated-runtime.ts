@@ -148,8 +148,8 @@ async function seedRuntimeCa(dbName: string): Promise<void> {
 		const rows = (await srcDb`
 			SELECT id, cert_der, key_der, created_at FROM runtime_ca WHERE id = 1
 		`) as Array<Record<string, unknown>>;
-		if (rows.length === 0) return;
 		const row = rows[0];
+		if (!row) return;
 		await dstDb.unsafe(
 			`
 			INSERT INTO runtime_ca (id, cert_der, key_der, created_at)
