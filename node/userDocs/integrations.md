@@ -50,8 +50,8 @@ bun add express
 
 ```ts
 import express from "express";
-import { ServiceBridge } from "servicebridge";
-import { attachExpress } from "servicebridge/express";
+import { ServiceBridge } from "service-bridge";
+import { attachExpress } from "service-bridge/express";
 
 const sb = new ServiceBridge(URL, KEY);
 const app = express();
@@ -83,8 +83,8 @@ bun add fastify
 
 ```ts
 import Fastify from "fastify";
-import { ServiceBridge } from "servicebridge";
-import { sbFastify } from "servicebridge/fastify";
+import { ServiceBridge } from "service-bridge";
+import { sbFastify } from "service-bridge/fastify";
 
 const sb = new ServiceBridge(URL, KEY);
 const app = Fastify();
@@ -111,8 +111,8 @@ Hono server-agnostic — сам сокет не открывает. `attachHono(
 
 ```ts
 import { Hono } from "hono";
-import { ServiceBridge } from "servicebridge";
-import { attachHono } from "servicebridge/hono";
+import { ServiceBridge } from "service-bridge";
+import { attachHono } from "service-bridge/hono";
 
 const sb = new ServiceBridge(URL, KEY);
 const app = new Hono();

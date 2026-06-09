@@ -13,23 +13,23 @@
 ## 1. Установка
 
 ```sh
-bun add servicebridge
+bun add service-bridge
 ```
 
 ## 2. Получение bootstrap-ключей
 
-Для каждого сервиса (минимум двух — callee и caller) сгенерируйте ключ через `sbkey-gen` рантайма:
+Каждому сервису (минимум двум — callee и caller) нужен bootstrap-ключ. Откройте дашборд на `http://localhost:14444`, зайдите в **Services → Create service**, задайте имя — дашборд вернёт строку `sb.Cgj...` со встроенным CA. Скопируйте её и сохраните как переменную окружения.
+
+Из исходников рантайма тот же ключ выдаёт `sbkey-gen` (CA берётся из Postgres, файлы сертификатов не нужны):
 
 ```sh
 cd runtime
 go run ./cmd/sbkey-gen \
-  -name    payment-svc \
-  -ca-cert ./certs/ca.crt \
-  -ca-key  ./certs/ca.key \
-  -dsn     "postgresql://user:pass@localhost:5433/servicebridge?sslmode=disable"
+  -name payment-svc \
+  -dsn  "postgresql://user:pass@localhost:5433/servicebridge?sslmode=disable"
 ```
 
-Получите строку `sb.Cgj...XYZ` — сохраните как переменную окружения. Подробнее в [Operations §6](./operations.md#6-security-bootstrap-key-mtls-ротация).
+Подробнее в [Operations §6](./operations.md#6-security-bootstrap-key-mtls-ротация).
 
 ```sh
 # .env
@@ -65,7 +65,7 @@ message ChargeResponse {
 
 ```ts
 // payment-svc.ts
-import { ServiceBridge } from "servicebridge";
+import { ServiceBridge } from "service-bridge";
 
 const sb = new ServiceBridge(
   process.env.SERVICEBRIDGE_URL!,
@@ -92,7 +92,7 @@ console.log("payment online:", sb.identity()?.serviceName);
 
 ```ts
 // checkout-svc.ts
-import { ServiceBridge } from "servicebridge";
+import { ServiceBridge } from "service-bridge";
 
 const sb = new ServiceBridge(
   process.env.SERVICEBRIDGE_URL!,

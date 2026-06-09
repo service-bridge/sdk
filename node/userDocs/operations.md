@@ -21,7 +21,7 @@
 ## 1. Конструктор и опции
 
 ```ts
-import { ServiceBridge } from "servicebridge";
+import { ServiceBridge } from "service-bridge";
 
 new ServiceBridge(url: string, key: string, options?: ServiceBridgeOptions)
 ```
@@ -235,19 +235,21 @@ for (const d of caller.serviceMap().values()) {
 ### Bootstrap key
 
 Каждому сервису нужен `sb.<base64url>`-ключ, содержащий:
-- `key_id` (UUID сервиса в БД runtime)
-- `secret` (proof of possession)
-- `ca_cert` (для TLS trust при bootstrap-вызове)
+- `key_id` (8 байт, идентификатор ключа в БД runtime)
+- `secret` (32 байта, proof of possession)
+- `ca_cert_der` (CA рантайма для TLS trust при bootstrap-вызове)
 
 ### Генерация
+
+Обычный путь — дашборд на `http://localhost:14444`: **Services → Create service**, задайте имя, скопируйте выданную строку `sb.Cgj...`.
+
+Из исходников рантайма тот же ключ выдаёт `sbkey-gen`. CA берётся из Postgres (таблица `runtime_ca`), файлы сертификатов не нужны:
 
 ```sh
 cd runtime
 go run ./cmd/sbkey-gen \
-  -name    payment-svc \
-  -ca-cert ./certs/ca.crt \
-  -ca-key  ./certs/ca.key \
-  -dsn     "postgresql://user:pass@localhost:5433/servicebridge?sslmode=disable"
+  -name payment-svc \
+  -dsn  "postgresql://user:pass@localhost:5433/servicebridge?sslmode=disable"
 ```
 
 Вывод (одна строка `sb.Cgj...`) — сохраните как env-переменную.

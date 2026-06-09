@@ -34,7 +34,7 @@ Runtime-triggered scheduled tasks: cron, delayed, interval. Handler выполн
 ## Регистрация
 
 ```ts
-import { ServiceBridge } from "servicebridge";
+import { ServiceBridge } from "service-bridge";
 
 const sb = new ServiceBridge(url, serviceKey);
 

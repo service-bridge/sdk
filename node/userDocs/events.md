@@ -444,7 +444,7 @@ Runtime хранит две строки в `service_methods` с одинако�
 ### Publisher
 
 ```ts
-import { ServiceBridge } from "servicebridge";
+import { ServiceBridge } from "service-bridge";
 
 const sb = new ServiceBridge(URL, SERVICE_KEY);
 
@@ -465,7 +465,7 @@ await sb.event.publish("payment.charged", {
 ### Subscriber
 
 ```ts
-import { ServiceBridge } from "servicebridge";
+import { ServiceBridge } from "service-bridge";
 
 const sb = new ServiceBridge(URL, SERVICE_KEY);
 

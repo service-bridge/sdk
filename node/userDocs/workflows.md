@@ -28,7 +28,7 @@ Workflow — это **frozen plan**: декларативный DAG шагов. 
 ## Регистрация workflow
 
 ```ts
-import { ServiceBridge } from "servicebridge";
+import { ServiceBridge } from "service-bridge";
 
 const sb = new ServiceBridge(url, key);
 
@@ -228,7 +228,7 @@ Workflows интегрированы с access policy (ADR-0014):
 ## Шпаргалка
 
 ```ts
-import { ServiceBridge } from "servicebridge";
+import { ServiceBridge } from "service-bridge";
 
 const sb = new ServiceBridge(url, key);
 

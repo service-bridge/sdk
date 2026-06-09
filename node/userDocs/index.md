@@ -3,7 +3,7 @@
 TypeScript SDK для [ServiceBridge runtime](https://github.com/servicebridge2/runtime).
 
 ```sh
-bun add servicebridge    # или npm install / yarn add
+bun add service-bridge    # или npm install / yarn add
 ```
 
 ## Документация — по доменам

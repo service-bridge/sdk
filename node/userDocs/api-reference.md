@@ -36,7 +36,7 @@ import {
   type ReconnectingEvent,
   type DisconnectedEvent,
   type PolicyViolationEvent,
-} from "servicebridge";
+} from "service-bridge";
 ```
 
 HTTP-интеграции — отдельные subpath-импорты (`servicebridge/express`, `servicebridge/fastify`, `servicebridge/hono`), см. [Integrations](./integrations.md).
@@ -413,9 +413,9 @@ type TypedClient = Record<
 HTTP-сервер запускает пользователь (Express / Fastify / Hono). SDK через subpath-импорт собирает роуты и публикует HTTP-endpoint в Service Map. Полный гайд — [Integrations](./integrations.md).
 
 ```ts
-import { attachExpress } from "servicebridge/express";
-import { sbFastify } from "servicebridge/fastify";
-import { attachHono } from "servicebridge/hono";
+import { attachExpress } from "service-bridge/express";
+import { sbFastify } from "service-bridge/fastify";
+import { attachHono } from "service-bridge/hono";
 ```
 
 ## ServiceBridgeError

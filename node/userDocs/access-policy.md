@@ -92,10 +92,10 @@ interface ServiceMapEntry {
 
 ```sh
 # Дефолт — всё разрешено
-sbkey-gen -dsn=... -ca-cert=... -ca-key=... -name=payments
+sbkey-gen -dsn=... -name=payments
 
 # С ограничениями
-sbkey-gen -dsn=... -ca-cert=... -ca-key=... -name=analytics \
+sbkey-gen -dsn=... -name=analytics \
   -no-cap=workflow.handle,job.handle \
   -allow-action='rpc.call:payments/charge,event.publish:metrics.*' \
   -allow-acceptance='event.handle:orders.*'
