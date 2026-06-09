@@ -1,0 +1,31 @@
+{
+	"input": {
+		"OrderRequest": {
+			"userId": { "type": "string", "fieldNumber": 1 },
+			"items": {
+				"type": "array",
+				"fieldNumber": 2,
+				"array": {
+					"type": "object",
+					"nested": {
+						"sku": { "type": "string", "fieldNumber": 1 },
+						"qty": { "type": "int32", "fieldNumber": 2 }
+					}
+				}
+			},
+			"metadata": {
+				"type": "object",
+				"fieldNumber": 3,
+				"nested": {
+					"source": { "type": "string", "fieldNumber": 1 }
+				}
+			}
+		}
+	},
+	"output": {
+		"OrderResponse": {
+			"orderId": { "type": "string", "fieldNumber": 1 },
+			"total": { "type": "double", "fieldNumber": 2 }
+		}
+	}
+}

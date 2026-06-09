@@ -1,0 +1,9 @@
+# bunfig.toml — bun runtime config for the Node SDK package.
+#
+# [test].preload runs before every test file. setup.ts hydrates process.env
+# from <repo>/.env.e2e so e2e tests can read persistent bootstrap keys
+# without depending on the surrounding shell. Unit tests under src/ do not
+# touch env vars, so the preload is a no-op for them.
+
+[test]
+preload = ["./tests/e2e/_helpers/setup.ts"]

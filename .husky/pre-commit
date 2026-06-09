@@ -1,0 +1,1 @@
+cd node && bun run check && bun test src/ && bun run build

@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package events.test;
+
+// OrderCreatedV1 is the payload schema for the `orders.created` event in
+// unit-test fixtures. Field numbers are stable; new fields must be added
+// with new numbers (see ADR-0013 / project CLAUDE.md "No Backward
+// Compatibility" rules around protocol evolution).
+message OrderCreatedV1 {
+  string order_id = 1;
+  double amount   = 2;
+  string currency = 3;
+}
+
+// OrderCreatedV2 is a schema-incompatible second version used to verify
+// keep-history behaviour in registry tests (different contract_hash for the
+// same event name).
+message OrderCreatedV2 {
+  string order_id = 1;
+  double amount   = 2;
+  string currency = 3;
+  string region   = 4;
+}
+
+service OrderEventService {
+  // Used by event.define(name, { protoFile, method }) to auto-resolve the
+  // input message. Output is irrelevant for events but required by the
+  // service block — we point it at the same message for simplicity.
+  rpc orders_created    (OrderCreatedV1) returns (OrderCreatedV1);
+  rpc orders_created_v2 (OrderCreatedV2) returns (OrderCreatedV2);
+}

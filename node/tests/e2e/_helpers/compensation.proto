@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+service InventoryService {
+  rpc Reserve(ReserveRequest)   returns (ReserveResponse);
+  rpc Release(ReleaseRequest)   returns (ReleaseResponse);
+  rpc Charge(ChargeRequest)     returns (ChargeResponse);
+  rpc CollectIds(CollectIdsRequest) returns (CollectIdsResponse);
+}
+
+message ReserveRequest  { string item_id = 1; int32 quantity = 2; }
+message ReserveResponse { string reservation_id = 1; bool ok = 2; }
+
+message ReleaseRequest  { string reservation_id = 1; }
+message ReleaseResponse { bool ok = 1; }
+
+message ChargeRequest   { string reservation_id = 1; double amount = 2; }
+message ChargeResponse  { string transaction_id = 1; bool ok = 2; }
+
+message CollectIdsRequest  { repeated int32 ids = 1; }
+message CollectIdsResponse { repeated int32 received = 1; int32 count = 2; }

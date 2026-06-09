@@ -1,0 +1,16 @@
+// Same schema as payment.proto, different formatting + comments.
+// contractHash MUST match.
+syntax = "proto3";
+
+package serde.test;
+
+// Charge a user some amount.
+message ChargeRequest {
+    string user_id    = 1;  // user UUID
+    double amount     = 2;  // currency-agnostic numeric value
+}
+
+message ChargeResponse {
+    string  transaction_id  = 1;
+    bool    ok              = 2;
+}

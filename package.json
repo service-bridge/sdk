@@ -1,0 +1,11 @@
+{
+	"name": "@service-bridge/sdk-workspace",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"prepare": "husky"
+	},
+	"devDependencies": {
+		"husky": "^9"
+	}
+}

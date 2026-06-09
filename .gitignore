@@ -1,0 +1,25 @@
+# dependencies
+node_modules
+node/node_modules
+
+# build output
+node/dist
+**/*.tsbuildinfo
+
+# local SQLite outbox (created by Storage.open at runtime)
+node/.servicebridge
+
+# secrets — never commit any env file to this public repo
+.env
+.env.*
+
+# OS
+.DS_Store
+
+# runtime artifacts if e2e spawns runtime from here
+node/var
+node/certs
+**/ca.key
+**/*.pem
+var
+certs

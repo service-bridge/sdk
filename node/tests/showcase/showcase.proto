@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+// Showcase fixture schemas. One proto file describes every RPC + event message
+// used by tests/showcase/showcase-workflow.ts. Keeping the schema centralized
+// matches the e2e suite's `compensation.proto` pattern — every service in the
+// fixture loads this single file and resolves the message it needs by method
+// name through the `service` definitions below.
+
+// --- Billing service ---
+service BillingService {
+  rpc Charge(ChargeRequest)   returns (ChargeResponse);
+  rpc Refund(RefundRequest)   returns (RefundResponse);
+}
+
+message ChargeRequest   { string order_id = 1; double amount = 2; }
+message ChargeResponse  { string charge_id = 1; bool ok = 2; }
+
+message RefundRequest   { string charge_id = 1; double amount = 2; }
+message RefundResponse  { bool ok = 1; }
+
+// --- Inventory service ---
+service InventoryService {
+  rpc Reserve(ReserveRequest)   returns (ReserveResponse);
+  rpc Release(ReleaseRequest)   returns (ReleaseResponse);
+}
+
+message ReserveRequest  { string item_id = 1; int32 quantity = 2; }
+message ReserveResponse { string reservation_id = 1; bool ok = 2; }
+
+message ReleaseRequest  { string reservation_id = 1; }
+message ReleaseResponse { bool ok = 1; }
+
+// --- External API service ---
+service ExternalApiService {
+  rpc Notify(NotifyRequest) returns (NotifyResponse);
+}
+
+message NotifyRequest   { string order_id = 1; string channel = 2; }
+message NotifyResponse  { bool delivered = 1; }
+
+// --- Abandoned demo (for abandoned-scenario.ts) ---
+service AbandonedDemoService {
+  rpc LongHandler(LongRequest) returns (LongResponse);
+}
+
+message LongRequest  { string note = 1; }
+message LongResponse { string note = 1; }
+
+// --- Events ---
+// Events use the same `service { rpc Method(In) returns (In); }` pattern as the
+// rest of the SDK so `event.define({ protoFile, method })` can auto-resolve the
+// payload type. Output type is irrelevant for events; we point it back at the
+// input for simplicity (matches src/events/testdata/order-event.proto).
+service ShowcaseEvents {
+  rpc order_created (OrderCreated) returns (OrderCreated);
+  rpc audit_log     (AuditLog)     returns (AuditLog);
+}
+
+message OrderCreated { string order_id = 1; double amount = 2; }
+message AuditLog     { string action   = 1; string actor  = 2; }

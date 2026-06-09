@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+// PaymentService demonstrates gRPC-native service definitions —
+// SDK auto-resolves input/output from service.method.requestType/responseType.
+service PaymentService {
+  rpc Charge(ChargeRequest) returns (ChargeResponse);
+  rpc Refund(RefundRequest) returns (RefundResponse);
+}
+
+message ChargeRequest {
+  string user_id = 1;
+  double amount  = 2;
+}
+
+message ChargeResponse {
+  string transaction_id = 1;
+  bool   ok             = 2;
+}
+
+message RefundRequest {
+  string transaction_id = 1;
+}
+
+message RefundResponse {
+  bool ok = 1;
+}

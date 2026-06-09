@@ -1,0 +1,61 @@
+{
+	"compilerOptions": {
+		// Environment setup & latest features
+		"lib": ["ESNext"],
+		"target": "ESNext",
+		"module": "Preserve",
+		"moduleDetection": "force",
+		"jsx": "react-jsx",
+		"allowJs": true,
+		"types": ["bun"],
+
+		// Bundler mode
+		"moduleResolution": "bundler",
+		"allowImportingTsExtensions": true,
+		"verbatimModuleSyntax": true,
+		"noEmit": true,
+
+		// Best practices
+		"strict": true,
+		"skipLibCheck": true,
+		"noFallthroughCasesInSwitch": true,
+		"noUncheckedIndexedAccess": true,
+		"noImplicitOverride": true,
+
+		// Some stricter flags (disabled by default)
+		"noUnusedLocals": false,
+		"noUnusedParameters": false,
+		"noPropertyAccessFromIndexSignature": false
+	},
+	"exclude": [
+		"node_modules",
+		"dist",
+		"src/tracing",
+		"src/connection/service-bridge.ts",
+		"src/rpc/client.ts",
+		"src/rpc/server.ts",
+		"src/rpc/direct-transport.ts",
+		"src/rpc/proxy-transport.ts",
+		"src/rpc/dispatch-port.ts",
+		"src/rpc/test-helpers.ts",
+		"src/rpc/client-release-scope.test.ts",
+		"src/rpc/client-retry-fresh-span.test.ts",
+		"src/rpc/client-span-emit.test.ts",
+		"src/rpc/server-span.test.ts",
+		"src/events/publisher.ts",
+		"src/events/subscriber.ts",
+		"src/events/drainer.ts",
+		"src/events/drainer.test.ts",
+		"src/events/publisher.test.ts",
+		"src/http/express/plugin.ts",
+		"src/http/fastify/plugin.ts",
+		"src/http/hono/plugin.ts",
+		"src/job/subscriber.ts",
+		"src/registry/registry.ts",
+		"src/workflow/subscriber.ts",
+		"src/workflow/subscriber.test.ts",
+		"src/workflow/domain.ts",
+		"src/workflow/telemetry.test.ts",
+		"tests/e2e/http-traces.test.ts"
+	]
+}

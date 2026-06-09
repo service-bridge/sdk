@@ -1,0 +1,14 @@
+{
+	"input": {
+		"ChargeRequest": {
+			"userId": { "type": "string", "fieldNumber": 1 },
+			"amount": { "type": "double", "fieldNumber": 2 }
+		}
+	},
+	"output": {
+		"ChargeResponse": {
+			"transactionId": { "type": "string", "fieldNumber": 1 },
+			"ok": { "type": "bool", "fieldNumber": 2 }
+		}
+	}
+}

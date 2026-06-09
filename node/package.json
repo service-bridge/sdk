@@ -1,0 +1,109 @@
+{
+	"name": "service-bridge",
+	"version": "2.0.0-alpha",
+	"description": "TypeScript SDK for ServiceBridge — RPC, durable events, workflows, jobs and observability over a single self-hosted gRPC runtime with mTLS.",
+	"license": "MIT",
+	"type": "module",
+	"main": "./dist/index.js",
+	"module": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/service-bridge/sdk.git",
+		"directory": "node"
+	},
+	"homepage": "https://servicebridge.dev",
+	"publishConfig": {
+		"tag": "alpha",
+		"access": "public",
+		"provenance": true
+	},
+	"keywords": [
+		"microservices",
+		"rpc",
+		"events",
+		"workflows",
+		"grpc",
+		"mtls",
+		"observability"
+	],
+	"engines": {
+		"node": ">=18",
+		"bun": ">=1.0"
+	},
+	"files": [
+		"dist",
+		"README.md",
+		"LICENSE"
+	],
+	"scripts": {
+		"dev": "bun run --hot index.ts",
+		"start": "bun run index.ts",
+		"build": "tsup",
+		"prepack": "bun run build",
+		"lint": "biome check .",
+		"format": "biome format --write .",
+		"typecheck": "tsc --noEmit",
+		"check": "biome check --write . && tsc --noEmit"
+	},
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		},
+		"./express": {
+			"types": "./dist/http/express/index.d.ts",
+			"import": "./dist/http/express/index.js"
+		},
+		"./fastify": {
+			"types": "./dist/http/fastify/index.d.ts",
+			"import": "./dist/http/fastify/index.js"
+		},
+		"./hono": {
+			"types": "./dist/http/hono/index.d.ts",
+			"import": "./dist/http/hono/index.js"
+		}
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.4.15",
+		"@hono/node-server": "^2.0.4",
+		"@types/better-sqlite3": "^7.6.13",
+		"@types/bun": "latest",
+		"@types/express": "^5.0.6",
+		"@types/pg": "^8.20.0",
+		"express": "^5.2.1",
+		"fast-check": "^4.8.0",
+		"fastify": "^5",
+		"hono": "^4",
+		"pg": "^8.21.0",
+		"ts-proto": "^2.11.8",
+		"tsup": "^8.5.1"
+	},
+	"peerDependencies": {
+		"express": "^4 || ^5",
+		"fastify": "^4 || ^5",
+		"hono": "^4",
+		"typescript": "^5"
+	},
+	"peerDependenciesMeta": {
+		"express": {
+			"optional": true
+		},
+		"fastify": {
+			"optional": true
+		},
+		"hono": {
+			"optional": true
+		}
+	},
+	"dependencies": {
+		"@bufbuild/protobuf": "^2.12.0",
+		"@grpc/grpc-js": "1.14.3",
+		"@peculiar/x509": "^2.0.0",
+		"better-sqlite3": "^12.10.0",
+		"fastify-plugin": "^5.0.1",
+		"protobufjs": "^8.4.0",
+		"reflect-metadata": "^0.2.2",
+		"uuidv7": "^1.2.1"
+	}
+}

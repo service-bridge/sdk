@@ -1,0 +1,42 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: write # OIDC trusted publishing to npm — no token needed
+
+jobs:
+  npm:
+    name: publish node SDK to npm
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./node
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # OIDC trusted publishing requires npm >= 11.5.1
+      - run: npm install -g npm@latest
+        working-directory: .
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      # No NODE_AUTH_TOKEN: auth comes from the GitHub Actions OIDC trust
+      # configured on the npm package (Trusted Publisher). Provenance is
+      # produced automatically. Skip if this version is already on npm so a
+      # re-tag never fails on a duplicate publish.
+      - run: |
+          ver=$(node -p "require('./package.json').version")
+          if npm view "service-bridge@${ver}" version >/dev/null 2>&1; then
+            echo "service-bridge@${ver} already published — skipping."
+            exit 0
+          fi
+          npm publish --tag alpha --provenance --access public

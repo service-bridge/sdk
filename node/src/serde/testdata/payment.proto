@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package serde.test;
+
+message ChargeRequest {
+  string user_id = 1;
+  double amount = 2;
+}
+
+message ChargeResponse {
+  string transaction_id = 1;
+  bool   ok = 2;
+}
