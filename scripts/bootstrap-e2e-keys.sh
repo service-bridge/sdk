@@ -27,10 +27,11 @@
 #       docker rm -f servicebridge2-pg 2>/dev/null
 #       docker run -d --name servicebridge2-pg -p 5433:5432 \
 #         -e POSTGRES_PASSWORD=postgres postgres:18-alpine
-#   - runtime/certs/ca.crt + runtime/certs/ca.key exist. Boot the runtime once
-#     if missing: `go run -C runtime ./cmd/runtime -pg-url postgres://servicebridge:servicebridge@localhost:5433/servicebridge?sslmode=disable`.
 #   - `docker` available so we can run psql via the servicebridge2-pg
 #     container (no system psql required).
+#
+# The CA lives in Postgres (table runtime_ca), created on first runtime boot.
+# sbkey-gen reads it from the DB via -dsn; there are no CA files to manage.
 #
 # Usage:
 #   bash scripts/bootstrap-e2e-keys.sh
@@ -38,8 +39,6 @@
 # Environment overrides:
 #   POSTGRES_DSN   default: postgres://servicebridge:servicebridge@localhost:5433/servicebridge?sslmode=disable
 #   RUNTIME_URL    default: localhost:14445
-#   CA_CERT        default: <repo>/runtime/certs/ca.crt
-#   CA_KEY         default: <repo>/runtime/certs/ca.key
 #   PG_CONTAINER   default: servicebridge2-pg (docker container name for psql)
 
 set -euo pipefail
@@ -47,13 +46,12 @@ set -euo pipefail
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$REPO_ROOT"
 
+# The runtime is a sibling repo in the workspace (../runtime), not under sdk/.
+RUNTIME_DIR="$REPO_ROOT/../runtime"
+
 POSTGRES_DSN=${POSTGRES_DSN:-'postgres://servicebridge:servicebridge@localhost:5433/servicebridge?sslmode=disable'}
 RUNTIME_URL=${RUNTIME_URL:-localhost:14445}
 PG_CONTAINER=${PG_CONTAINER:-servicebridge2-pg}
-CA_CERT=${CA_CERT:-"$REPO_ROOT/runtime/certs/ca.crt"}
-CA_KEY=${CA_KEY:-"$REPO_ROOT/runtime/certs/ca.key"}
-case "$CA_CERT" in /*) ;; *) CA_CERT="$REPO_ROOT/$CA_CERT" ;; esac
-case "$CA_KEY"  in /*) ;; *) CA_KEY="$REPO_ROOT/$CA_KEY"   ;; esac
 
 # Names tests expect — must match the const strings in sdk/node/tests/e2e/*.test.ts.
 SERVICE1_NAME="e2e-registry-svc"
@@ -61,13 +59,6 @@ SERVICE2_NAME="e2e-registry-consumer"
 # Dedicated service for the HTTP integration tests so the dashboard shows a
 # clearly-named "http-test" service owning /express /fastify /hono endpoints.
 SERVICE3_NAME="http-test"
-
-if [ ! -f "$CA_CERT" ] || [ ! -f "$CA_KEY" ]; then
-  echo "error: CA material missing at $CA_CERT / $CA_KEY" >&2
-  echo "       boot the runtime once to auto-generate it:" >&2
-  echo "       go run -C runtime ./cmd/runtime -pg-url postgres://servicebridge:servicebridge@localhost:5433/servicebridge?sslmode=disable" >&2
-  exit 2
-fi
 
 if ! docker ps --format '{{.Names}}' | grep -qx "$PG_CONTAINER"; then
   echo "error: postgres container '$PG_CONTAINER' is not running." >&2
@@ -98,10 +89,8 @@ SQL
 gen_one() {
   local name=$1
   local out
-  if ! out=$(cd "$REPO_ROOT/runtime" && go run ./cmd/sbkey-gen \
+  if ! out=$(cd "$RUNTIME_DIR" && go run ./cmd/sbkey-gen \
       -dsn "$POSTGRES_DSN" \
-      -ca-cert "$CA_CERT" \
-      -ca-key "$CA_KEY" \
       -name "$name" 2>&1); then
     echo "error: sbkey-gen failed for $name:" >&2
     echo "$out" >&2
