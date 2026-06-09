@@ -19,7 +19,6 @@ import { Channel, OpHandle, RpcCall } from "../telemetry/ops";
 import { TelemetryRing } from "../telemetry/ring";
 import { CircuitBreakerRegistry } from "./circuit-breaker";
 import { RpcClient } from "./client";
-import type { DirectTransport } from "./direct-transport";
 import { InstanceCache } from "./instance-cache";
 import type { Candidate, LoadBalancer } from "./lb";
 import type { ProxyTransport } from "./proxy-transport";

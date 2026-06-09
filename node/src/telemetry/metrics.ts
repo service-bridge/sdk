@@ -14,7 +14,7 @@ function encodeLabels(labels: Labels): Labels {
 
 function pushPoint(
 	ring: TelemetryRing,
-	instanceId: string,
+	_instanceId: string,
 	point: MetricPoint,
 ): void {
 	ring.push("metrics", point);

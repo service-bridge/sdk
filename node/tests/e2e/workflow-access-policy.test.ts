@@ -25,7 +25,7 @@ import {
 	wfEnv,
 } from "./_helpers/wf.ts";
 
-const COMP_PROTO = join(import.meta.dir, "_helpers", "compensation.proto");
+const _COMP_PROTO = join(import.meta.dir, "_helpers", "compensation.proto");
 
 // Helper: wait for a PolicyEvaluation warning matching a predicate.
 async function waitForWarning(
@@ -36,7 +36,7 @@ async function waitForWarning(
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		const pe = sb.policyEvaluation();
-		if (pe && pe.warnings.some(pred)) return;
+		if (pe?.warnings.some(pred)) return;
 		await sleep(200);
 	}
 	const pe = sb.policyEvaluation();
@@ -118,8 +118,8 @@ describe("workflow-access-policy", () => {
 		let callee2: ServiceBridge | undefined;
 		let ownerID: string | undefined;
 		let callerID: string | undefined;
-		let callee1ID: string | undefined;
-		let callee2ID: string | undefined;
+		let _callee1ID: string | undefined;
+		let _callee2ID: string | undefined;
 
 		beforeEach(() => {
 			owner = caller = callee1 = callee2 = undefined;
@@ -137,7 +137,7 @@ describe("workflow-access-policy", () => {
 
 		test("dynamic step.service — allowed run completes, denied run fails", async () => {
 			const wfName = `ap-dynamic-${Date.now()}`;
-			const method = `ap-dyn-${Date.now()}`;
+			const _method = `ap-dyn-${Date.now()}`;
 
 			// callee1 = ownerKey (e2e-registry-svc) handles the rpc.
 			// callee2 = callerKey (e2e-registry-consumer) — we will deny access.
@@ -313,7 +313,7 @@ describe("workflow-access-policy", () => {
 			// does NOT cover parentOwnerID. This disables default-allow and
 			// explicitly denies parentOwner's access.
 			if (subOwnerID) await clearRules(subOwnerID);
-			const dummySubCaller = `00000000-0000-0000-0000-000000000001`;
+			const _dummySubCaller = `00000000-0000-0000-0000-000000000001`;
 			// Insert a scoped acceptance for a non-existent caller to activate
 			// non-default-allow mode on subOwner.
 			// Use a valid UUID that references no real service (INSERT ignores FK if null peer).
@@ -328,7 +328,7 @@ describe("workflow-access-policy", () => {
 			);
 			await sleep(800);
 
-			let denied = false;
+			let _denied = false;
 			try {
 				const { runId: runId2 } = await parentOwner.workflow.start(
 					parentWf,
@@ -350,7 +350,7 @@ describe("workflow-access-policy", () => {
 			} catch (e) {
 				// start() itself may be denied if scope propagation removes
 				// the subWf from parent's snapshot.
-				denied = true;
+				_denied = true;
 				expect(String(e)).toMatch(/denied|PermissionDenied|access/i);
 			}
 			// Either denied at start() or run fails — both are valid.
@@ -412,7 +412,7 @@ describe("workflow-access-policy", () => {
 			);
 			callerID = caller.identity()!.serviceId;
 
-			const before = caller.policyEvaluation()!.warnings.length;
+			const _before = caller.policyEvaluation()!.warnings.length;
 
 			// Insert a rule that disables default-allow for workflow.run but does
 			// NOT cover wfName → this generates a warning in policyEvaluation().

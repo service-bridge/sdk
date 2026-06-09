@@ -1,7 +1,6 @@
 // @public — см. ./README.md
 
 import { createHash } from "node:crypto";
-import { MethodType } from "../pb/servicebridge/v1/registry";
 import type { Registry } from "../registry/registry";
 import type {
 	CatchupPolicy,

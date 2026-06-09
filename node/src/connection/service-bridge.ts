@@ -142,7 +142,7 @@ function randomJitter(maxMs: number): number {
 function makeTelemetryAPI(
 	ring: TelemetryRing,
 	getInstanceId: () => string,
-	getServiceId: () => string,
+	_getServiceId: () => string,
 	getCaptureModeForChannel: (channel: Channel) => CaptureMode,
 	payloadMaxBytes: number,
 ): TelemetryAPI {

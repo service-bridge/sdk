@@ -23,7 +23,10 @@
 	"linter": {
 		"enabled": true,
 		"rules": {
-			"recommended": true
+			"recommended": true,
+			"style": {
+				"noNonNullAssertion": "off"
+			}
 		}
 	},
 	"javascript": {
@@ -44,8 +47,8 @@
 			"includes": ["**/*.test.ts"],
 			"linter": {
 				"rules": {
-					"style": {
-						"noNonNullAssertion": "off"
+					"suspicious": {
+						"noTemplateCurlyInString": "off"
 					}
 				}
 			}

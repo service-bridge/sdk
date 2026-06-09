@@ -29,7 +29,7 @@ const SCHEMA = { protoFile, input: "ChargeRequest", output: "ChargeResponse" };
 
 describe("access-policy: live propagation via NOTIFY", () => {
 	const env = eventsEnv();
-	let calleeID: string;
+	let _calleeID: string;
 	let callerID: string;
 	let callee: ServiceBridge | undefined;
 	let caller: ServiceBridge | undefined;
@@ -38,7 +38,7 @@ describe("access-policy: live propagation via NOTIFY", () => {
 
 	beforeEach(async () => {
 		callee = caller = undefined;
-		calleeID = await serviceID(CALLEE_SVC);
+		_calleeID = await serviceID(CALLEE_SVC);
 		callerID = await serviceID("e2e-registry-consumer");
 		await clearRules(callerID);
 	});

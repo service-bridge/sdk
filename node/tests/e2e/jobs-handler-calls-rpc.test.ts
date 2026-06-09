@@ -6,7 +6,6 @@
 // and exercised in the telemetry integration tests.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { join } from "node:path";
 import { ServiceBridge } from "../../src/connection/service-bridge";
 import { ORDER_EVENT_PROTO, waitFor } from "./_helpers/events";
 import { harnessFromEnv } from "./_helpers/harness";

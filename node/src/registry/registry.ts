@@ -245,7 +245,7 @@ export class Handle {
 		name: string,
 	): { contractHash: string; pair: SchemaPair } | undefined {
 		const entry = this._published.find((e) => e.name === name);
-		if (!entry || !entry.schemaPair) return undefined;
+		if (!entry?.schemaPair) return undefined;
 		return { contractHash: entry.contractHash, pair: entry.schemaPair };
 	}
 
@@ -429,7 +429,7 @@ export class Handle {
 			): AsyncIterable<StreamItem> {
 				void handle;
 				const entry = findRpc(method);
-				if (!entry || !entry.streaming) {
+				if (!entry?.streaming) {
 					yield {
 						errorCode: "NOT_FOUND",
 						errorMessage: `no streaming handler for method ${method}`,

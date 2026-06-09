@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { beforeEach, describe, expect, test } from "bun:test";
 import type { MetricPoint } from "../pb/servicebridge/v1/telemetry";
 import { MetricKind } from "../pb/servicebridge/v1/telemetry";
 import { cpuPercent, ProcessSampler } from "./process-sampler";

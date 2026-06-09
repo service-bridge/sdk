@@ -65,7 +65,6 @@ const TTL_LEAD_MS = 5 * 60 * 1000;
 // @internal — см. ./README.md
 export class DirectTransport {
 	private cache = new Map<string, CacheEntry>();
-	private credsEpoch = 0;
 
 	constructor(private creds: DirectCredentials) {}
 
@@ -74,7 +73,6 @@ export class DirectTransport {
 	// previous cert and will reject after rotation.
 	updateCredentials(creds: DirectCredentials): void {
 		this.creds = creds;
-		this.credsEpoch++;
 		for (const [endpoint, entry] of this.cache) {
 			entry.client.close();
 			this.cache.delete(endpoint);
