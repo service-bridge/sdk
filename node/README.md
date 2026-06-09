@@ -89,13 +89,19 @@ The third constructor argument is an [options](#configuration) object. The SDK r
 
 ### Using an AI coding agent?
 
-Drop in the official **`servicebridge-node`** skill and your agent (Claude Code, etc.) writes correct ServiceBridge code on the first try — RPC, events, workflows, jobs and HTTP integration, grounded in this exact SDK:
+This package ships an official skill so your agent (Claude Code, etc.) writes correct ServiceBridge code on the first try — RPC, events, workflows, jobs and HTTP integration, grounded in this exact SDK. It comes with the install; copy it into your agent's skills directory:
 
 ```sh
-npx degit service-bridge/sdk/skills/servicebridge-node .claude/skills/servicebridge-node
+cp -r node_modules/service-bridge/skill .claude/skills/servicebridge-node
 ```
 
-Source and details: [`skills/servicebridge-node/`](https://github.com/service-bridge/sdk/tree/main/skills/servicebridge-node).
+Not installed yet? Pull it straight from the repo:
+
+```sh
+npx degit service-bridge/sdk/node/skill .claude/skills/servicebridge-node
+```
+
+Source: [`node/skill/`](https://github.com/service-bridge/sdk/tree/main/node/skill).
 
 ---
 
