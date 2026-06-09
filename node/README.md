@@ -41,6 +41,7 @@ You declare what your service handles and what it calls. ServiceBridge does the 
 
 - [Install](#install)
 - [AI coding skill](#ai-coding-skill)
+- [CLI](#cli)
 - [Why ServiceBridge](#why-servicebridge)
 - [Use cases](#use-cases)
 - [Quick start](#quick-start)
@@ -107,6 +108,18 @@ npx degit service-bridge/sdk/node/skill .claude/skills/servicebridge-node
 ```
 
 Restart the agent so it loads the skill. Source and contents: [`node/skill/`](https://github.com/service-bridge/sdk/tree/main/node/skill).
+
+---
+
+## CLI
+
+The runtime ships with `sb`, a command-line client for managing services, traces, events, jobs, workflows, alerts and settings. It comes with the runtime image — there is no separate install — so a running runtime already has it at `/usr/local/bin/sb`. Use `docker exec <container> sb …` or the host binary, and pass `-o json` to get machine-readable output for AI agents. Check it with:
+
+```sh
+sb version
+```
+
+Full command reference: **[servicebridge.dev/#docs/cli](https://servicebridge.dev/#docs/cli)**.
 
 ---
 
