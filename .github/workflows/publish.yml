@@ -39,4 +39,4 @@ jobs:
             echo "service-bridge@${ver} already published — skipping."
             exit 0
           fi
-          npm publish --provenance --access public
+          npm publish --tag latest --provenance --access public
