@@ -81,11 +81,21 @@ Every SDK speaks the same runtime over the same gRPC control plane, so the API s
 
 Each SDK directory holds its own README with install instructions, a quick start and the full API reference.
 
+## AI coding skill
+
+Building with an AI agent like Claude Code? Drop in the official **`servicebridge-node`** skill so the agent writes correct SDK code on the first try — the real RPC, events, workflows, jobs and Express/Fastify/Hono API, grounded in the shipped SDK rather than guessed.
+
+```sh
+npx degit service-bridge/sdk/skills/servicebridge-node .claude/skills/servicebridge-node
+```
+
+It lives at [`skills/servicebridge-node/`](./skills/servicebridge-node) and loads like any agent skill — `.claude/skills/` for Claude Code, or wherever your agent reads skills. Restart the agent to pick it up.
+
 ## Links
 
 - **Full feature tour, docs & quickstart:** [servicebridge.dev](https://servicebridge.dev) · [servicebridge.dev/docs](https://servicebridge.dev/docs)
 - **Node SDK — install, examples, API reference:** [`./node`](./node)
-- **Runtime:** [github.com/servicebridge2/runtime](https://github.com/servicebridge2/runtime)
+- **AI coding skill:** [`./skills/servicebridge-node`](./skills/servicebridge-node)
 
 ## License
 

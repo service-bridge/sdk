@@ -87,6 +87,16 @@ const sb = new ServiceBridge(
 
 The third constructor argument is an [options](#configuration) object. The SDK reads **no environment variables** — every knob is a constructor option, so you stay in control of where config comes from.
 
+### Using an AI coding agent?
+
+Drop in the official **`servicebridge-node`** skill and your agent (Claude Code, etc.) writes correct ServiceBridge code on the first try — RPC, events, workflows, jobs and HTTP integration, grounded in this exact SDK:
+
+```sh
+npx degit service-bridge/sdk/skills/servicebridge-node .claude/skills/servicebridge-node
+```
+
+Source and details: [`skills/servicebridge-node/`](https://github.com/service-bridge/sdk/tree/main/skills/servicebridge-node).
+
 ---
 
 ## Why ServiceBridge
