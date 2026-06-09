@@ -12,7 +12,7 @@ import {
 } from "./acceptance";
 
 function makeCallWithSpiffeSan(serviceId: string, instanceId = "i-1"): object {
-	const altName = `URI:spiffe://servicebridge/service/${serviceId}/instance/${instanceId}`;
+	const altName = `URI:spiffe://service-bridge/service/${serviceId}/instance/${instanceId}`;
 	return {
 		call: {
 			handler: {
@@ -31,7 +31,7 @@ function makeCallWithSpiffeSan(serviceId: string, instanceId = "i-1"): object {
 describe("parsePeerSpiffeUri", () => {
 	it("parses valid SPIFFE URI", () => {
 		const result = parsePeerSpiffeUri(
-			"spiffe://servicebridge/service/aaaaaaaa-0000-0000-0000-000000000001/instance/bbbbbbbb-0000-0000-0000-000000000002",
+			"spiffe://service-bridge/service/aaaaaaaa-0000-0000-0000-000000000001/instance/bbbbbbbb-0000-0000-0000-000000000002",
 		);
 		expect(result).toEqual({
 			serviceId: "aaaaaaaa-0000-0000-0000-000000000001",
@@ -44,7 +44,7 @@ describe("parsePeerSpiffeUri", () => {
 	});
 
 	it("returns null for SPIFFE URI with wrong structure", () => {
-		expect(parsePeerSpiffeUri("spiffe://servicebridge/foo/bar")).toBeNull();
+		expect(parsePeerSpiffeUri("spiffe://service-bridge/foo/bar")).toBeNull();
 	});
 });
 
@@ -53,7 +53,7 @@ describe("parsePeerSpiffeUri", () => {
 describe("extractSpiffeServiceId", () => {
 	it("extracts serviceId from valid subjectaltname", () => {
 		const fakeAltName =
-			"URI:spiffe://servicebridge/service/aaaaaaaa-0000-0000-0000-000000000001/instance/i-1";
+			"URI:spiffe://service-bridge/service/aaaaaaaa-0000-0000-0000-000000000001/instance/i-1";
 		const id = extractSpiffeServiceId({ subjectaltname: fakeAltName });
 		expect(id).toBe("aaaaaaaa-0000-0000-0000-000000000001");
 	});
@@ -155,7 +155,7 @@ describe("getPeerCertFromCall", () => {
 		const call = makeCallWithSpiffeSan(callerA);
 		const cert = getPeerCertFromCall(call);
 		expect(cert).not.toBeNull();
-		expect(cert?.subjectaltname).toContain("spiffe://servicebridge/");
+		expect(cert?.subjectaltname).toContain("spiffe://service-bridge/");
 	});
 
 	it("returns null when accessor is missing", () => {
