@@ -40,6 +40,7 @@ You declare what your service handles and what it calls. ServiceBridge does the 
 ## Table of contents
 
 - [Install](#install)
+- [AI coding skill](#ai-coding-skill)
 - [Why ServiceBridge](#why-servicebridge)
 - [Use cases](#use-cases)
 - [Quick start](#quick-start)
@@ -87,21 +88,25 @@ const sb = new ServiceBridge(
 
 The third constructor argument is an [options](#configuration) object. The SDK reads **no environment variables** — every knob is a constructor option, so you stay in control of where config comes from.
 
-### Using an AI coding agent?
+---
 
-This package ships an official skill so your agent (Claude Code, etc.) writes correct ServiceBridge code on the first try — RPC, events, workflows, jobs and HTTP integration, grounded in this exact SDK. It comes with the install; copy it into your agent's skills directory:
+## AI coding skill
+
+This package ships an official skill so your AI coding agent (Claude Code, etc.) writes correct ServiceBridge code on the first try — RPC, events, workflows, jobs and Express/Fastify/Hono integration, grounded in this exact SDK rather than guessed.
+
+It comes with the install. Copy it into your agent's skills directory — `.claude/skills/` for Claude Code, or `~/.claude/skills/` for all projects:
 
 ```sh
 cp -r node_modules/service-bridge/skill .claude/skills/servicebridge-node
 ```
 
-Not installed yet? Pull it straight from the repo:
+Not installed yet? Pull it straight from the repo with degit:
 
 ```sh
 npx degit service-bridge/sdk/node/skill .claude/skills/servicebridge-node
 ```
 
-Source: [`node/skill/`](https://github.com/service-bridge/sdk/tree/main/node/skill).
+Restart the agent so it loads the skill. Source and contents: [`node/skill/`](https://github.com/service-bridge/sdk/tree/main/node/skill).
 
 ---
 

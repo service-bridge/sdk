@@ -1,6 +1,6 @@
 {
 	"name": "service-bridge",
-	"version": "2.0.0-alpha.2",
+	"version": "2.0.0-alpha.3",
 	"description": "TypeScript SDK for ServiceBridge — RPC, durable events, workflows, jobs and observability over a single self-hosted gRPC runtime with mTLS.",
 	"license": "MIT",
 	"type": "module",
@@ -14,7 +14,6 @@
 	},
 	"homepage": "https://servicebridge.dev",
 	"publishConfig": {
-		"tag": "alpha",
 		"access": "public",
 		"provenance": true
 	},
