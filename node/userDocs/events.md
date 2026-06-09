@@ -51,7 +51,7 @@ sb.event.define(
 ): void
 ```
 
-`SchemaSpec` — тот же тип, что и у `sb.rpc.handle`: либо `.proto` файл (`ProtoFileSpec`), либо `.schema.json` (`JsonSchemaFileSpec`) c явными `fieldNumber`. Inline JSON Schema не поддерживается (ADR-0013).
+`SchemaSpec` — тот же тип, что и у `sb.rpc.handle`: либо `.proto` файл (`ProtoFileSpec`), либо `.schema.json` (`JsonSchemaFileSpec`) c явными `fieldNumber`. Inline JSON Schema не поддерживается (ADR-0002).
 
 Вызывать **до `sb.start()`**.
 
@@ -187,7 +187,7 @@ await sb.event.publish("payment.charged", {
 2. SDK кодирует payload через `SchemaPair` (Protobuf binary, тот же путь, что у RPC). `type.verify()` бросает на невалидный payload **до** записи в outbox — `await sb.event.publish(...)` rejected'ится сразу.
 3. SDK INSERT'ит row в локальный SQLite `event_outbox` (WAL mode, `synchronous=NORMAL`). Возврат из `event.publish` происходит после COMMIT.
 4. Фоновой drainer SDK читает pending rows батчами и шлёт runtime через `Events.Publish`.
-5. Runtime дедупает по `idempotency_key` и INSERT'ит `event_log` + `event_deliveries` (по строке на каждый matching consumer service) в **одной транзакции**. Payload — opaque bytes; runtime не декодит и не валидирует (ADR-0013).
+5. Runtime дедупает по `idempotency_key` и INSERT'ит `event_log` + `event_deliveries` (по строке на каждый matching consumer service) в **одной транзакции**. Payload — opaque bytes; runtime не декодит и не валидирует (ADR-0002).
 6. Dispatcher push'ит deliveries через open Subscribe stream подписчикам. Subscriber декодирует payload через свой `SchemaPair` (тот же `define(name, spec)` на subscriber-стороне).
 
 ### PublishOpts
@@ -200,7 +200,7 @@ await sb.event.publish("payment.charged", {
 | `headers` | `Record<string,string>` | `{}` | Метаданные envelope. Едут по wire в `EventEnvelope.headers`, но в handler subscriber'а **не передаются** (handler получает только декодированный payload). |
 | `occurredAtMs` | `number` | `Date.now()` | Время бизнес-события (а не ingest), unix-ms. Едет в `EventEnvelope.occurred_at_unix_ms`. |
 
-`event.publish` возвращает `{ eventId }` — UUID v7 через `Bun.randomUUIDv7()` (монотонен в пределах одной миллисекунды).
+`event.publish` возвращает `{ eventId }` — UUID v7 через npm-пакет `uuidv7` (монотонен в пределах одной миллисекунды).
 
 ---
 
@@ -215,7 +215,7 @@ Pattern — `[a-z0-9_-]+(\.[a-z0-9_-]+)*` плюс два специальных
 
 Wildcards комбинируются: `order.*.created` ловит `order.online.created`, не ловит `order.created` и не ловит `order.x.y.created`.
 
-> Матчинг patterns — **только на стороне runtime** (`registry.TopicMatch`, ADR-0011); в SDK matcher'а нет. SDK лишь регистрирует pattern как подписку и диспатчит входящие deliveries по точному имени события (см. §2).
+> Матчинг patterns — **только на стороне runtime** (`registry.TopicMatch`, ADR-0002); в SDK matcher'а нет. SDK лишь регистрирует pattern как подписку и диспатчит входящие deliveries по точному имени события (см. §2).
 
 ---
 
@@ -238,7 +238,7 @@ Wildcards комбинируются: `order.*.created` ловит `order.online
 
 ## 6. Идемпотентность
 
-Доставка at-least-once → handler **обязан** переживать дубликаты. SDK **не** делает client-side dedup доставок (ADR-0011): один и тот же `event_id` может прийти повторно, и handler будет вызван снова. Дедупликация — на двух уровнях.
+Доставка at-least-once → handler **обязан** переживать дубликаты. SDK **не** делает client-side dedup доставок (ADR-0002): один и тот же `event_id` может прийти повторно, и handler будет вызван снова. Дедупликация — на двух уровнях.
 
 ### Application-side dedup (обязателен для не-идемпотентных эффектов)
 
@@ -315,7 +315,7 @@ await sb.event.publish("metric.counter", { name: "page_view", value: 1 }, {
 
 ### Локальный SQLite outbox
 
-SDK хранит outbox в `${SB_DATA_DIR}/sdk.db` (default `./.servicebridge/sdk.db`):
+SDK хранит outbox в `<dataDir>/sdk.db`, где `dataDir` — опция конструктора (default `./.servicebridge`, т. е. `./.servicebridge/sdk.db`):
 
 | Колонка | Назначение |
 |---|---|
@@ -346,13 +346,13 @@ Drainer пытается до 5 раз с лестницей `[1s, 5s, 30s, 2m, 
 | `REJECTED_FORBIDDEN` | `status='failed'`, terminal; SDK дёргает `onPolicyViolation` (publish — это access-policy `event.publish`, denied) |
 | Сетевая ошибка / `UNSPECIFIED` | retry с backoff до `MAX_ATTEMPTS` |
 
-Отдельных schema-отказов в протоколе нет (ADR-0013): payload валидируется на SDK-стороне в момент `encode()` (Protobuf `type.verify()`), невалидные payload-ы вообще не попадают в outbox.
+Отдельных schema-отказов в протоколе нет (ADR-0002): payload валидируется на SDK-стороне в момент `encode()` (Protobuf `type.verify()`), невалидные payload-ы вообще не попадают в outbox.
 
 > `REJECTED_FORBIDDEN` — это асинхронный отказ: `publish()` уже вернул OK (row в outbox), поэтому ошибку нельзя бросить вызывающему. SDK помечает row `failed` и логирует warn; owner может подключить callback `onPolicyViolation`, чтобы заэмитить `policy_violation`.
 
 ### Outbox cap
 
-Если runtime недоступен надолго и outbox растёт — при достижении `SB_MAX_OUTBOX_ROWS` (default 100000) `event.publish` бросает `OutboxFullError`. Это явный сигнал, что что-то не так — лучше fail-fast, чем disk-full.
+Если runtime недоступен надолго и outbox растёт — при достижении опции `maxOutboxRows` (default 100000) `event.publish` бросает `OutboxFullError`. Это явный сигнал, что что-то не так — лучше fail-fast, чем disk-full.
 
 ---
 
@@ -428,7 +428,7 @@ Runtime хранит две строки в `service_methods` с одинако�
 | Ситуация | SDK / Runtime | Что делать |
 |---|---|---|
 | Невалидное имя | `InvalidEventNameError` (SDK) до RPC | Поменять имя на `[a-z0-9_-]+(\.[a-z0-9_-]+)*` |
-| Outbox переполнен | `OutboxFullError` (SDK) | Поднять `SB_MAX_OUTBOX_ROWS` или диагностировать почему drainer не катится |
+| Outbox переполнен | `OutboxFullError` (SDK) | Поднять опцию `maxOutboxRows` или диагностировать почему drainer не катится |
 | `event.publish` до `start()` | `Error: events publisher not ready` (SDK) | Перенести вызов после `await sb.start()` |
 | Имя не задекларировано / без spec | `Error: events: no schema registered for event "..."` (SDK, до RPC) | Добавить `sb.event.define(name, spec)` (со spec) до `start()` |
 | Невалидный payload | encode `type.verify()` throws (SDK, до outbox) | Поправить payload под схему |

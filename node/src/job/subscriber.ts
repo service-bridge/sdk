@@ -183,7 +183,7 @@ export class JobSubscriber {
 		};
 
 		// xSbTrace is the canonical "<traceID>-<parentOpID>" header per
-		// ADR T-017. The runtime always emits it for telemetry-enabled
+		// ADR 0006. The runtime always emits it for telemetry-enabled
 		// executions; absent (empty string) means runtime telemetry was
 		// disabled — handler still runs, just without trace propagation.
 		const xSbTrace = exec.xSbTrace ?? "";

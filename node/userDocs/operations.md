@@ -30,9 +30,13 @@ new ServiceBridge(url: string, key: string, options?: ServiceBridgeOptions)
 interface ServiceBridgeOptions {
   reconnectIntervalMs?: number;        // default 3000
   reconnectAttempts?: number;          // default 3 (0 = безлимит)
-  advertise?: { host: string; port: number } | false;
+  advertise?: { host: string; port: number } | false; // default: 127.0.0.1 на свободном порту (+warning)
   callDefaults?: CallOpts;             // default {}
-  certRefreshLeadMs?: number;          // default 7 * 24 * 60 * 60 * 1000
+  failOnPolicyViolation?: boolean;     // default false
+  dataDir?: string;                    // default "./.servicebridge"
+  maxOutboxRows?: number;              // default 100000
+  eventsDrainerBatch?: number;         // default 50
+  eventsMaxInFlight?: number;          // default 32
 }
 ```
 
@@ -42,7 +46,17 @@ interface ServiceBridgeOptions {
 | `reconnectAttempts` | Максимум попыток. По исчерпании — `disconnected` с `reason: "exhausted"`. `0` = бесконечный. |
 | `advertise` | Inbound CallServer. См. §5. |
 | `callDefaults` | Дефолтные `CallOpts` для всех `sb.rpc.call`/`sb.stream`. См. [RPC §4](./rpc.md#4-callopts). |
-| `certRefreshLeadMs` | За сколько до expiry leaf cert SDK начинает overlap-rotation. |
+| `failOnPolicyViolation` | `true` → нарушение политики в первом снапшоте обрывает `start()` (`disconnected`, `reason: "policy"`). По умолчанию `false` — только событие `policy_violation`. |
+| `dataDir` | Каталог локального SQLite-outbox. По умолчанию `"./.servicebridge"`. |
+| `maxOutboxRows` | Потолок строк в event-outbox до back-pressure на publish. По умолчанию `100000`. |
+| `eventsDrainerBatch` | Сколько строк дренер событий тянет за тик. По умолчанию `50`. |
+| `eventsMaxInFlight` | Максимум параллельно обрабатываемых inbound-событий. По умолчанию `32`. |
+
+Telemetry on/off и payload cap управляются runtime-настройками UI (Settings → Telemetry):
+- `telemetry.enable` (`true`/`false`) — рантайм пушит в SDK через `CaptureModes.telemetry_enabled`. Когда `false`, transport не стартует (ops/logs/metrics буферизуются в ring, не отправляются). Fail-safe до первого снапшота: включён.
+- `telemetry.payload_max_bytes` — per-direction cap payload'а в байтах. Пушится в SDK через `CaptureModes.payload_max_bytes`. Fail-safe до первого снапшота: `65536`.
+
+Overlap-rotation leaf-сертификата выполняется автоматически (за 30 минут до expiry) — публичной опции у неё нет.
 
 ### Типичные пресеты
 
@@ -197,7 +211,7 @@ SDK-инстанс способен принимать **входящие** RPC 
 
 | `advertise` значение | Поведение |
 |---------------------|-----------|
-| **не указано** | env `SB_ADVERTISE_HOST` → `port: 0`. Иначе `127.0.0.1:0` с warning. **Только для dev**: 127.0.0.1 недоступен из других подов. |
+| **не указано** | Bind `127.0.0.1` на свободном порту + warning. **Только для dev**: 127.0.0.1 недоступен из других подов. |
 | `{ host, port }` | Явный bind. `port: 0` = ОС выбирает. **Рекомендуется для production.** |
 | `false` | Caller-only mode. CallServer не поднимается, в реестре нет `call_endpoint`. |
 
@@ -241,18 +255,9 @@ for (const d of caller.serviceMap().values()) {
 
 ### Генерация
 
-Обычный путь — дашборд на `http://localhost:14444`: **Services → Create service**, задайте имя, скопируйте выданную строку `sb.Cgj...`.
+Дашборд рантайма на `http://localhost:14444`: **Services → Create service**, задайте имя, скопируйте выданную строку `sb.Cgj...`. CA автоматически хранится в Postgres (таблица `runtime_ca`), файлы сертификатов не нужны.
 
-Из исходников рантайма тот же ключ выдаёт `sbkey-gen`. CA берётся из Postgres (таблица `runtime_ca`), файлы сертификатов не нужны:
-
-```sh
-cd runtime
-go run ./cmd/sbkey-gen \
-  -name payment-svc \
-  -dsn  "postgresql://user:pass@localhost:5433/servicebridge?sslmode=disable"
-```
-
-Вывод (одна строка `sb.Cgj...`) — сохраните как env-переменную.
+Сохраните строку `sb.Cgj...` как env-переменную.
 
 ```sh
 # .env (в .gitignore!)
@@ -265,9 +270,9 @@ SERVICEBRIDGE_SERVICE_KEY=sb.Cgj...XYZ
 ### mTLS lifecycle
 
 После `sb.start()`:
-1. Bootstrap.Provision → получаем leaf cert (TTL обычно 24-72 часа).
+1. Bootstrap.Provision → получаем leaf cert (TTL 1 час).
 2. Long-lived mTLS-канал с runtime.
-3. За `certRefreshLeadMs` до expiry (default 7 дней) — **overlap rotation**: новый канал с новым cert, ждём первый `Welcome`, переключаемся, старый канал drain.
+3. За 30 минут до expiry — **overlap rotation**: новый канал с новым cert, ждём первый `Welcome`, переключаемся, старый канал drain.
 4. Все этапы — без потери in-flight вызовов. На каждой rotation эмитится повторный `connected`.
 
 ### SPIFFE identity
@@ -281,10 +286,7 @@ spiffe://servicebridge/service/<service_id>/instance/<instance_id>
 
 ### Ротация скомпрометированного ключа
 
-```sh
-# Создать новый ключ для того же сервиса
-go run ./cmd/sbkey-gen -name payment-svc ...
-```
+Создайте новый ключ для того же сервиса через дашборд (**Services → Create service**) и обновите env-переменные.
 
 После rotation:
 1. Обновите env-переменную.
@@ -305,9 +307,8 @@ go run ./cmd/sbkey-gen -name payment-svc ...
 |-----------|---------|-----------|
 | `SERVICEBRIDGE_URL` | — | Адрес runtime (`host:port`). Передаётся в конструктор. |
 | `SERVICEBRIDGE_SERVICE_KEY` | — | Bootstrap-ключ. Передаётся в конструктор. |
-| `SB_ADVERTISE_HOST` | — | Host для inbound CallServer (только если `advertise` не задан в коде). |
 
-> SDK не читает `URL`/`SERVICE_KEY` из env автоматически — вы сами передаёте `process.env.X!` в конструктор. Это явно по дизайну.
+> Это **ваша** конвенция имён, а не то, что читает SDK. SDK не читает из env ничего — ни `URL`/`SERVICE_KEY`, ни advertise host. Вы сами передаёте `process.env.X!` в конструктор, а `advertise` задаёте в коде. Это явно по дизайну.
 
 ### Runtime
 
@@ -338,7 +339,7 @@ go run ./cmd/sbkey-gen -name payment-svc ...
 - Запись удалена из БД runtime.
 - БД runtime пересоздана.
 
-Сгенерируйте новый ключ через `sbkey-gen`, обновите env.
+Сгенерируйте новый ключ через дашборд рантайма (**Services → Create service**), обновите env.
 
 ### no descriptor for `<svc>/<method>`
 
@@ -378,7 +379,7 @@ Auto-resolve не нашёл messages. Укажите явно: `{ protoFile, in
 
 ### advertise not configured warning
 
-Не указана `advertise` и нет `SB_ADVERTISE_HOST` env. Для production: задайте `advertise: { host, port }` явно. Для caller-only: `advertise: false`.
+Не указана `advertise`, поэтому inbound CallServer сел на недостижимый `127.0.0.1`. Для production: задайте `advertise: { host, port }` явно. Для caller-only: `advertise: false`.
 
 ### Все retry исчерпались с UNAVAILABLE
 

@@ -98,7 +98,7 @@ Domain namespace для durable workflows. Покрывает обе сторо�
   Добавление нового поля в нижележащий тип без обновления workflow types
   ломает compile (см. `types.test-d.ts`).
 - **`timeoutSec` user-facing в секундах.** Wire-поле `timeout_sec` (uint32,
-  ADR-0015 исключение для user-API) — отличается от wall-clock unix-ms
+  ADR-0006 исключение для user-API) — отличается от wall-clock unix-ms
   внутренних полей.
 - **Trace propagation (T-017, T-022).** `start()` пушит `X-SB-Trace` из ALS
   в `StartRunRequest.x_sb_trace`. Subscriber парсит `RunAssignment.xSbTrace`

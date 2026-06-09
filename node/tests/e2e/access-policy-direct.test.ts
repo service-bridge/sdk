@@ -1,5 +1,5 @@
 /**
- * access-policy-direct.test.ts — ADR-0014 Layer 2 (direct transport).
+ * access-policy-direct.test.ts — ADR-0004 Layer 2 (direct transport).
  *
  * When the caller and callee talk directly (SDK→SDK mTLS, bypassing the
  * runtime Invoke proxy), the callee enforces its own rpc.handle acceptance

@@ -70,7 +70,7 @@ export function eventsEnv(): EventsEnv {
 				``,
 				`Runtime must be up at SERVICEBRIDGE_URL — start it if needed:`,
 				``,
-				`    go run -C runtime ./cmd/runtime -pg-url postgres://servicebridge:servicebridge@localhost:5433/servicebridge?sslmode=disable`,
+				`    go run -C runtime ./cmd/runtime -pg-url postgres://servicebridge:servicebridge@localhost:5433/service-bridge?sslmode=disable`,
 			].join("\n"),
 		);
 	}

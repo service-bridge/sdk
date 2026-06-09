@@ -8,7 +8,7 @@
 
 ## Публичный контракт
 
-Импорт: `import { attachHono, collectHonoRoutes, type HonoEndpoint } from "servicebridge/hono";`
+Импорт: `import { attachHono, collectHonoRoutes, type HonoEndpoint } from "service-bridge/hono";`
 
 | Имя | Тип | По умолчанию | Что делает |
 |-----|-----|--------------|------------|
@@ -33,8 +33,8 @@
 
 ```ts
 import { Hono } from "hono";
-import { ServiceBridge } from "servicebridge";
-import { attachHono } from "servicebridge/hono";
+import { ServiceBridge } from "service-bridge";
+import { attachHono } from "service-bridge/hono";
 
 const sb = new ServiceBridge(URL, KEY);
 const app = new Hono();
@@ -51,7 +51,7 @@ Bun.serve({ fetch: app.fetch, port: 3000 });
 ```ts
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
-import { attachHono } from "servicebridge/hono";
+import { attachHono } from "service-bridge/hono";
 
 const sb = new ServiceBridge(URL, KEY);
 const app = new Hono();
@@ -92,4 +92,4 @@ serve({ fetch: app.fetch, port: 8080 });
 Используется в:
 - `sdk/node/tests/e2e/http-hono.test.ts`.
 - `sdk/node/src/http/hono/plugin.test.ts`.
-- Прикладной код через subpath `servicebridge/hono`.
+- Прикладной код через subpath `service-bridge/hono`.

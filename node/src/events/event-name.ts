@@ -1,5 +1,5 @@
 // event-name.ts — event name validation. Routing (AMQP wildcards) lives on
-// the server side only — ADR-0011.
+// the server side only — ADR-0002.
 // @public — см. ./README.md
 
 const EVENT_NAME_RE = /^[a-z0-9_-]+(\.[a-z0-9_-]+)*$/;

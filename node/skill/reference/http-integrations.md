@@ -42,7 +42,7 @@ app.listen(3000);
 await app.register(sbFastify, { sb: ServiceBridge, host?: string });
 ```
 
-Register **before** your routes (it collects them via the `onRoute` hook) — the advertise endpoint is published after `app.listen()` via the `onListen` hook, so the real port (even `0`) is known automatically. Supports Fastify 4.x and 5.x.
+Register the plugin (it collects routes via the `onRoute` hook regardless of registration order, since `fastify-plugin` un-encapsulates the hook) — the advertise endpoint is published after `app.listen()` via the `onListen` hook, so the real port (even `0`) is known automatically. Supports Fastify 4.x and 5.x.
 
 ```ts
 import Fastify from "fastify";
@@ -51,7 +51,7 @@ import { sbFastify } from "service-bridge/fastify";
 
 const sb = new ServiceBridge("localhost:14445", process.env.API_KEY!);
 const app = Fastify();
-await app.register(sbFastify, { sb, host: process.env.POD_IP });  // before routes
+await app.register(sbFastify, { sb, host: process.env.POD_IP });  // any order
 app.get("/api/orders/:id", async (req) => ({ id: (req.params as any).id }));
 app.post("/api/orders", async () => ({ created: true }));
 
@@ -84,4 +84,4 @@ export default { port: 3000, fetch: app.fetch }; // Bun
 
 ## Advertise host
 
-`host` is optional on all three. If omitted, the plugin falls back to `SB_HTTP_ADVERTISE_HOST` → `SB_ADVERTISE_HOST` → `127.0.0.1` (with a one-time warning). Pass an explicit reachable host (e.g. the pod IP) in production.
+`host` is optional on all three. If omitted, the plugin falls back to `127.0.0.1` (with a one-time warning). Pass an explicit reachable host (e.g. the pod IP) in production.

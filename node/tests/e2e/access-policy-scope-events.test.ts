@@ -1,4 +1,4 @@
-// access-policy-scope-events.test.ts — ADR-0014 Layer-1 scope filter (events).
+// access-policy-scope-events.test.ts — ADR-0004 Layer-1 scope filter (events).
 //
 // Verifies the runtime's scope filter on the event dimension uses real
 // PatternIntersect (not containment). The shipped semantic: a subscriber's

@@ -8,7 +8,7 @@
 
 ## Публичный контракт
 
-Импорт: `import { attachExpress, type ExpressEndpoint } from "servicebridge/express";`
+Импорт: `import { attachExpress, type ExpressEndpoint } from "service-bridge/express";`
 
 ### `attachExpress(app, sb, endpoint)`
 
@@ -44,8 +44,8 @@
 
 ```ts
 import express from "express";
-import { ServiceBridge } from "servicebridge";
-import { attachExpress } from "servicebridge/express";
+import { ServiceBridge } from "service-bridge";
+import { attachExpress } from "service-bridge/express";
 
 const sb = new ServiceBridge(URL, KEY);
 const app = express();
@@ -91,4 +91,4 @@ app.listen(3000);
 
 Используется в:
 - `sdk/node/tests/e2e/http-express.test.ts`.
-- Прикладной код через subpath `servicebridge/express`.
+- Прикладной код через subpath `service-bridge/express`.

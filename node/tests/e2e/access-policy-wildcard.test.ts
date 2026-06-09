@@ -1,4 +1,4 @@
-// access-policy-wildcard.test.ts — ADR-0014 gate #2 (event.handle subscription
+// access-policy-wildcard.test.ts — ADR-0004 gate #2 (event.handle subscription
 // declarations vs acceptance rule's pattern via PatternContains).
 //
 // Acceptance rule for the subscriber: pattern `orders.*` (one segment after

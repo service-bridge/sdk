@@ -8,16 +8,13 @@
 
 В `runtime/docs/adr/`:
 
-- [0001 — RPC architecture](../../../runtime/docs/adr/0001-rpc-architecture.md) — passthrough proxy, per-pod CB, explicit advertise
-- [0002 — Direct mode](../../../runtime/docs/adr/0002-direct-mode.md) — SPIFFE verification, TTL eviction
-- [0003 — Resilience](../../../runtime/docs/adr/0003-resilience.md) — LB + CB + retry + idempotency
-- [0004 — Server-side streaming](../../../runtime/docs/adr/0004-streaming.md)
-- [0005 — Contract-version routing](../../../runtime/docs/adr/0005-contract-version-routing.md) — SDK as hash source of truth
-- [0006 — Durable Events](../../../runtime/docs/adr/0006-durable-events.md) — at-least-once доставка, retries, DLQ
-- [0007 — Idempotency unified](../../../runtime/docs/adr/0007-idempotency-unified.md) — единый ключ дедупликации
-- [0012 — RPC contract hash + idempotency](../../../runtime/docs/adr/0012-rpc-contract-hash-and-idempotency.md) — enforcement `contract_hash` на proxy-пути
-- [0013 — Events Protobuf payload](../../../runtime/docs/adr/0013-events-protobuf-payload.md) — runtime трактует payload как opaque bytes
-- [0014 — Access policy](../../../runtime/docs/adr/0014-access-policy.md) — capabilities + двусторонние allow-list
+- [0001 — RPC](../../../runtime/docs/adr/0001-rpc.md) — транспорт (proxy + direct), resilience (LB / CB / retry), contract-version routing, single-row trace
+- [0002 — Durable Events](../../../runtime/docs/adr/0002-events.md) — at-least-once доставка, server-only routing, opaque-payload bytes
+- [0003 — Workflows](../../../runtime/docs/adr/0003-workflows.md) — DAG-исполнение шагов, runtime-observable trace
+- [0004 — Access policy, identity, TLS](../../../runtime/docs/adr/0004-access-security-tls.md) — capabilities + двусторонние allow-list, mTLS, CA в Postgres
+- [0005 — Reliability](../../../runtime/docs/adr/0005-reliability.md) — liveness, единый ключ идемпотентности, ABANDONED-sweep
+- [0006 — Time & identity](../../../runtime/docs/adr/0006-time-identity.md) — `int64 unix-ms`, UUIDv7, `X-SB-Trace`
+- [0007 — Telemetry](../../../runtime/docs/adr/0007-telemetry-tracing.md) — примитив `operations`, схема, единый Report-канал
 
 ## Internal module READMEs
 

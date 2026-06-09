@@ -64,7 +64,7 @@ await sb.start();
 app.listen(3000);
 ```
 
-`port` обязателен (Express может биндиться на `0`, и в момент сбора роутов реальный порт неизвестен). `host` опционален — по умолчанию резолвится из env (см. [Шпаргалку](#шпаргалка)).
+`port` обязателен (Express может биндиться на `0`, и в момент сбора роутов реальный порт неизвестен). `host` опционален — это явная опция; если её не передать, берётся `127.0.0.1` с одноразовым warn (см. [Шпаргалку](#шпаргалка)).
 
 `attachExpress` безопасен и до `sb.start()`: endpoint осядет в Registry и попадёт в первый register-запрос. Идемпотентен — повторный вызов не дублирует роуты.
 
@@ -97,7 +97,7 @@ await sb.start();
 await app.listen({ port: 3000 });          // onListen хук опубликует endpoint
 ```
 
-`SbFastifyOptions`: `sb` обязателен, `host` опционален (тот же env-fallback). HEAD-метод, который Fastify авто-генерирует к каждому GET, отсекается — не дублирует методы в Service Map. Совместимость: Fastify 4.x и 5.x.
+`SbFastifyOptions`: `sb` обязателен, `host` опционален (явная опция; иначе `127.0.0.1` с одноразовым warn). HEAD-метод, который Fastify авто-генерирует к каждому GET, отсекается — не дублирует методы в Service Map. Совместимость: Fastify 4.x и 5.x.
 
 См. [src/http/fastify/README.md](../src/http/fastify/README.md).
 
@@ -124,7 +124,7 @@ await sb.start();
 Bun.serve({ fetch: app.fetch, port: 3000 });
 ```
 
-`HonoEndpoint`: `port` обязателен, `host` опционален (env-fallback). Роуты, объявленные через `app.all(...)`, в Service Map не попадают — метод `ALL` не раскладывается в конкретные.
+`HonoEndpoint`: `port` обязателен, `host` опционален (явная опция; иначе `127.0.0.1` с одноразовым warn). Роуты, объявленные через `app.all(...)`, в Service Map не попадают — метод `ALL` не раскладывается в конкретные.
 
 См. [src/http/hono/README.md](../src/http/hono/README.md).
 
@@ -196,10 +196,10 @@ await app.register(sbFastify, { sb }); await sb.start(); await app.listen({ port
 attachHono(app, sb, { port: 3000 }); await sb.start(); Bun.serve({ fetch: app.fetch, port: 3000 });
 ```
 
-Advertise-host (опционально `host` в опциях интеграции перебивает env):
-```
-SB_HTTP_ADVERTISE_HOST=10.0.0.5   # для cross-host
-# fallback: SB_HTTP_ADVERTISE_HOST → SB_ADVERTISE_HOST → 127.0.0.1 (с одноразовым warn)
+Advertise-host задаётся только явной опцией `host` в опциях интеграции — env-переменных нет:
+```ts
+attachExpress(app, sb, { port: 3000, host: "10.0.0.5" });   // для cross-host
+// без host → 127.0.0.1 (с одноразовым warn)
 ```
 
 → Дальше: [Operations](./operations.md)

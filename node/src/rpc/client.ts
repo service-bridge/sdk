@@ -27,7 +27,7 @@ export interface CallOpts {
 	//   - "proxy"  : caller → runtime Invoke → callee (even if direct possible)
 	//   - "auto"   : direct if endpoint is known, else proxy (DEFAULT)
 	transport?: "direct" | "proxy" | "auto";
-	// idempotencyKey opts the call into runtime-side dedup (ADR 0012). When
+	// idempotencyKey opts the call into runtime-side dedup (ADR 0001). When
 	// set, the runtime claims the key before forwarding and replays of the
 	// same key within the TTL return the cached response. Omit for read-only
 	// or otherwise non-idempotent calls — INTERNAL/ABORTED/UNKNOWN errors
@@ -74,7 +74,7 @@ export class RpcClient {
 		private readonly cb: CircuitBreakerRegistry,
 		private readonly lb: LoadBalancer,
 		// sb owns the instance identity and telemetry ring used for RPC.CALL emission.
-		// Per ADR-0036, the caller SDK emits RPC.CALL for every outbound call.
+		// Per ADR-0001, the caller SDK emits RPC.CALL for every outbound call.
 		private readonly sb: ServiceBridge,
 	) {}
 
@@ -119,7 +119,7 @@ export class RpcClient {
 		);
 		const useDirect = this.shouldUseDirect(candidate, transport);
 
-		// One RPC.CALL op for the entire stream lifetime (ADR-0037..0042).
+		// One RPC.CALL op for the entire stream lifetime (ADR-0001).
 		const callOp = this.sb.telemetry.startOp({
 			channel: Channel.RPC,
 			kind: RpcCall,
@@ -217,7 +217,7 @@ export class RpcClient {
 
 		const reqBytes = schema.pair.input.encode(payload as object);
 		const requestId = opts?.requestId ?? randomUUID();
-		// Idempotency is opt-in (ADR 0012). Empty string is the wire signal for
+		// Idempotency is opt-in (ADR 0001). Empty string is the wire signal for
 		// "no key" — runtime then skips Claim/Save entirely.
 		const idempotencyKey = opts?.idempotencyKey ?? "";
 		const timeoutMs = parseTimeout(opts?.timeout) ?? 30_000;
@@ -225,7 +225,7 @@ export class RpcClient {
 		const retry = mergeRetryOpts(opts?.retry);
 		const hasIdempotency = idempotencyKey.length > 0;
 
-		// One RPC.CALL op for the whole logical call (ADR-0037..0042). Retries
+		// One RPC.CALL op for the whole logical call (ADR-0001). Retries
 		// bump the attempt counter on the SAME row — no op per attempt. The op is
 		// started lazily on the first successful candidate pick so peer_service_id
 		// and via_proxy reflect the transport actually used.
@@ -392,7 +392,7 @@ export class RpcClient {
 }
 
 // formatRpcCallSubject mirrors Go's telemetry.FormatSubject(ChannelRPC, KindRPCCall, svc, method)
-// → "rpc.call:<svc>/<method>" (ADR-T-019).
+// → "rpc.call:<svc>/<method>" (ADR-0007).
 function formatRpcCallSubject(serviceName: string, methodName: string): string {
 	return `rpc.call:${serviceName}/${methodName}`;
 }

@@ -72,14 +72,15 @@ async function dropDatabase(dbName: string): Promise<void> {
 const PG_MAIN_DB =
 	process.env.POSTGRES_DB ??
 	process.env.TEST_DATABASE_URL?.match(/\/([^/?]+)(\?|$)/)?.[1] ??
-	"servicebridge";
+	"service-bridge";
 
 /**
  * seedServices copies all rows from the main services table into the isolated
  * DB so that existing bootstrap keys (from .env.e2e) are recognized by the
- * isolated runtime. Both runtimes share the same CA (certs/ca.crt), so TLS
- * trust is preserved. The secret_hash is the bcrypt hash — copying it is safe
- * because the raw secret never leaves the calling process.
+ * isolated runtime. TLS trust is preserved by copying the runtime CA from the
+ * main DB separately (see seedRuntimeCa) — the CA lives in Postgres, not on
+ * disk. The secret_hash is the bcrypt hash — copying it is safe because the
+ * raw secret never leaves the calling process.
  */
 async function seedServices(dbName: string): Promise<void> {
 	const mainUrl = `postgresql://${PG_USER}:${PG_PASSWORD}@${PG_HOST}:${PG_PORT}/${PG_MAIN_DB}`;
@@ -125,6 +126,38 @@ async function seedServices(dbName: string): Promise<void> {
 				],
 			);
 		}
+	} finally {
+		await srcDb.close();
+		await dstDb.close();
+	}
+}
+
+/**
+ * seedRuntimeCa copies the runtime CA (cert + key) from the main DB into the
+ * isolated DB so the isolated runtime trusts the same CA as the ambient one and
+ * accepts the .env.e2e bootstrap keys. The CA lives in Postgres (table
+ * runtime_ca), not on disk; without this copy the isolated runtime generates a
+ * fresh CA on first access and mTLS trust fails. Run after migrations create
+ * the table and before the runtime starts.
+ */
+async function seedRuntimeCa(dbName: string): Promise<void> {
+	const mainUrl = `postgresql://${PG_USER}:${PG_PASSWORD}@${PG_HOST}:${PG_PORT}/${PG_MAIN_DB}`;
+	const srcDb = new Bun.SQL(mainUrl);
+	const dstDb = new Bun.SQL(isolatedDbUrl(dbName));
+	try {
+		const rows = (await srcDb`
+			SELECT id, cert_der, key_der, created_at FROM runtime_ca WHERE id = 1
+		`) as Array<Record<string, unknown>>;
+		if (rows.length === 0) return;
+		const row = rows[0];
+		await dstDb.unsafe(
+			`
+			INSERT INTO runtime_ca (id, cert_der, key_der, created_at)
+			VALUES ($1,$2,$3,$4)
+			ON CONFLICT (id) DO NOTHING
+		`,
+			[row.id, row.cert_der, row.key_der, row.created_at],
+		);
 	} finally {
 		await srcDb.close();
 		await dstDb.close();
@@ -307,6 +340,11 @@ export async function spawnIsolatedRuntime(
 	await createDatabase(dbName);
 
 	await runMigrateOnly(opts.binaryPath, dbName);
+
+	// Copy the runtime CA from the main DB before the runtime starts, so the
+	// isolated runtime trusts the same CA as the .env.e2e bootstrap keys
+	// (CA lives in Postgres runtime_ca, not on disk).
+	await seedRuntimeCa(dbName);
 
 	const allSettings: Record<string, string> = {
 		"network.grpc_port": String(opts.grpcPort),

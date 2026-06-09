@@ -1,4 +1,4 @@
-// trace-context.ts — UUID-based trace context (ADR T-017).
+// trace-context.ts — UUID-based trace context (ADR 0006).
 // traceId and parentOpId are RFC 9562 UUID strings.
 // @internal — см. ./README.md
 

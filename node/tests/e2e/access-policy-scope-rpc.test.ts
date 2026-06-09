@@ -1,4 +1,4 @@
-// access-policy-scope-rpc.test.ts — ADR-0014 Layer-1 scope filter (RPC).
+// access-policy-scope-rpc.test.ts — ADR-0004 Layer-1 scope filter (RPC).
 //
 // Caller A has a single egress rpc.call rule allowing (B, m1). Therefore A's
 // snapshot must:

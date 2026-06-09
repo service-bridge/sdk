@@ -96,7 +96,7 @@ export interface PayloadBatch {
 /**
  * OpReport is a single operation lifecycle event.
  * finished_at_ms absent = START frame; present = END frame (T-014).
- * actor identity is taken from the mTLS cert on the server side (ADR-T-026).
+ * actor identity is taken from the mTLS cert on the server side (ADR-0006).
  * @public — см. ./README.md
  */
 export interface OpReport {
@@ -3089,7 +3089,7 @@ export const QueryMetricsResponse: MessageFns<QueryMetricsResponse> = {
  * Server-side acks via TelemetryAck provide flow control.
  * Read-side unary RPCs serve the UI dashboard.
  *
- * ADR T-025: single stream per identity binding → one disconnect event for
+ * ADR 0007: single stream per identity binding → one disconnect event for
  * ABANDONED sweep, one HTTP/2 stream per SDK instance.
  */
 export type TelemetryService = typeof TelemetryService;

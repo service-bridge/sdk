@@ -31,6 +31,10 @@ function captureModeFromProto(m: ProtoCaptureMode): CaptureMode {
 // runtime pushes a snapshot.
 type ChannelCaptureModes = Record<Channel, CaptureMode>;
 
+// DEFAULT_PAYLOAD_MAX_BYTES_PUSHED is the fallback used before the runtime
+// pushes a payload_max_bytes value via the registry snapshot.
+const DEFAULT_PAYLOAD_MAX_BYTES_PUSHED = 65536;
+
 function defaultChannelCaptureModes(): ChannelCaptureModes {
 	return {
 		[Channel.CHANNEL_UNSPECIFIED]: "none",
@@ -56,6 +60,13 @@ function channelCaptureModesFromProto(
 	out[Channel.EVENT] = captureModeFromProto(m.event);
 	out[Channel.WORKFLOW] = captureModeFromProto(m.workflow);
 	return out;
+}
+
+// PushedTelemetryConfig carries the runtime-pushed telemetry global settings.
+// @internal — см. ./README.md
+export interface PushedTelemetryConfig {
+	enabled: boolean;
+	payloadMaxBytes: number;
 }
 
 function channelModesEqual(
@@ -92,7 +103,7 @@ export class WatchStream {
 	private stream: ReturnType<RegistryClient["registerAndWatch"]> | null = null;
 	private cache = new Map<string, MethodDescriptor>();
 	private instances = new Map<string, ServiceInstanceInfo>();
-	// ADR-0014 enrichment: caller's own event subscriptions + outgoing calls
+	// ADR-0004 enrichment: caller's own event subscriptions + outgoing calls
 	// plus its current PolicyEvaluation. Updated from snapshot + update frames.
 	private eventSubs = new Map<string, EventSubscriptionDescriptor>();
 	private outgoing = new Map<string, OutgoingCallDescriptor>();
@@ -103,6 +114,15 @@ export class WatchStream {
 	private _captureModes: ChannelCaptureModes = defaultChannelCaptureModes();
 	private captureModeListeners = new Set<
 		(modes: ChannelCaptureModes) => void
+	>();
+	// Runtime-pushed telemetry global config. Default fail-safe: enabled=true,
+	// payloadMaxBytes=65536. Applied once the first snapshot arrives.
+	private _telemetryConfig: PushedTelemetryConfig = {
+		enabled: true,
+		payloadMaxBytes: DEFAULT_PAYLOAD_MAX_BYTES_PUSHED,
+	};
+	private telemetryConfigListeners = new Set<
+		(config: PushedTelemetryConfig) => void
 	>();
 	private onError: (err: Error) => void = () => {};
 	private instanceListeners = new Set<
@@ -148,7 +168,7 @@ export class WatchStream {
 		return this.instances;
 	}
 
-	// ADR-0014: snapshot accessors for service-map enrichment.
+	// ADR-0004: snapshot accessors for service-map enrichment.
 	eventSubscriptionsSnapshot(): Map<string, EventSubscriptionDescriptor> {
 		return new Map(this.eventSubs);
 	}
@@ -179,6 +199,46 @@ export class WatchStream {
 		if (channelModesEqual(next, this._captureModes)) return;
 		this._captureModes = next;
 		for (const fn of this.captureModeListeners) fn(next);
+	}
+
+	// pushedTelemetryConfig returns the last runtime-pushed telemetry global
+	// config. Default fail-safe before the first snapshot: enabled=true, cap=65536.
+	pushedTelemetryConfig(): PushedTelemetryConfig {
+		return this._telemetryConfig;
+	}
+
+	// onTelemetryConfig fires whenever the runtime pushes a (changed) telemetry
+	// config on the snapshot or an update.
+	onTelemetryConfig(fn: (config: PushedTelemetryConfig) => void): () => void {
+		this.telemetryConfigListeners.add(fn);
+		return () => this.telemetryConfigListeners.delete(fn);
+	}
+
+	private applyTelemetryConfig(m: ProtoCaptureModes | undefined): void {
+		if (!m) return;
+		// payload_max_bytes=0 on the wire means "not set" (proto3 default); fall
+		// back to the default cap so an older runtime that doesn't push the field
+		// doesn't silently truncate everything to 0.
+		const payloadMaxBytes =
+			m.payloadMaxBytes > 0
+				? m.payloadMaxBytes
+				: DEFAULT_PAYLOAD_MAX_BYTES_PUSHED;
+		// telemetry_enabled defaults to false in proto3; the runtime always
+		// explicitly sets it from telemetry.enable (default true), so a missing
+		// field means the runtime didn't push it — keep the current value.
+		const enabled =
+			m.payloadMaxBytes !== 0 || m.telemetryEnabled
+				? m.telemetryEnabled
+				: this._telemetryConfig.enabled;
+		const next: PushedTelemetryConfig = { enabled, payloadMaxBytes };
+		if (
+			next.enabled === this._telemetryConfig.enabled &&
+			next.payloadMaxBytes === this._telemetryConfig.payloadMaxBytes
+		) {
+			return;
+		}
+		this._telemetryConfig = next;
+		for (const fn of this.telemetryConfigListeners) fn(next);
 	}
 
 	onInstancesChange(
@@ -242,6 +302,7 @@ export class WatchStream {
 			this.applyCaptureModes(
 				channelCaptureModesFromProto(evt.snapshot.captureModes),
 			);
+			this.applyTelemetryConfig(evt.snapshot.captureModes);
 			this.emitInstances(evt.snapshot.instances, prev);
 		} else if (evt.update) {
 			for (const m of evt.update.added) {
@@ -302,6 +363,7 @@ export class WatchStream {
 			this.applyCaptureModes(
 				channelCaptureModesFromProto(evt.update.captureModes),
 			);
+			this.applyTelemetryConfig(evt.update.captureModes);
 			const addedPeers = evt.update.addedPeers ?? [];
 			if (addedPeers.length > 0 || removedPeers.length > 0) {
 				for (const fn of this.peersChangeListeners) {

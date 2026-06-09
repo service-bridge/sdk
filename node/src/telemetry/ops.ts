@@ -157,7 +157,7 @@ export class OpHandle {
 	/**
 	 * Record the retry attempt count on this in-flight op. The END frame carries
 	 * the final value so a single RPC.CALL row reflects how many tries it took
-	 * (ADR-0037..0042). No new row is minted per attempt.
+	 * (ADR-0001). No new row is minted per attempt.
 	 */
 	setAttempt(attempt: number): void {
 		this.params.attempt = attempt;

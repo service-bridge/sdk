@@ -23,7 +23,7 @@ ServiceBridge поддерживает гранулярную политику �
 
 ## Default-allow
 
-Сразу после `sbkey-gen` сервис может всё. В БД нет ни одного `service_policy_rules` для него; runtime трактует «нет правил для (service, action)» как разрешение.
+Сразу после регистрации через UI консоль сервис может всё. В БД нет ни одного `service_policy_rules` для него; runtime трактует «нет правил для (service, action)» как разрешение.
 
 Оператор добавляет правила, чтобы ограничить.
 
@@ -88,18 +88,9 @@ interface ServiceMapEntry {
 
 Виден только caller'у — его собственный сервис и сервисы из его outgoing-deps (через `sb.service(...)`).
 
-## CLI: создание сервиса с ограничениями
+## Создание сервиса
 
-```sh
-# Дефолт — всё разрешено
-sbkey-gen -dsn=... -name=payments
-
-# С ограничениями
-sbkey-gen -dsn=... -name=analytics \
-  -no-cap=workflow.handle,job.handle \
-  -allow-action='rpc.call:payments/charge,event.publish:metrics.*' \
-  -allow-acceptance='event.handle:orders.*'
-```
+Сервисы регистрируются через UI консоль рантайма (Services → Create service). Создайте сервис, получите ключ через дашборд, обновите env. По умолчанию новый сервис не ограничен — всё разрешено. Ограничения добавляются правилами политики (ниже).
 
 ## CLI: редактирование политики
 
@@ -156,6 +147,6 @@ UI-дашборду доступен runtime endpoint `UI.GetServiceGraph` (от
 
 ## Ссылки
 
-- ADR-0014 (`runtime/docs/adr/0014-access-policy.md`) — детальное обоснование
+- ADR-0004 (`runtime/docs/adr/0004-access-security-tls.md`) — детальное обоснование
 - `runtime/internal/access/README.md` — internals реализации
 - `runtime/cmd/sb-policy/README.md` — полная спецификация CLI

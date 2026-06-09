@@ -1,4 +1,4 @@
-// access-policy-warnings.test.ts — ADR-0014 SDK-side smoke for the
+// access-policy-warnings.test.ts — ADR-0004 SDK-side smoke for the
 // policy_violation event surface.
 //
 // Verifies that when a service declares something its policy disallows, the
@@ -12,7 +12,7 @@ import { eventsEnv, FAST_OPTS, sleep, waitFor } from "./_helpers/events";
 
 const PG_URL =
 	process.env.TEST_DATABASE_URL ??
-	"postgresql://servicebridge:servicebridge@localhost:5433/servicebridge";
+	"postgresql://servicebridge:servicebridge@localhost:5433/service-bridge";
 
 async function withDb<T>(
 	fn: (sql: typeof import("bun").sql) => Promise<T>,

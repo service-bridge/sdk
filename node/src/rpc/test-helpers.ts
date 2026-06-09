@@ -7,7 +7,7 @@ import { TelemetryRing } from "../telemetry/ring";
 
 // makeStubSb returns a minimal ServiceBridge-shaped object that satisfies
 // RpcClient: a fixed instance id ("test-instance") + identity probe +
-// a real telemetry ring for RPC.CALL emission (ADR-0036).
+// a real telemetry ring for RPC.CALL emission (ADR-0001).
 //
 // Returning via `as unknown as` is intentional: we avoid pulling in the full
 // bridge (connection, transports, registry) for unit tests.

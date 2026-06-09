@@ -7,7 +7,7 @@ new ServiceBridge(url: string, key: string, options?: ServiceBridgeOptions)
 ```
 
 - `url` — runtime gRPC control plane, e.g. `"localhost:14445"`.
-- `key` — the `sb.…` bootstrap key (dashboard → Services → Create service, or `sbkey-gen`).
+- `key` — the `sb.…` bootstrap key (dashboard → Services → Create service).
 - The SDK reads **no env vars** for `url`/`key`. Pass them yourself: `new ServiceBridge(process.env.SERVICEBRIDGE_URL!, process.env.MY_SERVICE_KEY!)`.
 
 ## ServiceBridgeOptions

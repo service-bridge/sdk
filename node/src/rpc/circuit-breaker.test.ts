@@ -27,7 +27,7 @@ describe("CircuitBreakerRegistry (sliding window)", () => {
 	it("does not trip below MIN_REQUESTS even at 100% errors", () => {
 		const { cb } = withClock();
 		// One short failure burst — below the gate. The breaker stays closed
-		// so low-QPS instances don't flap (ADR 0009 §2).
+		// so low-QPS instances don't flap (ADR 0001).
 		for (let i = 0; i < MIN_REQUESTS - 1; i++) cb.recordFailure("svc:i-1");
 		expect(cb.state("svc:i-1")).toBe("CLOSED");
 		expect(cb.canCall("svc:i-1")).toBe(true);

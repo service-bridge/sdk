@@ -76,7 +76,7 @@ Node.js SDK — backend-SDK (Bun + TypeScript), подключается к ра
 
 ### Observability
 - `sb.telemetry` — ops/traces, structured logs (`sb.logger`), `counter` / `gauge` / `histogram`
-- Авто-flush в runtime (off-switch — env `SB_TELEMETRY=off`); trace-контекст наследуется вложенными вызовами
+- Авто-flush в runtime (off-switch — опция `telemetry: false`); trace-контекст наследуется вложенными вызовами
 
 ### Schemas
 - Источники: `.proto` (с/без service block) и `.schema.json` с явными `fieldNumber`

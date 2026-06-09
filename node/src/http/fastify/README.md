@@ -8,7 +8,7 @@
 
 ## Публичный контракт
 
-Импорт: `import { sbFastify, type SbFastifyOptions } from "servicebridge/fastify";`
+Импорт: `import { sbFastify, type SbFastifyOptions } from "service-bridge/fastify";`
 
 | Имя | Тип | По умолчанию | Что делает |
 |-----|-----|--------------|------------|
@@ -22,8 +22,8 @@
 
 ```ts
 import Fastify from "fastify";
-import { ServiceBridge } from "servicebridge";
-import { sbFastify } from "servicebridge/fastify";
+import { ServiceBridge } from "service-bridge";
+import { sbFastify } from "service-bridge/fastify";
 
 const sb = new ServiceBridge(URL, KEY);
 const app = Fastify();
@@ -75,4 +75,4 @@ await app.register(sbFastify, { sb, host: process.env.POD_IP });
 
 Используется в:
 - `sdk/node/tests/e2e/http-fastify.test.ts`.
-- Прикладной код через subpath `servicebridge/fastify`.
+- Прикладной код через subpath `service-bridge/fastify`.

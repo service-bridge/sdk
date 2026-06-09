@@ -334,7 +334,7 @@ new ServiceBridge(URL, KEY, { advertise: { host, port } | false })
 
 | Значение | Поведение |
 |---------|-----------|
-| **не указано** | env `SB_ADVERTISE_HOST` → `port: 0`. Иначе `127.0.0.1:0` с warning (dev only). |
+| **не указано** | Bind `127.0.0.1` на свободном порту + warning (dev only). |
 | `{ host, port }` | Явный bind. `port: 0` = ОС подбирает. **Рекомендуется для production.** |
 | `false` | Caller-only mode. CallServer не поднимается, runtime не получает `call_endpoint`. |
 
@@ -384,7 +384,7 @@ CLOSED ──≥10 req & >50% errors / 10s──► OPEN ──30s──► HALF
 
 В HALF_OPEN пропускается ровно один пробный вызов — остальные ждут его исхода. Failure = любой throw из transport ИЛИ application-error от callee. Success = успешно декодированный response. Порог в ≥10 запросов значит, что на малом трафике CB не откроется от пары случайных ошибок.
 
-Per-pod, без synchronization между caller-подами. См. [ADR 0001](../../../runtime/docs/adr/0001-rpc-architecture.md#per-pod-cb).
+Per-pod, без synchronization между caller-подами. См. [ADR 0001](../../../runtime/docs/adr/0001-rpc.md).
 
 ### Retry
 
@@ -512,7 +512,7 @@ hash = sha256_hex(
 )
 ```
 
-`canonical` — JSON с рекурсивно отсортированными ключами и без пробелов (массивы сохраняют порядок). Без префикса версии — голый hex SHA-256. Runtime хранит хеш как opaque-строку и не пересчитывает. Полная спека: [ADR 0005](../../../runtime/docs/adr/0005-contract-version-routing.md).
+`canonical` — JSON с рекурсивно отсортированными ключами и без пробелов (массивы сохраняют порядок). Без префикса версии — голый hex SHA-256. Runtime хранит хеш как opaque-строку и не пересчитывает. Полная спека: [ADR 0001](../../../runtime/docs/adr/0001-rpc.md).
 
 ### Ограничения
 

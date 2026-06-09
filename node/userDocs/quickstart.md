@@ -20,15 +20,6 @@ bun add service-bridge
 
 Каждому сервису (минимум двум — callee и caller) нужен bootstrap-ключ. Откройте дашборд на `http://localhost:14444`, зайдите в **Services → Create service**, задайте имя — дашборд вернёт строку `sb.Cgj...` со встроенным CA. Скопируйте её и сохраните как переменную окружения.
 
-Из исходников рантайма тот же ключ выдаёт `sbkey-gen` (CA берётся из Postgres, файлы сертификатов не нужны):
-
-```sh
-cd runtime
-go run ./cmd/sbkey-gen \
-  -name payment-svc \
-  -dsn  "postgresql://user:pass@localhost:5433/servicebridge?sslmode=disable"
-```
-
 Подробнее в [Operations §6](./operations.md#6-security-bootstrap-key-mtls-ротация).
 
 ```sh

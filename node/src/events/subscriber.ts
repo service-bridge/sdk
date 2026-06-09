@@ -28,7 +28,7 @@ interface SubscriberIdentity {
 }
 
 // EventHandler is the registered handler for one event name. Dispatch is by
-// exact name match — wildcards are server-side only (ADR-0011).
+// exact name match — wildcards are server-side only (ADR-0002).
 // @internal
 export interface EventHandler {
 	pattern: string;
@@ -62,7 +62,7 @@ export interface SubscriberDeps {
 
 // Subscriber opens a long-lived bidi Subscribe stream and dispatches inbound
 // EventDelivery messages to registered handlers by exact event name. Routing
-// + dedup live on the server (ADR-0011); handlers must be idempotent.
+// + dedup live on the server (ADR-0002); handlers must be idempotent.
 // @public — см. ./README.md
 export class Subscriber {
 	private readonly deps: SubscriberDeps;
@@ -233,7 +233,7 @@ export class Subscriber {
 		}
 
 		// Dispatch by exact name — server is the single source of truth for
-		// routing (ADR-0011). Handlers must be idempotent.
+		// routing (ADR-0002). Handlers must be idempotent.
 		const handlers = this.deps.handlers().filter((h) => h.pattern === name);
 		if (handlers.length === 0) {
 			this.sendAck(stream, deliveryId, eventId);

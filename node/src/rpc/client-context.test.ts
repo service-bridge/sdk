@@ -1,5 +1,5 @@
 // client-context.test.ts — tests that RpcClient propagates trace context
-// correctly to the transport per ADR-0036:
+// correctly to the transport per ADR-0001:
 // - Transport sees callOp.opId as parentOpId (not ambient parentOpId).
 // - traceId is inherited from ambient context when present.
 // - When no ambient context: fresh traceId minted for the CALL op.
@@ -154,7 +154,7 @@ class SpyProxy {
 }
 
 describe("RpcClient trace-context propagation", () => {
-	it("transport sees callOp.opId as parentOpId — traceId inherited from ambient (ADR-0036)", async () => {
+	it("transport sees callOp.opId as parentOpId — traceId inherited from ambient (ADR-0001)", async () => {
 		const pair = await buildSchemaPair({
 			protoFile,
 			input: "ChargeRequest",
@@ -208,7 +208,7 @@ describe("RpcClient trace-context propagation", () => {
 		expect(parsed!.traceId).toBe(ambientTraceId);
 
 		// parentOpId seen by transport = callOp.opId (NOT ambient parentOpId).
-		// This is the ADR-0036 contract: CALL op wraps invoke(), so transport
+		// This is the ADR-0001 contract: CALL op wraps invoke(), so transport
 		// sees call op as its parent, enabling HANDLE.parent = CALL.
 		expect(parsed!.parentOpId).not.toBe(ZERO_OP_ID);
 		expect(parsed!.parentOpId).not.toBe(ambientParentOpId);
@@ -260,7 +260,7 @@ describe("RpcClient trace-context propagation", () => {
 			{ transport: "proxy", retry: { maxAttempts: 1 } },
 		);
 
-		// With ADR-0036: even without ambient context, a CALL op is started,
+		// With ADR-0001: even without ambient context, a CALL op is started,
 		// and the transport sees the callOp context (fresh traceId + callOp.opId).
 		const captured = proxy.capturedXSbTrace;
 		expect(captured).toBeDefined();
@@ -279,7 +279,7 @@ describe("RpcClient trace-context propagation", () => {
 		expect(parsed!.parentOpId).toBe(callStart!.opId);
 	});
 
-	it("streaming: callStream body sees childCtx with callOp.opId as parentOpId (ADR-0036)", async () => {
+	it("streaming: callStream body sees childCtx with callOp.opId as parentOpId (ADR-0001)", async () => {
 		const pair = await buildSchemaPair({
 			protoFile,
 			input: "ChargeRequest",

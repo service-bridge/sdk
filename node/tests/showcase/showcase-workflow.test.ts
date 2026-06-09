@@ -9,7 +9,7 @@
  *     failed / failed_compensated / cancelled).
  *   - WORKFLOW.RUN op for the run lands in `operations`.
  *   - ≥ 1 RPC.CALL op lands during the run (one row per logical call, owned by
- *     the caller SDK; no FORWARD/HANDLE rows — ADR-0037).
+ *     the caller SDK; no FORWARD/HANDLE rows — ADR-0001).
  *   - ≥ 1 USER.SUBOP with `meta.is_compensation = true` lands — this is the
  *     Phase 5 compensation-marker wire under test.
  *   - The is_compensation meta carries the forward step id under
@@ -30,7 +30,7 @@ import { runShowcase } from "./showcase-workflow";
 
 const dbUrl =
 	process.env.TEST_DATABASE_URL ??
-	"postgresql://servicebridge:servicebridge@localhost:5433/servicebridge";
+	"postgresql://servicebridge:servicebridge@localhost:5433/service-bridge";
 const RUNTIME_URL = process.env.SERVICEBRIDGE_URL ?? "localhost:14445";
 
 async function withDb<T>(fn: (sql: typeof import("bun").sql) => Promise<T>) {
@@ -78,7 +78,7 @@ describe.skipIf(!process.env.SERVICEBRIDGE_URL && !process.env.RUN_SHOWCASE)(
 			expect(wfRows.length).toBeGreaterThanOrEqual(1);
 
 			// RPC.CALL for billing/Charge — one row per logical call, owned by the
-			// caller SDK (ADR-0037; no FORWARD/HANDLE rows). We check the recent
+			// caller SDK (ADR-0001; no FORWARD/HANDLE rows). We check the recent
 			// window because trace stitching is covered by the visual checklist,
 			// not this DB-level smoke test.
 			const rpcCalls = (await withDb(

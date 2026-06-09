@@ -59,8 +59,8 @@ Per-kind ring buffers, примитивы для emit'а ops/logs/metrics, real 
 | `process.cpu_percent` | metric name | — | CPU-процент процесса: (userDelta+systemDelta)/elapsedMicros×100. Нормировано к одному ядру — multi-core может давать >100. Первый сэмпл сразу при старте, далее интервал 30 s. Тег: `instance_id`. |
 | `process.rss_bytes` | metric name | — | Resident Set Size в байтах (`process.memoryUsage().rss`). Интервал 30 s. Тег: `instance_id`. |
 | Kind constants | `number` | — | Per-channel op-kind numeric values (mirror Go `enums.go`): `RpcCall=1`; `EventPublish=1`, `EventDeliver=2`; `WorkflowRun=1`, `WorkflowSleep=2`, `WorkflowWaitEvent=3`, `WorkflowWaitSignal=4`; `JobExec=1`; `HttpHandle=1`; `UserSubOp=1`. |
-| `OpHandle.setAttempt(n)` | method | — | Records the retry attempt on an in-flight op; END frame carries the final value (one row across retries, ADR-0037..0042) |
-| `TraceContext` | interface | — | `{ traceId: string; parentOpId: string }`. UUID strings per ADR T-017. |
+| `OpHandle.setAttempt(n)` | method | — | Records the retry attempt on an in-flight op; END frame carries the final value (one row across retries, ADR-0001) |
+| `TraceContext` | interface | — | `{ traceId: string; parentOpId: string }`. UUID strings per ADR 0006. |
 | `ZERO_OP_ID` | constant | `"00000000-..."` | Sentinel: root operation (no parent). Never use as an explicit parent. |
 | `mintRootContext()` | function | — | Fresh `TraceContext` with new UUIDv7 traceId and `ZERO_OP_ID` parentOpId. |
 | `als` | `AsyncLocalStorage<TraceContext>` | — | ALS-носитель trace-контекста. Реэкспортируется для hook-style фреймворков (Fastify), которым нужен `als.enterWith(ctx)` без `next()`-callback. |

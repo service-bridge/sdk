@@ -1,4 +1,4 @@
-// access-policy-scope-workflow.test.ts — ADR-0014 Layer-1 scope filter (workflows).
+// access-policy-scope-workflow.test.ts — ADR-0004 Layer-1 scope filter (workflows).
 //
 // Caller A declares outgoing workflows on B: [flowA, flowB]. A has a single
 // egress rule `workflow.run` allowing only (B, flowA). The scope filter must
@@ -40,7 +40,7 @@ describe("access-policy: scope filter (workflow.run)", () => {
 	test("A with workflow.run (B, flowA) sees B/flowA but not B/flowB", async () => {
 		callee = new ServiceBridge(env.url, env.publisherKey, FAST_OPTS);
 		// Workflow handlers — registry records the declaration; execution
-		// endpoint is dormant per ADR-0014 plan.
+		// endpoint is dormant per ADR-0004 plan.
 		callee.workflow.handle(flowA, {
 			steps: [{ id: "noop", type: "sleep", durationSec: 0 }],
 		});

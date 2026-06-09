@@ -1,4 +1,4 @@
-// client.test.ts — unit tests for RpcClient caller-side RPC.CALL emission (ADR-0036).
+// client.test.ts — unit tests for RpcClient caller-side RPC.CALL emission (ADR-0001).
 // These tests verify that RpcClient.call() and RpcClient.stream() emit the
 // correct telemetry frames to the ring on each invocation.
 
@@ -306,7 +306,7 @@ describe("RpcClient caller-side CALL emission", () => {
 
 	// ─── T6: retry reuses ONE CALL op, attempt counter on the same row ──────────
 
-	it("retry produces ONE CALL op across attempts — single op_id, attempt counter, ends OK (ADR-0037..0042)", async () => {
+	it("retry produces ONE CALL op across attempts — single op_id, attempt counter, ends OK (ADR-0001)", async () => {
 		const candidate = makeCandidate("target-svc", "Charge");
 		const proxy = makeFailingProxyTransport(2); // first 2 fail, 3rd succeeds
 		const cache = makeInstanceCache("target-svc", "Charge");

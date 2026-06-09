@@ -3,7 +3,7 @@
 // payload appears as $.<step-id> in run state.
 //
 // Verifies the publisher-supplied payload_json + SignalRouter filter
-// evaluation path (ADR-0013: runtime keeps the canonical protobuf payload
+// evaluation path (ADR-0002: runtime keeps the canonical protobuf payload
 // opaque, filter matching uses the JSON view supplied by the SDK).
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";

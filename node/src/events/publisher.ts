@@ -91,7 +91,7 @@ export class Publisher {
 
 		const encoded = entry.pair.input.encode(payload);
 		// JSON view of the same payload — runtime treats it as opaque bytes
-		// (ADR-0013) but uses it for workflow wait_event JSON-path filters.
+		// (ADR-0002) but uses it for workflow wait_event JSON-path filters.
 		// Falls back to empty bytes when payload is not JSON-serializable.
 		let payloadJsonBytes: Buffer;
 		try {

@@ -10,7 +10,7 @@ export interface SpiffeIdentity {
 }
 
 // parsePeerSpiffeUri parses a full SPIFFE URI of the form:
-// spiffe://servicebridge/service/<serviceId>/instance/<instanceId>
+// spiffe://service-bridge/service/<serviceId>/instance/<instanceId>
 // Returns null for any other URI.
 export function parsePeerSpiffeUri(uri: string): SpiffeIdentity | null {
 	const prefix = `spiffe://${SPIFFE_TRUST_DOMAIN}/service/`;

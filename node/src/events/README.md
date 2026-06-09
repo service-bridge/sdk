@@ -2,7 +2,7 @@
 
 ## Зона ответственности
 
-SDK-сторона Durable Events: domain namespace (`EventDomain`), публикация событий в локальный SQLite outbox (Publisher), фоновая доставка в runtime (Drainer), приём входящих событий через bidi Subscribe stream (Subscriber). Не работает напрямую с сетью — только через gRPC-клиент `EventsClient`. Wire format — Protobuf binary через `serde/` (ADR-0013); runtime трактует payload как opaque bytes. Routing и dedup живут на сервере (ADR-0011); handlers обязаны быть идемпотентны.
+SDK-сторона Durable Events: domain namespace (`EventDomain`), публикация событий в локальный SQLite outbox (Publisher), фоновая доставка в runtime (Drainer), приём входящих событий через bidi Subscribe stream (Subscriber). Не работает напрямую с сетью — только через gRPC-клиент `EventsClient`. Wire format — Protobuf binary через `serde/` (ADR-0002); runtime трактует payload как opaque bytes. Routing и dedup живут на сервере (ADR-0002); handlers обязаны быть идемпотентны.
 
 ## Публичный контракт
 
@@ -66,7 +66,7 @@ SDK-сторона Durable Events: domain namespace (`EventDomain`), публи�
 
 ## Архитектурные решения и почему
 
-**Wire format — Protobuf через serde/ (ADR-0013).** `EventDomain.define(name, spec)` принимает тот же `SchemaSpec`, что и `sb.rpc.handle`. `buildSchemaPair(spec)` строит Protobuf encoder через `protobufjs`; `pair.input.encode()` валидирует payload (`type.verify()`) и кодирует в binary. Runtime не декодит payload — это passthrough bytes. Inline JSON Schema не поддерживается.
+**Wire format — Protobuf через serde/ (ADR-0002).** `EventDomain.define(name, spec)` принимает тот же `SchemaSpec`, что и `sb.rpc.handle`. `buildSchemaPair(spec)` строит Protobuf encoder через `protobufjs`; `pair.input.encode()` валидирует payload (`type.verify()`) и кодирует в binary. Runtime не декодит payload — это passthrough bytes. Inline JSON Schema не поддерживается.
 
 **payload_json рядом с canonical payload.** Publisher кладёт JSON-вид того же payload в `EventEnvelope.payload_json` (через `JSON.stringify`, пустые байты если payload не сериализуем). Runtime использует его только для JSON-path `wait_event` фильтров в workflow-роутере, не декодя protobuf-форму.
 
@@ -76,7 +76,7 @@ SDK-сторона Durable Events: domain namespace (`EventDomain`), публи�
 
 **UUID v7 — npm-пакет `uuidv7`.** Пакет хранит монотонный counter внутри процесса (sequential id'ы в пределах одной ms), даёт ту же защиту от clock skew, что требует ADR-0006, и работает под чистым Node (`node:crypto`) и под Bun одинаково. `ids.ts` реэкспортирует `uuidv7` как единую точку входа SDK; реализация не дублируется.
 
-**Subscriber dispatch по exact `event.name`** — никакого client-side AMQP matcher'а, никакого Seen dedup (ADR-0011). Routing — `registry.TopicMatch` на сервере. Handler contract: at-least-once + idempotency required. События с непустым `partition_key` сериализуются в FIFO через per-partition promise-цепочку; пустой ключ обрабатывается параллельно.
+**Subscriber dispatch по exact `event.name`** — никакого client-side AMQP matcher'а, никакого Seen dedup (ADR-0002). Routing — `registry.TopicMatch` на сервере. Handler contract: at-least-once + idempotency required. События с непустым `partition_key` сериализуются в FIFO через per-partition promise-цепочку; пустой ключ обрабатывается параллельно.
 
 **Ack/Nack семантика.** Успешный handler → `Ack`. Отсутствие envelope/схемы, decode-ошибка, throw из handler → `Nack` с причиной; ретраи и DLQ — на стороне runtime (events = статус доставки, не клиентские ретраи). После успешной доставки subscriber сбрасывает reconnect-счётчик.
 

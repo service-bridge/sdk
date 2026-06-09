@@ -4,7 +4,7 @@ import type {
 } from "../pb/servicebridge/v1/registry";
 import type { CircuitBreakerRegistry } from "./circuit-breaker";
 
-// Power-of-Two-Choices load balancer with per-pod inflight tracking (ADR 0009).
+// Power-of-Two-Choices load balancer with per-pod inflight tracking (ADR 0001).
 // Local CB filter excludes OPEN instances; runtime `is_unhealthy_since_unix_ms` hint
 // excludes instances marked unhealthy by the runtime within the last
 // HEALTH_HINT_TTL_MS. After the TTL the hint is treated as stale (runtime may
@@ -13,14 +13,14 @@ import type { CircuitBreakerRegistry } from "./circuit-breaker";
 // @internal — см. ./README.md
 
 // HEALTH_HINT_TTL_MS bounds how long a runtime-supplied unhealthy hint is
-// trusted. Bound = 2× the runtime HealthTracker healing window (ADR 0009 §3).
+// trusted. Bound = 2× the runtime HealthTracker healing window (ADR 0001).
 export const HEALTH_HINT_TTL_MS = 60_000;
 
 export interface Candidate {
 	descriptor: MethodDescriptor;
 	instance: ServiceInstanceInfo;
 	// isUnhealthyAt is the wall-clock time the runtime first marked this
-	// instance unhealthy through the watch snapshot (ADR 0009 §3). Null when
+	// instance unhealthy through the watch snapshot (ADR 0001). Null when
 	// the runtime has no opinion or has not yet wired the hint.
 	isUnhealthyAt: Date | null;
 }

@@ -1,4 +1,4 @@
-// service-map-enrichment.test.ts — ADR-0014 service map enrichment.
+// service-map-enrichment.test.ts — ADR-0004 service map enrichment.
 //
 // A service that registers both event-handle subscriptions and outgoing rpc
 // deps must see those reflected in its OWN ServiceMapEntry via the enriched

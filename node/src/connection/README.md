@@ -44,7 +44,7 @@ new ServiceBridge(url: string, key: string, options?: ServiceBridgeOptions)
 | `.telemetry` | `TelemetryAPI` | Surface эмита: `.startOp(params)`, `.captureModeForChannel(channel)`, `.log.{debug,info,warn,error}(msg, fields?)`, `.counter/gauge/histogram(name, ...)`. До `start()` ops/logs/metrics буферизуются в ring; transport их flush'нет после connect. См. [telemetry/README.md](../telemetry/README.md). |
 | `.logger` | `ReturnType<typeof makeLogger>` | Эквивалент `sb.telemetry.log` как top-level convenience. |
 
-`ServiceMapEntry`, `ServiceInstanceInfo`, `TelemetryAPI` экспортируются из `service-bridge.ts`, но **не** реэкспортируются через `index.ts`; это типы возвращаемых значений публичных методов. `ServiceMapEntry = { methods: MethodDescriptor[]; instances: ServiceInstanceInfo[]; eventSubscriptions: EventSubscriptionDescriptor[]; outgoingCalls: OutgoingCallDescriptor[] }`. Последние два массива заполняются для своего сервиса и сервисов в outgoing-dep scope (ADR-0014), иначе пустые.
+`ServiceMapEntry`, `ServiceInstanceInfo`, `TelemetryAPI` экспортируются из `service-bridge.ts`, но **не** реэкспортируются через `index.ts`; это типы возвращаемых значений публичных методов. `ServiceMapEntry = { methods: MethodDescriptor[]; instances: ServiceInstanceInfo[]; eventSubscriptions: EventSubscriptionDescriptor[]; outgoingCalls: OutgoingCallDescriptor[] }`. Последние два массива заполняются для своего сервиса и сервисов в outgoing-dep scope (ADR-0004), иначе пустые.
 
 ### `interface ServiceBridgeOptions`
 
@@ -54,14 +54,13 @@ new ServiceBridge(url: string, key: string, options?: ServiceBridgeOptions)
 | `reconnectAttempts` | `number` | `3` | Кол-во попыток до `disconnected{reason:'exhausted'}` + auto-stop. `0` = без лимита. |
 | `advertise` | `AdvertiseConfig \| false \| undefined` | `undefined` | `{ host, port }` — поднять inbound Call gRPC сервер (`port=0` → ОС выбирает). `undefined` — `127.0.0.1:0` с одноразовым warn. `false` — caller-only, inbound сервер не поднимается. |
 | `callDefaults` | `CallOpts \| undefined` | `{}` | Дефолтные опции для каждого `sb.rpc.call()` / `sb.stream()` (`timeout` default `"30s"`, `requestId` авто). Перебиваются per-call аргументом. |
-| `failOnPolicyViolation` | `boolean` | `false` | `true` — любой policy-warning в снепшоте реестра роняет `start()` через `disconnected{reason:'policy'}` + `stop()`. `false` — только warn + `policy_violation`-события (ADR-0014). |
-| `telemetry` | `boolean` | `true` | `false` полностью отключает telemetry-transport (ops/logs/metrics не уходят; ring буферизует, но не дренится). |
-| `telemetryRingSize` | `number` | `262144` | Байтовый budget ops-ring'а (kind под burst-давлением dense workflow step-span emission). Маленький budget молча drop'ает step spans. |
+| `failOnPolicyViolation` | `boolean` | `false` | `true` — любой policy-warning в снепшоте реестра роняет `start()` через `disconnected{reason:'policy'}` + `stop()`. `false` — только warn + `policy_violation`-события (ADR-0004). |
 | `dataDir` | `string` | `"./.servicebridge"` | Каталог local SQLite outbox (`sdk.db`); прокидывается в `../sqlite/storage.ts`. |
 | `maxOutboxRows` | `number` | `100000` | Максимум строк в local SQLite outbox до `OutboxFullError`. |
 | `eventsDrainerBatch` | `number` | `50` | Размер batch'а drainer'а событий. |
 | `eventsMaxInFlight` | `number` | `32` | Максимум in-flight event-доставок на subscriber-стрим. |
-| `payloadMaxBytes` | `number` | `65536` | Per-direction cap байтов захватываемого payload'а; прокидывается в op'ы через telemetry API. |
+
+Telemetry-transport on/off и payload cap управляются runtime-настройками (`telemetry.enable` и `telemetry.payload_max_bytes`) и приходят в SDK через `CaptureModes.telemetry_enabled` / `CaptureModes.payload_max_bytes` в registry snapshot. Fail-safe до первого snapshot: transport включён, cap = 65536.
 
 ### `class ServiceBridgeError`
 
@@ -133,7 +132,8 @@ Module-level экспорты, **не** реэкспортируемые чер�
 - **`@peculiar/x509`** для CSR — даёт `Pkcs10CertificateRequestGenerator` через Web Crypto без нативной openssl.
 - **`privateKeyDer` материализуется один раз** при provision (async export), хранится в `ProvisionResult`, чтобы `buildMTLSCredentials` собирал PEM синхронно.
 - **`certRefreshLeadMs` / `certRefreshJitterMs` / `rotationHandshakeTimeoutMs` — приватные hooks**, не публичные опции: связаны с серверной корректностью протокола, их перенастройка без понимания контракта его ломает.
-- **Конфигурация только через `ServiceBridgeOptions`** — SDK не читает `process.env`. Все настройки (`advertise`, `telemetry`, `telemetryRingSize`, `dataDir`, `maxOutboxRows`, `eventsDrainerBatch`, `eventsMaxInFlight`, `payloadMaxBytes`) задаются явными опциями конструктора и прокидываются вниз в storage / drainer / subscriber / telemetry ring.
+- **Конфигурация только через `ServiceBridgeOptions`** — SDK не читает `process.env`. Настройки (`advertise`, `dataDir`, `maxOutboxRows`, `eventsDrainerBatch`, `eventsMaxInFlight`) задаются явными опциями конструктора.
+- **Telemetry enable + payload cap управляются рантаймом**: `telemetry.enable` → `CaptureModes.telemetry_enabled` → `WatchStream.pushedTelemetryConfig().enabled`; `telemetry.payload_max_bytes` → `CaptureModes.payload_max_bytes` → `WatchStream.pushedTelemetryConfig().payloadMaxBytes`. Ops ring byte budget — внутренняя константа `DEFAULT_TELEMETRY_RING_SIZE` (256 KiB), не управляется конструктором.
 
 ## Зависимости
 

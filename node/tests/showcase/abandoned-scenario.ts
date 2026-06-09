@@ -120,7 +120,7 @@ async function runCaller(): Promise<{ traceId: string }> {
 	const prev = process.env.DATABASE_URL;
 	process.env.DATABASE_URL =
 		process.env.TEST_DATABASE_URL ??
-		"postgresql://servicebridge:servicebridge@localhost:5433/servicebridge";
+		"postgresql://servicebridge:servicebridge@localhost:5433/service-bridge";
 	let calleeId: string;
 	try {
 		const rows = (await sql`
@@ -176,7 +176,7 @@ async function runCaller(): Promise<{ traceId: string }> {
 	const { sql: sql2 } = await import("bun");
 	process.env.DATABASE_URL =
 		process.env.TEST_DATABASE_URL ??
-		"postgresql://servicebridge:servicebridge@localhost:5433/servicebridge";
+		"postgresql://servicebridge:servicebridge@localhost:5433/service-bridge";
 	let traceId: string;
 	try {
 		const rows = (await sql2`

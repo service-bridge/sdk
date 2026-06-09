@@ -24,7 +24,7 @@
  *
  * Run:
  *   docker ps | grep servicebridge2-pg          # PG18 on :5433
- *   go run -C runtime ./cmd/runtime -pg-url postgres://servicebridge:servicebridge@localhost:5433/servicebridge?sslmode=disable & # runtime on :14444 + :14445
+ *   go run -C runtime ./cmd/runtime -pg-url postgres://servicebridge:servicebridge@localhost:5433/service-bridge?sslmode=disable & # runtime on :14444 + :14445
  *   cd sdk/node && bun run tests/showcase/showcase-workflow.ts
  */
 
@@ -535,7 +535,7 @@ async function queryTraceIds(wfRunId: string): Promise<RunOutput> {
 	const { sql } = await import("bun");
 	const dbUrl =
 		process.env.TEST_DATABASE_URL ??
-		"postgresql://servicebridge:servicebridge@localhost:5433/servicebridge";
+		"postgresql://servicebridge:servicebridge@localhost:5433/service-bridge";
 	const prev = process.env.DATABASE_URL;
 	process.env.DATABASE_URL = dbUrl;
 	try {

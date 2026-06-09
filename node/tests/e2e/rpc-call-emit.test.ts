@@ -1,5 +1,5 @@
 /**
- * RPC.CALL op emission e2e (ADR-0037..0042) — поднимает callee + caller SDK,
+ * RPC.CALL op emission e2e (ADR-0001) — поднимает callee + caller SDK,
  * делает direct RPC, проверяет, что в `operations` появилась РОВНО ОДНА строка
  * RPC.CALL (channel=2, kind=1) с не-null finished_at и status=OK (2), и НЕТ
  * строк RPC.FORWARD/HANDLE (kind 2/3). Прокси-факт — via_proxy=false (direct).
@@ -58,7 +58,7 @@ async function waitFor(
 // rows (kind=1), the count of legacy FORWARD/HANDLE rows (kind 2/3) — which
 // MUST be zero under the one-row model — and the single CALL row's canonical
 // subject / via_proxy / attempt so the proxy-fact and retry counter can be
-// asserted directly (ADR-0037..0042).
+// asserted directly (ADR-0001).
 async function countRpcOps(
 	method: string,
 	startedAfterMs: number,
@@ -179,7 +179,7 @@ describe.skipIf(!enabled)("RPC.CALL op emit e2e", () => {
 
 		// Exactly one CALL row, zero FORWARD/HANDLE rows, canonical subject,
 		// via_proxy=false (direct transport), attempt=0 (no retries) — the full
-		// one-row model contract (ADR-0037..0042).
+		// one-row model contract (ADR-0001).
 		const { callOk, callTotal, forwardHandle, subject, viaProxy, attempt } =
 			await countRpcOps("charge", baseline);
 		expect(callOk).toBe(1);

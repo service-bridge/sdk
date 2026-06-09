@@ -1,4 +1,4 @@
-// access-policy-acceptance.test.ts — ADR-0014 gate #3, callee side.
+// access-policy-acceptance.test.ts — ADR-0004 gate #3, callee side.
 //
 // Callee has an acceptance rule allowing only `<allowed>` from the caller.
 // A call to `<allowed>` is accepted; a call to `<forbidden>` is rejected by

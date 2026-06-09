@@ -4,7 +4,7 @@ package events.test;
 
 // OrderCreatedV1 is the payload schema for the `orders.created` event in
 // unit-test fixtures. Field numbers are stable; new fields must be added
-// with new numbers (see ADR-0013 / project CLAUDE.md "No Backward
+// with new numbers (see ADR-0002 / project CLAUDE.md "No Backward
 // Compatibility" rules around protocol evolution).
 message OrderCreatedV1 {
   string order_id = 1;

@@ -9,7 +9,7 @@ import { InstanceCache } from "./instance-cache";
 // Stub WatchStream that returns prepared snapshots. Tests the mapping logic
 // inside InstanceCache.refresh — specifically, that the runtime-supplied
 // `is_unhealthy_since_unix_ms` (proto field, decoded to `isUnhealthySinceUnixMs: number`) is
-// propagated into the Instance.isUnhealthyAt slot consumed by the LB (ADR-0009 §3).
+// propagated into the Instance.isUnhealthyAt slot consumed by the LB (ADR-0001).
 function stubWatch(
 	instances: ServiceInstanceInfo[],
 	methods: MethodDescriptor[],
@@ -68,7 +68,7 @@ function mkMethod(instanceId: string, name: string): MethodDescriptor {
 	} as unknown as MethodDescriptor;
 }
 
-describe("InstanceCache health hint propagation (ADR-0009 §3)", () => {
+describe("InstanceCache health hint propagation (ADR-0001)", () => {
 	it("maps runtime-supplied isUnhealthySinceUnixMs → isUnhealthyAt", () => {
 		const unhealthyAtMs = new Date("2026-05-20T10:00:00Z").getTime();
 		const cache = new InstanceCache();

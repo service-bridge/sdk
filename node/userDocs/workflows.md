@@ -211,7 +211,7 @@ const { runId: replayRunId } = await sb.workflow.replay(runId, { fromStepId: "pr
 
 ## Access policy
 
-Workflows интегрированы с access policy (ADR-0014):
+Workflows интегрированы с access policy (ADR-0004):
 
 - **Register-time walk.** При регистрации runtime проходит все `call` / `publish` / `workflow` шаги frozen plan'а и проверяет egress-policy каждого. Warnings приходят в первой `RegistrySnapshot` с `declaration = "workflow.<name>.step.<id>"`.
 - **Bilateral check на caller-side.** Когда peer ≠ owner, `start` / `signal` / `cancel` / `replay` проходят двусторонний check (egress вызывающего + acceptance владельца). По умолчанию — allow; denial → `WorkflowAccessDeniedError` и `policy_violation` с `declaration: "workflow.run"`.

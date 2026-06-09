@@ -37,7 +37,7 @@
 #   bash scripts/bootstrap-e2e-keys.sh
 #
 # Environment overrides:
-#   POSTGRES_DSN   default: postgres://servicebridge:servicebridge@localhost:5433/servicebridge?sslmode=disable
+#   POSTGRES_DSN   default: postgres://servicebridge:servicebridge@localhost:5433/service-bridge?sslmode=disable
 #   RUNTIME_URL    default: localhost:14445
 #   PG_CONTAINER   default: servicebridge2-pg (docker container name for psql)
 
@@ -49,7 +49,7 @@ cd "$REPO_ROOT"
 # The runtime is a sibling repo in the workspace (../runtime), not under sdk/.
 RUNTIME_DIR="$REPO_ROOT/../runtime"
 
-POSTGRES_DSN=${POSTGRES_DSN:-'postgres://servicebridge:servicebridge@localhost:5433/servicebridge?sslmode=disable'}
+POSTGRES_DSN=${POSTGRES_DSN:-'postgres://servicebridge:servicebridge@localhost:5433/service-bridge?sslmode=disable'}
 RUNTIME_URL=${RUNTIME_URL:-localhost:14445}
 PG_CONTAINER=${PG_CONTAINER:-servicebridge2-pg}
 
@@ -67,7 +67,7 @@ if ! docker ps --format '{{.Names}}' | grep -qx "$PG_CONTAINER"; then
 fi
 
 psql_cmd() {
-  docker exec -i "$PG_CONTAINER" psql -U servicebridge -d servicebridge -v ON_ERROR_STOP=1 -q -t -A "$@"
+  docker exec -i "$PG_CONTAINER" psql -U servicebridge -d service-bridge -v ON_ERROR_STOP=1 -q -t -A "$@"
 }
 
 # Step 1+2 — quiesce any prior occurrences of the test service names so the

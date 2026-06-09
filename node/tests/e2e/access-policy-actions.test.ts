@@ -1,4 +1,4 @@
-// access-policy-actions.test.ts — ADR-0014 gate #3 (caller egress on rpc.call).
+// access-policy-actions.test.ts — ADR-0004 gate #3 (caller egress on rpc.call).
 //
 // Caller has an egress rule allowing only `<allowed>` on the callee. A call
 // to `<allowed>` succeeds via runtime proxy; a call to `<forbidden>` is

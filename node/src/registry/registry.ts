@@ -347,7 +347,7 @@ export class Handle {
 			}));
 	}
 
-	// publishedEvents emits PublishedEvent rows for RegisterRequest. ADR-0013:
+	// publishedEvents emits PublishedEvent rows for RegisterRequest. ADR-0002:
 	// publishers carry contract_hash so the runtime keep-history per schema
 	// version (different hashes coexist for the same name) works correctly.
 	publishedEvents(): PbPublishedEvent[] {

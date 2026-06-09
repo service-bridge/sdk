@@ -197,7 +197,7 @@ describe("Subscriber", () => {
 	});
 
 	it("DuplicateDelivery_HandlerCalledEachTime", async () => {
-		// At-least-once: server is single source of truth (ADR-0011). SDK no
+		// At-least-once: server is single source of truth (ADR-0002). SDK no
 		// longer dedups — handler contract requires idempotency.
 		const fn = mock(async () => {});
 		const { deps, fake } = makeDeps({

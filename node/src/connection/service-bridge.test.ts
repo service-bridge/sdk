@@ -79,7 +79,7 @@ describe("ServiceBridge constructor", () => {
 	test("instantiates without throwing", () => {
 		const sb = new ServiceBridge("localhost:14445", VALID_KEY, {
 			advertise: false,
-			telemetry: false,
+			_disableTelemetryTransport: true,
 		});
 		expect(sb).toBeDefined();
 	});
@@ -87,7 +87,7 @@ describe("ServiceBridge constructor", () => {
 	test("on() registers handlers without throwing", () => {
 		const sb = new ServiceBridge("localhost:14445", VALID_KEY, {
 			advertise: false,
-			telemetry: false,
+			_disableTelemetryTransport: true,
 		});
 		expect(() => {
 			sb.on("connected", () => {});
@@ -102,7 +102,7 @@ describe("ServiceBridge connect lifecycle", () => {
 		const stream = new FakeServerStream();
 		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
 			advertise: false,
-			telemetry: false,
+			_disableTelemetryTransport: true,
 			provisionFn: async () => fakeProvisionResult(),
 			clientFactory: () => makeFakeClient(stream),
 			certRefreshLeadMs: 1_000_000,
@@ -129,7 +129,7 @@ describe("ServiceBridge connect lifecycle", () => {
 		const stream = new FakeServerStream();
 		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
 			advertise: false,
-			telemetry: false,
+			_disableTelemetryTransport: true,
 			provisionFn: async () => fakeProvisionResult(),
 			clientFactory: () => makeFakeClient(stream),
 			certRefreshLeadMs: 1_000_000,
@@ -167,7 +167,7 @@ describe("ServiceBridge connect lifecycle", () => {
 	test("emits reconnecting when provision throws", async () => {
 		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
 			advertise: false,
-			telemetry: false,
+			_disableTelemetryTransport: true,
 			provisionFn: async () => {
 				throw new Error("network");
 			},
@@ -190,7 +190,7 @@ describe("ServiceBridge connect lifecycle", () => {
 	test("emits disconnected{reason:'exhausted'} after attempts run out", async () => {
 		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
 			advertise: false,
-			telemetry: false,
+			_disableTelemetryTransport: true,
 			provisionFn: async () => {
 				throw new Error("nope");
 			},
@@ -217,7 +217,7 @@ describe("ServiceBridge connect lifecycle", () => {
 		const stream = new FakeServerStream();
 		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
 			advertise: false,
-			telemetry: false,
+			_disableTelemetryTransport: true,
 			provisionFn: async () => fakeProvisionResult(),
 			clientFactory: () => makeFakeClient(stream),
 			certRefreshLeadMs: 1_000_000,
@@ -247,7 +247,7 @@ describe("ServiceBridge connect lifecycle", () => {
 		let provisionCalls = 0;
 		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
 			advertise: false,
-			telemetry: false,
+			_disableTelemetryTransport: true,
 			provisionFn: async () => {
 				provisionCalls++;
 				throw new Error("nope");
@@ -275,7 +275,7 @@ describe("ServiceBridge cert rotation (overlap)", () => {
 
 		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
 			advertise: false,
-			telemetry: false,
+			_disableTelemetryTransport: true,
 			provisionFn: async () => ({
 				...fakeProvisionResult(),
 				notAfterUnix: BigInt(Math.floor(Date.now() / 1000) + 1),
@@ -343,7 +343,7 @@ describe("ServiceBridge cert rotation (overlap)", () => {
 
 		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
 			advertise: false,
-			telemetry: false,
+			_disableTelemetryTransport: true,
 			provisionFn: async () => ({
 				...fakeProvisionResult(),
 				notAfterUnix: BigInt(Math.floor(Date.now() / 1000) + 1),
@@ -389,7 +389,7 @@ describe("ServiceBridge non-retryable errors (H11)", () => {
 		let provisionCalls = 0;
 		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
 			advertise: false,
-			telemetry: false,
+			_disableTelemetryTransport: true,
 			provisionFn: async () => {
 				provisionCalls++;
 				throw unauthErr;
@@ -421,7 +421,7 @@ describe("ServiceBridge non-retryable errors (H11)", () => {
 		});
 		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
 			advertise: false,
-			telemetry: false,
+			_disableTelemetryTransport: true,
 			provisionFn: async () => {
 				throw unavailErr;
 			},

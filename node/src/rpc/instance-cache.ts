@@ -10,7 +10,7 @@ import type { Candidate } from "./lb";
 // WatchStream events. Used by the call client to look up target instances for
 // a given (serviceName, methodName) pair.
 //
-// Only the primary `byService` index is kept (ADR 0009 §4): at ≤1000 services
+// Only the primary `byService` index is kept (ADR 0001): at ≤1000 services
 // the per-call linear scan over methods is single-digit microseconds, whereas
 // a secondary `byServiceMethod` index needs O(methods) rebuild on every
 // snapshot tick.
@@ -19,9 +19,9 @@ import type { Candidate } from "./lb";
 
 // Instance bundles the registry-supplied ServiceInstanceInfo with the
 // runtime-supplied health hint. `isUnhealthyAt` is the wall-clock the runtime
-// first marked this instance unhealthy via HealthTracker (ADR-0008); null
+// first marked this instance unhealthy via HealthTracker (ADR-0007); null
 // means "healthy or unknown". The LB filter treats hints older than
-// HEALTH_HINT_TTL_MS as stale (ADR-0009 §3).
+// HEALTH_HINT_TTL_MS as stale (ADR-0001).
 export interface Instance extends ServiceInstanceInfo {
 	isUnhealthyAt: Date | null;
 }

@@ -4,7 +4,7 @@
  * Verifies that when a single ServiceBridge instance registers two event.handle()
  * calls for the same event name, BOTH handlers are invoked for each delivery.
  * The subscriber dispatches incoming events to all registered handlers whose
- * pattern matches the exact event name (ADR-0011: server-only routing, SDK
+ * pattern matches the exact event name (ADR-0002: server-only routing, SDK
  * dispatches by exact name).
  */
 

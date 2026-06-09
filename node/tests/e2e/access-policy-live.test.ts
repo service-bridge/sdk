@@ -1,4 +1,4 @@
-// access-policy-live.test.ts — ADR-0014 live propagation.
+// access-policy-live.test.ts — ADR-0004 live propagation.
 //
 // After an operator INSERTs a restrictive egress rule, the runtime gate
 // enforces it within <2s (NOTIFY policy_changed → access.Loader → snapshot).

@@ -10,7 +10,7 @@ import type { Publisher, PublishOpts } from "./publisher";
 // Schema source is the same `SchemaSpec` used by `sb.rpc.handle` — either a
 // `.proto` file (ProtoFileSpec) or a `.schema.json` file with explicit
 // `fieldNumber` per property (JsonSchemaFileSpec). Inline JSON Schema is no
-// longer accepted (ADR-0013). The Protobuf encoder also runs `type.verify()`
+// longer accepted (ADR-0002). The Protobuf encoder also runs `type.verify()`
 // on publish, so payload errors throw before reaching the outbox.
 export class EventDomain {
 	constructor(

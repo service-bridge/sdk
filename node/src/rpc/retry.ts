@@ -27,7 +27,7 @@ const ALWAYS_RETRYABLE = new Set([
 
 // Codes safe to retry ONLY when the caller passed an idempotency_key — the
 // runtime de-dups replays so a second invocation cannot create a double effect
-// (ADR 0012).
+// (ADR 0001).
 const RETRYABLE_WITH_IDEMPOTENCY = new Set([
 	GRPC_CODE_INTERNAL,
 	GRPC_CODE_ABORTED,

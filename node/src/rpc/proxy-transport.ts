@@ -30,7 +30,7 @@ function buildTraceMetadata(header: string): Metadata {
 // ProxyTransport routes outbound RPC calls through the runtime's Invoke service.
 // Reuses the SDK's mTLS credentials to the runtime — same URL and creds as the
 // Control/Registry streams. The caller-side contract hash is forwarded so the
-// runtime Resolver can filter target instances by it (ADR 0012).
+// runtime Resolver can filter target instances by it (ADR 0001).
 //
 // @internal — см. ./README.md
 export class ProxyTransport {

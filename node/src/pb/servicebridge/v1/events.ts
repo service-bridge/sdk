@@ -27,7 +27,7 @@ export enum PublishStatus {
   PUBLISH_STATUS_REJECTED_DUPLICATE = 3,
   PUBLISH_STATUS_REJECTED_INVALID_NAME = 5,
   /**
-   * PUBLISH_STATUS_REJECTED_FORBIDDEN - ADR-0014: publisher does not have event.publish action rule matching this
+   * PUBLISH_STATUS_REJECTED_FORBIDDEN - ADR-0004: publisher does not have event.publish action rule matching this
    * event name (or its capability is disabled). Per-envelope reject — other
    * events in the batch proceed.
    */
@@ -52,7 +52,7 @@ export interface EventEnvelope {
    * publisher SDK alongside the canonical protobuf `payload`. Used by the
    * workflow signal router to evaluate JSON-path `wait_event` filters
    * without decoding the protobuf form (runtime treats payload as opaque
-   * bytes per ADR-0013). Empty when publisher cannot produce JSON.
+   * bytes per ADR-0002). Empty when publisher cannot produce JSON.
    */
   payloadJson: Buffer;
 }

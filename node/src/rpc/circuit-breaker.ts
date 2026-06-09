@@ -1,6 +1,6 @@
 // Per-instance circuit breaker. State per (serviceId, instanceId) — scope
-// matches ADR 0001 #2 + ADR 0009: per-pod, not synchronized across caller pods.
-// Multi-pod coherence comes from runtime telemetry hints (ADR 0009 §3), not
+// matches ADR 0001: per-pod, not synchronized across caller pods.
+// Multi-pod coherence comes from runtime telemetry hints (ADR 0001), not
 // from a shared CB state.
 //
 // State machine:
@@ -13,7 +13,7 @@
 //
 // Only one probe is allowed in HALF_OPEN — concurrent callers see canCall()=false
 // until the probe completes or the probe window times out (probe ownership is
-// best-effort within a pod; ADR 0009 §1 accepts duplicate probes across pods).
+// best-effort within a pod; ADR 0001 accepts duplicate probes across pods).
 //
 // @internal — см. ./README.md
 

@@ -51,10 +51,7 @@ import {
 	Status,
 	UserSubOp,
 } from "../telemetry/ops";
-import {
-	type CaptureMode,
-	DEFAULT_PAYLOAD_MAX_BYTES,
-} from "../telemetry/payload-capture";
+import type { CaptureMode } from "../telemetry/payload-capture";
 import { ProcessSampler } from "../telemetry/process-sampler";
 import { TelemetryRing } from "../telemetry/ring";
 import { childContext } from "../telemetry/trace-context";
@@ -93,7 +90,7 @@ export type {
 export interface ServiceMapEntry {
 	methods: MethodDescriptor[];
 	instances: ServiceInstanceInfo[];
-	// ADR-0014 service-map enrichment (populated for caller's own service +
+	// ADR-0004 service-map enrichment (populated for caller's own service +
 	// services in caller's outgoing-dep scope). Empty arrays when the runtime
 	// doesn't carry that info for this service in the current snapshot.
 	eventSubscriptions: EventSubscriptionDescriptor[];
@@ -111,8 +108,7 @@ const RECONNECT_ATTEMPTS = 3; // 0 = unlimited
 const DEFAULT_MAX_OUTBOX_ROWS = 100_000;
 const DEFAULT_DRAINER_BATCH = 50;
 const DEFAULT_EVENTS_MAX_IN_FLIGHT = 32;
-// Default telemetry ops-ring byte budget. Override via
-// ServiceBridgeOptions.telemetryRingSize. Sized for the dense USER.SUBOP
+// Default telemetry ops-ring byte budget. Sized for the dense USER.SUBOP
 // step-span emission of a workflow run between flush ticks (≈800 op frames).
 const DEFAULT_TELEMETRY_RING_SIZE = 256 * 1024;
 // Refresh cert 30 minutes before expiry.
@@ -144,7 +140,7 @@ function makeTelemetryAPI(
 	getInstanceId: () => string,
 	_getServiceId: () => string,
 	getCaptureModeForChannel: (channel: Channel) => CaptureMode,
-	payloadMaxBytes: number,
+	getPayloadMaxBytes: () => number,
 ): TelemetryAPI {
 	const log = makeLazyLogger(ring, getInstanceId);
 	return {
@@ -152,7 +148,7 @@ function makeTelemetryAPI(
 			return OpHandle.start(ring, {
 				...params,
 				effectiveCaptureMode: getCaptureModeForChannel(params.channel),
-				payloadMaxBytes,
+				payloadMaxBytes: getPayloadMaxBytes(),
 			});
 		},
 		captureModeForChannel: getCaptureModeForChannel,
@@ -327,21 +323,13 @@ export interface ServiceBridgeOptions {
 	 */
 	callDefaults?: CallOpts;
 	/**
-	 * ADR-0014: when `true`, any policy violation reported by the runtime in
+	 * ADR-0004: when `true`, any policy violation reported by the runtime in
 	 * the registry snapshot's `PolicyEvaluation.warnings` makes `start()`
 	 * surface a `disconnected` event with reason='policy' and the SDK stops.
 	 * Default `false` — warnings only (logged via console.warn + emitted as
 	 * `policy_violation` events).
 	 */
 	failOnPolicyViolation?: boolean;
-	/**
-	 * Emit telemetry (ops, logs, metrics) to the runtime. `false` fully disables
-	 * the telemetry transport — the ring still buffers but nothing is drained.
-	 * Default `true`.
-	 */
-	telemetry?: boolean;
-	/** Ops-ring byte budget. Default 262144 (256 KiB). */
-	telemetryRingSize?: number;
 	/** Local SQLite outbox directory. Default "./.servicebridge". */
 	dataDir?: string;
 	/** Max rows kept in the event outbox before publish back-pressures. Default 100000. */
@@ -350,8 +338,6 @@ export interface ServiceBridgeOptions {
 	eventsDrainerBatch?: number;
 	/** Max in-flight inbound events the subscriber processes concurrently. Default 32. */
 	eventsMaxInFlight?: number;
-	/** Per-direction captured-payload byte cap. Default 65536. */
-	payloadMaxBytes?: number;
 }
 
 /**
@@ -371,6 +357,8 @@ interface ServiceBridgeInternalHooks extends ServiceBridgeOptions {
 		url: string,
 		creds: grpc.ChannelCredentials,
 	) => RegistryClient;
+	/** Test hook: skip TelemetryClient + TelemetryTransport startup. */
+	_disableTelemetryTransport?: boolean;
 }
 
 interface ResolvedOptions {
@@ -389,13 +377,11 @@ interface ResolvedOptions {
 	advertise: AdvertiseConfig | null;
 	callDefaults: CallOpts;
 	failOnPolicyViolation: boolean;
-	telemetry: boolean;
-	telemetryRingSize: number;
 	dataDir: string;
 	maxOutboxRows: number;
 	eventsDrainerBatch: number;
 	eventsMaxInFlight: number;
-	payloadMaxBytes: number;
+	_disableTelemetryTransport: boolean;
 }
 
 /**
@@ -457,10 +443,12 @@ export class ServiceBridge {
 	// Telemetry infrastructure — лежит на самом ServiceBridge, потому что её
 	// lifecycle совпадает с lifecycle сессии (Welcome → start, stop → close).
 	// Ring создаётся в конструкторе, чтобы prod-код мог писать логи / ops до
-	// подключения; они буферятся в ring до старта transport'а. SDK всегда
-	// flushes (ADR-0008); единственный off-switch — option telemetry: false,
-	// который полностью отключает создание transport.
-	private readonly _telemetryEnabled: boolean;
+	// подключения; они буферятся в ring до старта transport'а.
+	// _telemetryEnabled tracks the runtime-pushed telemetry.enable value (default
+	// fail-safe: true until the first snapshot). Transport is started only when
+	// true and not yet running; when the pushed value changes to false the
+	// transport is stopped on the next reconnect cycle.
+	private _telemetryEnabled: boolean = true;
 	private readonly _telemetryRing: TelemetryRing;
 	private readonly _telemetryApi: TelemetryAPI;
 	private _telemetryClient: TelemetryClient | null = null;
@@ -518,41 +506,35 @@ export class ServiceBridge {
 			advertise: resolveAdvertise(options.advertise),
 			callDefaults: options.callDefaults ?? {},
 			failOnPolicyViolation: options.failOnPolicyViolation ?? false,
-			telemetry: options.telemetry ?? true,
-			telemetryRingSize:
-				options.telemetryRingSize ?? DEFAULT_TELEMETRY_RING_SIZE,
 			dataDir: options.dataDir ?? "./.servicebridge",
 			maxOutboxRows: options.maxOutboxRows ?? DEFAULT_MAX_OUTBOX_ROWS,
 			eventsDrainerBatch: options.eventsDrainerBatch ?? DEFAULT_DRAINER_BATCH,
 			eventsMaxInFlight:
 				options.eventsMaxInFlight ?? DEFAULT_EVENTS_MAX_IN_FLIGHT,
-			payloadMaxBytes: options.payloadMaxBytes ?? DEFAULT_PAYLOAD_MAX_BYTES,
+			_disableTelemetryTransport: hooks._disableTelemetryTransport ?? false,
 		};
 
-		// Telemetry wiring (ADR-0008). Ring is owned by the bridge so user code
+		// Telemetry wiring (ADR-0007). Ring is owned by the bridge so user code
 		// may emit logs/ops/metrics before start(); they buffer in the ring and
-		// the transport drains once it's up.
-		this._telemetryEnabled = this.opts.telemetry;
-		// telemetryRingSize sets the ops ring byte budget (the kind under burst
-		// pressure from dense workflow step-span emission). The ring's own per-kind
-		// defaults apply when the value is non-finite or non-positive.
-		const opsBudget = this.opts.telemetryRingSize;
-		this._telemetryRing = new TelemetryRing(
-			Number.isFinite(opsBudget) && opsBudget > 0
-				? { ops: opsBudget }
-				: undefined,
-		);
+		// the transport drains once it's up. The ops ring byte budget is the
+		// internal DEFAULT_TELEMETRY_RING_SIZE — sized for dense workflow step-span
+		// emission bursts (≈800 op frames). Not user-configurable.
+		this._telemetryRing = new TelemetryRing({
+			ops: DEFAULT_TELEMETRY_RING_SIZE,
+		});
 
 		// Telemetry API surface. Identity fields are resolved lazily — user code
 		// may call sb.telemetry.log() before start(), in which case instance_id
 		// will be empty (best-effort). After Welcome, all subsequent emits carry
 		// the real instanceId from currentIdentity.
+		// payloadMaxBytes is resolved live from the runtime-pushed value so ops
+		// always use the current runtime setting, not a stale constructor value.
 		this._telemetryApi = makeTelemetryAPI(
 			this._telemetryRing,
 			() => this._telemetryInstanceId,
 			() => this.currentIdentity?.serviceId ?? "",
 			(channel) => this._watchStream.captureModeForChannel(channel),
-			this.opts.payloadMaxBytes,
+			() => this._watchStream.pushedTelemetryConfig().payloadMaxBytes,
 		);
 
 		// Wire domain namespaces with lazy transport access. Call-time policy
@@ -892,7 +874,7 @@ export class ServiceBridge {
 			entry.instances.push(i);
 			result.set(i.serviceName, entry);
 		}
-		// ADR-0014 enrichment. Subscriptions are keyed by serviceId — find the
+		// ADR-0004 enrichment. Subscriptions are keyed by serviceId — find the
 		// matching ServiceMapEntry by walking known instances/methods.
 		const byServiceId = new Map<string, ServiceMapEntry>();
 		for (const [name, entry] of result) {
@@ -912,7 +894,7 @@ export class ServiceBridge {
 	}
 
 	/**
-	 * ADR-0014: the caller's last-known PolicyEvaluation as pushed by the
+	 * ADR-0004: the caller's last-known PolicyEvaluation as pushed by the
 	 * runtime via `RegistrySnapshot.policy`. `null` until the first snapshot
 	 * frame arrives. Updated automatically when the operator edits policy and
 	 * Postgres NOTIFY fires → runtime re-emits.
@@ -962,7 +944,7 @@ export class ServiceBridge {
 		await this.ensureRpcReady(prov, creds);
 
 		const registryClient = this.opts.registryClientFactory(this.url, creds);
-		// ADR-0014: subscribe to PolicyEvaluation BEFORE start() so the first
+		// ADR-0004: subscribe to PolicyEvaluation BEFORE start() so the first
 		// snapshot frame's `policy.warnings` triggers `console.warn` + the
 		// `policy_violation` event for each violation. Listener is idempotent
 		// across reconnects; restart() preserves it.
@@ -988,6 +970,11 @@ export class ServiceBridge {
 				this.emit("disconnected", { reason: err.message, error: err });
 				void this.stop();
 			}
+		});
+		// Track runtime-pushed telemetry enable flag. The listener is idempotent
+		// across reconnects (onTelemetryConfig adds the same closure reference once).
+		this._watchStream.onTelemetryConfig((cfg) => {
+			this._telemetryEnabled = cfg.enabled;
 		});
 		this._watchStream.start(
 			this._registry.buildRegisterRequest(),
@@ -1116,7 +1103,13 @@ export class ServiceBridge {
 		// Telemetry transport: idempotent across reconnects. Creds change on cert
 		// rotation but the gRPC channel underneath the TelemetryClient already
 		// re-resolves; we keep the same client + transport instance.
-		if (this._telemetryEnabled && !this._telemetryClient) {
+		// _disableTelemetryTransport is a test hook; _telemetryEnabled is the
+		// runtime-pushed telemetry.enable value (default true until first snapshot).
+		if (
+			this._telemetryEnabled &&
+			!this._telemetryClient &&
+			!this.opts._disableTelemetryTransport
+		) {
 			this._telemetryClient = new TelemetryClient(this.url, creds);
 			this._telemetryTransport = new TelemetryTransport({
 				client: adaptTelemetryClient(this._telemetryClient),
@@ -1232,7 +1225,7 @@ export class ServiceBridge {
 			deps: {
 				sb: { rpc: this.rpc, event: this.event, workflow: this.workflow },
 				ops: makeRuntimeOps(rpc, () => this.currentIdentity?.instanceId ?? ""),
-				// Step span emission (T-022 / ADR-0026 nesting): the runner calls
+				// Step span emission (ADR-0003 nesting): the runner calls
 				// this around every executed unit — each step, each fanout group,
 				// each fanout branch, each compensation. We open one USER.SUBOP
 				// op (parent = the current trace context, i.e. the run root or an

@@ -45,13 +45,13 @@ function inboundTraceContext(req: CallRequest): TraceContext {
 // registration and schema (de)serialization. Errors thrown by handlers are
 // converted to CallResponse.error_code/error_message — gRPC status stays OK.
 //
-// Acceptance check (Layer 2, ADR-0014 Gap 1): for each incoming direct call,
+// Acceptance check (Layer 2, ADR-0004): for each incoming direct call,
 // the server extracts the caller's SPIFFE service UUID from the peer TLS cert
 // and checks it against the callee's rpc.handle acceptance rules. If the
 // private grpc-js accessor path is broken the server fails closed — all direct
 // calls are rejected with PermissionDenied until the accessor is restored.
 //
-// Tracing (ADR-0037..0042): the server emits NO op. It runs the handler inside
+// Tracing (ADR-0001): the server emits NO op. It runs the handler inside
 // the inbound call's trace context (parent = caller CALL.op_id) so the handler's
 // nested ops (rpc.call / event.publish) parent to the single caller-owned
 // RPC.CALL row. Callee errors flow back in the CallResponse and the caller
@@ -162,7 +162,7 @@ export class CallServer {
 		const traceCtx = inboundTraceContext(req);
 		// The handler runs in the call's trace context (parent = caller CALL.op_id)
 		// so its nested ops parent to CALL. No RPC.HANDLE op is emitted — the single
-		// RPC.CALL row owned by the caller SDK is the whole call (ADR-0037..0042).
+		// RPC.CALL row owned by the caller SDK is the whole call (ADR-0001).
 		await runWithTrace(traceCtx, async () => {
 			try {
 				const result = await this.dispatch.dispatchUnary(
@@ -211,7 +211,7 @@ export class CallServer {
 		}
 		const req = call.request;
 		const traceCtx = inboundTraceContext(req);
-		// Handler runs in the call's trace context; no RPC.HANDLE op (ADR-0037..0042).
+		// Handler runs in the call's trace context; no RPC.HANDLE op (ADR-0001).
 		await runWithTrace(traceCtx, async () => {
 			try {
 				for await (const item of this.dispatch.dispatchStream(

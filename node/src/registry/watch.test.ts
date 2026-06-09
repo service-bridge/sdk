@@ -13,7 +13,14 @@ import { WatchStream } from "./watch";
 // allModes builds a CaptureModes message with every channel set to one mode,
 // for tests that only care about a single channel's propagation.
 function allModes(m: CaptureMode): CaptureModes {
-	return { rpc: m, http: m, event: m, workflow: m };
+	return {
+		rpc: m,
+		http: m,
+		event: m,
+		workflow: m,
+		telemetryEnabled: true,
+		payloadMaxBytes: 65536,
+	};
 }
 
 // ── fake RegistryClient ──────────────────────────────────────────────────────
@@ -143,6 +150,8 @@ describe("WatchStream per-channel capture modes (runtime authority)", () => {
 				http: CaptureMode.CAPTURE_MODE_ERRORS,
 				event: CaptureMode.CAPTURE_MODE_NONE,
 				workflow: CaptureMode.CAPTURE_MODE_ALL,
+				telemetryEnabled: true,
+				payloadMaxBytes: 65536,
 			}),
 		);
 		expect(ws.captureModeForChannel(Channel.RPC)).toBe("all");
@@ -163,6 +172,8 @@ describe("WatchStream per-channel capture modes (runtime authority)", () => {
 				http: CaptureMode.CAPTURE_MODE_NONE,
 				event: CaptureMode.CAPTURE_MODE_NONE,
 				workflow: CaptureMode.CAPTURE_MODE_NONE,
+				telemetryEnabled: true,
+				payloadMaxBytes: 65536,
 			}),
 		);
 		expect(ws.captureModeForChannel(Channel.RPC)).toBe("all");
@@ -286,5 +297,115 @@ describe("WatchStream stop/restart", () => {
 		// New snapshot from stream2 replaces old cache.
 		stream2.emit("data", snapshot([]));
 		expect(ws.snapshot().size).toBe(0);
+	});
+});
+
+describe("WatchStream pushed telemetry config", () => {
+	it("defaults to enabled=true, payloadMaxBytes=65536 before any snapshot", () => {
+		const ws = new WatchStream();
+		const cfg = ws.pushedTelemetryConfig();
+		expect(cfg.enabled).toBe(true);
+		expect(cfg.payloadMaxBytes).toBe(65536);
+	});
+
+	it("applies telemetryEnabled=false from snapshot", () => {
+		const stream = new FakeStream();
+		const ws = new WatchStream();
+		ws.start(emptyReq, makeClient(stream));
+		stream.emit(
+			"data",
+			snapshot([], {
+				rpc: CaptureMode.CAPTURE_MODE_NONE,
+				http: CaptureMode.CAPTURE_MODE_NONE,
+				event: CaptureMode.CAPTURE_MODE_NONE,
+				workflow: CaptureMode.CAPTURE_MODE_NONE,
+				telemetryEnabled: false,
+				payloadMaxBytes: 65536,
+			}),
+		);
+		expect(ws.pushedTelemetryConfig().enabled).toBe(false);
+	});
+
+	it("applies custom payloadMaxBytes from snapshot", () => {
+		const stream = new FakeStream();
+		const ws = new WatchStream();
+		ws.start(emptyReq, makeClient(stream));
+		stream.emit(
+			"data",
+			snapshot([], {
+				rpc: CaptureMode.CAPTURE_MODE_NONE,
+				http: CaptureMode.CAPTURE_MODE_NONE,
+				event: CaptureMode.CAPTURE_MODE_NONE,
+				workflow: CaptureMode.CAPTURE_MODE_NONE,
+				telemetryEnabled: true,
+				payloadMaxBytes: 1024,
+			}),
+		);
+		expect(ws.pushedTelemetryConfig().payloadMaxBytes).toBe(1024);
+	});
+
+	it("fires onTelemetryConfig listener when config changes", () => {
+		const stream = new FakeStream();
+		const ws = new WatchStream();
+		const seen: Array<{ enabled: boolean; payloadMaxBytes: number }> = [];
+		ws.onTelemetryConfig((cfg) => seen.push({ ...cfg }));
+		ws.start(emptyReq, makeClient(stream));
+		stream.emit(
+			"data",
+			snapshot([], {
+				rpc: CaptureMode.CAPTURE_MODE_NONE,
+				http: CaptureMode.CAPTURE_MODE_NONE,
+				event: CaptureMode.CAPTURE_MODE_NONE,
+				workflow: CaptureMode.CAPTURE_MODE_NONE,
+				telemetryEnabled: false,
+				payloadMaxBytes: 2048,
+			}),
+		);
+		expect(seen).toHaveLength(1);
+		const first = seen[0]!;
+		expect(first.enabled).toBe(false);
+		expect(first.payloadMaxBytes).toBe(2048);
+	});
+
+	it("does not fire listener when config is unchanged", () => {
+		const stream = new FakeStream();
+		const ws = new WatchStream();
+		let fireCount = 0;
+		ws.onTelemetryConfig(() => fireCount++);
+		ws.start(emptyReq, makeClient(stream));
+		// Same as default: enabled=true, payloadMaxBytes=65536
+		stream.emit(
+			"data",
+			snapshot([], {
+				rpc: CaptureMode.CAPTURE_MODE_NONE,
+				http: CaptureMode.CAPTURE_MODE_NONE,
+				event: CaptureMode.CAPTURE_MODE_NONE,
+				workflow: CaptureMode.CAPTURE_MODE_NONE,
+				telemetryEnabled: true,
+				payloadMaxBytes: 65536,
+			}),
+		);
+		expect(fireCount).toBe(0);
+	});
+
+	it("applies config from an update frame", () => {
+		const stream = new FakeStream();
+		const ws = new WatchStream();
+		ws.start(emptyReq, makeClient(stream));
+		stream.emit("data", snapshot([], allModes(CaptureMode.CAPTURE_MODE_NONE)));
+		stream.emit(
+			"data",
+			update([], [], {
+				rpc: CaptureMode.CAPTURE_MODE_NONE,
+				http: CaptureMode.CAPTURE_MODE_NONE,
+				event: CaptureMode.CAPTURE_MODE_NONE,
+				workflow: CaptureMode.CAPTURE_MODE_NONE,
+				telemetryEnabled: false,
+				payloadMaxBytes: 512,
+			}),
+		);
+		const cfg = ws.pushedTelemetryConfig();
+		expect(cfg.enabled).toBe(false);
+		expect(cfg.payloadMaxBytes).toBe(512);
 	});
 });

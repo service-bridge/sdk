@@ -72,7 +72,7 @@ export class RpcDomain {
 				opts,
 			);
 		} catch (err) {
-			// Gate #3 denial (ADR-0014): surface as a typed, catchable error and
+			// Gate #3 denial (ADR-0004): surface as a typed, catchable error and
 			// emit a policy_violation so call-time denials are observable on the
 			// same channel as registration warnings.
 			if ((err as { code?: number }).code === GRPC_PERMISSION_DENIED) {

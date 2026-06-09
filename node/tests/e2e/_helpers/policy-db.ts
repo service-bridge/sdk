@@ -7,7 +7,7 @@
 
 const PG_URL =
 	process.env.TEST_DATABASE_URL ??
-	"postgresql://servicebridge:servicebridge@localhost:5433/servicebridge";
+	"postgresql://servicebridge:servicebridge@localhost:5433/service-bridge";
 
 export async function withDb<T>(
 	fn: (sql: typeof import("bun").sql) => Promise<T>,

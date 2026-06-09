@@ -22,7 +22,7 @@ const CA_CERT = resolve(REPO_ROOT, "runtime", "certs", "ca.crt");
 const CA_KEY = resolve(REPO_ROOT, "runtime", "certs", "ca.key");
 const POSTGRES_DSN =
 	process.env.POSTGRES_DSN ??
-	"postgres://servicebridge:servicebridge@localhost:5433/servicebridge?sslmode=disable";
+	"postgres://servicebridge:servicebridge@localhost:5433/service-bridge?sslmode=disable";
 const PG_CONTAINER = process.env.PG_CONTAINER ?? "servicebridge2-pg";
 
 export type ShowcaseRole =
@@ -185,7 +185,7 @@ export function ensureShowcaseKeys(opts?: {
 	if (!existsSync(CA_CERT) || !existsSync(CA_KEY)) {
 		throw new Error(
 			`showcase: CA material missing at ${CA_CERT} / ${CA_KEY}. ` +
-				"Boot the runtime once to auto-generate: go run -C runtime ./cmd/runtime -pg-url postgres://servicebridge:servicebridge@localhost:5433/servicebridge?sslmode=disable",
+				"Boot the runtime once to auto-generate: go run -C runtime ./cmd/runtime -pg-url postgres://servicebridge:servicebridge@localhost:5433/service-bridge?sslmode=disable",
 		);
 	}
 	const keys: Partial<Record<ShowcaseRole, string>> = {};

@@ -1,4 +1,4 @@
-// access-policy-capabilities.test.ts — ADR-0014 gate #1.
+// access-policy-capabilities.test.ts — ADR-0004 gate #1.
 //
 // When a service's `cap_rpc_handle` is FALSE, the runtime hard-rejects the
 // registration of an rpc handler with PermissionDenied — the registration

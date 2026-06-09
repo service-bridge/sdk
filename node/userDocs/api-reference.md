@@ -6,7 +6,7 @@
 
 ## Импорт
 
-Пакет называется `servicebridge`. Корневой импорт даёт класс, ошибки и типы:
+Пакет называется `service-bridge`. Корневой импорт даёт класс, ошибки и типы:
 
 ```ts
 import {
@@ -14,6 +14,8 @@ import {
   ServiceBridgeError,
   RpcAccessDeniedError,
   WorkflowAccessDeniedError,
+  WorkflowNotFoundError,
+  WorkflowTerminalError,
   InvalidEventNameError,
   OutboxFullError,
   // типы
@@ -23,14 +25,22 @@ import {
   type RetryOpts,
   type Identity,
   type MethodDescriptor,
+  type MethodType,
   type ServiceDeps,
   type RpcHandlerOpts,
   type WorkflowHandlerOpts,
   type SchemaSpec,
   type PublishOpts,
   type JobOpts,
-  type Trigger,
   type JobHandlerCtx,
+  type Trigger,
+  type CronTrigger,
+  type DelayedTrigger,
+  type IntervalTrigger,
+  type CatchupPolicy,
+  type OverlapPolicy,
+  type RetryPolicy,
+  type DeclaredDep,
   type TypedClient,
   type ConnectedEvent,
   type ReconnectingEvent,
@@ -39,7 +49,7 @@ import {
 } from "service-bridge";
 ```
 
-HTTP-интеграции — отдельные subpath-импорты (`servicebridge/express`, `servicebridge/fastify`, `servicebridge/hono`), см. [Integrations](./integrations.md).
+HTTP-интеграции — отдельные subpath-импорты (`service-bridge/express`, `service-bridge/fastify`, `service-bridge/hono`), см. [Integrations](./integrations.md).
 
 ## ServiceBridge
 
@@ -73,7 +83,7 @@ policyEvaluation(): PolicyEvaluation | null              // последний �
 instanceIdString(): string                               // "" до первого Welcome
 ```
 
-`serviceMap()` группирует по `serviceName`: для каждого сервиса — видимые методы (`methods`), живые инстансы с endpoint'ами (`instances`), а также `eventSubscriptions` и `outgoingCalls` (ADR-0014).
+`serviceMap()` группирует по `serviceName`: для каждого сервиса — видимые методы (`methods`), живые инстансы с endpoint'ами (`instances`), а также `eventSubscriptions` и `outgoingCalls` (ADR-0004).
 
 ### Домены
 
@@ -143,7 +153,7 @@ sb.stream<Req, Chunk>(
 ): AsyncIterable<Chunk>
 ```
 
-Прерывание `for await`-цикла (break/return) закрывает gRPC-стрим, что доходит до callee. Retry к стримам не применяется (single-pick by design, ADR 0004).
+Прерывание `for await`-цикла (break/return) закрывает gRPC-стрим, что доходит до callee. Retry к стримам не применяется (single-pick by design, ADR 0001).
 
 ### RPC handlers (`sb.rpc`)
 
@@ -274,9 +284,13 @@ sb.on("policy_violation",(e: PolicyViolationEvent) => void): this
 interface ServiceBridgeOptions {
   reconnectIntervalMs?: number;        // default 3000
   reconnectAttempts?: number;          // default 3 (0 = unlimited)
-  advertise?: AdvertiseConfig | false; // default: auto — SB_ADVERTISE_HOST env > "127.0.0.1" на свободном порту (+warning)
+  advertise?: AdvertiseConfig | false; // default: undefined → "127.0.0.1" на свободном порту (+warning)
   callDefaults?: CallOpts;             // дефолты для каждого sb.rpc.call / sb.stream
   failOnPolicyViolation?: boolean;     // default false — иначе warning при нарушении политики делает start() → disconnected
+  dataDir?: string;                    // default "./.servicebridge" — каталог SQLite-outbox
+  maxOutboxRows?: number;              // default 100000 — потолок event-outbox до back-pressure
+  eventsDrainerBatch?: number;         // default 50 — строк за тик дренера событий
+  eventsMaxInFlight?: number;          // default 32 — параллельных inbound-событий
 }
 
 interface AdvertiseConfig {
@@ -285,7 +299,9 @@ interface AdvertiseConfig {
 }
 ```
 
-`advertise: false` — явный caller-only режим: inbound Call-сервер не поднимается (инстанс никогда не обслуживает RPC). По умолчанию (`undefined`) SDK берёт `SB_ADVERTISE_HOST`, иначе откатывается на `127.0.0.1` с предупреждением — loopback недостижим с других хостов, в контейнерах/k8s задавайте `SB_ADVERTISE_HOST` или явный `{ host, port }`.
+`advertise: false` — явный caller-only режим: inbound Call-сервер не поднимается (инстанс никогда не обслуживает RPC). По умолчанию (`undefined`) SDK биндит `127.0.0.1` на свободном порту с предупреждением — loopback недостижим с других хостов, в контейнерах/k8s задавайте явный `{ host, port }`.
+
+Telemetry on/off и payload cap задаются в UI рантайма (Settings → Telemetry), а не в конструкторе. Настройки `telemetry.enable` и `telemetry.payload_max_bytes` пушатся в SDK через поля `CaptureModes.telemetry_enabled` / `CaptureModes.payload_max_bytes` в registry snapshot. Fail-safe до первого снапшота: transport включён, cap = 65536 байт.
 
 ### CallOpts
 
@@ -293,7 +309,7 @@ interface AdvertiseConfig {
 interface CallOpts {
   timeout?: string;                          // "500ms" | "10s" | "2m" — default "30s"
   requestId?: string;                        // авто UUID v4 если не задан
-  idempotencyKey?: string;                   // НЕ авто — задайте, чтобы включить runtime-side dedup (ADR 0012)
+  idempotencyKey?: string;                   // НЕ авто — задайте, чтобы включить runtime-side dedup (ADR 0001)
   transport?: "direct" | "proxy" | "auto";   // default "auto"
   retry?: Partial<RetryOpts>;
 }

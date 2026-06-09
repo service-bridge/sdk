@@ -28,7 +28,7 @@ visual acceptance gate for the Phase 5 tracing rebuild.
 ```bash
 # Prerequisites
 docker ps | grep servicebridge2-pg                 # PG18 on :5433
-go run -C runtime ./cmd/runtime -pg-url postgres://servicebridge:servicebridge@localhost:5433/servicebridge?sslmode=disable &  # runtime on :14444 + :14445
+go run -C runtime ./cmd/runtime -pg-url postgres://servicebridge:servicebridge@localhost:5433/service-bridge?sslmode=disable &  # runtime on :14444 + :14445
 
 # First time only — provisions 8 services (~5 s) and caches keys.
 # Re-runs reuse .env.showcase.

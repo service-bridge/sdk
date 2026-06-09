@@ -33,7 +33,7 @@ export interface InvokeRequest {
   /**
    * Caller-side contract hash for (method input, output) schemas. Resolver
    * filters target instances to those advertising the same hash on this
-   * method (ADR-0012). Empty for non-RPC paths or when the caller has no
+   * method (ADR-0001). Empty for non-RPC paths or when the caller has no
    * schema registered — matched only against instances that advertise an
    * empty hash for the method.
    */

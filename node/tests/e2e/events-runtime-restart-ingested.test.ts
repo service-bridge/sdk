@@ -21,7 +21,7 @@
  *   recovery possible. If the runtime were restarted between step 1 and step 3,
  *   it would recover the 'pending' delivery rows from Postgres on boot.
  *
- * DB connection: postgresql://servicebridge:servicebridge@localhost:5433/servicebridge
+ * DB connection: postgresql://servicebridge:servicebridge@localhost:5433/service-bridge
  * (matches runtime/.env on the dev machine).
  */
 
@@ -40,7 +40,7 @@ import {
 
 const PG_URL =
 	process.env.TEST_DATABASE_URL ??
-	"postgresql://servicebridge:servicebridge@localhost:5433/servicebridge";
+	"postgresql://servicebridge:servicebridge@localhost:5433/service-bridge";
 
 // Thin wrapper that opens a Bun.sql connection for the test duration.
 // Each query is a tagged template that Bun.sql sends as a parameterised

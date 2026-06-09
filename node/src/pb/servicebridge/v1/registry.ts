@@ -56,6 +56,18 @@ export interface CaptureModes {
   http: CaptureMode;
   event: CaptureMode;
   workflow: CaptureMode;
+  /**
+   * telemetry_enabled gates the telemetry transport on the SDK side. Resolved
+   * from the telemetry.enable runtime setting. SDK stops/skips the transport
+   * when false; default fail-safe before first snapshot is enabled=true.
+   */
+  telemetryEnabled: boolean;
+  /**
+   * payload_max_bytes is the per-direction byte cap for captured payloads,
+   * resolved from telemetry.payload_max_bytes. SDK uses this instead of any
+   * constructor-provided value. Fallback before first snapshot: 65536.
+   */
+  payloadMaxBytes: number;
 }
 
 export interface IncomingMethod {
@@ -77,7 +89,7 @@ export interface PublishedEvent {
   /**
    * SDK-supplied contract hash (hex SHA-256) of the Protobuf descriptor for
    * this event's payload schema. Empty when the publisher declared the event
-   * without a schema. Runtime stores opaque, does not recompute (ADR-0005).
+   * without a schema. Runtime stores opaque, does not recompute (ADR-0001).
    */
   contractHash: string;
 }
@@ -132,7 +144,7 @@ export interface ServiceInstanceInfo {
    */
   httpEndpoint: string;
   /**
-   * Start of the current unhealthy window for this instance (ADR-0008 §6).
+   * Start of the current unhealthy window for this instance (ADR-0007).
    * Unix-ms timestamp; 0 when the instance is healthy. SDK-side LB treats it as a hint.
    */
   isUnhealthySinceUnixMs: number;
@@ -142,7 +154,7 @@ export interface RegistrySnapshot {
   methods: MethodDescriptor[];
   instances: ServiceInstanceInfo[];
   /**
-   * ── Service-map enrichment (ADR-0014) ────────────────────────────────────
+   * ── Service-map enrichment (ADR-0004) ────────────────────────────────────
    * Per-service event subscriptions visible to the caller. Combined with
    * event publishers from `methods` (METHOD_TYPE_EVENT + published=true) this
    * lets UI / SDK draw the full pub/sub graph including wildcards.
@@ -274,7 +286,7 @@ export interface PolicyViolation {
 }
 
 function createBaseCaptureModes(): CaptureModes {
-  return { rpc: 0, http: 0, event: 0, workflow: 0 };
+  return { rpc: 0, http: 0, event: 0, workflow: 0, telemetryEnabled: false, payloadMaxBytes: 0 };
 }
 
 export const CaptureModes: MessageFns<CaptureModes> = {
@@ -290,6 +302,12 @@ export const CaptureModes: MessageFns<CaptureModes> = {
     }
     if (message.workflow !== 0) {
       writer.uint32(32).int32(message.workflow);
+    }
+    if (message.telemetryEnabled !== false) {
+      writer.uint32(48).bool(message.telemetryEnabled);
+    }
+    if (message.payloadMaxBytes !== 0) {
+      writer.uint32(56).int32(message.payloadMaxBytes);
     }
     return writer;
   },
@@ -333,6 +351,22 @@ export const CaptureModes: MessageFns<CaptureModes> = {
           message.workflow = reader.int32() as any;
           continue;
         }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.telemetryEnabled = reader.bool();
+          continue;
+        }
+        case 7: {
+          if (tag !== 56) {
+            break;
+          }
+
+          message.payloadMaxBytes = reader.int32();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -351,6 +385,8 @@ export const CaptureModes: MessageFns<CaptureModes> = {
     message.http = object.http ?? 0;
     message.event = object.event ?? 0;
     message.workflow = object.workflow ?? 0;
+    message.telemetryEnabled = object.telemetryEnabled ?? false;
+    message.payloadMaxBytes = object.payloadMaxBytes ?? 0;
     return message;
   },
 };

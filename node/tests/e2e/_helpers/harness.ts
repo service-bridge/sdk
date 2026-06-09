@@ -33,7 +33,7 @@ export class E2ESetupError extends Error {
 				`Preconditions: runtime must be reachable + runtime/certs/ca.{crt,key} exist.`,
 				`Boot the runtime once if the CA material is missing:`,
 				``,
-				`    go run -C runtime ./cmd/runtime -pg-url postgres://servicebridge:servicebridge@localhost:5433/servicebridge?sslmode=disable`,
+				`    go run -C runtime ./cmd/runtime -pg-url postgres://servicebridge:servicebridge@localhost:5433/service-bridge?sslmode=disable`,
 			].join("\n"),
 		);
 		this.name = "E2ESetupError";
@@ -64,7 +64,7 @@ export class E2EKeysExpiredError extends Error {
 				``,
 				`If the runtime is not running, start it first:`,
 				``,
-				`    go run -C runtime ./cmd/runtime -pg-url postgres://servicebridge:servicebridge@localhost:5433/servicebridge?sslmode=disable`,
+				`    go run -C runtime ./cmd/runtime -pg-url postgres://servicebridge:servicebridge@localhost:5433/service-bridge?sslmode=disable`,
 			].join("\n"),
 		);
 		this.name = "E2EKeysExpiredError";

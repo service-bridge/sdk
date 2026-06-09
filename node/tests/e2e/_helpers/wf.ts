@@ -31,7 +31,7 @@ export function wfEnv(): WfEnv {
 				`workflow e2e: missing env: ${missing.join(", ")}.`,
 				``,
 				`Run once: bash scripts/bootstrap-e2e-keys.sh`,
-				`Then start runtime: go run -C runtime ./cmd/runtime -pg-url postgres://servicebridge:servicebridge@localhost:5433/servicebridge?sslmode=disable`,
+				`Then start runtime: go run -C runtime ./cmd/runtime -pg-url postgres://servicebridge:servicebridge@localhost:5433/service-bridge?sslmode=disable`,
 			].join("\n"),
 		);
 	}

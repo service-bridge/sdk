@@ -2,7 +2,7 @@
 //
 // Service 1 (job owner) fires a delayed job. Inside the handler it calls
 // an RPC on Service 2. We verify the handler ran and the RPC reached
-// service 2 — trace propagation is now via X-SB-Trace header (ADR T-017)
+// service 2 — trace propagation via X-SB-Trace header (ADR 0006)
 // and exercised in the telemetry integration tests.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";

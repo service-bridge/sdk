@@ -43,8 +43,8 @@ await sb.start();
 ## Golden rules
 
 - **Package name is `service-bridge`.** `npm i service-bridge` / `import { ServiceBridge } from "service-bridge"`. Never `servicebridge`.
-- **The SDK reads NO env vars for `url`/`key`.** You pass them explicitly (e.g. `process.env.PAYMENT_KEY!`). It only reads `SB_HTTP_ADVERTISE_HOST`/`SB_ADVERTISE_HOST` as a fallback for HTTP-plugin advertise host.
-- **Get the bootstrap key from the dashboard.** Open the runtime dashboard (`http://localhost:14444`) → **Services → Create service** → copy the `sb.…` string. That opaque value is the second constructor arg. (From runtime source you can also mint one with `go run ./cmd/sbkey-gen -name <svc> -dsn <postgres-dsn>`.)
+- **The SDK reads NO env vars.** You pass `url`, `key`, and the advertise host explicitly (e.g. `process.env.PAYMENT_KEY!` in your own code). There is no env-var fallback inside the SDK.
+- **Get the bootstrap key from the dashboard.** Open the runtime dashboard (`http://localhost:14444`) → **Services → Create service** → copy the `sb.…` string. That opaque value is the second constructor arg.
 - **Every RPC handler needs a `schema`.** `rpc.handle(name, fn, { schema })` — schema is required. Without it, registration fails.
 - **`event.handle` matches the EXACT event name**, not a wildcard. Wildcard routing is configured server-side, not in the handler string.
 - **Event and job handlers must be idempotent.** Delivery is at-least-once. For jobs, dedup on `ctx.idempotencyKey`, never on `ctx.attempt`.

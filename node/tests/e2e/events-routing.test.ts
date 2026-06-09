@@ -2,7 +2,7 @@
  * events-routing.test.ts — server-side event routing semantics.
  *
  * Verifies that the runtime's AMQP-style topic matching routes events correctly.
- * Per ADR-0011, routing is server-only: the SDK dispatches deliveries by exact
+ * Per ADR-0002, routing is server-only: the SDK dispatches deliveries by exact
  * event name (envelope.name === handler.pattern). Tests use one subscriber with
  * multiple handlers, each registered for a specific exact name, and verify
  * which events each receives based on what the server routes.
@@ -12,7 +12,7 @@
  *   - `prefix.*`        — matches any single-segment `prefix.X`
  *   - `prefix.#`        — matches any multi-segment `prefix.X.Y.Z`
  *
- * Per ADR-0011 design, the SDK dispatches to handlers by exact name match.
+ * Per ADR-0002 design, the SDK dispatches to handlers by exact name match.
  * The handler registered as `prefix.created` fires for deliveries with that
  * exact name; the other two patterns fire for deliveries whose exact name
  * is `prefix.*` or `prefix.#` respectively (which never occurs in practice).
