@@ -50,7 +50,7 @@ new ServiceBridge(url: string, key: string, options?: ServiceBridgeOptions)
 
 | Имя | Тип | По умолчанию | Что делает |
 |-----|-----|--------------|------------|
-| `reconnectIntervalMs` | `number` | `3000` | Задержка между попытками reconnect. |
+| `reconnectIntervalMs` | `number \| undefined` | `undefined` (ladder) | Задержка между попытками reconnect. Не задано → общий джиттерный `utils/reconnect-ladder` (растущие rung'и `[1s,5s,15s,30s,60s]` ±20% джиттера), чтобы флот не долбил рантайм синхронно на фиксированном тике. Явное число → плоская задержка (детерминированный override для тюнинга/тестов). |
 | `reconnectAttempts` | `number` | `3` | Кол-во попыток до `disconnected{reason:'exhausted'}` + auto-stop. `0` = без лимита. |
 | `advertise` | `AdvertiseConfig \| false \| undefined` | `undefined` | `{ host, port }` — поднять inbound Call gRPC сервер (`port=0` → ОС выбирает). `undefined` — `127.0.0.1:0` с одноразовым warn. `false` — caller-only, inbound сервер не поднимается. |
 | `callDefaults` | `CallOpts \| undefined` | `{}` | Дефолтные опции для каждого `sb.rpc.call()` / `sb.stream()` (`timeout` default `"30s"`, `requestId` авто). Перебиваются per-call аргументом. |
@@ -90,7 +90,8 @@ Module-level экспорты, **не** реэкспортируемые чер�
 |-----|------|-----|------------|
 | `parseBootstrapKey(raw)` | `key.ts` | `(string) => BootstrapKey` | Декодит `sb.<base64url>` → `BootstrapKeyPayload` → `{keyID, secret, caCertDer}`. Бросает на кривом prefix/base64/пустых полях. |
 | `BootstrapKey` | `key.ts` | `interface` | `{ keyID, secret, caCertDer: Buffer }`. |
-| `provision(url, key)` | `provision.ts` | `(string, BootstrapKey) => Promise<ProvisionResult>` | Генерит keypair+CSR, делает `Bootstrap.Provision`, возвращает leaf cert + chain. |
+| `provision(url, key, clientFactory?)` | `provision.ts` | `(string, BootstrapKey, BootstrapClientFactory?) => Promise<ProvisionResult>` | Генерит keypair+CSR, делает `Bootstrap.Provision`, возвращает leaf cert + chain. Bootstrap-канал одноразовый: закрывается в `finally` на всех путях (успех/ошибка/пустой ответ), иначе каждая попытка reconnect навсегда утекает TLS-канал. `clientFactory` — инжектируемая фабрика канала (`@internal`, дефолт `newBootstrapClient`); тесты считают create/close без живого рантайма. |
+| `BootstrapClientFactory` | `provision.ts` | `type` | `(url, caCertDer) => BootstrapClient`. Инжектируемая фабрика bootstrap-канала для `provision()`. |
 | `refresh(client, previous)` | `provision.ts` | `(ControlClient, ProvisionResult) => Promise<ProvisionResult>` | Перевыпуск cert через `Control.RefreshCert` на живом mTLS-канале (без argon2). Новый `instance_id`; `serviceId`/`serviceName` переносятся. |
 | `ProvisionResult` | `provision.ts` | `interface` | `{ certDer, caChainDer, serviceId, serviceName, instanceId, notAfterUnix: bigint, privateKey, privateKeyDer }`. `privateKeyDer` (PKCS#8) материализуется один раз для синхронной сборки mTLS-кредов. |
 | `Keypair` | `provision.ts` | `interface` | `{ privateKey, publicKey, csrDer }`. |
@@ -98,7 +99,7 @@ Module-level экспорты, **не** реэкспортируемые чер�
 | `buildPinnedCredentials(caCertDer)` | `provision.ts` | `(Buffer) => grpc.ChannelCredentials` | `createSsl` с встроенной CA + отключённой hostname-проверкой. |
 | `newBootstrapClient(url, caCertDer)` | `provision.ts` | `(string, Buffer) => BootstrapClient` | Конструирует pinned gRPC-клиент Bootstrap. |
 | `parseURL(url)` | `provision.ts` | `(string) => { host, port }` | Парсит и валидирует `host:port`. |
-| `Session` | `session.ts` | `class` | Обёртка над live-соединением: владеет `Control.Open` (Welcome/Drain) и `Registry.RegisterAndWatch`. `close()`, `isClosed()`, `updateRegistration(req)` (рестарт watch с новым `RegisterRequest`). Флаг `expectedClose` подавляет reconnect при намеренном закрытии. |
+| `Session` | `session.ts` | `class` | Обёртка над live-соединением: ведёт стримы `Control.Open` (Welcome/Drain) и `Registry.RegisterAndWatch`. `close()`, `isClosed()`, `updateRegistration(req)` (рестарт watch с новым `RegisterRequest`). Флаг `expectedClose` подавляет reconnect при намеренном закрытии. **`close()` отменяет только стрим**; gRPC-каналы (`controlClient`/`registryClient`) принадлежат `ServiceBridge` и закрываются им. |
 | `SessionCallbacks` | `session.ts` | `interface` | `{ onWelcome, onDrain, onError, onEnd }`. |
 | `ServerStream` | `session.ts` | `type` | `ReturnType<ControlClient["open"]>`. |
 | `openControlStream(client)` | `session.ts` | `(ControlClient) => ServerStream` | Конструирует `Control.Open` server-stream; выделен для тестового стаба. |
@@ -126,6 +127,7 @@ Module-level экспорты, **не** реэкспортируемые чер�
 - **CA cert встроен в bootstrap-ключ** как доверенный якорь: `@grpc/grpc-js` валидирует chain до `checkServerIdentity`; встроенный cert — единственный надёжный путь (Bun's `getPeerCertificate` не отдаёт полный chain).
 - **Hostname-проверка выключена** через `checkServerIdentity: () => undefined`. У серверного cert'а нет SAN; доверие — chain-валидацией к встроенной CA.
 - **Heartbeat'ов в Control нет.** `Control.Open` — read-only server-stream (Welcome/Drain); liveness держит telemetry-стрим. Cert refresh — отдельный unary `Control.RefreshCert`.
+- **Lifecycle gRPC-каналов: ровно один владелец, детерминированный close.** Каждый созданный канал имеет одного владельца и закрывается на всех путях (ошибка/успех/reconnect/rotation/stop) — иначе утечка памяти в цикле реконнекта (grpc-js не GC'ит незакрытый канал: внутри живут backoff-таймеры, канал сам продолжает открывать TCP+TLS). Конкретно: bootstrap-канал `provision()` — `finally` close; `controlClient` и `registryClient` живут полями `ServiceBridge`, закрываются перед перезаписью на каждом `openSession` (reconnect) и в `stop()`; overlap-rotation закрывает **старую** пару только после Welcome на новой (на rollback — закрывает **новую** пару, которая не была принята). `Session.close()` / `WatchStream.stop()` отменяют только стримы поверх канала, сам канал закрывает владелец (`ServiceBridge`). EventsClient/JobsClient/WorkflowsClient/TelemetryClient — idempotent: создаются один раз в `ensureRpcReady` (guard `if (!this._xClient)`), переиспользуются между reconnect'ами (gRPC re-resolve'ит канал под капотом), закрываются в `stop()`.
 - **Reconnect переиспользует валидный leaf cert, не ре-провижинится.** `connect()` берёт закэшированный `lastProvision`, если до `notAfter` остаётся больше `certRefreshLeadMs`; `Bootstrap.Provision` (64 MiB argon2 на рантайме) зовётся только на первом подключении или когда cert у края истечения (обычно его опережает refresh-таймер через лёгкий `Control.RefreshCert`). Транспортный обрыв стрима больше не запускает argon2 на каждый reconnect — иначе flaky-сеть превращалась в шторм memory-hard хешей на рантайме.
 - **Overlap rotation ждёт `Welcome`** на новой сессии перед закрытием старой: иначе окно гонки, когда новая сессия в БД, а `Control.Open` ещё не установлен. При неуспехе — rollback на старую сессию + `reconnecting`.
 - **`Session.close()` ставит `expectedClose=true`** — иначе при overlap-rotation `onEnd` старой session порождает фантомный `reconnecting`.

@@ -78,56 +78,73 @@ export function newBootstrapClient(
 	return new BootstrapClient(url, creds);
 }
 
+/** @internal Factory for the bootstrap gRPC client; injectable so tests can
+ * count channel creation/close without a live runtime. */
+export type BootstrapClientFactory = (
+	url: string,
+	caCertDer: Buffer,
+) => BootstrapClient;
+
 /**
  * Runs the full Provision flow:
  *   1. Use the CA cert embedded in the bootstrap key as the trusted root.
  *   2. Generate keypair + CSR.
  *   3. Call Bootstrap.Provision over a gRPC channel rooted at that CA.
+ *
+ * The bootstrap channel is single-use: it is closed in `finally` on every path
+ * (success, gRPC error, empty response). Leaking it would keep a TLS channel
+ * with its own backoff timers alive after every reconnect attempt — the exact
+ * shape of the production OOM in a runtime-down reconnect storm.
  */
 export async function provision(
 	url: string,
 	key: BootstrapKey,
+	clientFactory: BootstrapClientFactory = newBootstrapClient,
 ): Promise<ProvisionResult> {
 	parseURL(url); // validate format early — throws on garbage
 	const { privateKey, csrDer } = await generateKeypairAndCSR();
 	const privateKeyDer = Buffer.from(
 		await crypto.subtle.exportKey("pkcs8", privateKey),
 	);
-	const client = newBootstrapClient(url, key.caCertDer);
+	const client = clientFactory(url, key.caCertDer);
 
-	return new Promise((resolve, reject) => {
-		client.provision(
-			{
-				keyId: key.keyID,
-				secret: key.secret,
-				csrDer: Buffer.from(csrDer),
-			},
-			(err, response) => {
-				if (err) {
-					reject(new ServiceBridgeError("provision", err));
-					return;
-				}
-				if (!response) {
-					reject(
-						new Error("provision: empty response", {
-							cause: new Error("gRPC returned null response"),
-						}),
-					);
-					return;
-				}
-				resolve({
-					certDer: Buffer.from(response.certDer),
-					caChainDer: Buffer.from(response.caChainDer),
-					serviceId: response.serviceId,
-					serviceName: response.serviceName,
-					instanceId: response.instanceId,
-					notAfterUnix: BigInt(response.notAfterUnix),
-					privateKey,
-					privateKeyDer,
-				});
-			},
-		);
-	});
+	try {
+		return await new Promise<ProvisionResult>((resolve, reject) => {
+			client.provision(
+				{
+					keyId: key.keyID,
+					secret: key.secret,
+					csrDer: Buffer.from(csrDer),
+				},
+				(err, response) => {
+					if (err) {
+						reject(new ServiceBridgeError("provision", err));
+						return;
+					}
+					if (!response) {
+						reject(
+							new Error("provision: empty response", {
+								cause: new Error("gRPC returned null response"),
+							}),
+						);
+						return;
+					}
+					resolve({
+						certDer: Buffer.from(response.certDer),
+						caChainDer: Buffer.from(response.caChainDer),
+						serviceId: response.serviceId,
+						serviceName: response.serviceName,
+						instanceId: response.instanceId,
+						notAfterUnix: BigInt(response.notAfterUnix),
+						privateKey,
+						privateKeyDer,
+					});
+				},
+			);
+		});
+	} finally {
+		client.close();
+	}
 }
 
 /**

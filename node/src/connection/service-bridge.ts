@@ -60,6 +60,7 @@ import {
 	TelemetryTransport,
 } from "../telemetry/transport";
 import { formatXSbTrace, parseXSbTrace } from "../telemetry/wire-trace";
+import { reconnectDelay } from "../utils/reconnect-ladder";
 import { WorkflowDomain } from "../workflow/domain";
 import { makeRuntimeOps } from "../workflow/runtime-ops";
 import { WorkflowSubscriber } from "../workflow/subscriber";
@@ -100,8 +101,11 @@ export type { CallOpts } from "../rpc/client";
 export type { AdvertiseConfig } from "../rpc/server";
 export type { SchemaSpec } from "../serde/serializer";
 
-// Reconnect configuration.
-const RECONNECT_INTERVAL_MS = 3_000;
+// Reconnect configuration. When reconnectIntervalMs is left unset the SDK uses
+// the shared jittered reconnect-ladder so a fleet that loses the runtime at once
+// does not hammer it back in lockstep on a fixed 3s tick (the production OOM
+// reconnect storm). An explicit reconnectIntervalMs overrides the ladder with a
+// flat delay for callers that tune it deliberately.
 const RECONNECT_ATTEMPTS = 3; // 0 = unlimited
 
 // Events defaults (overridden via ServiceBridgeOptions in ensureRpcReady).
@@ -362,7 +366,8 @@ interface ServiceBridgeInternalHooks extends ServiceBridgeOptions {
 }
 
 interface ResolvedOptions {
-	reconnectIntervalMs: number;
+	// undefined → use the jittered reconnect-ladder; a number → flat override.
+	reconnectIntervalMs: number | undefined;
 	reconnectAttempts: number;
 	certRefreshLeadMs: number;
 	certRefreshJitterMs: number;
@@ -405,6 +410,10 @@ export class ServiceBridge {
 	private stopped = false;
 	private session: Session | null = null;
 	private controlClient: ControlClient | null = null;
+	// Registry channel of the current live session. Owned here (not by Session or
+	// WatchStream — those only drive the stream on top of it) so every (re)connect
+	// and rotation can close the predecessor channel and stop() closes the last.
+	private registryClient: RegistryClient | null = null;
 	private lastProvision: ProvisionResult | null = null;
 	private certRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -494,7 +503,7 @@ export class ServiceBridge {
 		this.rawKey = key;
 		const hooks = options as ServiceBridgeInternalHooks;
 		this.opts = {
-			reconnectIntervalMs: options.reconnectIntervalMs ?? RECONNECT_INTERVAL_MS,
+			reconnectIntervalMs: options.reconnectIntervalMs,
 			reconnectAttempts: options.reconnectAttempts ?? RECONNECT_ATTEMPTS,
 			certRefreshLeadMs: hooks.certRefreshLeadMs ?? CERT_REFRESH_LEAD_MS,
 			certRefreshJitterMs: hooks.certRefreshJitterMs ?? CERT_REFRESH_JITTER_MS,
@@ -700,6 +709,13 @@ export class ServiceBridge {
 		this._watchStream.stop();
 		this.session?.close();
 		this.session = null;
+		// Close the live session's control + registry channels. Session.close()
+		// only cancels the streams on top of them; the channels (and their backoff
+		// timers) are owned here and must be released explicitly.
+		this.controlClient?.close();
+		this.controlClient = null;
+		this.registryClient?.close();
+		this.registryClient = null;
 		this.currentIdentity = null;
 		this._instanceCache.dispose();
 		if (this._callServer) {
@@ -1002,6 +1018,13 @@ export class ServiceBridge {
 		const creds = this.buildMTLSCredentials(prov);
 		const client = this.opts.clientFactory(this.url, creds);
 		const stream = openControlStream(client);
+		// A transport-level reconnect lands here with the previous session's
+		// control/registry channels still referenced. grpc-js channels are not
+		// GC'd while their internal backoff timers live, so we must close the
+		// predecessors explicitly before overwriting the fields — otherwise each
+		// reconnect permanently leaks two TLS channels (the production OOM).
+		this.controlClient?.close();
+		this.registryClient?.close();
 		this.controlClient = client;
 		this.lastProvision = prov;
 
@@ -1010,6 +1033,7 @@ export class ServiceBridge {
 		await this.ensureRpcReady(prov, creds);
 
 		const registryClient = this.opts.registryClientFactory(this.url, creds);
+		this.registryClient = registryClient;
 		this._watchStream.start(
 			this._registry.buildRegisterRequest(),
 			registryClient,
@@ -1427,6 +1451,8 @@ export class ServiceBridge {
 		const newClient = this.opts.clientFactory(this.url, newCreds);
 		const newStream = openControlStream(newClient);
 		const oldSession = this.session;
+		const oldControlClient = this.controlClient;
+		const oldRegistryClient = this.registryClient;
 
 		const swapPromise = new Promise<void>((resolve, reject) => {
 			const timer = setTimeout(() => {
@@ -1438,6 +1464,11 @@ export class ServiceBridge {
 				onWelcome: (welcome) => {
 					welcomed = true;
 					this.session = newSession;
+					// Adopt the new channels as the live pair. Ownership transfers
+					// here so a later reconnect / stop() closes them; the old pair is
+					// closed by the success block once the swap completes.
+					this.controlClient = newClient;
+					this.registryClient = newRegistryClient;
 					this.scheduleCertRefresh(newProv);
 					this.currentIdentity = {
 						sessionId: welcome.sessionId,
@@ -1481,8 +1512,12 @@ export class ServiceBridge {
 
 		try {
 			await swapPromise;
-			// Close the old session only after the new one is fully usable.
+			// Close the old session only after the new one is fully usable, then
+			// release the old session's channels (Session.close cancels the stream
+			// but not the underlying channel).
 			oldSession?.close();
+			oldControlClient?.close();
+			oldRegistryClient?.close();
 			this._watchStream.restart(
 				this._registry.buildRegisterRequest(),
 				newRegistryClient,
@@ -1490,11 +1525,16 @@ export class ServiceBridge {
 			);
 		} catch (err) {
 			// Roll back to the previous session: keep oldSession alive and tear
-			// down the partially-built new one. Schedule a reconnect to retry.
+			// down the partially-built new one. The new channels were never adopted
+			// (no Welcome) so close them here, then schedule a reconnect to retry.
 			if (this.session !== oldSession) {
 				this.session?.close();
 				this.session = oldSession;
 			}
+			this.controlClient = oldControlClient;
+			this.registryClient = oldRegistryClient;
+			newClient.close();
+			newRegistryClient.close();
 			this.scheduleReconnect(
 				1,
 				`rotation: ${err instanceof Error ? err.message : String(err)}`,
@@ -1512,16 +1552,30 @@ export class ServiceBridge {
 			void this.stop();
 			return;
 		}
+		const delayMs = this.computeReconnectDelay(attempt);
 		this.emit("reconnecting", {
 			attempt,
-			delayMs: this.opts.reconnectIntervalMs,
+			delayMs,
 			reason,
 		});
 		if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
 		this.reconnectTimer = setTimeout(() => {
 			this.reconnectTimer = null;
 			void this.connect(attempt);
-		}, this.opts.reconnectIntervalMs);
+		}, delayMs);
+	}
+
+	// computeReconnectDelay returns the backoff before the next reconnect. An
+	// explicit reconnectIntervalMs is honoured as a flat delay (deliberate caller
+	// tuning, deterministic for tests). Otherwise the shared jittered ladder is
+	// used so a fleet reconnecting at once spreads its load across a window
+	// instead of spiking the runtime on a fixed tick. `attempt` is the 1-based
+	// next-attempt number; the ladder is 0-based, so attempt 1 → first rung.
+	private computeReconnectDelay(attempt: number): number {
+		if (this.opts.reconnectIntervalMs !== undefined) {
+			return this.opts.reconnectIntervalMs;
+		}
+		return reconnectDelay(attempt - 1);
 	}
 
 	private clearTimers(): void {
