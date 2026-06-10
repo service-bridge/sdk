@@ -135,15 +135,6 @@ export interface ListAccountsResponse {
   nextPageToken: string;
 }
 
-export interface UpdateRoleRequest {
-  id: string;
-  role: Role;
-}
-
-export interface UpdateRoleResponse {
-  account?: Account | undefined;
-}
-
 export interface DeleteAccountRequest {
   id: string;
 }
@@ -808,8 +799,9 @@ export interface EventDefSummary {
 export interface ListRpcMethodsRequest {
   pageSize: number;
   pageToken: string;
-  service: string;
-  status: string;
+  services: string[];
+  /** "active"|"inactive"; empty = any */
+  statuses: string[];
   q: string;
 }
 
@@ -833,11 +825,12 @@ export interface ListHttpRoutesRequest {
   pageSize: number;
   pageToken: string;
   serviceId: string;
-  service: string;
-  status: string;
+  services: string[];
+  /** "active"|"inactive"; empty = any */
+  statuses: string[];
   q: string;
-  /** HTTP method фильтр (GET/POST/...); "" — все. */
-  method: string;
+  /** HTTP method фильтр (GET/POST/...); пустой список — все. */
+  methods: string[];
 }
 
 export interface ListHttpRoutesResponse {
@@ -1068,7 +1061,7 @@ export interface ListDeliveriesRequest {
   topic: string;
   sinceMs: number;
   untilMs: number;
-  service: string;
+  services: string[];
   q: string;
 }
 
@@ -1083,7 +1076,7 @@ export interface ListDlqRequest {
   pageToken: string;
   consumerGroup: string;
   topic: string;
-  service: string;
+  services: string[];
   q: string;
 }
 
@@ -1114,7 +1107,7 @@ export interface PurgeDlqResponse {
 export interface ListSubscriptionPatternsRequest {
   pageSize: number;
   pageToken: string;
-  service: string;
+  services: string[];
   q: string;
 }
 
@@ -1262,8 +1255,9 @@ export interface JobRun {
 export interface ListJobDefsRequest {
   pageSize: number;
   pageToken: string;
-  service: string;
-  status: string;
+  services: string[];
+  /** "active"|"inactive"; empty = any */
+  statuses: string[];
   q: string;
 }
 
@@ -1376,8 +1370,9 @@ export interface WorkflowRun {
 export interface ListWorkflowDefsRequest {
   pageSize: number;
   pageToken: string;
-  service: string;
-  status: string;
+  services: string[];
+  /** "active"|"inactive"; empty = any */
+  statuses: string[];
   q: string;
 }
 
@@ -2562,112 +2557,6 @@ export const ListAccountsResponse: MessageFns<ListAccountsResponse> = {
     const message = createBaseListAccountsResponse();
     message.accounts = object.accounts?.map((e) => Account.fromPartial(e)) || [];
     message.nextPageToken = object.nextPageToken ?? "";
-    return message;
-  },
-};
-
-function createBaseUpdateRoleRequest(): UpdateRoleRequest {
-  return { id: "", role: 0 };
-}
-
-export const UpdateRoleRequest: MessageFns<UpdateRoleRequest> = {
-  encode(message: UpdateRoleRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.id !== "") {
-      writer.uint32(10).string(message.id);
-    }
-    if (message.role !== 0) {
-      writer.uint32(16).int32(message.role);
-    }
-    return writer;
-  },
-
-  decode(input: BinaryReader | Uint8Array, length?: number): UpdateRoleRequest {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
-    const end = length === undefined ? reader.len : reader.pos + length;
-    const message = createBaseUpdateRoleRequest();
-    while (reader.pos < end) {
-      const tag = reader.uint32();
-      switch (tag >>> 3) {
-        case 1: {
-          if (tag !== 10) {
-            break;
-          }
-
-          message.id = reader.string();
-          continue;
-        }
-        case 2: {
-          if (tag !== 16) {
-            break;
-          }
-
-          message.role = reader.int32() as any;
-          continue;
-        }
-      }
-      if ((tag & 7) === 4 || tag === 0) {
-        break;
-      }
-      reader.skip(tag & 7);
-    }
-    return message;
-  },
-
-  create<I extends Exact<DeepPartial<UpdateRoleRequest>, I>>(base?: I): UpdateRoleRequest {
-    return UpdateRoleRequest.fromPartial(base ?? ({} as any));
-  },
-  fromPartial<I extends Exact<DeepPartial<UpdateRoleRequest>, I>>(object: I): UpdateRoleRequest {
-    const message = createBaseUpdateRoleRequest();
-    message.id = object.id ?? "";
-    message.role = object.role ?? 0;
-    return message;
-  },
-};
-
-function createBaseUpdateRoleResponse(): UpdateRoleResponse {
-  return { account: undefined };
-}
-
-export const UpdateRoleResponse: MessageFns<UpdateRoleResponse> = {
-  encode(message: UpdateRoleResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.account !== undefined) {
-      Account.encode(message.account, writer.uint32(10).fork()).join();
-    }
-    return writer;
-  },
-
-  decode(input: BinaryReader | Uint8Array, length?: number): UpdateRoleResponse {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
-    const end = length === undefined ? reader.len : reader.pos + length;
-    const message = createBaseUpdateRoleResponse();
-    while (reader.pos < end) {
-      const tag = reader.uint32();
-      switch (tag >>> 3) {
-        case 1: {
-          if (tag !== 10) {
-            break;
-          }
-
-          message.account = Account.decode(reader, reader.uint32());
-          continue;
-        }
-      }
-      if ((tag & 7) === 4 || tag === 0) {
-        break;
-      }
-      reader.skip(tag & 7);
-    }
-    return message;
-  },
-
-  create<I extends Exact<DeepPartial<UpdateRoleResponse>, I>>(base?: I): UpdateRoleResponse {
-    return UpdateRoleResponse.fromPartial(base ?? ({} as any));
-  },
-  fromPartial<I extends Exact<DeepPartial<UpdateRoleResponse>, I>>(object: I): UpdateRoleResponse {
-    const message = createBaseUpdateRoleResponse();
-    message.account = (object.account !== undefined && object.account !== null)
-      ? Account.fromPartial(object.account)
-      : undefined;
     return message;
   },
 };
@@ -9540,7 +9429,7 @@ export const EventDefSummary: MessageFns<EventDefSummary> = {
 };
 
 function createBaseListRpcMethodsRequest(): ListRpcMethodsRequest {
-  return { pageSize: 0, pageToken: "", service: "", status: "", q: "" };
+  return { pageSize: 0, pageToken: "", services: [], statuses: [], q: "" };
 }
 
 export const ListRpcMethodsRequest: MessageFns<ListRpcMethodsRequest> = {
@@ -9551,11 +9440,11 @@ export const ListRpcMethodsRequest: MessageFns<ListRpcMethodsRequest> = {
     if (message.pageToken !== "") {
       writer.uint32(18).string(message.pageToken);
     }
-    if (message.service !== "") {
-      writer.uint32(26).string(message.service);
+    for (const v of message.services) {
+      writer.uint32(26).string(v!);
     }
-    if (message.status !== "") {
-      writer.uint32(34).string(message.status);
+    for (const v of message.statuses) {
+      writer.uint32(34).string(v!);
     }
     if (message.q !== "") {
       writer.uint32(42).string(message.q);
@@ -9591,7 +9480,7 @@ export const ListRpcMethodsRequest: MessageFns<ListRpcMethodsRequest> = {
             break;
           }
 
-          message.service = reader.string();
+          message.services.push(reader.string());
           continue;
         }
         case 4: {
@@ -9599,7 +9488,7 @@ export const ListRpcMethodsRequest: MessageFns<ListRpcMethodsRequest> = {
             break;
           }
 
-          message.status = reader.string();
+          message.statuses.push(reader.string());
           continue;
         }
         case 5: {
@@ -9626,8 +9515,8 @@ export const ListRpcMethodsRequest: MessageFns<ListRpcMethodsRequest> = {
     const message = createBaseListRpcMethodsRequest();
     message.pageSize = object.pageSize ?? 0;
     message.pageToken = object.pageToken ?? "";
-    message.service = object.service ?? "";
-    message.status = object.status ?? "";
+    message.services = object.services?.map((e) => e) || [];
+    message.statuses = object.statuses?.map((e) => e) || [];
     message.q = object.q ?? "";
     return message;
   },
@@ -9824,7 +9713,7 @@ export const GetRpcMethodResponse: MessageFns<GetRpcMethodResponse> = {
 };
 
 function createBaseListHttpRoutesRequest(): ListHttpRoutesRequest {
-  return { pageSize: 0, pageToken: "", serviceId: "", service: "", status: "", q: "", method: "" };
+  return { pageSize: 0, pageToken: "", serviceId: "", services: [], statuses: [], q: "", methods: [] };
 }
 
 export const ListHttpRoutesRequest: MessageFns<ListHttpRoutesRequest> = {
@@ -9838,17 +9727,17 @@ export const ListHttpRoutesRequest: MessageFns<ListHttpRoutesRequest> = {
     if (message.serviceId !== "") {
       writer.uint32(26).string(message.serviceId);
     }
-    if (message.service !== "") {
-      writer.uint32(34).string(message.service);
+    for (const v of message.services) {
+      writer.uint32(34).string(v!);
     }
-    if (message.status !== "") {
-      writer.uint32(42).string(message.status);
+    for (const v of message.statuses) {
+      writer.uint32(42).string(v!);
     }
     if (message.q !== "") {
       writer.uint32(50).string(message.q);
     }
-    if (message.method !== "") {
-      writer.uint32(58).string(message.method);
+    for (const v of message.methods) {
+      writer.uint32(58).string(v!);
     }
     return writer;
   },
@@ -9889,7 +9778,7 @@ export const ListHttpRoutesRequest: MessageFns<ListHttpRoutesRequest> = {
             break;
           }
 
-          message.service = reader.string();
+          message.services.push(reader.string());
           continue;
         }
         case 5: {
@@ -9897,7 +9786,7 @@ export const ListHttpRoutesRequest: MessageFns<ListHttpRoutesRequest> = {
             break;
           }
 
-          message.status = reader.string();
+          message.statuses.push(reader.string());
           continue;
         }
         case 6: {
@@ -9913,7 +9802,7 @@ export const ListHttpRoutesRequest: MessageFns<ListHttpRoutesRequest> = {
             break;
           }
 
-          message.method = reader.string();
+          message.methods.push(reader.string());
           continue;
         }
       }
@@ -9933,10 +9822,10 @@ export const ListHttpRoutesRequest: MessageFns<ListHttpRoutesRequest> = {
     message.pageSize = object.pageSize ?? 0;
     message.pageToken = object.pageToken ?? "";
     message.serviceId = object.serviceId ?? "";
-    message.service = object.service ?? "";
-    message.status = object.status ?? "";
+    message.services = object.services?.map((e) => e) || [];
+    message.statuses = object.statuses?.map((e) => e) || [];
     message.q = object.q ?? "";
-    message.method = object.method ?? "";
+    message.methods = object.methods?.map((e) => e) || [];
     return message;
   },
 };
@@ -12276,7 +12165,7 @@ export const SubscriptionPattern: MessageFns<SubscriptionPattern> = {
 };
 
 function createBaseListDeliveriesRequest(): ListDeliveriesRequest {
-  return { pageSize: 0, pageToken: "", topic: "", sinceMs: 0, untilMs: 0, service: "", q: "" };
+  return { pageSize: 0, pageToken: "", topic: "", sinceMs: 0, untilMs: 0, services: [], q: "" };
 }
 
 export const ListDeliveriesRequest: MessageFns<ListDeliveriesRequest> = {
@@ -12296,8 +12185,8 @@ export const ListDeliveriesRequest: MessageFns<ListDeliveriesRequest> = {
     if (message.untilMs !== 0) {
       writer.uint32(40).int64(message.untilMs);
     }
-    if (message.service !== "") {
-      writer.uint32(50).string(message.service);
+    for (const v of message.services) {
+      writer.uint32(50).string(v!);
     }
     if (message.q !== "") {
       writer.uint32(58).string(message.q);
@@ -12357,7 +12246,7 @@ export const ListDeliveriesRequest: MessageFns<ListDeliveriesRequest> = {
             break;
           }
 
-          message.service = reader.string();
+          message.services.push(reader.string());
           continue;
         }
         case 7: {
@@ -12387,7 +12276,7 @@ export const ListDeliveriesRequest: MessageFns<ListDeliveriesRequest> = {
     message.topic = object.topic ?? "";
     message.sinceMs = object.sinceMs ?? 0;
     message.untilMs = object.untilMs ?? 0;
-    message.service = object.service ?? "";
+    message.services = object.services?.map((e) => e) || [];
     message.q = object.q ?? "";
     return message;
   },
@@ -12464,7 +12353,7 @@ export const ListDeliveriesResponse: MessageFns<ListDeliveriesResponse> = {
 };
 
 function createBaseListDlqRequest(): ListDlqRequest {
-  return { pageSize: 0, pageToken: "", consumerGroup: "", topic: "", service: "", q: "" };
+  return { pageSize: 0, pageToken: "", consumerGroup: "", topic: "", services: [], q: "" };
 }
 
 export const ListDlqRequest: MessageFns<ListDlqRequest> = {
@@ -12481,8 +12370,8 @@ export const ListDlqRequest: MessageFns<ListDlqRequest> = {
     if (message.topic !== "") {
       writer.uint32(34).string(message.topic);
     }
-    if (message.service !== "") {
-      writer.uint32(42).string(message.service);
+    for (const v of message.services) {
+      writer.uint32(42).string(v!);
     }
     if (message.q !== "") {
       writer.uint32(50).string(message.q);
@@ -12534,7 +12423,7 @@ export const ListDlqRequest: MessageFns<ListDlqRequest> = {
             break;
           }
 
-          message.service = reader.string();
+          message.services.push(reader.string());
           continue;
         }
         case 6: {
@@ -12563,7 +12452,7 @@ export const ListDlqRequest: MessageFns<ListDlqRequest> = {
     message.pageToken = object.pageToken ?? "";
     message.consumerGroup = object.consumerGroup ?? "";
     message.topic = object.topic ?? "";
-    message.service = object.service ?? "";
+    message.services = object.services?.map((e) => e) || [];
     message.q = object.q ?? "";
     return message;
   },
@@ -12848,7 +12737,7 @@ export const PurgeDlqResponse: MessageFns<PurgeDlqResponse> = {
 };
 
 function createBaseListSubscriptionPatternsRequest(): ListSubscriptionPatternsRequest {
-  return { pageSize: 0, pageToken: "", service: "", q: "" };
+  return { pageSize: 0, pageToken: "", services: [], q: "" };
 }
 
 export const ListSubscriptionPatternsRequest: MessageFns<ListSubscriptionPatternsRequest> = {
@@ -12859,8 +12748,8 @@ export const ListSubscriptionPatternsRequest: MessageFns<ListSubscriptionPattern
     if (message.pageToken !== "") {
       writer.uint32(18).string(message.pageToken);
     }
-    if (message.service !== "") {
-      writer.uint32(26).string(message.service);
+    for (const v of message.services) {
+      writer.uint32(26).string(v!);
     }
     if (message.q !== "") {
       writer.uint32(34).string(message.q);
@@ -12896,7 +12785,7 @@ export const ListSubscriptionPatternsRequest: MessageFns<ListSubscriptionPattern
             break;
           }
 
-          message.service = reader.string();
+          message.services.push(reader.string());
           continue;
         }
         case 4: {
@@ -12925,7 +12814,7 @@ export const ListSubscriptionPatternsRequest: MessageFns<ListSubscriptionPattern
     const message = createBaseListSubscriptionPatternsRequest();
     message.pageSize = object.pageSize ?? 0;
     message.pageToken = object.pageToken ?? "";
-    message.service = object.service ?? "";
+    message.services = object.services?.map((e) => e) || [];
     message.q = object.q ?? "";
     return message;
   },
@@ -14264,7 +14153,7 @@ export const JobRun: MessageFns<JobRun> = {
 };
 
 function createBaseListJobDefsRequest(): ListJobDefsRequest {
-  return { pageSize: 0, pageToken: "", service: "", status: "", q: "" };
+  return { pageSize: 0, pageToken: "", services: [], statuses: [], q: "" };
 }
 
 export const ListJobDefsRequest: MessageFns<ListJobDefsRequest> = {
@@ -14275,11 +14164,11 @@ export const ListJobDefsRequest: MessageFns<ListJobDefsRequest> = {
     if (message.pageToken !== "") {
       writer.uint32(18).string(message.pageToken);
     }
-    if (message.service !== "") {
-      writer.uint32(26).string(message.service);
+    for (const v of message.services) {
+      writer.uint32(26).string(v!);
     }
-    if (message.status !== "") {
-      writer.uint32(34).string(message.status);
+    for (const v of message.statuses) {
+      writer.uint32(34).string(v!);
     }
     if (message.q !== "") {
       writer.uint32(42).string(message.q);
@@ -14315,7 +14204,7 @@ export const ListJobDefsRequest: MessageFns<ListJobDefsRequest> = {
             break;
           }
 
-          message.service = reader.string();
+          message.services.push(reader.string());
           continue;
         }
         case 4: {
@@ -14323,7 +14212,7 @@ export const ListJobDefsRequest: MessageFns<ListJobDefsRequest> = {
             break;
           }
 
-          message.status = reader.string();
+          message.statuses.push(reader.string());
           continue;
         }
         case 5: {
@@ -14350,8 +14239,8 @@ export const ListJobDefsRequest: MessageFns<ListJobDefsRequest> = {
     const message = createBaseListJobDefsRequest();
     message.pageSize = object.pageSize ?? 0;
     message.pageToken = object.pageToken ?? "";
-    message.service = object.service ?? "";
-    message.status = object.status ?? "";
+    message.services = object.services?.map((e) => e) || [];
+    message.statuses = object.statuses?.map((e) => e) || [];
     message.q = object.q ?? "";
     return message;
   },
@@ -15549,7 +15438,7 @@ export const WorkflowRun: MessageFns<WorkflowRun> = {
 };
 
 function createBaseListWorkflowDefsRequest(): ListWorkflowDefsRequest {
-  return { pageSize: 0, pageToken: "", service: "", status: "", q: "" };
+  return { pageSize: 0, pageToken: "", services: [], statuses: [], q: "" };
 }
 
 export const ListWorkflowDefsRequest: MessageFns<ListWorkflowDefsRequest> = {
@@ -15560,11 +15449,11 @@ export const ListWorkflowDefsRequest: MessageFns<ListWorkflowDefsRequest> = {
     if (message.pageToken !== "") {
       writer.uint32(18).string(message.pageToken);
     }
-    if (message.service !== "") {
-      writer.uint32(26).string(message.service);
+    for (const v of message.services) {
+      writer.uint32(26).string(v!);
     }
-    if (message.status !== "") {
-      writer.uint32(34).string(message.status);
+    for (const v of message.statuses) {
+      writer.uint32(34).string(v!);
     }
     if (message.q !== "") {
       writer.uint32(42).string(message.q);
@@ -15600,7 +15489,7 @@ export const ListWorkflowDefsRequest: MessageFns<ListWorkflowDefsRequest> = {
             break;
           }
 
-          message.service = reader.string();
+          message.services.push(reader.string());
           continue;
         }
         case 4: {
@@ -15608,7 +15497,7 @@ export const ListWorkflowDefsRequest: MessageFns<ListWorkflowDefsRequest> = {
             break;
           }
 
-          message.status = reader.string();
+          message.statuses.push(reader.string());
           continue;
         }
         case 5: {
@@ -15635,8 +15524,8 @@ export const ListWorkflowDefsRequest: MessageFns<ListWorkflowDefsRequest> = {
     const message = createBaseListWorkflowDefsRequest();
     message.pageSize = object.pageSize ?? 0;
     message.pageToken = object.pageToken ?? "";
-    message.service = object.service ?? "";
-    message.status = object.status ?? "";
+    message.services = object.services?.map((e) => e) || [];
+    message.statuses = object.statuses?.map((e) => e) || [];
     message.q = object.q ?? "";
     return message;
   },
@@ -22440,15 +22329,6 @@ export const AccountServiceService = {
       Buffer.from(ListAccountsResponse.encode(value).finish()),
     responseDeserialize: (value: Buffer): ListAccountsResponse => ListAccountsResponse.decode(value),
   },
-  updateRole: {
-    path: "/ui.v1.AccountService/UpdateRole" as const,
-    requestStream: false as const,
-    responseStream: false as const,
-    requestSerialize: (value: UpdateRoleRequest): Buffer => Buffer.from(UpdateRoleRequest.encode(value).finish()),
-    requestDeserialize: (value: Buffer): UpdateRoleRequest => UpdateRoleRequest.decode(value),
-    responseSerialize: (value: UpdateRoleResponse): Buffer => Buffer.from(UpdateRoleResponse.encode(value).finish()),
-    responseDeserialize: (value: Buffer): UpdateRoleResponse => UpdateRoleResponse.decode(value),
-  },
   delete: {
     path: "/ui.v1.AccountService/Delete" as const,
     requestStream: false as const,
@@ -22488,7 +22368,6 @@ export interface AccountServiceServer extends UntypedServiceImplementation {
   logout: handleUnaryCall<Empty, Empty>;
   me: handleUnaryCall<Empty, MeResponse>;
   list: handleUnaryCall<ListAccountsRequest, ListAccountsResponse>;
-  updateRole: handleUnaryCall<UpdateRoleRequest, UpdateRoleResponse>;
   delete: handleUnaryCall<DeleteAccountRequest, Empty>;
   changePassword: handleUnaryCall<ChangePasswordRequest, Empty>;
   changeUsername: handleUnaryCall<ChangeUsernameRequest, ChangeUsernameResponse>;
@@ -22578,21 +22457,6 @@ export interface AccountServiceClient extends Client {
     metadata: Metadata,
     options: Partial<CallOptions>,
     callback: (error: ServiceError | null, response: ListAccountsResponse) => void,
-  ): ClientUnaryCall;
-  updateRole(
-    request: UpdateRoleRequest,
-    callback: (error: ServiceError | null, response: UpdateRoleResponse) => void,
-  ): ClientUnaryCall;
-  updateRole(
-    request: UpdateRoleRequest,
-    metadata: Metadata,
-    callback: (error: ServiceError | null, response: UpdateRoleResponse) => void,
-  ): ClientUnaryCall;
-  updateRole(
-    request: UpdateRoleRequest,
-    metadata: Metadata,
-    options: Partial<CallOptions>,
-    callback: (error: ServiceError | null, response: UpdateRoleResponse) => void,
   ): ClientUnaryCall;
   delete(
     request: DeleteAccountRequest,
