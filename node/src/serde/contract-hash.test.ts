@@ -101,11 +101,11 @@ describe("computeSerializerHash", () => {
 			input: "ChargeRequest",
 			output: "ChargeResponse",
 		});
-		expect(computeSerializerHash(pair.input)).toBe(
-			computeSerializerHash(pair.input),
+		expect(computeSerializerHash(pair.input.toJsonSchema())).toBe(
+			computeSerializerHash(pair.input.toJsonSchema()),
 		);
-		expect(computeSerializerHash(pair.input)).not.toBe(
-			computeSerializerHash(pair.output),
+		expect(computeSerializerHash(pair.input.toJsonSchema())).not.toBe(
+			computeSerializerHash(pair.output.toJsonSchema()),
 		);
 	});
 });

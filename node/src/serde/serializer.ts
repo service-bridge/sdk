@@ -172,14 +172,4 @@ function typeToSerializer(
 // perSerializerHash reuses the shared canonical-JSON algorithm from
 // contract-hash.ts so the per-serializer informational hash and the
 // SchemaPair compatibility hash stay in lockstep.
-import { computeSerializerHash as sharedPerSerializerHash } from "./contract-hash";
-
-function perSerializerHash(descriptor: Record<string, unknown>): string {
-	// Build a one-off Serializer-shaped object to reuse the shared algorithm.
-	return sharedPerSerializerHash({
-		encode: () => new Uint8Array(),
-		decode: () => null,
-		contractHash: () => "",
-		toJsonSchema: () => descriptor,
-	});
-}
+import { computeSerializerHash as perSerializerHash } from "./contract-hash";

@@ -181,16 +181,9 @@ function buildType(
 
 function typeToSerializer(type: protobuf.Type): Serializer {
 	const jsonSchema = type.toJSON() as unknown as Record<string, unknown>;
-	// Two-pass: build the serializer with a placeholder, then capture its own
-	// hash via the shared algorithm. Per-serializer hash is informational only —
-	// LB uses the SchemaPair hash from contract-hash.ts:computeContractHash.
-	const stub: Serializer = {
-		encode: () => new Uint8Array(),
-		decode: () => null,
-		contractHash: () => "",
-		toJsonSchema: () => jsonSchema,
-	};
-	const hash = computeSerializerHash(stub);
+	// Per-serializer hash is informational only — LB uses the SchemaPair hash
+	// from contract-hash.ts:computeContractHash.
+	const hash = computeSerializerHash(jsonSchema);
 	return {
 		encode(value: unknown): Uint8Array {
 			const err = type.verify(value as object);

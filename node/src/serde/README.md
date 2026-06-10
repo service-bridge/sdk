@@ -42,7 +42,7 @@
 | `buildSchemaPair(spec)` | `(spec: SchemaSpec) => Promise<SchemaPair>` | нет | Диспетчер: `.proto` грузит через `protobuf.load` (async) и резолвит input/output; `.schema.json` — через `buildSchemaPairFromJsonFile`. Бросает на ошибке загрузки/резолва. |
 | `buildSchemaPairFromJsonFile(spec)` | `(spec: JsonSchemaFileSpec) => SchemaPair` | нет | Синхронно читает `.schema.json`, валидирует `fieldNumber`, строит `protobuf.Type` динамически. |
 | `computeContractHash(pair)` | `(pair: SchemaPair) => string` | нет | SHA-256 (hex) от `<input_canonical>:<output_canonical>`. Одинаковая структура схемы на caller и callee → одинаковый hash. |
-| `computeSerializerHash(s)` | `(s: Serializer) => string` | нет | SHA-256 (hex) одного `Serializer` (одной стороны пары). |
+| `computeSerializerHash(descriptor)` | `(descriptor: Record<string, unknown>) => string` | нет | SHA-256 (hex) одного JSON-schema дескриптора (одной стороны пары). Принимает дескриптор напрямую — вызывающий передаёт `serializer.toJsonSchema()`. |
 | `canonicalize(value)` | `(value: unknown) => string` | нет | Детерминированная стрингификация: объекты — sorted keys рекурсивно, массивы сохраняют порядок, без пробелов. |
 | `SchemaPairCache` | class | нет | Дедупликация `SchemaPair` по ключу `SchemaSpec` (`get`/`clear`/`size`), с in-flight-промисами против гонок. |
 

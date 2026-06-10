@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { SchemaPair, Serializer } from "./serializer";
+import type { SchemaPair } from "./serializer";
 
 // computeContractHash returns the canonical SHA-256 (hex) of a SchemaPair.
 // The hash identifies an exact (input, output) schema combination — caller
@@ -25,10 +25,13 @@ export function computeContractHash(pair: SchemaPair): string {
 		.digest("hex");
 }
 
-// computeSerializerHash hashes a single Serializer (used when only one side
-// of the pair is relevant — e.g. event schemas in future branches).
-export function computeSerializerHash(s: Serializer): string {
-	const canonical = canonicalize(s.toJsonSchema());
+// computeSerializerHash hashes a single JSON-schema descriptor (one side of a
+// pair). Takes the descriptor directly — callers pass `serializer.toJsonSchema()`
+// — so building a serializer is not required just to hash its schema.
+export function computeSerializerHash(
+	descriptor: Record<string, unknown>,
+): string {
+	const canonical = canonicalize(descriptor);
 	return createHash("sha256").update(canonical).digest("hex");
 }
 
