@@ -36,7 +36,6 @@ SDK-сторона Durable Events: domain namespace (`EventDomain`), публи�
 | `SubscriberDeps.sb` | `ServiceBridge?` | `undefined` | Reserved. EVENT.DELIVER op пишет runtime (T-015); SDK только ack/nack обратно. |
 | `SubscriberDeps.runWithTrace` | `(xSbTrace, fn) => Promise<void>` | — (обязателен) | Оборачивает handler в ALS trace scope из `envelope.x_sb_trace`, чтобы вложенные RPC/event-публикации наследовали trace. |
 | `uuidv7()` | `() => string` | — | Реэкспорт `uuidv7()` из npm-пакета `uuidv7` (монотонна в пределах ms через внутренний counter; работает под Node и Bun). |
-| `validEventName(name)` | `(string) => boolean` | — | Валидирует имя по regex `^[a-z0-9_-]+(\.[a-z0-9_-]+)*$`. |
 | `InvalidEventNameError` | class | — | Бросается при невалидном имени события. |
 | `OutboxFullError` | class | — | Бросается при превышении `maxOutboxRows`. |
 | `Logger` | interface | — | `{ warn, error }` — единый logger contract для Publisher / Drainer / Subscriber. |
@@ -58,10 +57,9 @@ SDK-сторона Durable Events: domain namespace (`EventDomain`), публи�
 | `DrainerDeps.clockFn` | `(() => number)?` | `Date.now` | Test-only hook: источник текущего времени unix-ms. |
 | `DrainerDeps.sleepFn` | `((ms) => Promise<void>)?` | `setTimeout` | Test-only hook: задержка в loop. |
 | `OutboxRow` | interface (`@internal`) | — | Строка `event_outbox`, селектится drainer'ом. |
-| `EVENT_NAME_RE` | `RegExp` | — | `^[a-z0-9_-]+(\.[a-z0-9_-]+)*$` (в `event-name.ts` и `publisher.ts`). |
+| `EVENT_NAME_RE` | `RegExp` | — | `^[a-z0-9_-]+(\.[a-z0-9_-]+)*$` (единственный источник — `publisher.ts`). |
 | `BACKOFF_MS` | `number[]` | `[1000, 5000, 30000, 120000, 600000]` | Drainer retry-лестница, ±25% jitter. |
 | `MAX_ATTEMPTS` | `number` | `5` | Максимум попыток drainer'а перед `status='failed'`. |
-| `RECONNECT_LADDER_MS` | `number[]` | `[1000, 5000, 15000, 30000, 60000]` | Subscriber reconnect-лестница (inline в `subscriber.ts`). |
 | `DEFAULT_MAX_IN_FLIGHT` | `number` | `32` | Дефолт `Subscriber.maxInFlight` при отсутствии явного значения. |
 
 ## Архитектурные решения и почему
@@ -78,7 +76,7 @@ SDK-сторона Durable Events: domain namespace (`EventDomain`), публи�
 
 **Subscriber dispatch по exact `event.name`** — никакого client-side AMQP matcher'а, никакого Seen dedup (ADR-0002). Routing — `registry.TopicMatch` на сервере. Handler contract: at-least-once + idempotency required. События с непустым `partition_key` сериализуются в FIFO через per-partition promise-цепочку; пустой ключ обрабатывается параллельно.
 
-**Ack/Nack семантика.** Успешный handler → `Ack`. Отсутствие envelope/схемы, decode-ошибка, throw из handler → `Nack` с причиной; ретраи и DLQ — на стороне runtime (events = статус доставки, не клиентские ретраи). После успешной доставки subscriber сбрасывает reconnect-счётчик.
+**Ack/Nack семантика.** Успешный handler → `Ack`. Отсутствие envelope/схемы, decode-ошибка, throw из handler → `Nack` с причиной; ретраи и DLQ — на стороне runtime (events = статус доставки, не клиентские ретраи). Reconnect-счётчик subscriber сбрасывается синхронно при получении первой `delivery` на стриме (доказательство, что стрим жив), а не из async-пути handler→ack — иначе сброс гонялся бы с инкрементом счётчика в обработчиках `error`/`end`.
 
 **Drainer статусы (PublishStatus).** `ACCEPTED` и `REJECTED_DUPLICATE` → строка удаляется из outbox (успех/идемпотентный дубль). `REJECTED_INVALID_NAME` → `failed` (терминально). `REJECTED_FORBIDDEN` → `failed` + `onPolicyViolation` (терминально). `UNSPECIFIED` и сетевые ошибки → retry с backoff до `MAX_ATTEMPTS`, затем `failed`. Outbox-колонка `status` принимает значения `pending`/`inflight`/`failed` — это локальные SQLite-состояния, не wire-статусы.
 
@@ -88,11 +86,11 @@ SDK-сторона Durable Events: domain namespace (`EventDomain`), публи�
 
 **fireAndForget bypass** — напрямую в `rpcClient.publish`, без записи в outbox и без kick. Для use-case без требования durability.
 
-**Reconnect по фиксированной лестнице** (без рандомизации) — детерминированно для тестов: 1s, 5s, 15s, 30s, 60s, затем удержание максимума. Inline в `subscriber.ts`.
+**Reconnect по общей лестнице** `utils/reconnect-ladder` (1s, 5s, 15s, 30s, 60s + удержание максимума) с ±20% jitter против thundering-herd. Та же лестница у job- и workflow-подписчиков — единый источник вместо трёх копий.
 
 **Trace propagation (T-015, T-017).** Publisher кладёт текущий X-SB-Trace в `EventEnvelope.x_sb_trace` ("traceID-parentOpID"); runtime связывает EVENT.PUBLISH op в существующее trace-дерево, либо минтит свежий root при пустом trace. Subscriber читает `envelope.x_sb_trace` (DELIVER-level header от runtime) и оборачивает handler в `runWithTrace`, чтобы вложенные `sb.rpc.call` / `sb.event.publish` / `sb.workflow.start` наследовали trace. EVENT.DELIVER op-строку пишет runtime.
 
 ## Зависимости
 
-- Использует: `sdk/node/src/sqlite/` (`Storage`), `sdk/node/src/pb/servicebridge/v1/events` (`EventsClient`, `PublishStatus`, `SubscribeClientMessage`, `Ack`, `Nack`, `SubscribeInit`), `sdk/node/src/connection/service-bridge` (`Identity`, `ServiceBridge`), `sdk/node/src/registry/registry` (`Registry`), `sdk/node/src/serde/serializer` (`SchemaSpec`, `SchemaPair`), npm-пакет `uuidv7`.
+- Использует: `sdk/node/src/sqlite/` (`Storage`), `sdk/node/src/pb/servicebridge/v1/events` (`EventsClient`, `PublishStatus`, `SubscribeClientMessage`, `Ack`, `Nack`, `SubscribeInit`), `sdk/node/src/connection/service-bridge` (`Identity`, `ServiceBridge`), `sdk/node/src/registry/registry` (`Registry`), `sdk/node/src/serde/serializer` (`SchemaSpec`, `SchemaPair`), `sdk/node/src/utils/reconnect-ladder` (`reconnectDelay`), npm-пакет `uuidv7`.
 - Используется: `sdk/node/src/connection/service-bridge.ts` (собирает Publisher, Drainer, Subscriber, EventDomain), `sdk/node/index.ts` (реэкспортирует `EventDomain`, `PublishOpts`, `InvalidEventNameError`, `OutboxFullError`).
