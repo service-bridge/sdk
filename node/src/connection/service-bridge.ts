@@ -915,8 +915,14 @@ export class ServiceBridge {
 	private async connect(attempt: number): Promise<void> {
 		if (this.stopped) return;
 		try {
-			const key = parseBootstrapKey(this.rawKey);
-			const result = await this.opts.provisionFn(this.url, key);
+			// Reuse the cached leaf cert on a transport-level reconnect instead of
+			// re-running the expensive Bootstrap.Provision (a 64 MiB argon2 hash on
+			// the runtime) every time the stream drops. A fresh Provision happens
+			// only on the first connect or once the cached cert nears expiry; the
+			// cert-refresh timer normally renews earlier via the lighter RefreshCert.
+			const result =
+				this.reusableProvision() ??
+				(await this.opts.provisionFn(this.url, parseBootstrapKey(this.rawKey)));
 			await this.openSession(result, attempt);
 		} catch (err) {
 			const sbErr = new ServiceBridgeError("provision", err);
@@ -927,6 +933,22 @@ export class ServiceBridge {
 			}
 			this.scheduleReconnect(attempt + 1, sbErr.message);
 		}
+	}
+
+	/**
+	 * Returns the cached provision when its leaf cert is still comfortably valid
+	 * (more than certRefreshLeadMs remaining), so a reconnect reuses the existing
+	 * identity instead of re-running the Bootstrap argon2 handshake. Returns null
+	 * on the first connect or when the cert is near expiry — the caller then does
+	 * a fresh Provision.
+	 */
+	private reusableProvision(): ProvisionResult | null {
+		const prov = this.lastProvision;
+		if (!prov) return null;
+		const now = BigInt(Math.floor(Date.now() / 1000));
+		const remainingMs = Number(prov.notAfterUnix - now) * 1000;
+		if (remainingMs <= this.opts.certRefreshLeadMs) return null;
+		return prov;
 	}
 
 	private async openSession(

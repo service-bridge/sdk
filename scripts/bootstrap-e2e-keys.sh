@@ -14,8 +14,8 @@
 #   2. Stale `service_instances` rows for those services are marked
 #      `disconnected` + their endpoints cleared, so `serviceMap()` and the
 #      proxy resolver won't surface them once the new SDK comes online.
-#   3. sbkey-gen INSERTs a fresh `services` row with the same name plus a
-#      brand-new key_id / secret.
+#   3. `sb service create` (UI-gateway API) inserts a fresh `services` row with
+#      the same name plus a brand-new key_id / secret and prints the key once.
 #   4. .env.e2e is rewritten to point at the new keys.
 #
 # Step (1)+(2) is what tests can't do on their own — they only have SDK
@@ -31,7 +31,8 @@
 #     container (no system psql required).
 #
 # The CA lives in Postgres (table runtime_ca), created on first runtime boot.
-# sbkey-gen reads it from the DB via -dsn; there are no CA files to manage.
+# `sb service create` embeds the CA into the key for the SDK; there are no CA
+# files to manage.
 #
 # Usage:
 #   bash scripts/bootstrap-e2e-keys.sh
@@ -39,6 +40,9 @@
 # Environment overrides:
 #   POSTGRES_DSN   default: postgres://servicebridge:servicebridge@localhost:5433/service-bridge?sslmode=disable
 #   RUNTIME_URL    default: localhost:14445
+#   GW_ADDR        default: http://127.0.0.1:14444 (sb UI-gateway address)
+#   SB_USER        default: admin (UI account used to create services)
+#   SB_PASSWORD    default: admin (dev account; created on first boot)
 #   PG_CONTAINER   default: servicebridge2-pg (docker container name for psql)
 
 set -euo pipefail
@@ -51,14 +55,16 @@ RUNTIME_DIR="$REPO_ROOT/../runtime"
 
 POSTGRES_DSN=${POSTGRES_DSN:-'postgres://servicebridge:servicebridge@localhost:5433/service-bridge?sslmode=disable'}
 RUNTIME_URL=${RUNTIME_URL:-localhost:14445}
+GW_ADDR=${GW_ADDR:-http://127.0.0.1:14444}
+SB_USER=${SB_USER:-admin}
+SB_PASSWORD=${SB_PASSWORD:-admin}
 PG_CONTAINER=${PG_CONTAINER:-servicebridge2-pg}
 
-# Names tests expect — must match the const strings in sdk/node/tests/e2e/*.test.ts.
-SERVICE1_NAME="e2e-registry-svc"
-SERVICE2_NAME="e2e-registry-consumer"
-# Dedicated service for the HTTP integration tests so the dashboard shows a
-# clearly-named "http-test" service owning /express /fastify /hono endpoints.
-SERVICE3_NAME="http-test"
+# Per-domain service identities. Each e2e domain runs as its own process
+# against its own three identities (e2e-<domain>-1/2/3, pool.ts roles
+# primary/second/third), so domains run in parallel without sharing any
+# identity. Tests namespace their own work within a domain.
+DOMAINS="access-policy events jobs rpc workflow http misc"
 
 if ! docker ps --format '{{.Names}}' | grep -qx "$PG_CONTAINER"; then
   echo "error: postgres container '$PG_CONTAINER' is not running." >&2
@@ -86,48 +92,65 @@ UPDATE services SET status = 'revoked' WHERE name = '$name' AND status = 'active
 SQL
 }
 
+sb_cli() {
+  (cd "$RUNTIME_DIR" && go run ./cmd/sb --addr "$GW_ADDR" "$@")
+}
+
+# Authenticate the sb CLI once. The dev admin account is seeded on first boot;
+# `setup` initialises it, `login` re-uses it on subsequent runs.
+sb_login() {
+  if sb_cli setup -u "$SB_USER" -p "$SB_PASSWORD" >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! sb_cli login -u "$SB_USER" -p "$SB_PASSWORD" >/dev/null 2>&1; then
+    echo "error: sb login failed for user '$SB_USER' at $GW_ADDR" >&2
+    echo "       runtime must be up and the dev account must exist." >&2
+    exit 1
+  fi
+}
+
 gen_one() {
   local name=$1
   local out
-  if ! out=$(cd "$RUNTIME_DIR" && go run ./cmd/sbkey-gen \
-      -dsn "$POSTGRES_DSN" \
-      -name "$name" 2>&1); then
-    echo "error: sbkey-gen failed for $name:" >&2
+  if ! out=$(sb_cli service create "$name" -o json 2>&1); then
+    echo "error: sb service create failed for $name:" >&2
     echo "$out" >&2
     exit 1
   fi
-  # sbkey-gen prints the key on the last line of stdout; stderr is the logger.
-  echo "$out" | tail -1
+  # Extract the one-time api_key ("sb.<base64url>") from the JSON response.
+  local key
+  key=$(echo "$out" | grep -oE '"api_key":[[:space:]]*"sb\.[A-Za-z0-9_-]+"' | grep -oE 'sb\.[A-Za-z0-9_-]+')
+  if [ -z "$key" ]; then
+    echo "error: could not parse api_key for $name from sb output:" >&2
+    echo "$out" >&2
+    exit 1
+  fi
+  echo "$key"
 }
 
-echo "Provisioning e2e service keys against $POSTGRES_DSN ..."
-echo "  - quiescing prior '$SERVICE1_NAME', '$SERVICE2_NAME' and '$SERVICE3_NAME' rows ..."
-quiesce_service "$SERVICE1_NAME"
-quiesce_service "$SERVICE2_NAME"
-quiesce_service "$SERVICE3_NAME"
-
-echo "  - generating fresh key for '$SERVICE1_NAME' ..."
-KEY1=$(gen_one "$SERVICE1_NAME")
-echo "  - generating fresh key for '$SERVICE2_NAME' ..."
-KEY2=$(gen_one "$SERVICE2_NAME")
-echo "  - generating fresh key for '$SERVICE3_NAME' ..."
-KEY3=$(gen_one "$SERVICE3_NAME")
+echo "Provisioning per-domain e2e service keys against $POSTGRES_DSN ..."
+echo "  - authenticating sb CLI as '$SB_USER' at $GW_ADDR ..."
+sb_login
 
 ENV_FILE="$REPO_ROOT/.env.e2e"
-cat > "$ENV_FILE" <<EOF
-# Persistent e2e keys — DO NOT COMMIT (.env.e2e is gitignored).
-# Regenerate via: bash scripts/bootstrap-e2e-keys.sh
-# Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)
-SERVICEBRIDGE_URL=$RUNTIME_URL
-SERVICEBRIDGE_SERVICE_KEY=$KEY1
-SERVICEBRIDGE_SERVICE2_KEY=$KEY2
-SERVICEBRIDGE_HTTP_TEST_KEY=$KEY3
-EOF
+{
+  echo "# Persistent e2e keys — DO NOT COMMIT (.env.e2e is gitignored)."
+  echo "# Regenerate via: bash scripts/bootstrap-e2e-keys.sh"
+  echo "# Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "SERVICEBRIDGE_URL=$RUNTIME_URL"
+} > "$ENV_FILE"
 
-echo "Wrote $ENV_FILE"
-echo "  SERVICEBRIDGE_URL=$RUNTIME_URL"
-echo "  SERVICEBRIDGE_SERVICE_KEY=${KEY1:0:24}...(truncated, name=$SERVICE1_NAME)"
-echo "  SERVICEBRIDGE_SERVICE2_KEY=${KEY2:0:24}...(truncated, name=$SERVICE2_NAME)"
-echo "  SERVICEBRIDGE_HTTP_TEST_KEY=${KEY3:0:24}...(truncated, name=$SERVICE3_NAME)"
+for d in $DOMAINS; do
+  prefix=$(echo "$d" | tr 'a-z-' 'A-Z_')
+  echo "  - domain '$d' → e2e-$d-1/2/3 ..."
+  for n in 1 2 3; do
+    name="e2e-${d}-${n}"
+    quiesce_service "$name"
+    key=$(gen_one "$name")
+    echo "SB_E2E_${prefix}_${n}=$key" >> "$ENV_FILE"
+  done
+done
+
+echo "Wrote $ENV_FILE ($(grep -c '^SB_E2E_' "$ENV_FILE") keys, domains: $DOMAINS)"
 echo ""
 echo "Run e2e: bun --cwd sdk/node test tests/e2e/"

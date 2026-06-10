@@ -46,6 +46,43 @@ export const FAST_WF_OPTS = {
 	certRefreshLeadMs: 60 * 60 * 1000,
 } as const;
 
+// startWorkflowWhenAllowed — starts a run, retrying while two registrations are
+// still propagating to the runtime: the owner's workflow definition
+// (WorkflowNotFoundError) and the bilateral policy rule
+// (WorkflowAccessDeniedError, gate #5). The runtime rejects on both BEFORE
+// creating a run, so retrying never creates duplicate runs — the first
+// non-rejected call creates exactly one. This replaces a fixed `sleep(800)`
+// after registering the handler + seeding policy: it returns as soon as both
+// are live (usually well under the old fixed wait).
+const RETRYABLE_START_ERRORS = new Set([
+	"WorkflowAccessDeniedError",
+	"WorkflowNotFoundError",
+]);
+
+export async function startWorkflowWhenAllowed(
+	caller: ServiceBridge,
+	wfName: string,
+	input: unknown,
+	timeoutMs = 15_000,
+): Promise<{ runId: string }> {
+	const deadline = Date.now() + timeoutMs;
+	let lastErr: unknown;
+	for (;;) {
+		try {
+			return await caller.workflow.start(wfName, input);
+		} catch (err) {
+			if (!RETRYABLE_START_ERRORS.has((err as Error)?.name)) throw err;
+			lastErr = err;
+			if (Date.now() >= deadline) {
+				throw new Error(
+					`startWorkflowWhenAllowed(${wfName}): not startable after ${timeoutMs}ms: ${(lastErr as Error).message}`,
+				);
+			}
+			await sleep(50);
+		}
+	}
+}
+
 // awaitRunStatus — polls sb.workflow.query(runId) until predicate is true
 // or timeoutMs elapses. Throws on timeout.
 export async function awaitRunStatus(

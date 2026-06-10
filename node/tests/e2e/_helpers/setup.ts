@@ -14,8 +14,19 @@
 //   2. Any other key from .env.e2e → does NOT overwrite an existing
 //      process.env entry, so CI / shell exports still win for non-key vars.
 
+import { afterAll } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
+
+// Close the warm SDK pool (pool.ts) once, after the entire run. A top-level
+// afterAll in a Bun preload fires once per `bun test` process, not per file —
+// so the pool survives across all e2e files and is torn down at the very end.
+// Lazy-imported so plain unit runs (which never touch the pool) don't load the
+// SDK here.
+afterAll(async () => {
+	const { closeAll } = await import("./pool");
+	await closeAll();
+});
 
 const ENV_FILE_NAMES = [".env.e2e"];
 
@@ -55,14 +66,13 @@ function parseDotEnv(content: string): Record<string, string> {
 	return out;
 }
 
-// E2E_OVERRIDE_KEYS = vars where .env.e2e is authoritative. Bun's autoloaded
-// .env may contain stale values for these (from earlier test sessions); they
-// must not leak into the e2e run.
-const E2E_OVERRIDE_KEYS = new Set([
-	"SERVICEBRIDGE_URL",
-	"SERVICEBRIDGE_SERVICE_KEY",
-	"SERVICEBRIDGE_SERVICE2_KEY",
-]);
+// isOverride — vars where .env.e2e is authoritative. Bun's autoloaded .env may
+// hold stale values for these from earlier sessions; they must not leak into
+// the e2e run. The runtime URL plus every per-domain key (SB_E2E_*) are always
+// taken from .env.e2e.
+function isOverride(key: string): boolean {
+	return key === "SERVICEBRIDGE_URL" || key.startsWith("SB_E2E_");
+}
 
 // SB_DISABLE_E2E_PRELOAD=1 — set by the Go integration test
 // (runtime/tests/integration/connection_test.go::TestSDKE2E) which spawns its
@@ -75,7 +85,7 @@ const envPath = locateEnvFile();
 if (envPath && !disablePreload) {
 	const parsed = parseDotEnv(readFileSync(envPath, "utf8"));
 	for (const [k, v] of Object.entries(parsed)) {
-		if (E2E_OVERRIDE_KEYS.has(k) || process.env[k] === undefined) {
+		if (isOverride(k) || process.env[k] === undefined) {
 			process.env[k] = v;
 		}
 	}

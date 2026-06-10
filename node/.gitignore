@@ -38,3 +38,6 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Local SQLite outbox (created by Storage.open at runtime; SB_DATA_DIR default)
 .servicebridge/
+
+# local e2e runtime data dirs (per-service outbox/state)
+.servicebridge-e2e/

@@ -277,6 +277,9 @@ export interface DedicatedRuntime {
 	grpcPort: number;
 	/** gRPC URL: "localhost:<grpcPort>". */
 	url: string;
+	/** Connection URL to this runtime's isolated Postgres DB, for tests that
+	 *  read/poke rows directly (e.g. lease/job-execution assertions). */
+	dbUrl: string;
 	/** Underlying subprocess (current process after a restart). */
 	proc: Bun.Subprocess;
 
@@ -383,6 +386,7 @@ export async function spawnIsolatedRuntime(
 	const handle: DedicatedRuntime = {
 		grpcPort: opts.grpcPort,
 		url: `localhost:${opts.grpcPort}`,
+		dbUrl: isolatedDbUrl(dbName),
 
 		get proc() {
 			return proc;

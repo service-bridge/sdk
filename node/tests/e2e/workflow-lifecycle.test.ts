@@ -1,7 +1,7 @@
-// workflow-access-policy — workflow access-policy facets.
+// workflow-lifecycle — workflow access-policy facets.
 //
 // Every sub-test mutates service_policy_rules / toggles default-allow on its
-// OWN identities, so all clients are dedicated (never pooled): clearRules on a
+// OWN identities, so all clients are DEDICATED (never pooled): clearRules on a
 // pooled identity would delete sibling tests' rules. serviceIds are resolved
 // from identity() after connect; rules are cleared on those dedicated ids in
 // afterEach. Isolation is by unique names plus per-identity rule cleanup.
@@ -22,12 +22,6 @@ import {
 	FAST_WF_OPTS,
 } from "./_helpers/wf.ts";
 
-const TERMINAL_WITH_COMP = (s: string) =>
-	s === "success" ||
-	s === "failed" ||
-	s === "cancelled" ||
-	s === "failed_compensated";
-
 // waitForWarning polls policyEvaluation() until a warning matches the predicate.
 async function waitForWarning(
 	sb: ServiceBridge,
@@ -46,7 +40,7 @@ async function waitForWarning(
 	);
 }
 
-describe("workflow-access-policy", () => {
+describe("workflow-lifecycle", () => {
 	let clients: ServiceBridge[] = [];
 	let dirtyIDs: string[] = [];
 
@@ -150,90 +144,8 @@ describe("workflow-access-policy", () => {
 		expect(denied).toBe(true);
 	}, 30_000);
 
-	test("access-policy: sub-workflow bilateral acceptance gates the sub-step", async () => {
-		const parentWf = uniqueName("ap-bilateral-parent");
-		const subWf = uniqueName("ap-bilateral-sub");
-
-		// subOwner handles the sub-workflow.
-		const subOwner = dedicated("second");
-		subOwner.workflow.handle(subWf, {
-			steps: [{ type: "local", id: "s", fn: async () => ({ sub: "ok" }) }],
-		});
-		await connect(subOwner);
-		clients.push(subOwner);
-		const subOwnerID = subOwner.identity()!.serviceId;
-		dirtyIDs.push(subOwnerID);
-
-		// parentOwner owns the parent workflow and starts runs against itself.
-		const parentOwner = dedicated("primary");
-		parentOwner.workflow.handle(parentWf, {
-			steps: [{ type: "workflow", id: "sub", workflow: subWf, input: {} }],
-		});
-		await connect(parentOwner);
-		clients.push(parentOwner);
-		const parentOwnerID = parentOwner.identity()!.serviceId;
-		dirtyIDs.push(parentOwnerID);
-
-		// CASE 1: bilateral rules present → parent run succeeds.
-		await addRule(parentOwnerID, "E", "workflow.run", subOwnerID, subWf);
-		await addRule(subOwnerID, "A", "workflow.handle", parentOwnerID, subWf);
-		await addRule(parentOwnerID, "E", "workflow.run", parentOwnerID, parentWf);
-		await addRule(
-			parentOwnerID,
-			"A",
-			"workflow.handle",
-			parentOwnerID,
-			parentWf,
-		);
-		// The sub-step's bilateral acceptance is evaluated when the run reaches it,
-		// not at start. Retry the whole run until the freshly-seeded rules are live
-		// AND the nested run completes — NOTIFY→snapshot propagation and sub-workflow
-		// dispatch are both slower under parallel load. Unique wf name makes each
-		// re-run independent; orphaned failed/slow runs are harmless.
-		let status1 = "";
-		const deadline = Date.now() + 45_000;
-		while (Date.now() < deadline) {
-			const { runId } = await parentOwner.workflow.start(parentWf, {});
-			try {
-				status1 = await awaitRunStatus(
-					parentOwner,
-					runId,
-					TERMINAL_WITH_COMP,
-					30_000,
-				);
-			} catch {
-				status1 = "timeout"; // still running under load — re-run
-			}
-			if (status1 === "success") break;
-			await sleep(500);
-		}
-		expect(status1).toBe("success");
-
-		// CASE 2: tighten subOwner acceptance to no longer cover parentOwner/subWf.
-		await clearRules(subOwnerID);
-		await addRule(
-			subOwnerID,
-			"A",
-			"workflow.handle",
-			parentOwnerID,
-			uniqueName("dummy-sub"),
-		);
-		await sleep(800);
-
-		try {
-			const { runId: runId2 } = await parentOwner.workflow.start(parentWf, {});
-			const status2 = await awaitRunStatus(
-				parentOwner,
-				runId2,
-				TERMINAL_WITH_COMP,
-				15_000,
-			);
-			// Sub-workflow step denied → run must not be success.
-			expect(status2).not.toBe("success");
-		} catch (e) {
-			expect(String(e)).toMatch(/denied|PermissionDenied|access/i);
-		}
-	}, 90_000);
+	// "access-policy: sub-workflow bilateral acceptance gates the sub-step" lives
+	// in workflow-access-policy.test.ts (its domain home), not here.
 
 	test("access-policy: mid-flight rule tightening surfaces in policyEvaluation() within 5s", async () => {
 		const wfName = uniqueName("ap-live");

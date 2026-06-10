@@ -164,6 +164,51 @@ describe("ServiceBridge connect lifecycle", () => {
 		expect(sb.identity()).toBeNull();
 	});
 
+	test("reuses cached cert on reconnect — no re-Provision (argon2)", async () => {
+		let provisionCalls = 0;
+		const streams: FakeServerStream[] = [];
+		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
+			advertise: false,
+			_disableTelemetryTransport: true,
+			provisionFn: async () => {
+				provisionCalls++;
+				return fakeProvisionResult();
+			},
+			clientFactory: () => {
+				const s = new FakeServerStream();
+				streams.push(s);
+				return makeFakeClient(s);
+			},
+			certRefreshLeadMs: 1_000_000,
+			reconnectIntervalMs: 5,
+			reconnectAttempts: 5,
+		});
+		activeBridges.push(sb);
+
+		const reconnects: ReconnectingEvent[] = [];
+		sb.on("reconnecting", (e) => reconnects.push(e));
+
+		await sb.start();
+		await waitFor(() => streams.length >= 1, "first stream opened");
+		streams[0]?.emitData({
+			welcome: { sessionId: "s1", serviceId: "svc", serviceName: "n" },
+		});
+		await tick();
+		expect(provisionCalls).toBe(1);
+
+		// Drop the stream → reconnect. The cert is still valid, so connect() must
+		// reuse the cached provision instead of calling provisionFn again.
+		streams[0]?.emitError(new Error("transport drop"));
+		await waitFor(() => streams.length >= 2, "reconnect opened a new stream");
+		streams[1]?.emitData({
+			welcome: { sessionId: "s2", serviceId: "svc", serviceName: "n" },
+		});
+		await tick();
+
+		expect(reconnects.length).toBeGreaterThanOrEqual(1);
+		expect(provisionCalls).toBe(1);
+	});
+
 	test("emits reconnecting when provision throws", async () => {
 		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
 			advertise: false,
