@@ -2,10 +2,10 @@
 
 import type { ClientReadableStream, ServiceError } from "@grpc/grpc-js";
 import type { JobExecution, JobsClient } from "../pb/servicebridge/v1/jobs";
+import { reconnectDelay } from "../utils/reconnect-ladder";
 import type { JobDomain } from "./domain";
 import type { JobHandler, JobHandlerCtx, JobOpts } from "./types";
 
-const RECONNECT_LADDER_MS = [1000, 5000, 15000, 30000, 60000] as const;
 const HEARTBEAT_INTERVAL_MS = 5_000;
 const HEARTBEAT_FAIL_THRESHOLD = 3;
 
@@ -17,15 +17,6 @@ export interface Logger {
 export interface IdentityProvider {
 	serviceId: string;
 	instanceId: string;
-}
-
-function nextDelay(attempt: number): number {
-	const idx = Math.min(Math.max(attempt, 0), RECONNECT_LADDER_MS.length - 1);
-	return (
-		RECONNECT_LADDER_MS[idx] ??
-		RECONNECT_LADDER_MS[RECONNECT_LADDER_MS.length - 1] ??
-		60000
-	);
 }
 
 // Semaphore limits concurrent in-flight job executions.
@@ -107,7 +98,7 @@ export class JobSubscriber {
 					`jobs subscriber: stream error: ${(err as Error).message}`,
 				);
 			}
-			const delay = nextDelay(attempt++);
+			const delay = reconnectDelay(attempt++);
 			await new Promise((r) => setTimeout(r, delay));
 		}
 	}

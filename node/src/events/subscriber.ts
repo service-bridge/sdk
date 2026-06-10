@@ -10,16 +10,8 @@ import {
 	SubscribeInit,
 } from "../pb/servicebridge/v1/events";
 import type { SchemaPair } from "../serde/serializer";
+import { reconnectDelay } from "../utils/reconnect-ladder";
 import type { Logger } from "./publisher";
-
-// Fixed reconnect ladder — deterministic for tests; saturates at the last
-// rung. Wildcards and rare-event hooks do not belong here, only timing.
-const RECONNECT_LADDER_MS = [1000, 5000, 15000, 30000, 60000] as const;
-
-function nextDelay(attempt: number): number {
-	const idx = Math.min(Math.max(attempt, 0), RECONNECT_LADDER_MS.length - 1);
-	return RECONNECT_LADDER_MS[idx]!;
-}
 
 // @internal
 interface SubscriberIdentity {
@@ -123,7 +115,7 @@ export class Subscriber {
 		const id = this.deps.identity();
 		if (!id) {
 			// Identity not yet available — schedule reconnect.
-			const delay = nextDelay(++this._attempt);
+			const delay = reconnectDelay(++this._attempt);
 			this.scheduleReconnect(delay);
 			return;
 		}
@@ -158,6 +150,11 @@ export class Subscriber {
 				};
 			}) => {
 				if (msg.delivery) {
+					// A delivery arriving proves the stream is healthy. Reset the
+					// reconnect attempt here — the connect/reconnect owner — and not
+					// from the async handleDelivery ack path, which would race the
+					// synchronous ++this._attempt in the error/end handlers below.
+					this._attempt = 0;
 					const delivery = msg.delivery;
 					const key = delivery.envelope?.partitionKey ?? "";
 					const xSbTrace = delivery.envelope?.xSbTrace ?? "";
@@ -188,7 +185,7 @@ export class Subscriber {
 			this.logger.warn("events: subscriber: stream error", err.message);
 			this._stream = null;
 			if (!this._stopped) {
-				const delay = nextDelay(++this._attempt);
+				const delay = reconnectDelay(++this._attempt);
 				this.scheduleReconnect(delay);
 			}
 		});
@@ -196,7 +193,7 @@ export class Subscriber {
 		stream.on("end", () => {
 			this._stream = null;
 			if (!this._stopped) {
-				const delay = nextDelay(++this._attempt);
+				const delay = reconnectDelay(++this._attempt);
 				this.scheduleReconnect(delay);
 			}
 		});
@@ -264,9 +261,6 @@ export class Subscriber {
 		}
 
 		this.sendAck(stream, deliveryId, eventId);
-
-		// Successful delivery — reset attempt counter.
-		this._attempt = 0;
 	}
 
 	// biome-ignore lint/suspicious/noExplicitAny: grpc stream write

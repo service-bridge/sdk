@@ -1,7 +1,8 @@
 // Owner-side workflow subscriber: long-poll `Workflows.Subscribe`, hand each
 // RunAssignment to the thin runner, manage lease heartbeat.
 //
-// Mirrors `events/subscriber.ts` ladder semantics. Reconnect is fixed.
+// Reconnect backoff is the shared utils/reconnect-ladder (jittered ladder),
+// same as events and job subscribers.
 //
 // Telemetry (T-022): the runtime owns the WORKFLOW.RUN root op. The SDK wraps
 // dispatch in runWithTrace(parent = run root) to establish the run-root trace
@@ -21,16 +22,11 @@ import type {
 } from "../pb/servicebridge/v1/workflows";
 import { runWithTrace } from "../telemetry/context";
 import { parseXSbTrace } from "../telemetry/wire-trace";
+import { reconnectDelay } from "../utils/reconnect-ladder";
 import { type RunnerDeps, RunnerParkedError, run } from "./runner";
 import type { Step } from "./types";
 
-const RECONNECT_LADDER_MS = [1000, 5000, 15000, 30000, 60000] as const;
 const HEARTBEAT_INTERVAL_MS = 10_000;
-
-function nextDelay(attempt: number): number {
-	const idx = Math.min(Math.max(attempt, 0), RECONNECT_LADDER_MS.length - 1);
-	return RECONNECT_LADDER_MS[idx]!;
-}
 
 interface SubscriberDeps {
 	rpc: WorkflowsClient;
@@ -86,7 +82,7 @@ export class WorkflowSubscriber {
 					(err as Error).message,
 				);
 			}
-			const delay = nextDelay(attempt++);
+			const delay = reconnectDelay(attempt++);
 			await new Promise((r) => setTimeout(r, delay));
 		}
 	}
