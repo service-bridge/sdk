@@ -15,6 +15,7 @@ import {
 	Status,
 } from "../../telemetry/ops";
 import type { TraceContext } from "../../telemetry/trace-context";
+import { childContext } from "../../telemetry/trace-context";
 import { bodyToBytes, RAW_JSON_CONTRACT } from "../_common/body-capture";
 import { contextFromXSbTrace } from "../_common/trace-wrap";
 import { resolveHttpAdvertiseHost } from "../endpoint";
@@ -70,28 +71,33 @@ const plugin: FastifyPluginAsync<SbFastifyOptions> = async (
 	// API возвращает Promise, а не принимает next() callback. enterWith
 	// устанавливает ALS-фрейм на текущий async-scope, hand'ler и downstream
 	// user-code (sb.rpc.call / sb.event.publish / etc.) видят TraceContext.
-	// HTTP.HANDLE op стартует здесь, end — в onResponse hook.
+	// HTTP.HANDLE op стартует здесь, end — в onResponse hook. ALS-фрейм несёт
+	// childContext(ctx, handle.opId): downstream-операции вложены под HTTP.HANDLE
+	// (симметрично rpc-клиенту, который ставит CALL.op_id родителем для callee).
 	fastify.addHook("preHandler", async (req: FastifyRequest) => {
 		const header = req.headers["x-sb-trace"];
 		const value = Array.isArray(header) ? header[0] : header;
 		const ctx = contextFromXSbTrace(value ?? null);
 		req.sbTraceCtx = ctx;
-		als.enterWith(ctx);
 
 		const idempotencyHeader = req.headers["idempotency-key"];
 		const businessKey = Array.isArray(idempotencyHeader)
 			? idempotencyHeader[0]
 			: idempotencyHeader;
 		const subject = `http.handle:${req.method}/${req.routeOptions?.url ?? req.url}`;
-		req.sbHttpHandle = sb.telemetry.startOp({
+		const handle = sb.telemetry.startOp({
+			traceId: ctx.traceId,
+			parentOpId: ctx.parentOpId,
 			channel: Channel.HTTP,
 			kind: HttpHandle,
 			subject,
 			businessKey: businessKey ?? `${req.method} ${req.url}`,
 		});
+		req.sbHttpHandle = handle;
+		als.enterWith(childContext(ctx, handle.opId));
 		// Request body (IN) — Fastify has already parsed it by preHandler.
 		const inBytes = bodyToBytes(req.body);
-		if (inBytes) req.sbHttpHandle.captureIn(inBytes, RAW_JSON_CONTRACT);
+		if (inBytes) handle.captureIn(inBytes, RAW_JSON_CONTRACT);
 	});
 
 	// onSend exposes the serialized response payload — capture it (OUT) before

@@ -22,4 +22,8 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run check
       - run: bun test src/
+      # Non-e2e regression suites (no runtime needed): build-output invariant
+      # (single AsyncLocalStorage across entry bundles) + HTTP→downstream trace
+      # nesting. e2e/ and showcase/ are excluded — they require a live runtime.
+      - run: bun test tests/build tests/http
       - run: bun run build

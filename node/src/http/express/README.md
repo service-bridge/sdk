@@ -35,7 +35,7 @@
 
 Ставится автоматически внутри `attachExpress`. Отдельного публичного API нет.
 
-- Читает заголовок `x-sb-trace`, восстанавливает `TraceContext` (`contextFromXSbTrace`) и оборачивает downstream chain в `runWithTrace(ctx, () => next())` — route handlers видят контекст через ALS.
+- Читает заголовок `x-sb-trace`, восстанавливает `TraceContext` (`contextFromXSbTrace`), стартует HTTP.HANDLE op и оборачивает downstream chain в `runWithTrace(childContext(ctx, handle.opId), () => next())`. Route handlers и их `sb.rpc.call` / `event.publish` видят через ALS контекст, где `traceId` един с HTTP.HANDLE, а `parentOpId` = `opId` этого op'а — downstream вложен под HTTP.HANDLE, а не отдельный корень.
 - Эмитит op `Channel.HTTP` / `HttpHandle`: `subject = "http.handle:${method}/${path}"`, `businessKey` = заголовок `Idempotency-Key` или `"${method} ${path}"`.
 - Захватывает тело запроса (IN) и ответа (OUT) как raw-JSON (`RAW_JSON_CONTRACT`); пустые тела не пишутся.
 - Завершает op статусом из единого словаря: `SUCCESS` (код < 400), `ERROR` (код ≥ 400), `TIMEOUT` (`client abort` — соединение закрылось без `res.end`).
@@ -88,6 +88,7 @@ app.listen(3000);
 - `../route` — тип `Route` через `sb.routes`.
 - `../../connection/service-bridge` — type-only `ServiceBridge`.
 - `../../telemetry/context`, `../../telemetry/ops` — `runWithTrace`, `Channel`, `HttpHandle`, `Status`.
+- `../../telemetry/trace-context` — `childContext` (вложенность downstream под HTTP.HANDLE).
 
 Используется в:
 - `sdk/node/tests/e2e/http-express.test.ts`.

@@ -2,6 +2,7 @@ import type { Express, NextFunction, Request, Response, Router } from "express";
 import type { ServiceBridge } from "../../connection/service-bridge";
 import { runWithTrace } from "../../telemetry/context";
 import { Channel, HttpHandle, Status } from "../../telemetry/ops";
+import { childContext } from "../../telemetry/trace-context";
 import { bodyToBytes, RAW_JSON_CONTRACT } from "../_common/body-capture";
 import { contextFromXSbTrace } from "../_common/trace-wrap";
 import { resolveHttpAdvertiseHost } from "../endpoint";
@@ -137,17 +138,22 @@ function installTraceMiddleware(app: Express, sb: ServiceBridge): void {
 		const header = req.headers["x-sb-trace"];
 		const value = Array.isArray(header) ? header[0] : header;
 		const ctx = contextFromXSbTrace(value ?? null);
-		runWithTrace(ctx, () => {
-			const idempotencyHeader = req.headers["idempotency-key"];
-			const businessKey = Array.isArray(idempotencyHeader)
-				? idempotencyHeader[0]
-				: idempotencyHeader;
-			const handle = sb.telemetry.startOp({
-				channel: Channel.HTTP,
-				kind: HttpHandle,
-				subject: `http.handle:${req.method}/${req.path}`,
-				businessKey: businessKey ?? `${req.method} ${req.path}`,
-			});
+		const idempotencyHeader = req.headers["idempotency-key"];
+		const businessKey = Array.isArray(idempotencyHeader)
+			? idempotencyHeader[0]
+			: idempotencyHeader;
+		const handle = sb.telemetry.startOp({
+			traceId: ctx.traceId,
+			parentOpId: ctx.parentOpId,
+			channel: Channel.HTTP,
+			kind: HttpHandle,
+			subject: `http.handle:${req.method}/${req.path}`,
+			businessKey: businessKey ?? `${req.method} ${req.path}`,
+		});
+		// downstream (handler + sb.rpc.call / event.publish) видит HTTP.HANDLE как
+		// родителя — childContext(ctx, handle.opId). traceId наследуется, op_id op'а
+		// становится parentOpId для вложенных операций.
+		runWithTrace(childContext(ctx, handle.opId), () => {
 			// Capture the response body (OUT) by tapping res.json/res.send. The
 			// request body (IN) is read in finalize, by when any body-parser ran.
 			let outBody: unknown;

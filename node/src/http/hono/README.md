@@ -24,7 +24,7 @@
 
 - `X-SB-Trace` парсится в `TraceContext`; при отсутствии/невалидности минтится свежий root.
 - `businessKey` = заголовок `Idempotency-Key`, иначе `"<METHOD> <pathname>"`.
-- downstream-цепочка выполняется внутри `runWithTrace`, чтобы handler и пользовательский код видели активный контекст через ALS.
+- downstream-цепочка выполняется внутри `runWithTrace(childContext(ctx, handle.opId), …)`, чтобы handler и его `sb.rpc.call` / `event.publish` видели через ALS контекст, где `traceId` един с HTTP.HANDLE, а `parentOpId` = `opId` этого op'а (downstream вложен под HTTP.HANDLE, не отдельный корень).
 - эмитится HTTP.HANDLE-операция (`Channel.HTTP`, `kind: HttpHandle`).
 - тело запроса (через клон, чтобы не «съесть» стрим для handler) и тело ответа захватываются best-effort как raw-JSON (`contract: "raw/json"`); пустые/`{}`/`null` тела не пишутся.
 - статус операции: HTTP `>= 400` (включая `>= 500`) → `Status.ERROR` (с текстом `HTTP <code>`); исключение из цепочки → `Status.ERROR` с сообщением и ре-throw; иначе → `Status.SUCCESS`. На wire это единый словарь статусов (`success`/`error`).
@@ -85,6 +85,7 @@ serve({ fetch: app.fetch, port: 8080 });
 - `../../connection/service-bridge` — тип `ServiceBridge` (`sb.routes`, `sb.telemetry`).
 - `../../telemetry/context` — `runWithTrace`.
 - `../../telemetry/ops` — `Channel`, `HttpHandle`, `Status`.
+- `../../telemetry/trace-context` — `childContext` (вложенность downstream под HTTP.HANDLE).
 - `../_common/body-capture` — `bodyToBytes`, `RAW_JSON_CONTRACT`.
 - `../_common/trace-wrap` — `contextFromXSbTrace`.
 - `../endpoint` — `resolveHttpAdvertiseHost`.

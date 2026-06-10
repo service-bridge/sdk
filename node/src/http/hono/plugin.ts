@@ -2,6 +2,7 @@ import type { Hono } from "hono";
 import type { ServiceBridge } from "../../connection/service-bridge";
 import { runWithTrace } from "../../telemetry/context";
 import { Channel, HttpHandle, Status } from "../../telemetry/ops";
+import { childContext } from "../../telemetry/trace-context";
 import { bodyToBytes, RAW_JSON_CONTRACT } from "../_common/body-capture";
 import { contextFromXSbTrace } from "../_common/trace-wrap";
 import { resolveHttpAdvertiseHost } from "../endpoint";
@@ -85,13 +86,18 @@ function installHonoTracing(app: Hono, sb: ServiceBridge): void {
 		// Clone the request up front so reading its body for capture never
 		// consumes the stream the route handler will read.
 		const reqClone = req.clone();
-		return runWithTrace(ctx, async () => {
-			const handle = sb.telemetry.startOp({
-				channel: Channel.HTTP,
-				kind: HttpHandle,
-				subject: `http.handle:${req.method}/${url.pathname}`,
-				businessKey,
-			});
+		const handle = sb.telemetry.startOp({
+			traceId: ctx.traceId,
+			parentOpId: ctx.parentOpId,
+			channel: Channel.HTTP,
+			kind: HttpHandle,
+			subject: `http.handle:${req.method}/${url.pathname}`,
+			businessKey,
+		});
+		// downstream (handler + sb.rpc.call / event.publish) видит HTTP.HANDLE как
+		// родителя — childContext(ctx, handle.opId): traceId наследуется, op_id
+		// HTTP.HANDLE становится parentOpId для вложенных операций.
+		return runWithTrace(childContext(ctx, handle.opId), async () => {
 			const captureBodies = async (res: Response) => {
 				try {
 					const inBytes = bodyToBytes(await reqClone.text());

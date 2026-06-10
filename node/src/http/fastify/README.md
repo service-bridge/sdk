@@ -54,7 +54,7 @@ await app.register(sbFastify, { sb, host: process.env.POD_IP });
 
 - **`fp` (fastify-plugin) обязателен.** Без обёртки `onRoute` видит только роуты этого encapsulated context — а нужны все роуты app. `fastify-plugin` снимает encapsulation, чтобы хуки добрались до root scope.
 - **`onListen`, не `onReady`.** `onReady` срабатывает ДО `listen` — `fastify.server.address()` ещё null. `onListen` — после bind, port уже доступен (важно при `{ port: 0 }`). Прочитанный bound-address подаётся как explicit в `resolveHttpAdvertiseHost`, поверх него — `opts.host`. Если адрес прочитать не удалось — `fastify.log.warn`, endpoint не публикуется.
-- **HTTP.HANDLE op-lifecycle через хуки.** `preHandler` ставит ALS trace-scope через `als.enterWith` (Fastify-хуки возвращают Promise, а не принимают `next()`), стартует HTTP.HANDLE op и захватывает IN-payload (тело запроса уже распарсено к этому моменту). `onSend` захватывает OUT-payload (сериализованный ответ) до закрытия op. `onResponse` закрывает op: `statusCode >= 400` (включая `>= 500`) → `Status.ERROR`, иначе `Status.SUCCESS`. `onRequestAbort` закрывает op как `Status.TIMEOUT` («client abort»), если клиент отвалился до ответа — иначе `onResponse` не сработает и START-frame (`Status.PENDING`) останется без END-frame (выравнено с express/hono). `OpHandle.end` идемпотентен — двойной end безопасен.
+- **HTTP.HANDLE op-lifecycle через хуки.** `preHandler` стартует HTTP.HANDLE op и ставит ALS trace-scope через `als.enterWith(childContext(ctx, handle.opId))` (Fastify-хуки возвращают Promise, а не принимают `next()`). Downstream user-code (`sb.rpc.call` / `event.publish`) видит контекст, где `traceId` един с HTTP.HANDLE, а `parentOpId` = `opId` этого op'а — вложен под HTTP.HANDLE, не отдельный корень (симметрично rpc-клиенту). IN-payload захватывается тут же (тело запроса уже распарсено). `onSend` захватывает OUT-payload (сериализованный ответ) до закрытия op. `onResponse` закрывает op: `statusCode >= 400` (включая `>= 500`) → `Status.ERROR`, иначе `Status.SUCCESS`. `onRequestAbort` закрывает op как `Status.TIMEOUT` («client abort»), если клиент отвалился до ответа — иначе `onResponse` не сработает и START-frame (`Status.PENDING`) останется без END-frame (выравнено с express/hono). `OpHandle.end` идемпотентен — двойной end безопасен.
 - **Payload capture — `raw/json`.** Тело HTTP не имеет proto-схемы, захватывается как есть с контракт-маркером `RAW_JSON_CONTRACT` (`"raw/json"`, зеркалит runtime `telemetry.ContractRawJSON`); пустые/`{}`/несериализуемые тела не эмитят payload. Фактический режим (`none`/`errors`/`all`) приходит из registry-стрима и применяется внутри `startOp`.
 - **HEAD отсекается.** Fastify auto-генерирует HEAD из GET. Дублировать в Service Map бессмысленно.
 - **`fastify-plugin` в `dependencies`, не `peerDependencies`.** Zero-dep утилита; пользователь не ставит её руками.
@@ -71,7 +71,7 @@ await app.register(sbFastify, { sb, host: process.env.POD_IP });
 - `../../connection/service-bridge` — type-only `ServiceBridge` (доступ к `sb.routes`, `sb.telemetry`).
 - `../../telemetry/context` — `als` (AsyncLocalStorage trace-scope).
 - `../../telemetry/ops` — `Channel`, `HttpHandle`, `OpHandle`, `Status`.
-- `../../telemetry/trace-context` — type-only `TraceContext`.
+- `../../telemetry/trace-context` — `childContext` (вложенность downstream под HTTP.HANDLE) + type-only `TraceContext`.
 
 Используется в:
 - `sdk/node/tests/e2e/http-fastify.test.ts`.
