@@ -32,7 +32,7 @@ WAL-режим обеспечивает concurrent reads без блокиров
 
 Схема таблицы `event_outbox` вшита inline через `CREATE TABLE IF NOT EXISTS`, без миграционного фреймворка и поля версии схемы: у SDK нет требований эволюции схемы между релизами, проще пересоздать `.servicebridge/sdk.db` при breaking change. Недостающие колонки (`payload_json`, `x_sb_trace`) добавляются идемпотентно через `PRAGMA table_info` + `ALTER TABLE ADD COLUMN`.
 
-Колонка `status` (`pending`/`inflight`/`done`/`failed`) — локальный жизненный цикл строки outbox, не путать с wire-статусом доставки (`PublishStatus` в proto): на gRPC уходит результат `Events.Publish`, а локальный `status` лишь управляет повторной выборкой строк drainer'ом.
+Колонка `status` (`pending`/`inflight`/`failed`) — локальный жизненный цикл строки outbox, не путать с wire-статусом доставки (`PublishStatus` в proto): на gRPC уходит результат `Events.Publish`, а локальный `status` лишь управляет повторной выборкой строк drainer'ом. Успешная доставка не пишет терминальный статус — drainer удаляет строку (`DELETE`), поэтому `done` в CHECK не нужен.
 
 Имя пакета `sqlite` — явный technology choice (как `serde`), не слой-ориентированное имя (не `storage`).
 

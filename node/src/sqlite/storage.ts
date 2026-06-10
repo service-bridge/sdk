@@ -80,7 +80,7 @@ CREATE TABLE IF NOT EXISTS event_outbox (
   headers           TEXT    NOT NULL DEFAULT '{}',
   occurred_at_ms    INTEGER NOT NULL,
   enqueued_at_ms    INTEGER NOT NULL,
-  status            TEXT    NOT NULL CHECK(status IN ('pending','inflight','done','failed')),
+  status            TEXT    NOT NULL CHECK(status IN ('pending','inflight','failed')),
   attempts          INTEGER NOT NULL DEFAULT 0,
   last_error        TEXT    NOT NULL DEFAULT '',
   next_attempt_at_ms INTEGER NOT NULL DEFAULT 0,
