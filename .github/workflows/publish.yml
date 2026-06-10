@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -40,3 +41,20 @@ jobs:
             exit 0
           fi
           npm publish --tag latest --provenance --access public
+      # Publish itself stays on OIDC (provenance, no long-lived token). The
+      # alpha dist-tag is a separate registry op OIDC tokens cannot perform,
+      # so move it with NPM_TOKEN. Runs for prerelease versions only, so a
+      # future stable release never drags the alpha channel onto itself.
+      - env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          ver=$(node -p "require('./package.json').version")
+          case "$ver" in
+            *-alpha*)
+              echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
+              npm dist-tag add "service-bridge@${ver}" alpha
+              ;;
+            *)
+              echo "$ver is not an alpha prerelease — leaving the alpha dist-tag untouched."
+              ;;
+          esac
