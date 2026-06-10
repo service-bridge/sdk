@@ -6,9 +6,14 @@ import type {
 	ControlClient,
 	ServerControl,
 } from "../pb/servicebridge/v1/control";
+import type {
+	RegistryClient,
+	RegistryEvent,
+} from "../pb/servicebridge/v1/registry";
 import type { ProvisionResult } from "./provision";
 import {
 	type DisconnectedEvent,
+	type PolicyViolationEvent,
 	type ReconnectingEvent,
 	ServiceBridge,
 } from "./service-bridge";
@@ -46,6 +51,35 @@ function makeFakeClient(stream: FakeServerStream): ControlClient {
 		open: () => stream,
 		close: () => {},
 	} as unknown as ControlClient;
+}
+
+// FakeRegistryStream mimics the gRPC ClientReadableStream<RegistryEvent> the
+// WatchStream attaches "data"/"error" listeners to.
+class FakeRegistryStream extends EventEmitter {
+	cancelled = false;
+	cancel(): void {
+		this.cancelled = true;
+	}
+	emitEvent(evt: RegistryEvent): void {
+		this.emit("data", evt);
+	}
+}
+
+// makeRegistryFactory returns a registryClientFactory that records every stream
+// it hands out, so a test can drive the most-recent registry stream after a
+// reconnect created a fresh one.
+function makeRegistryFactory(
+	streams: FakeRegistryStream[],
+): () => RegistryClient {
+	return () =>
+		({
+			registerAndWatch: () => {
+				const s = new FakeRegistryStream();
+				streams.push(s);
+				return s as unknown as ReturnType<RegistryClient["registerAndWatch"]>;
+			},
+			close: () => {},
+		}) as unknown as RegistryClient;
 }
 
 function fakeProvisionResult(): ProvisionResult {
@@ -308,6 +342,121 @@ describe("ServiceBridge connect lifecycle", () => {
 		const after = provisionCalls;
 		await new Promise((r) => setTimeout(r, 50));
 		expect(provisionCalls).toBe(after);
+	});
+
+	test("stop() clears the pending reconnect timer (BUG-17)", async () => {
+		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
+			advertise: false,
+			_disableTelemetryTransport: true,
+			provisionFn: async () => {
+				throw new Error("nope");
+			},
+			// Large interval: the reconnect timer is parked, not fired, so we can
+			// assert it is cleared by stop() rather than by elapsing.
+			reconnectIntervalMs: 1_000_000,
+			reconnectAttempts: 5,
+		});
+		activeBridges.push(sb);
+
+		await sb.start();
+		// First provision throws → scheduleReconnect parks a setTimeout handle.
+		await waitFor(
+			() =>
+				(sb as unknown as { reconnectTimer: unknown }).reconnectTimer !== null,
+			"reconnect timer parked after failed provision",
+		);
+
+		await sb.stop();
+		expect(
+			(sb as unknown as { reconnectTimer: unknown }).reconnectTimer,
+		).toBeNull();
+	});
+});
+
+describe("ServiceBridge policy listener registration (BUG-18)", () => {
+	function snapshotWithWarnings(declarations: string[]): RegistryEvent {
+		return {
+			snapshot: {
+				methods: [],
+				instances: [],
+				eventSubscriptions: [],
+				outgoingCalls: [],
+				policy: {
+					capabilities: [],
+					egress: [],
+					acceptance: [],
+					warnings: declarations.map((d) => ({
+						declaration: d,
+						value: "svc",
+						denySide: "self_egress",
+						reason: "not declared",
+					})),
+				},
+				captureModes: undefined,
+			},
+			update: undefined,
+		} as unknown as RegistryEvent;
+	}
+
+	test("policy_violation fires once per warning after two reconnect cycles", async () => {
+		const controlStreams: FakeServerStream[] = [];
+		const registryStreams: FakeRegistryStream[] = [];
+		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
+			advertise: false,
+			_disableTelemetryTransport: true,
+			provisionFn: async () => fakeProvisionResult(),
+			clientFactory: () => {
+				const s = new FakeServerStream();
+				controlStreams.push(s);
+				return makeFakeClient(s);
+			},
+			registryClientFactory: makeRegistryFactory(registryStreams),
+			certRefreshLeadMs: 1_000_000,
+			reconnectIntervalMs: 5,
+			reconnectAttempts: 10,
+		});
+		activeBridges.push(sb);
+
+		const violations: PolicyViolationEvent[] = [];
+		sb.on("policy_violation", (v) => violations.push(v));
+
+		await sb.start();
+		await waitFor(() => registryStreams.length >= 1, "first registry stream");
+		controlStreams[0]?.emitData({
+			welcome: { sessionId: "s1", serviceId: "svc", serviceName: "n" },
+		});
+		await tick();
+
+		// Two transport drops → two reconnects → three openSession calls total.
+		controlStreams[0]?.emitError(new Error("drop-1"));
+		await waitFor(
+			() => registryStreams.length >= 2,
+			"second registry stream after reconnect 1",
+		);
+		controlStreams[1]?.emitData({
+			welcome: { sessionId: "s2", serviceId: "svc", serviceName: "n" },
+		});
+		await tick();
+
+		controlStreams[1]?.emitError(new Error("drop-2"));
+		await waitFor(
+			() => registryStreams.length >= 3,
+			"third registry stream after reconnect 2",
+		);
+		controlStreams[2]?.emitData({
+			welcome: { sessionId: "s3", serviceId: "svc", serviceName: "n" },
+		});
+		await tick();
+
+		// Emit a single PolicyEvaluation carrying one warning on the latest stream.
+		// With the listener registered once (not per openSession), exactly one
+		// policy_violation must fire — not three.
+		const latest = registryStreams[registryStreams.length - 1]!;
+		latest.emitEvent(snapshotWithWarnings(["rpc.call"]));
+		await tick();
+
+		expect(violations.length).toBe(1);
+		expect(violations[0]?.declaration).toBe("rpc.call");
 	});
 });
 

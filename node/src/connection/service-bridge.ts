@@ -407,6 +407,7 @@ export class ServiceBridge {
 	private controlClient: ControlClient | null = null;
 	private lastProvision: ProvisionResult | null = null;
 	private certRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 	private currentIdentity: Identity | null = null;
 
 	private readonly _registry: Registry = new Registry(() =>
@@ -416,6 +417,7 @@ export class ServiceBridge {
 	private readonly _instanceCache = new InstanceCache();
 	private readonly _schemaRegistry = new SchemaRegistry();
 	private _started = false;
+	private _watchListenersRegistered = false;
 	private _callServer: CallServer | null = null;
 	private _proxyTransport: ProxyTransport | null = null;
 	private _directTransport: DirectTransport | null = null;
@@ -472,7 +474,7 @@ export class ServiceBridge {
 	/** Event domain — define published events, subscribe, publish. */
 	readonly event: EventDomain;
 
-	/** Workflow domain — register workflow handlers (stub; full impl in workflows.md). */
+	/** Workflow domain — define workflows, register step handlers, start/execute runs. */
 	readonly workflow: WorkflowDomain;
 
 	/** Job domain — register scheduled job handlers via `.handle(name, opts, fn)`. */
@@ -646,7 +648,49 @@ export class ServiceBridge {
 		this._directTransport = null;
 		this._rpcClient = null;
 
+		this.registerWatchListeners();
+
 		await this.connect(1);
+	}
+
+	// registerWatchListeners subscribes the policy/telemetry-config listeners
+	// onto the shared _watchStream exactly once per bridge. The _watchStream
+	// instance outlives reconnects (openSession only restarts the underlying
+	// gRPC stream, not the listener set), so registering here — not in
+	// openSession — avoids re-adding a fresh closure on every reconnect, which
+	// would otherwise fire each PolicyEvaluation N times after N reconnects.
+	private registerWatchListeners(): void {
+		if (this._watchListenersRegistered) return;
+		this._watchListenersRegistered = true;
+		// ADR-0004: PolicyEvaluation must be observed before the first snapshot
+		// frame so `policy.warnings` triggers the `policy_violation` event for
+		// each violation on initial connect.
+		this._watchStream.onPolicyEvaluation((policy) => {
+			for (const w of policy.warnings) {
+				this.emitPolicyViolation({
+					declaration: w.declaration,
+					value: w.value,
+					denySide: w.denySide,
+					reason: w.reason,
+				});
+			}
+			if (this.opts.failOnPolicyViolation && policy.warnings.length > 0) {
+				// Surface as a clear ServiceBridgeError; the connect loop catches
+				// and emits 'disconnected'.
+				const message = policy.warnings
+					.map((w) => `${w.declaration} ${w.value}: ${w.reason}`)
+					.join("; ");
+				const err = new ServiceBridgeError(
+					"policy",
+					new Error(`policy violations on start: ${message}`),
+				);
+				this.emit("disconnected", { reason: err.message, error: err });
+				void this.stop();
+			}
+		});
+		this._watchStream.onTelemetryConfig((cfg) => {
+			this._telemetryEnabled = cfg.enabled;
+		});
 	}
 
 	async stop(): Promise<void> {
@@ -966,38 +1010,6 @@ export class ServiceBridge {
 		await this.ensureRpcReady(prov, creds);
 
 		const registryClient = this.opts.registryClientFactory(this.url, creds);
-		// ADR-0004: subscribe to PolicyEvaluation BEFORE start() so the first
-		// snapshot frame's `policy.warnings` triggers `console.warn` + the
-		// `policy_violation` event for each violation. Listener is idempotent
-		// across reconnects; restart() preserves it.
-		this._watchStream.onPolicyEvaluation((policy) => {
-			for (const w of policy.warnings) {
-				this.emitPolicyViolation({
-					declaration: w.declaration,
-					value: w.value,
-					denySide: w.denySide,
-					reason: w.reason,
-				});
-			}
-			if (this.opts.failOnPolicyViolation && policy.warnings.length > 0) {
-				// Surface as a clear ServiceBridgeError; the upcoming connect
-				// loop catches and emits 'disconnected'.
-				const message = policy.warnings
-					.map((w) => `${w.declaration} ${w.value}: ${w.reason}`)
-					.join("; ");
-				const err = new ServiceBridgeError(
-					"policy",
-					new Error(`policy violations on start: ${message}`),
-				);
-				this.emit("disconnected", { reason: err.message, error: err });
-				void this.stop();
-			}
-		});
-		// Track runtime-pushed telemetry enable flag. The listener is idempotent
-		// across reconnects (onTelemetryConfig adds the same closure reference once).
-		this._watchStream.onTelemetryConfig((cfg) => {
-			this._telemetryEnabled = cfg.enabled;
-		});
 		this._watchStream.start(
 			this._registry.buildRegisterRequest(),
 			registryClient,
@@ -1505,7 +1517,9 @@ export class ServiceBridge {
 			delayMs: this.opts.reconnectIntervalMs,
 			reason,
 		});
-		setTimeout(() => {
+		if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+		this.reconnectTimer = setTimeout(() => {
+			this.reconnectTimer = null;
 			void this.connect(attempt);
 		}, this.opts.reconnectIntervalMs);
 	}
@@ -1514,6 +1528,10 @@ export class ServiceBridge {
 		if (this.certRefreshTimer) {
 			clearTimeout(this.certRefreshTimer);
 			this.certRefreshTimer = null;
+		}
+		if (this.reconnectTimer) {
+			clearTimeout(this.reconnectTimer);
+			this.reconnectTimer = null;
 		}
 	}
 }
