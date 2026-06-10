@@ -120,4 +120,33 @@ describe("CircuitBreakerRegistry (sliding window)", () => {
 		cb.reset("svc:i-1");
 		expect(cb.state("svc:i-1")).toBe("CLOSED");
 	});
+
+	describe("probeAvailable (read-only eligibility for the LB)", () => {
+		it("is true for an unknown key and a CLOSED breaker", () => {
+			const { cb } = withClock();
+			expect(cb.probeAvailable("svc:i-1")).toBe(true);
+			cb.recordSuccess("svc:i-1");
+			expect(cb.probeAvailable("svc:i-1")).toBe(true);
+		});
+
+		it("is false while OPEN", () => {
+			const { cb } = withClock();
+			for (let i = 0; i < MIN_REQUESTS; i++) cb.recordFailure("svc:i-1");
+			expect(cb.state("svc:i-1")).toBe("OPEN");
+			expect(cb.probeAvailable("svc:i-1")).toBe(false);
+		});
+
+		it("does NOT claim the probe (unlike canCall), so it stays repeatable", () => {
+			const { cb, advance } = withClock();
+			for (let i = 0; i < MIN_REQUESTS; i++) cb.recordFailure("svc:i-1");
+			advance(OPEN_DURATION_MS);
+			expect(cb.state("svc:i-1")).toBe("HALF_OPEN");
+			// Repeated reads stay true — no side effect on the probe slot.
+			expect(cb.probeAvailable("svc:i-1")).toBe(true);
+			expect(cb.probeAvailable("svc:i-1")).toBe(true);
+			// canCall claims it; after that probeAvailable flips to false.
+			expect(cb.canCall("svc:i-1")).toBe(true);
+			expect(cb.probeAvailable("svc:i-1")).toBe(false);
+		});
+	});
 });

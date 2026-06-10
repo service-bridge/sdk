@@ -103,6 +103,11 @@ export class CircuitBreakerRegistry {
 
 	// canCall returns true when the breaker is CLOSED, or when it has been
 	// OPEN long enough to transition to HALF_OPEN and no probe is in flight.
+	// In HALF_OPEN it CLAIMS the single probe slot as a side effect — the first
+	// caller gets true and owns the probe; concurrent callers get false until
+	// recordSuccess/recordFailure releases it. Call this only for the instance
+	// actually about to be dispatched (the LB winner), never during candidate
+	// filtering, or the claim leaks onto instances that are never called.
 	canCall(key: string): boolean {
 		const e = this.map.get(key);
 		if (!e) return true;
@@ -114,6 +119,18 @@ export class CircuitBreakerRegistry {
 			return true;
 		}
 		return false;
+	}
+
+	// probeAvailable is the side-effect-free read used by the LB to decide
+	// whether a HALF_OPEN instance is eligible (probe slot free) before it
+	// commits to a winner. Unlike canCall it does NOT claim the probe.
+	probeAvailable(key: string): boolean {
+		const e = this.map.get(key);
+		if (!e) return true;
+		this.maybeHalfOpen(e);
+		if (e.state === "OPEN") return false;
+		if (e.state === "HALF_OPEN") return !e.probeInFlight;
+		return true;
 	}
 
 	recordSuccess(key: string): void {

@@ -46,6 +46,8 @@
 
 Retryable-коды: `UNAVAILABLE(14)`, `RESOURCE_EXHAUSTED(8)`, `DEADLINE_EXCEEDED(4)` — всегда; `INTERNAL(13)`, `ABORTED(10)`, `UNKNOWN(2)` — только при заданном `idempotencyKey` (ADR-0001). Ошибки без числового `.code` (application errors хендлера, schema errors) — non-retryable.
 
+**Streaming (`sb.stream` / `TypedClient` методы с `responseStream=true`) ретраи не применяет вообще** — включая сбой установки соединения на самом первом пике кандидата. Стрим выбирает инстанс один раз; любая ошибка (connect-failure, mid-stream разрыв) пробрасывается наружу без повторной попытки. Mid-stream replay ре-доставил бы уже полученные чанки (ADR-0004), а ретраить только connect-фазу — значит держать скрытую дву­режимность «до первого чанка ретраим, после — нет»; этого нет. Нужен retry на стриме — caller переоткрывает стрим сам.
+
 ## Приватный контракт
 
 Не реэкспортируется через корневой `index.ts`; используется только wire-up'ом в `connection/service-bridge.ts` либо в `*.test.ts`. В коде помечено `@internal`.
@@ -64,12 +66,12 @@ Retryable-коды: `UNAVAILABLE(14)`, `RESOURCE_EXHAUSTED(8)`, `DEADLINE_EXCEED
 | `DirectCredentials` / `DirectTarget` | interface | DER-креды (+`notAfterUnix` для TTL) и резолвнутая пара `(endpoint, serviceId, instanceId)` для SPIFFE-канала. |
 | `InstanceCache` | class | Join `MethodDescriptor` × `ServiceInstanceInfo` из `WatchStream`. `bind`/`dispose`, `pickAll`, `descriptorFor`. |
 | `Instance` | interface | `ServiceInstanceInfo` + `isUnhealthyAt: Date \| null` (health-hint из watch snapshot). |
-| `LoadBalancer` | class | Power-of-Two-Choices (ADR-0001) по inflight. `pick` исключает CB-OPEN и instances с health-hint моложе `HEALTH_HINT_TTL_MS`; `acquire(id)` → release-closure для `finally`; `inflightOf`. |
+| `LoadBalancer` | class | Power-of-Two-Choices (ADR-0001) по inflight. `pick` исключает CB-OPEN и instances с health-hint моложе `HEALTH_HINT_TTL_MS`; для HALF_OPEN-инстанса кандидат допускается только если свободен probe-слот (`cb.probeAvailable`), и на выбранном победителе `pick` атомарно занимает probe через `cb.canCall` — освобождает его парный `cb.recordSuccess`/`recordFailure` после диспатча, поэтому в HALF_OPEN летит ровно один probe. `acquire(id)` → release-closure для `finally`; `inflightOf`. |
 | `Candidate` | interface | `{ descriptor, instance, isUnhealthyAt }` — кандидат для P2C. |
 | `NoLiveInstanceError` | class | Бросается `LoadBalancer.pick`, когда нет живых кандидатов. |
 | `HEALTH_HINT_TTL_MS` | const | `60_000` — TTL доверия runtime-хинту нездоровья (2× окно HealthTracker). |
 | `cbKey(instance)` | function | `"${serviceId}:${instanceId}"` — ключ CB/LB на инстанс. |
-| `CircuitBreakerRegistry` | class | Sliding-window CB per `(serviceId, instanceId)` (ADR-0001). Окно 10s × 10 buckets; OPEN при `total ≥ 10 && errorRate > 0.5` на 30s; HALF_OPEN допускает один probe. `canCall`/`recordSuccess`/`recordFailure`/`state`/`reset`. |
+| `CircuitBreakerRegistry` | class | Sliding-window CB per `(serviceId, instanceId)` (ADR-0001). Окно 10s × 10 buckets; OPEN при `total ≥ 10 && errorRate > 0.5` на 30s; HALF_OPEN допускает один probe. `canCall` (атомарно занимает probe-слот в HALF_OPEN — зовётся LB только на выбранном инстансе), `probeAvailable` (read-only eligibility-проверка для фильтра LB, без захвата слота), `recordSuccess`/`recordFailure` (освобождают probe), `state`/`reset`. |
 | `DispatchPort` | interface | Boundary Registry/Handle ↔ CallServer: `dispatchUnary`, `dispatchStream`, `captureMode`. Изолирует gRPC-слой от `Handle._entries`. |
 | `UnaryResult` / `StreamItem` | interface | Результат диспатча: `payload` + опциональные `errorCode`/`errorMessage`. |
 | `RpcDomain._declareForTests(name, streaming=false)` | метод | Регистрирует RPC-запись без схемы. Только для e2e-тестов; прод-код использует `handle()` с явной схемой. |
@@ -107,7 +109,8 @@ X-SB-Trace прокидывается двумя путями:
 - **CallServer mTLS reuse.** Cert от runtime Bootstrap переиспользуется как server-cert call-сервера; `caChainDer` — тот же CA, что у runtime.
 - **Auto-port `port=0`.** SDK биндится на свободный порт, advertise = `${host}:${bound}`. `host` обязателен явный — не угадываем hostname.
 - **Application errors через `error_code/error_message`, не gRPC status.** Handler `throw` → `error_code: "INTERNAL"`; транспортные ошибки — через gRPC status. Чёткое разделение для retry-решений.
-- **Retry не применяется к streaming.** Mid-stream replay ре-доставил бы уже полученные чанки (ADR-0001).
+- **Retry не применяется к streaming — ни к одной фазе.** Mid-stream replay ре-доставил бы уже полученные чанки (ADR-0001). Connect-фазу тоже не ретраим: иначе появилась бы скрытая двухрежимность по фазе вызова. Стрим — single-pick; повтор на стороне caller'а.
+- **HALF_OPEN single-probe enforced в LB, не только в CB.** `CircuitBreakerRegistry.canCall` всегда умел отдавать probe-слот ровно одному вызывающему, но `LoadBalancer.pick` фильтровал лишь `state() !== "OPEN"`, пропуская в HALF_OPEN все конкурентные вызовы. Теперь `pick` фильтрует кандидатов через read-only `probeAvailable`, а на выбранном победителе занимает слот через `canCall`; парный `recordSuccess`/`recordFailure` после диспатча освобождает его. `pick` синхронен, поэтому конкурентный `pick` видит занятый слот и уходит на здоровый peer или падает в `NoLiveInstanceError` — инвариант «один probe в HALF_OPEN» реально выполняется per-pod (cross-pod дубли допускает ADR-0001).
 - **Identity by UUID, имена display-only.** Идентификаторы внутри SDK и на проводе — `service_id` (UUID). `service_name` — только DX-поверхность и UI label (ADR-0004).
 - **Direct-transport acceptance enforcement (ADR-0004).** `CallServer` извлекает SPIFFE-URI из verified peer-cert и проверяет локально по `PolicyEvaluation.acceptance`. Сломан accessor → fail-closed (`PERMISSION_DENIED`); peer без SPIFFE-URI = runtime-proxy (caller-gate уже отработал) → пропуск.
 - **Одна RPC.CALL строка, владелец — caller-SDK (ADR-0001).** Caller-SDK один видит и direct-, и proxy-путь, поэтому эмиттит единственную op. Ретраи — счётчик `attempt`; proxy-факт — `meta.via_proxy`.

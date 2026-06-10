@@ -48,11 +48,20 @@ export class LoadBalancer {
 	// pick selects an eligible candidate via Power of Two Choices. Eligibility:
 	//   - candidate has a non-empty call_endpoint
 	//   - the runtime health hint is stale or absent
-	//   - the local circuit breaker is not OPEN for the instance
+	//   - the local circuit breaker is not OPEN, and — when HALF_OPEN — its single
+	//     probe slot is free
 	// Throws NoLiveInstanceError when no candidate is eligible. Picking is
 	// random when fewer than two eligible candidates exist or when inflight
 	// counters tie. Caller MUST pair every successful pick with a `release`
 	// call in a finally block so inflight stays balanced.
+	//
+	// HALF_OPEN single-probe: a HALF_OPEN instance is eligible only while its
+	// probe slot is free (read-only `probeAvailable`). Once a winner is chosen,
+	// pick CLAIMS the probe on that instance via `canCall`; the claim is released
+	// by the matching cb.recordSuccess/recordFailure the caller runs after the
+	// dispatch. pick runs to completion synchronously, so a concurrent caller's
+	// later pick sees the claimed slot and routes elsewhere (or fails over) —
+	// exactly one probe in flight per HALF_OPEN instance.
 	pick(candidates: Candidate[]): Candidate {
 		const now = this.now();
 		const live = candidates.filter((c) => {
@@ -61,11 +70,17 @@ export class LoadBalancer {
 				c.isUnhealthyAt !== null &&
 				now - c.isUnhealthyAt.getTime() < HEALTH_HINT_TTL_MS;
 			if (hintActive) return false;
-			return this.cb.state(cbKey(c.instance)) !== "OPEN";
+			return this.cb.probeAvailable(cbKey(c.instance));
 		});
 		if (live.length === 0) throw new NoLiveInstanceError();
-		if (live.length === 1) return live[0]!;
+		const winner = live.length === 1 ? live[0]! : this.choose(live);
+		// Claim the HALF_OPEN probe slot on the winner only. CLOSED instances
+		// always return true here without side effects.
+		this.cb.canCall(cbKey(winner.instance));
+		return winner;
+	}
 
+	private choose(live: Candidate[]): Candidate {
 		const i = Math.floor(this.random() * live.length);
 		let j = Math.floor(this.random() * (live.length - 1));
 		if (j >= i) j++;

@@ -4,7 +4,11 @@ import type {
 	ServiceInstanceInfo,
 } from "../pb/servicebridge/v1/registry";
 import { MethodType } from "../pb/servicebridge/v1/registry";
-import { CircuitBreakerRegistry, MIN_REQUESTS } from "./circuit-breaker";
+import {
+	CircuitBreakerRegistry,
+	MIN_REQUESTS,
+	OPEN_DURATION_MS,
+} from "./circuit-breaker";
 import {
 	type Candidate,
 	cbKey,
@@ -147,5 +151,87 @@ describe("LoadBalancer P2C", () => {
 		expect(lb.inflightOf("a")).toBe(1);
 		r2();
 		expect(lb.inflightOf("a")).toBe(0);
+	});
+});
+
+describe("LoadBalancer HALF_OPEN single-probe", () => {
+	// driveHalfOpen opens the breaker for `inst` then advances the shared clock
+	// past OPEN_DURATION_MS so the next state read lazily transitions to HALF_OPEN.
+	function driveHalfOpen(
+		cb: CircuitBreakerRegistry,
+		clock: { t: number },
+		key: string,
+	): void {
+		for (let i = 0; i < MIN_REQUESTS; i++) cb.recordFailure(key);
+		expect(cb.state(key)).toBe("OPEN");
+		clock.t += OPEN_DURATION_MS + 1;
+		expect(cb.state(key)).toBe("HALF_OPEN");
+	}
+
+	it("admits exactly one probe through concurrent picks in HALF_OPEN", () => {
+		const clock = { t: 1_000_000 };
+		const cb = new CircuitBreakerRegistry(() => clock.t);
+		const lb = new LoadBalancer(cb, { now: () => clock.t });
+		const a = cand("a", "h:1");
+		driveHalfOpen(cb, clock, cbKey(a.instance));
+
+		// First pick claims the single probe slot.
+		const first = lb.pick([a]);
+		expect(first.instance.instanceId).toBe("a");
+
+		// While the probe is in flight (no record* yet), the instance is no longer
+		// eligible — a concurrent pick fails over to nothing → NoLiveInstance.
+		expect(() => lb.pick([a])).toThrow(NoLiveInstanceError);
+	});
+
+	it("routes a concurrent caller to a healthy peer instead of the probing instance", () => {
+		const clock = { t: 1_000_000 };
+		const cb = new CircuitBreakerRegistry(() => clock.t);
+		const lb = new LoadBalancer(cb, { now: () => clock.t });
+		const probing = cand("a", "h:1");
+		const healthy = cand("b", "h:2");
+		driveHalfOpen(cb, clock, cbKey(probing.instance));
+
+		// First pick may land on the probing instance (claims probe) or the
+		// healthy one; force it onto the probing instance via inflight skew is not
+		// needed — claim it directly to make the test deterministic.
+		cb.canCall(cbKey(probing.instance)); // claim probe explicitly
+		const picked = lb.pick([probing, healthy]);
+		expect(picked.instance.instanceId).toBe("b");
+	});
+
+	it("re-admits a probe after the prior probe fails and the window reopens then re-halfopens", () => {
+		const clock = { t: 1_000_000 };
+		const cb = new CircuitBreakerRegistry(() => clock.t);
+		const lb = new LoadBalancer(cb, { now: () => clock.t });
+		const a = cand("a", "h:1");
+		const key = cbKey(a.instance);
+		driveHalfOpen(cb, clock, key);
+
+		lb.pick([a]); // claims probe
+		cb.recordFailure(key); // probe fails → OPEN, probe released
+		expect(cb.state(key)).toBe("OPEN");
+		expect(() => lb.pick([a])).toThrow(NoLiveInstanceError);
+
+		// After another OPEN_DURATION_MS it half-opens again and admits one probe.
+		clock.t += OPEN_DURATION_MS + 1;
+		const second = lb.pick([a]);
+		expect(second.instance.instanceId).toBe("a");
+	});
+
+	it("closes the breaker on probe success and admits all callers again", () => {
+		const clock = { t: 1_000_000 };
+		const cb = new CircuitBreakerRegistry(() => clock.t);
+		const lb = new LoadBalancer(cb, { now: () => clock.t });
+		const a = cand("a", "h:1");
+		const key = cbKey(a.instance);
+		driveHalfOpen(cb, clock, key);
+
+		lb.pick([a]); // claims probe
+		cb.recordSuccess(key); // probe succeeds → CLOSED
+		expect(cb.state(key)).toBe("CLOSED");
+		// CLOSED instance has no probe gate — repeated picks all succeed.
+		expect(lb.pick([a]).instance.instanceId).toBe("a");
+		expect(lb.pick([a]).instance.instanceId).toBe("a");
 	});
 });
