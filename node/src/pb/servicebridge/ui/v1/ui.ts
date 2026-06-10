@@ -148,6 +148,20 @@ export interface DeleteAccountRequest {
   id: string;
 }
 
+export interface ChangePasswordRequest {
+  currentPassword: string;
+  newPassword: string;
+}
+
+export interface ChangeUsernameRequest {
+  currentPassword: string;
+  newUsername: string;
+}
+
+export interface ChangeUsernameResponse {
+  account?: Account | undefined;
+}
+
 export interface InstanceSummary {
   id: string;
   status: string;
@@ -565,13 +579,14 @@ export interface TraceRow {
 export interface ListTracesRequest {
   pageSize: number;
   pageToken: string;
-  serviceId: string;
-  status: string;
+  serviceIds: string[];
+  /** "pending"|"success"|"error"; empty = any */
+  statuses: string[];
   sinceMs: number;
   untilMs: number;
   subject: string;
-  /** "http"|"rpc"|"event"|"workflow"|"job"|"generic"|"" (any) */
-  channel: string;
+  /** "http"|"rpc"|"event"|"workflow"|"job"; empty = any */
+  channels: string[];
   rootOnly: boolean;
   q: string;
 }
@@ -2699,6 +2714,170 @@ export const DeleteAccountRequest: MessageFns<DeleteAccountRequest> = {
   fromPartial<I extends Exact<DeepPartial<DeleteAccountRequest>, I>>(object: I): DeleteAccountRequest {
     const message = createBaseDeleteAccountRequest();
     message.id = object.id ?? "";
+    return message;
+  },
+};
+
+function createBaseChangePasswordRequest(): ChangePasswordRequest {
+  return { currentPassword: "", newPassword: "" };
+}
+
+export const ChangePasswordRequest: MessageFns<ChangePasswordRequest> = {
+  encode(message: ChangePasswordRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.currentPassword !== "") {
+      writer.uint32(10).string(message.currentPassword);
+    }
+    if (message.newPassword !== "") {
+      writer.uint32(18).string(message.newPassword);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ChangePasswordRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseChangePasswordRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.currentPassword = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.newPassword = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  create<I extends Exact<DeepPartial<ChangePasswordRequest>, I>>(base?: I): ChangePasswordRequest {
+    return ChangePasswordRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ChangePasswordRequest>, I>>(object: I): ChangePasswordRequest {
+    const message = createBaseChangePasswordRequest();
+    message.currentPassword = object.currentPassword ?? "";
+    message.newPassword = object.newPassword ?? "";
+    return message;
+  },
+};
+
+function createBaseChangeUsernameRequest(): ChangeUsernameRequest {
+  return { currentPassword: "", newUsername: "" };
+}
+
+export const ChangeUsernameRequest: MessageFns<ChangeUsernameRequest> = {
+  encode(message: ChangeUsernameRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.currentPassword !== "") {
+      writer.uint32(10).string(message.currentPassword);
+    }
+    if (message.newUsername !== "") {
+      writer.uint32(18).string(message.newUsername);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ChangeUsernameRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseChangeUsernameRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.currentPassword = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.newUsername = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  create<I extends Exact<DeepPartial<ChangeUsernameRequest>, I>>(base?: I): ChangeUsernameRequest {
+    return ChangeUsernameRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ChangeUsernameRequest>, I>>(object: I): ChangeUsernameRequest {
+    const message = createBaseChangeUsernameRequest();
+    message.currentPassword = object.currentPassword ?? "";
+    message.newUsername = object.newUsername ?? "";
+    return message;
+  },
+};
+
+function createBaseChangeUsernameResponse(): ChangeUsernameResponse {
+  return { account: undefined };
+}
+
+export const ChangeUsernameResponse: MessageFns<ChangeUsernameResponse> = {
+  encode(message: ChangeUsernameResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.account !== undefined) {
+      Account.encode(message.account, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ChangeUsernameResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseChangeUsernameResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.account = Account.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  create<I extends Exact<DeepPartial<ChangeUsernameResponse>, I>>(base?: I): ChangeUsernameResponse {
+    return ChangeUsernameResponse.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ChangeUsernameResponse>, I>>(object: I): ChangeUsernameResponse {
+    const message = createBaseChangeUsernameResponse();
+    message.account = (object.account !== undefined && object.account !== null)
+      ? Account.fromPartial(object.account)
+      : undefined;
     return message;
   },
 };
@@ -7212,12 +7391,12 @@ function createBaseListTracesRequest(): ListTracesRequest {
   return {
     pageSize: 0,
     pageToken: "",
-    serviceId: "",
-    status: "",
+    serviceIds: [],
+    statuses: [],
     sinceMs: 0,
     untilMs: 0,
     subject: "",
-    channel: "",
+    channels: [],
     rootOnly: false,
     q: "",
   };
@@ -7231,11 +7410,11 @@ export const ListTracesRequest: MessageFns<ListTracesRequest> = {
     if (message.pageToken !== "") {
       writer.uint32(18).string(message.pageToken);
     }
-    if (message.serviceId !== "") {
-      writer.uint32(26).string(message.serviceId);
+    for (const v of message.serviceIds) {
+      writer.uint32(26).string(v!);
     }
-    if (message.status !== "") {
-      writer.uint32(34).string(message.status);
+    for (const v of message.statuses) {
+      writer.uint32(34).string(v!);
     }
     if (message.sinceMs !== 0) {
       writer.uint32(40).int64(message.sinceMs);
@@ -7246,8 +7425,8 @@ export const ListTracesRequest: MessageFns<ListTracesRequest> = {
     if (message.subject !== "") {
       writer.uint32(58).string(message.subject);
     }
-    if (message.channel !== "") {
-      writer.uint32(66).string(message.channel);
+    for (const v of message.channels) {
+      writer.uint32(66).string(v!);
     }
     if (message.rootOnly !== false) {
       writer.uint32(72).bool(message.rootOnly);
@@ -7286,7 +7465,7 @@ export const ListTracesRequest: MessageFns<ListTracesRequest> = {
             break;
           }
 
-          message.serviceId = reader.string();
+          message.serviceIds.push(reader.string());
           continue;
         }
         case 4: {
@@ -7294,7 +7473,7 @@ export const ListTracesRequest: MessageFns<ListTracesRequest> = {
             break;
           }
 
-          message.status = reader.string();
+          message.statuses.push(reader.string());
           continue;
         }
         case 5: {
@@ -7326,7 +7505,7 @@ export const ListTracesRequest: MessageFns<ListTracesRequest> = {
             break;
           }
 
-          message.channel = reader.string();
+          message.channels.push(reader.string());
           continue;
         }
         case 9: {
@@ -7361,12 +7540,12 @@ export const ListTracesRequest: MessageFns<ListTracesRequest> = {
     const message = createBaseListTracesRequest();
     message.pageSize = object.pageSize ?? 0;
     message.pageToken = object.pageToken ?? "";
-    message.serviceId = object.serviceId ?? "";
-    message.status = object.status ?? "";
+    message.serviceIds = object.serviceIds?.map((e) => e) || [];
+    message.statuses = object.statuses?.map((e) => e) || [];
     message.sinceMs = object.sinceMs ?? 0;
     message.untilMs = object.untilMs ?? 0;
     message.subject = object.subject ?? "";
-    message.channel = object.channel ?? "";
+    message.channels = object.channels?.map((e) => e) || [];
     message.rootOnly = object.rootOnly ?? false;
     message.q = object.q ?? "";
     return message;
@@ -22279,6 +22458,27 @@ export const AccountServiceService = {
     responseSerialize: (value: Empty): Buffer => Buffer.from(Empty.encode(value).finish()),
     responseDeserialize: (value: Buffer): Empty => Empty.decode(value),
   },
+  changePassword: {
+    path: "/ui.v1.AccountService/ChangePassword" as const,
+    requestStream: false as const,
+    responseStream: false as const,
+    requestSerialize: (value: ChangePasswordRequest): Buffer =>
+      Buffer.from(ChangePasswordRequest.encode(value).finish()),
+    requestDeserialize: (value: Buffer): ChangePasswordRequest => ChangePasswordRequest.decode(value),
+    responseSerialize: (value: Empty): Buffer => Buffer.from(Empty.encode(value).finish()),
+    responseDeserialize: (value: Buffer): Empty => Empty.decode(value),
+  },
+  changeUsername: {
+    path: "/ui.v1.AccountService/ChangeUsername" as const,
+    requestStream: false as const,
+    responseStream: false as const,
+    requestSerialize: (value: ChangeUsernameRequest): Buffer =>
+      Buffer.from(ChangeUsernameRequest.encode(value).finish()),
+    requestDeserialize: (value: Buffer): ChangeUsernameRequest => ChangeUsernameRequest.decode(value),
+    responseSerialize: (value: ChangeUsernameResponse): Buffer =>
+      Buffer.from(ChangeUsernameResponse.encode(value).finish()),
+    responseDeserialize: (value: Buffer): ChangeUsernameResponse => ChangeUsernameResponse.decode(value),
+  },
 } as const;
 
 export interface AccountServiceServer extends UntypedServiceImplementation {
@@ -22290,6 +22490,8 @@ export interface AccountServiceServer extends UntypedServiceImplementation {
   list: handleUnaryCall<ListAccountsRequest, ListAccountsResponse>;
   updateRole: handleUnaryCall<UpdateRoleRequest, UpdateRoleResponse>;
   delete: handleUnaryCall<DeleteAccountRequest, Empty>;
+  changePassword: handleUnaryCall<ChangePasswordRequest, Empty>;
+  changeUsername: handleUnaryCall<ChangeUsernameRequest, ChangeUsernameResponse>;
 }
 
 export interface AccountServiceClient extends Client {
@@ -22406,6 +22608,36 @@ export interface AccountServiceClient extends Client {
     metadata: Metadata,
     options: Partial<CallOptions>,
     callback: (error: ServiceError | null, response: Empty) => void,
+  ): ClientUnaryCall;
+  changePassword(
+    request: ChangePasswordRequest,
+    callback: (error: ServiceError | null, response: Empty) => void,
+  ): ClientUnaryCall;
+  changePassword(
+    request: ChangePasswordRequest,
+    metadata: Metadata,
+    callback: (error: ServiceError | null, response: Empty) => void,
+  ): ClientUnaryCall;
+  changePassword(
+    request: ChangePasswordRequest,
+    metadata: Metadata,
+    options: Partial<CallOptions>,
+    callback: (error: ServiceError | null, response: Empty) => void,
+  ): ClientUnaryCall;
+  changeUsername(
+    request: ChangeUsernameRequest,
+    callback: (error: ServiceError | null, response: ChangeUsernameResponse) => void,
+  ): ClientUnaryCall;
+  changeUsername(
+    request: ChangeUsernameRequest,
+    metadata: Metadata,
+    callback: (error: ServiceError | null, response: ChangeUsernameResponse) => void,
+  ): ClientUnaryCall;
+  changeUsername(
+    request: ChangeUsernameRequest,
+    metadata: Metadata,
+    options: Partial<CallOptions>,
+    callback: (error: ServiceError | null, response: ChangeUsernameResponse) => void,
   ): ClientUnaryCall;
 }
 
