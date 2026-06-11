@@ -199,6 +199,10 @@ export class WorkflowSubscriber {
 
 	private startHeartbeat(runId: string, leaseEpoch: number): void {
 		if (this.closed) return;
+		// A re-dispatched runId (lease expiry → re-assignment) must replace the
+		// old timer, not orphan it: an overwritten map entry leaks the interval
+		// and its closure forever.
+		this.stopHeartbeat(runId);
 		const timer = setInterval(() => {
 			if (this.closed) {
 				clearInterval(timer);
