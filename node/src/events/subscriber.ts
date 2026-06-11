@@ -10,7 +10,10 @@ import {
 	SubscribeInit,
 } from "../pb/servicebridge/v1/events";
 import type { SchemaPair } from "../serde/serializer";
-import { reconnectDelay } from "../utils/reconnect-ladder";
+import {
+	type ReconnectDelayOptions,
+	reconnectDelay,
+} from "../utils/reconnect-ladder";
 import type { Logger } from "./publisher";
 
 // @internal
@@ -44,6 +47,10 @@ export interface SubscriberDeps {
 	maxInFlight?: number;
 	logger?: Logger;
 	sb?: ServiceBridge;
+	// reconnectOpts pins the backoff ladder/jitter; tests inject a short
+	// deterministic ladder so reconnect behaviour is observable in milliseconds.
+	// @internal
+	reconnectOpts?: ReconnectDelayOptions;
 	// runWithTrace runs the handler inside an AsyncLocalStorage trace context
 	// derived from envelope.xSbTrace so nested RPC/event calls inherit the trace.
 	// Mandatory: a missing hook would silently drop trace propagation into the
@@ -115,8 +122,7 @@ export class Subscriber {
 		const id = this.deps.identity();
 		if (!id) {
 			// Identity not yet available — schedule reconnect.
-			const delay = reconnectDelay(++this._attempt);
-			this.scheduleReconnect(delay);
+			this.scheduleReconnect();
 			return;
 		}
 
@@ -184,27 +190,26 @@ export class Subscriber {
 		stream.on("error", (err: Error) => {
 			this.logger.warn("events: subscriber: stream error", err.message);
 			this._stream = null;
-			if (!this._stopped) {
-				const delay = reconnectDelay(++this._attempt);
-				this.scheduleReconnect(delay);
-			}
+			this.scheduleReconnect();
 		});
 
 		stream.on("end", () => {
 			this._stream = null;
-			if (!this._stopped) {
-				const delay = reconnectDelay(++this._attempt);
-				this.scheduleReconnect(delay);
-			}
+			this.scheduleReconnect();
 		});
 	}
 
-	private scheduleReconnect(delayMs: number): void {
-		if (this._stopped) return;
+	// One pending timer at a time: grpc-js emits both "error" and "end" for a
+	// single broken stream, and a second timer here would double the number of
+	// live reconnect loops on every cycle — exponential runaway that grows the
+	// heap by gigabytes within the hour.
+	private scheduleReconnect(): void {
+		if (this._stopped || this._timer !== null) return;
+		const delay = reconnectDelay(++this._attempt, this.deps.reconnectOpts);
 		this._timer = setTimeout(() => {
 			this._timer = null;
 			this.connect();
-		}, delayMs);
+		}, delay);
 	}
 
 	private async handleDelivery(

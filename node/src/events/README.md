@@ -30,7 +30,7 @@ SDK-сторона Durable Events: domain namespace (`EventDomain`), публи�
 | `Subscriber` | class | — | Открывает long-lived bidi Subscribe stream; конструктор принимает `SubscriberDeps`. |
 | `Subscriber.start()` | `() => void` | — | Запускает connect (no-op после `stop()`). |
 | `Subscriber.stop()` | `async () => void` | — | Отменяет reconnect-таймер, закрывает stream. |
-| `SubscriberDeps` | interface | — | Зависимости Subscriber. Поля: `rpcClient`, `schemaIndex`, `identity`, `handlers`, `maxInFlight?`, `logger?`, `sb?`, `runWithTrace`. |
+| `SubscriberDeps` | interface | — | Зависимости Subscriber. Поля: `rpcClient`, `schemaIndex`, `identity`, `handlers`, `maxInFlight?`, `logger?`, `sb?`, `reconnectOpts?`, `runWithTrace`. |
 | `SubscriberDeps.maxInFlight` | `number?` | `32` (`ServiceBridgeOptions.eventsMaxInFlight`) | Макс. параллельных доставок (объявляется серверу в `SubscribeInit.max_in_flight`). |
 | `SubscriberDeps.logger` | `Logger?` | `{ warn: console.warn, error: console.error }` | Логгер для ошибок stream/ack/nack. |
 | `SubscriberDeps.sb` | `ServiceBridge?` | `undefined` | Reserved. EVENT.DELIVER op пишет runtime (T-015); SDK только ack/nack обратно. |
@@ -51,6 +51,7 @@ SDK-сторона Durable Events: domain namespace (`EventDomain`), публи�
 | `SchemaIndex` | interface (`@internal`) | — | `{ get(name): { contractHash, pair } \| undefined }` — schema-lookup для Publisher. |
 | `DrainerHandle` | interface (`@internal`) | — | `{ kick() }` — edge-triggered wakeup, который Publisher дёргает после INSERT в outbox. |
 | `SubscriberDeps.runWithTrace` | callback | — | (описан в публичном контракте; реализация — `@internal` hook composition root'а.) |
+| `SubscriberDeps.reconnectOpts` | `ReconnectDelayOptions?` (`@internal`) | общая лестница + ±20% jitter | Тестовый hook: пиннит лестницу/jitter, чтобы reconnect-поведение наблюдалось за миллисекунды. |
 | `SubscriberSchemaIndex` | interface (`@internal`) | — | `{ get(name): { contractHash, pair } \| undefined }` — schema-lookup для Subscriber (decode входящих). |
 | `EventHandler` | interface (`@internal`) | — | `{ pattern, fn }` — зарегистрированный обработчик; dispatch по exact `name`. |
 | `SubscriberIdentity` | interface (`@internal`) | — | `{ serviceId, instanceId }` — идентичность подписчика для `SubscribeInit`. |
@@ -86,7 +87,7 @@ SDK-сторона Durable Events: domain namespace (`EventDomain`), публи�
 
 **fireAndForget bypass** — напрямую в `rpcClient.publish`, без записи в outbox и без kick. Для use-case без требования durability.
 
-**Reconnect по общей лестнице** `utils/reconnect-ladder` (1s, 5s, 15s, 30s, 60s + удержание максимума) с ±20% jitter против thundering-herd. Та же лестница у job- и workflow-подписчиков — единый источник вместо трёх копий.
+**Reconnect по общей лестнице** `utils/reconnect-ladder` (1s, 5s, 15s, 30s, 60s + удержание максимума) с ±20% jitter против thundering-herd. Та же лестница у job- и workflow-подписчиков — единый источник вместо трёх копий. Один pending-таймер на Subscriber: grpc-js на одном обрыве стрима эмитит и `error`, и `end`, и второй таймер удваивал бы число живых reconnect-циклов на каждом обрыве — экспоненциальная лавина (гигабайты heap за час); guard в `scheduleReconnect` пропускает планирование при живом таймере.
 
 **Trace propagation (T-015, T-017).** Publisher кладёт текущий X-SB-Trace в `EventEnvelope.x_sb_trace` ("traceID-parentOpID"); runtime связывает EVENT.PUBLISH op в существующее trace-дерево, либо минтит свежий root при пустом trace. Subscriber читает `envelope.x_sb_trace` (DELIVER-level header от runtime) и оборачивает handler в `runWithTrace`, чтобы вложенные `sb.rpc.call` / `sb.event.publish` / `sb.workflow.start` наследовали trace. EVENT.DELIVER op-строку пишет runtime.
 

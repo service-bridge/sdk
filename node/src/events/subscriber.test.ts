@@ -400,4 +400,47 @@ describe("Subscriber", () => {
 
 		expect(connectCount).toBeGreaterThanOrEqual(1);
 	});
+
+	it("ErrorPlusEnd_SchedulesSingleReconnectPerCycle", async () => {
+		// grpc-js emits both "error" and "end" for one broken stream. Each cycle
+		// must schedule exactly one reconnect — a second timer doubles the live
+		// reconnect loops every cycle (exponential runaway, gigabytes of heap).
+		let connectCount = 0;
+		const fakes: ReturnType<typeof makeFakeStream>[] = [];
+
+		const deps: SubscriberDeps = {
+			rpcClient: {
+				subscribe: () => {
+					connectCount++;
+					const f = makeFakeStream();
+					fakes.push(f);
+					return f.stream;
+				},
+				// biome-ignore lint/suspicious/noExplicitAny: minimal stub
+			} as any,
+			schemaIndex: { get: () => undefined },
+			identity: () => ({ serviceId: "svc-1", instanceId: "inst-1" }),
+			handlers: () => [],
+			maxInFlight: 32,
+			logger: { warn: () => {}, error: () => {} },
+			runWithTrace: (_x, fn) => fn(),
+			reconnectOpts: { ladder: [1], jitterRatio: 0 },
+		};
+
+		const sub = new Subscriber(deps);
+		sub.start();
+		expect(connectCount).toBe(1);
+
+		for (let cycle = 0; cycle < 3; cycle++) {
+			const current = fakes[fakes.length - 1];
+			current?.emitter.emit("error", new Error("broken"));
+			current?.emitter.emit("end");
+			await Bun.sleep(20);
+			// One reconnect per cycle. The doubling bug yields 2^cycle extra
+			// connects here (1 → 3 → 7 → 15).
+			expect(connectCount).toBe(cycle + 2);
+		}
+
+		await sub.stop();
+	});
 });
