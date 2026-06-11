@@ -64,10 +64,10 @@
 | `Handle.asDispatchPort()` | `DispatchPort` | — | Boundary для `CallServer`: decode/encode по `SchemaPair`, маппинг ошибок в `errorCode` (NOT_FOUND, FAILED_PRECONDITION, INTERNAL, INVALID_ARGUMENT); `captureMode(method)` — per-handler override |
 | `Handle._declareForTests(name, streaming?)` | — | `streaming=false` | Регистрирует RPC-запись без схемы. Только unit-тесты |
 | `Handle._declarePublishedEventForTests(name)` | — | — | Регистрирует published event без `.proto`-загрузки. Только unit-тесты |
-| `WatchStream` | class @internal | — | Управляет gRPC-стримом `RegisterAndWatch`; держит кеш дескрипторов, instances, event-subs, outgoing-calls, policy, per-channel capture modes |
-| `WatchStream.start(req, client, onError?)` | — | `onError=() => {}` | Открывает стрим; вешает `"data"`/`"error"` хендлеры |
-| `WatchStream.stop()` | — | — | `stream.cancel()`; не закрывает gRPC-канал |
-| `WatchStream.restart(req, client, onError?)` | — | — | `stop()` + `start()` |
+| `WatchStream` | class @internal | — | Управляет gRPC-стримом `RegisterAndWatch`; держит кеш дескрипторов, instances, event-subs, outgoing-calls, policy, per-channel capture modes. Конструктор принимает опциональный `ReconnectDelayOptions` (тестовый hook лестницы) |
+| `WatchStream.start(req, client, onError?)` | — | `onError=() => {}` | Открывает стрим, запоминает `(req, client)` для авторестартов, сбрасывает retry-состояние. Упавший стрим (`"error"`/`"end"`) сам рестартует по общей лестнице `utils/reconnect-ladder`; один pending-таймер на инстанс (error+end одного обрыва не множат циклы), события устаревших стримов отбрасываются по identity-guard. Пришедший `"data"` сбрасывает лестницу. `onError` — нотификация, не управление рестартом |
+| `WatchStream.stop()` | — | — | Гасит retry-таймер, `stream.cancel()`; не закрывает gRPC-канал |
+| `WatchStream.restart(req, client, onError?)` | — | — | `stop()` + `start()`; ротация сессии подменяет client этим путём |
 | `WatchStream.snapshot()` | `ReadonlyMap<string, MethodDescriptor>` | — | Копия кеша; ключ `"${instanceId}:${type}:${name}:${published}"` |
 | `WatchStream.instancesSnapshot()` | `Map<string, ServiceInstanceInfo>` | — | Живой map инстансов по `instanceId` |
 | `WatchStream.eventSubscriptionsSnapshot()` | `Map<string, EventSubscriptionDescriptor>` | — | Копия event-subs; ключ `"${serviceId}\|${pattern}"` (ADR-0004) |

@@ -409,3 +409,94 @@ describe("WatchStream pushed telemetry config", () => {
 		expect(cfg.payloadMaxBytes).toBe(512);
 	});
 });
+
+describe("WatchStream retry", () => {
+	function makeCountingClient(streams: FakeStream[]): {
+		client: RegistryClient;
+		calls: () => number;
+	} {
+		let n = 0;
+		const client = {
+			registerAndWatch: () => {
+				const s = new FakeStream();
+				streams.push(s);
+				n++;
+				return s as unknown as ReturnType<RegistryClient["registerAndWatch"]>;
+			},
+		} as unknown as RegistryClient;
+		return { client, calls: () => n };
+	}
+
+	it("ErrorPlusEnd_SchedulesSingleRestartPerCycle", async () => {
+		// grpc-js can emit both "error" and "end" for one broken stream. Each
+		// break must schedule exactly one restart — a second timer would
+		// multiply live restart loops on every cycle.
+		const streams: FakeStream[] = [];
+		const { client, calls } = makeCountingClient(streams);
+		const ws = new WatchStream({ ladder: [1], jitterRatio: 0 });
+		ws.start(emptyReq, client);
+		expect(calls()).toBe(1);
+
+		for (let cycle = 0; cycle < 3; cycle++) {
+			const current = streams.at(-1);
+			current?.emit("error", new Error("broken"));
+			current?.emit("end");
+			await Bun.sleep(20);
+			expect(calls()).toBe(cycle + 2);
+		}
+		ws.stop();
+	});
+
+	it("StaleStreamEvents_Ignored", async () => {
+		const streams: FakeStream[] = [];
+		const { client, calls } = makeCountingClient(streams);
+		const ws = new WatchStream({ ladder: [1], jitterRatio: 0 });
+		ws.start(emptyReq, client);
+
+		const first = streams[0];
+		first?.emit("error", new Error("broken"));
+		await Bun.sleep(20);
+		expect(calls()).toBe(2);
+
+		// The replaced stream keeps emitting (late cancel/error) — no effect.
+		first?.emit("error", new Error("late"));
+		first?.emit("end");
+		await Bun.sleep(20);
+		expect(calls()).toBe(2);
+		ws.stop();
+	});
+
+	it("Stop_NoRestart", async () => {
+		const streams: FakeStream[] = [];
+		const { client, calls } = makeCountingClient(streams);
+		const ws = new WatchStream({ ladder: [1], jitterRatio: 0 });
+		ws.start(emptyReq, client);
+		ws.stop();
+
+		streams[0]?.emit("error", new Error("closed"));
+		await Bun.sleep(20);
+		expect(calls()).toBe(1);
+	});
+
+	it("DataResetsBackoffLadder", async () => {
+		// After a delivered event the ladder restarts from the bottom: with
+		// ladder [1, 1, 60000] a non-reset attempt counter would park the
+		// second restart on the 60s rung and the count below would stay at 2.
+		const streams: FakeStream[] = [];
+		const { client, calls } = makeCountingClient(streams);
+		const ws = new WatchStream({ ladder: [1, 1, 60_000], jitterRatio: 0 });
+		ws.start(emptyReq, client);
+
+		streams.at(-1)?.emit("error", new Error("first break"));
+		await Bun.sleep(20);
+		expect(calls()).toBe(2);
+
+		streams
+			.at(-1)
+			?.emit("data", snapshot([], allModes(CaptureMode.CAPTURE_MODE_NONE)));
+		streams.at(-1)?.emit("error", new Error("second break"));
+		await Bun.sleep(20);
+		expect(calls()).toBe(3);
+		ws.stop();
+	});
+});

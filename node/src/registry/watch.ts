@@ -12,6 +12,10 @@ import type {
 import { CaptureMode as ProtoCaptureMode } from "../pb/servicebridge/v1/registry";
 import { Channel } from "../pb/servicebridge/v1/telemetry";
 import type { CaptureMode } from "../telemetry/payload-capture";
+import {
+	type ReconnectDelayOptions,
+	reconnectDelay,
+} from "../utils/reconnect-ladder";
 
 // captureModeFromProto maps the runtime-pushed registry enum to the SDK string
 // mode. UNSPECIFIED and unknown values fail safe to "none".
@@ -132,6 +136,18 @@ export class WatchStream {
 	private peersChangeListeners = new Set<
 		(added: string[], removed: string[]) => void
 	>();
+	// Retry state. A broken watch self-restarts on the shared jittered ladder
+	// using the (req, client) from the latest start()/restart(); session
+	// rotation refreshes both via restart(). One pending timer at a time —
+	// "error" and "end" can both fire for a single broken stream, and a second
+	// timer would multiply live restart loops on every break.
+	private _stopped = false;
+	private _attempt = 0;
+	private _timer: ReturnType<typeof setTimeout> | null = null;
+	private lastReq: RegisterRequest | null = null;
+	private lastClient: RegistryClient | null = null;
+
+	constructor(private readonly reconnectOpts?: ReconnectDelayOptions) {}
 
 	start(
 		req: RegisterRequest,
@@ -139,16 +155,20 @@ export class WatchStream {
 		onError?: (err: Error) => void,
 	): void {
 		if (onError) this.onError = onError;
-		this.stream = client.registerAndWatch(req);
-		this.stream.on("data", (evt: RegistryEvent) => this.handleEvent(evt));
-		this.stream.on("error", (err: Error) => this.onError(err));
+		this.lastReq = req;
+		this.lastClient = client;
+		this._stopped = false;
+		this._attempt = 0;
+		this.clearRetryTimer();
+		this.open();
 	}
 
 	stop(): void {
-		if (this.stream) {
-			this.stream.cancel();
-			this.stream = null;
-		}
+		this._stopped = true;
+		this.clearRetryTimer();
+		const old = this.stream;
+		this.stream = null;
+		old?.cancel();
 	}
 
 	restart(
@@ -158,6 +178,53 @@ export class WatchStream {
 	): void {
 		this.stop();
 		this.start(req, client, onError);
+	}
+
+	private open(): void {
+		if (this.lastReq === null || this.lastClient === null) {
+			throw new Error("registry: watch: open before start");
+		}
+		const old = this.stream;
+		this.stream = null;
+		old?.cancel();
+
+		const stream = this.lastClient.registerAndWatch(this.lastReq);
+		this.stream = stream;
+		// Identity guards: a cancelled/replaced stream still emits error/end
+		// asynchronously; only the current stream may act.
+		stream.on("data", (evt: RegistryEvent) => {
+			if (this.stream !== stream) return;
+			this._attempt = 0;
+			this.handleEvent(evt);
+		});
+		stream.on("error", (err: Error) => {
+			if (this.stream !== stream) return;
+			this.stream = null;
+			this.onError(err);
+			this.scheduleRestart();
+		});
+		stream.on("end", () => {
+			if (this.stream !== stream) return;
+			this.stream = null;
+			this.scheduleRestart();
+		});
+	}
+
+	private scheduleRestart(): void {
+		if (this._stopped || this._timer !== null) return;
+		const delay = reconnectDelay(++this._attempt, this.reconnectOpts);
+		this._timer = setTimeout(() => {
+			this._timer = null;
+			if (this._stopped) return;
+			this.open();
+		}, delay);
+	}
+
+	private clearRetryTimer(): void {
+		if (this._timer !== null) {
+			clearTimeout(this._timer);
+			this._timer = null;
+		}
 	}
 
 	snapshot(): ReadonlyMap<string, MethodDescriptor> {

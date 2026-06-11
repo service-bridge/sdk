@@ -1037,7 +1037,11 @@ export class ServiceBridge {
 		this._watchStream.start(
 			this._registry.buildRegisterRequest(),
 			registryClient,
-			(_err) => {},
+			(err) => {
+				console.warn(
+					`[ServiceBridge] registry watch stream error (auto-restarts): ${err.message}`,
+				);
+			},
 		);
 
 		const callbacks: SessionCallbacks = {
@@ -1521,7 +1525,11 @@ export class ServiceBridge {
 			this._watchStream.restart(
 				this._registry.buildRegisterRequest(),
 				newRegistryClient,
-				(_err) => {},
+				(err) => {
+					console.warn(
+						`[ServiceBridge] registry watch stream error (auto-restarts): ${err.message}`,
+					);
+				},
 			);
 		} catch (err) {
 			// Roll back to the previous session: keep oldSession alive and tear
