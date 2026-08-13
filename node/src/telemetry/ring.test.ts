@@ -40,12 +40,15 @@ function logMsg(i: number): Log {
 	};
 }
 
-function metric(name: string): MetricPoint {
+function metric(
+	name: string,
+	labels: Record<string, string> = {},
+): MetricPoint {
 	return {
 		atUnixMs: 1,
 		name,
 		kind: 1,
-		labels: {},
+		labels,
 		instanceId: "i",
 		value: 1,
 		unit: "1",
@@ -165,6 +168,153 @@ describe("TelemetryRing", () => {
 		for (let i = 0; i < 5; i++) ring.push("metrics", metric(`metric_${i}`));
 		expect(ring.totalDropCount()).toBe(ring.dropCount("metrics"));
 		expect(ring.totalDropCount()).toBeGreaterThan(0);
+	});
+
+	test("overflow keeps FIFO order and counts every eviction", () => {
+		// meta padding sizes each op at ~1000 bytes; budget = 10KiB → 10 fit.
+		const ring = new TelemetryRing({ ops: 10 * 1024 });
+		for (let i = 0; i < 100; i++) {
+			ring.push("ops", op(`01900000-0000-7000-8000-0000000${1000 + i}`, 850));
+		}
+		const items = ring.peek(1000);
+		expect(items).toHaveLength(10);
+		expect(ring.size("ops")).toBe(10);
+		expect(ring.dropCount("ops")).toBe(90);
+		// The survivors are the newest 10, still oldest-first.
+		expect(items.map((it) => (it.message as OpReport).opId)).toEqual(
+			Array.from(
+				{ length: 10 },
+				(_, i) => `01900000-0000-7000-8000-0000000${1090 + i}`,
+			),
+		);
+	});
+
+	test("FIFO order survives interleaved commits and evictions", () => {
+		const ring = new TelemetryRing({ ops: 10 * 1024 });
+		for (let i = 0; i < 10; i++) {
+			ring.push("ops", op(`01900000-0000-7000-8000-0000000${1000 + i}`, 850));
+		}
+		// Ack a non-prefix subset: leaves holes in the middle of the buffer.
+		const all = ring.peek(1000);
+		ring.commit([all[2]!, all[5]!, all[6]!]);
+		expect(ring.size("ops")).toBe(7);
+		// Refill past the budget so eviction has to walk over the holes.
+		for (let i = 0; i < 6; i++) {
+			ring.push("ops", op(`01900000-0000-7000-8000-0000000${2000 + i}`, 850));
+		}
+		const ids = ring.peek(1000).map((it) => (it.message as OpReport).opId);
+		expect(ids).toHaveLength(10);
+		expect(ids).toEqual([...ids].sort());
+		expect(ids.slice(-6)).toEqual(
+			Array.from(
+				{ length: 6 },
+				(_, i) => `01900000-0000-7000-8000-0000000${2000 + i}`,
+			),
+		);
+	});
+
+	test("un-acked items outlive repeated peeks after neighbours were acked", () => {
+		const ring = new TelemetryRing();
+		for (let i = 0; i < 5; i++) {
+			ring.push("ops", op(`01900000-0000-7000-8000-0000000000b${i}`));
+		}
+		const all = ring.peek(100);
+		ring.commit([all[0]!, all[1]!, all[3]!]);
+		const first = ring.peek(100).map((it) => (it.message as OpReport).opId);
+		const second = ring.peek(100).map((it) => (it.message as OpReport).opId);
+		expect(first).toEqual([
+			"01900000-0000-7000-8000-0000000000b2",
+			"01900000-0000-7000-8000-0000000000b4",
+		]);
+		expect(second).toEqual(first);
+	});
+
+	test("committing an already-evicted id is a no-op", () => {
+		const ring = new TelemetryRing({ ops: 4 * 1024 });
+		ring.push("ops", op("01900000-0000-7000-8000-0000000000c0", 850));
+		const stale = ring.peek(100);
+		for (let i = 0; i < 8; i++) {
+			ring.push("ops", op(`01900000-0000-7000-8000-0000000000c${i + 1}`, 850));
+		}
+		const before = ring.size("ops");
+		ring.commit(stale);
+		expect(ring.size("ops")).toBe(before);
+	});
+
+	test("metric labels count towards the byte budget", () => {
+		const bare = new TelemetryRing({ metrics: 16 * 1024 });
+		const labelled = new TelemetryRing({ metrics: 16 * 1024 });
+		bare.push("metrics", metric("m"));
+		labelled.push(
+			"metrics",
+			metric("m", { route: "/orders", region: "eu-central-1" }),
+		);
+		expect(labelled.bytes("metrics")).toBe(
+			bare.bytes("metrics") +
+				"route".length +
+				"/orders".length +
+				"region".length +
+				"eu-central-1".length,
+		);
+	});
+
+	test("sustained overflow holds capacity, FIFO and drop accounting", () => {
+		const ring = new TelemetryRing({ ops: 10 * 1024 });
+		for (let i = 0; i < 200_000; i++) {
+			ring.push("ops", op(`01900000-0000-7000-8000-00000${1000000 + i}`, 850));
+		}
+		expect(ring.size("ops")).toBe(10);
+		expect(ring.dropCount("ops")).toBe(199_990);
+		const ids = ring.peek(1000).map((it) => (it.message as OpReport).opId);
+		expect(ids).toEqual(
+			Array.from(
+				{ length: 10 },
+				(_, i) => `01900000-0000-7000-8000-00000${1199990 + i}`,
+			),
+		);
+		expect(ring.bytes("ops")).toBeLessThanOrEqual(10 * 1024);
+	});
+
+	test("push into a saturated ring does not degrade with ring depth", () => {
+		// Each op is ~1000 bytes. The small ring holds ~8 items, the large one
+		// ~1000, and every push over budget evicts one. Cost per push must not
+		// scale with how deep the ring is.
+		const PUSHES = 40_000;
+		const run = (budgetBytes: number): number => {
+			const ring = new TelemetryRing({ ops: budgetBytes });
+			const msg = op("01900000-0000-7000-8000-0000000000d0", 850);
+			const started = performance.now();
+			for (let i = 0; i < PUSHES; i++) ring.push("ops", msg);
+			return performance.now() - started;
+		};
+		run(8 * 1024); // warm the JIT so the first measured run is not penalised
+		const small = run(8 * 1024);
+		const large = run(1000 * 1024);
+		expect(large).toBeLessThan(small * 6 + 100);
+	});
+
+	test("steady-state peek/commit/push does not degrade with ring depth", () => {
+		// The transport peeks a fixed batch, acks it and keeps producing. Rebuilding
+		// the backing array on every ack costs O(depth) and allocates a fresh array
+		// per ack; releasing slots in place and short-circuiting the head prefix
+		// costs O(batch). Growing the ring 80x must not grow the time in step.
+		const BATCH = 256;
+		const ROUNDS = 400;
+		const msg = op("01900000-0000-7000-8000-0000000000e0");
+		const run = (depth: number): number => {
+			const ring = new TelemetryRing({ ops: depth * 4096 });
+			for (let i = 0; i < depth; i++) ring.push("ops", msg);
+			const started = performance.now();
+			for (let r = 0; r < ROUNDS; r++) {
+				ring.commit(ring.peek(BATCH));
+				for (let i = 0; i < BATCH; i++) ring.push("ops", msg);
+			}
+			return performance.now() - started;
+		};
+		run(300); // warm the JIT
+		const shallow = run(300);
+		const deep = run(24_000);
+		expect(deep).toBeLessThan(shallow * 6 + 100);
 	});
 
 	test("push and peek payloads", () => {

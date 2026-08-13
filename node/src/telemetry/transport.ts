@@ -25,7 +25,7 @@ import {
 	type ReconnectDelayOptions,
 	reconnectDelay,
 } from "../utils/reconnect-ladder";
-import type { RingItem, TelemetryRing } from "./ring";
+import type { RingItem, RingKind, TelemetryRing } from "./ring";
 
 /**
  * Minimal stream shape we depend on. The generated gRPC client returns
@@ -99,12 +99,19 @@ export interface TelemetryTransportOptions {
 const DEFAULT_FLUSH_INTERVAL_MS = 250;
 const DEFAULT_MAX_BATCH_ITEMS = 256;
 
+/** One in-flight item plus the ack epoch during which it was written. */
+interface InflightEntry {
+	epoch: number;
+	item: RingItem;
+}
+
 /**
  * TelemetryTransport owns the lifecycle of the Telemetry.Report bidi stream:
  *
- * - Periodically peeks the ring and writes TelemetryBatch frames, tracking the
- *   peeked items as in-flight.
- * - Commits (releases) in-flight items only when the runtime acks — at-least-once.
+ * - Drains the ring into TelemetryBatch frames on every flush tick and on every
+ *   ack, tracking written items as in-flight.
+ * - Commits (releases) in-flight items only once an ack proves the runtime saw
+ *   them — at-least-once.
  * - On `error`/`end` from the stream — drops the in-flight marker (items stay in
  *   the ring) and reopens with an exponential backoff.
  * - Reconnect backoff resets on the FIRST successful ack, not on openStream.
@@ -127,12 +134,16 @@ export class TelemetryTransport {
 	private draining = false;
 	private stopped = false;
 	private reconnectAttempt = 0;
-	// Items written on the current stream but not yet released. Committed on the
-	// next ack; left in the ring (uncommitted) if the stream dies first.
-	private inflight: RingItem[] = [];
+	// Items written on the current stream but not yet released, each tagged with
+	// the ack epoch it was written in. Released once an ack proves the runtime
+	// received them; left in the ring (uncommitted) if the stream dies first.
+	private inflight: InflightEntry[] = [];
 	// Ids currently in-flight, so repeated flushes before an ack do not re-write
 	// the same items (peek leaves them in the ring).
 	private inflightIds = new Set<number>();
+	// Number of acks received on the current connection. Bumped by every ack; an
+	// item's epoch is the value at the moment it was written. See releaseConfirmed.
+	private ackEpoch = 0;
 	// Last drop counts we reported via onDrop, to fire only on increase.
 	private lastServerDrops = 0;
 	private lastRingDrops = 0;
@@ -149,9 +160,12 @@ export class TelemetryTransport {
 	async start(): Promise<void> {
 		this.stopped = false;
 		this.openStream();
-		this.flushTimer = setInterval(() => {
+		const timer = setInterval(() => {
 			void this.flushNow();
 		}, this.flushIntervalMs);
+		// The flusher must not keep the process alive on its own.
+		if (typeof timer.unref === "function") timer.unref();
+		this.flushTimer = timer;
 	}
 
 	async stop(): Promise<void> {
@@ -167,7 +181,7 @@ export class TelemetryTransport {
 		if (this.stream) {
 			try {
 				// Best-effort final flush so in-flight ops reach the runtime on shutdown.
-				this.writeBatchToStream();
+				this.pump();
 				this.stream.end();
 			} catch {
 				// Stream already torn down — nothing to do.
@@ -186,22 +200,33 @@ export class TelemetryTransport {
 	async flushNow(): Promise<void> {
 		if (this.stopped) return;
 		if (!this.stream) return;
-		this.writeBatchToStream();
+		this.pump();
 	}
 
-	// writeBatchToStream peeks the ring, writes one TelemetryBatch per non-empty
-	// kind, and records the peeked items as in-flight (released on the next ack).
-	// Peek does NOT remove from the ring, so a stream death before the ack leaves
-	// the items in place for the next stream (at-least-once).
-	private writeBatchToStream(): void {
-		if (!this.stream) return;
-		// Peek leaves items in the ring, so a repeated flush before an ack sees the
-		// same items again — skip the ones already on the wire (in-flight) so we do
-		// not double-write them every tick.
-		const items = this.ring
-			.peek(this.maxBatchItems)
-			.filter((it) => !this.inflightIds.has(it.id));
-		if (items.length === 0) return;
+	// pump materialises the accumulated metric series into the ring, then writes
+	// batch after batch until nothing is left un-written. Throughput is bounded by
+	// what the ring holds, not by one batch per timer tick: a single batch per
+	// 250ms tick caps the SDK at maxBatchItems*4 frames/s regardless of how fast
+	// the runtime consumes them. Each pass strictly grows inflightIds, so the loop
+	// terminates.
+	private pump(): void {
+		// One aggregation window per flush cycle. Draining here rather than per
+		// written batch keeps a cycle's metric points in one batch instead of
+		// splintering them across the batches the loop below emits.
+		this.ring.metrics.flush();
+		let wrote = true;
+		while (wrote) wrote = this.writeBatchToStream();
+	}
+
+	// writeBatchToStream selects the next un-written slice of the ring, writes one
+	// TelemetryBatch per non-empty kind, and records the items as in-flight. Peek
+	// does NOT remove from the ring, so a stream death before confirmation leaves
+	// the items in place for the next stream (at-least-once). Returns whether
+	// anything was written.
+	private writeBatchToStream(): boolean {
+		if (!this.stream) return false;
+		const items = this.selectNextBatch();
+		if (items.length === 0) return false;
 		const byKind = groupByKind(items);
 		if (byKind.ops.length > 0) {
 			this.stream.write({ ops: OpBatch.fromPartial({ items: byKind.ops }) });
@@ -219,10 +244,33 @@ export class TelemetryTransport {
 				payloads: PayloadBatch.fromPartial({ items: byKind.payloads }),
 			});
 		}
-		// Track everything written on this stream as in-flight. The next ack
-		// confirms the runtime processed (or at least received) it.
 		for (const it of items) this.inflightIds.add(it.id);
-		this.inflight.push(...items);
+		for (const it of items)
+			this.inflight.push({ epoch: this.ackEpoch, item: it });
+		return true;
+	}
+
+	// selectNextBatch returns up to maxBatchItems per kind that are not already on
+	// the wire. It peeks PAST the in-flight prefix: peek() returns the ring head
+	// oldest-first and in-flight items sit at that head until they are committed,
+	// so a peek capped at maxBatchItems would return in-flight items only and the
+	// transport would write nothing at all until the next ack.
+	private selectNextBatch(): RingItem[] {
+		const peeked = this.ring.peek(this.maxBatchItems + this.inflightIds.size);
+		const perKind: Record<RingKind, number> = {
+			ops: 0,
+			logs: 0,
+			metrics: 0,
+			payloads: 0,
+		};
+		const taken: RingItem[] = [];
+		for (const it of peeked) {
+			if (this.inflightIds.has(it.id)) continue;
+			if (perKind[it.kind] >= this.maxBatchItems) continue;
+			perKind[it.kind]++;
+			taken.push(it);
+		}
+		return taken;
 	}
 
 	private openStream(): void {
@@ -247,27 +295,52 @@ export class TelemetryTransport {
 
 		this.backpressureLevel = ack.backpressureLevel;
 
-		// Release everything written before this ack: the runtime has received it.
-		if (this.inflight.length > 0) {
-			this.ring.commit(this.inflight);
-			this.inflight = [];
-			this.inflightIds.clear();
-		}
-
+		this.releaseConfirmed();
 		this.reportDrops(ack);
+
+		// Credit-based pipelining: an ack is the cheapest signal that the runtime
+		// is keeping up, so refill the wire immediately instead of idling until the
+		// next timer tick. Costs nothing when the ring is empty.
+		this.pump();
 
 		if (ack.drainReason && !this.draining) {
 			this.draining = true;
-			// Final flush of everything still in the ring, then graceful local close.
-			// The runtime sends EOF; handleStreamGone reopens after a delay so future
-			// ops are not silently dropped if the process keeps running.
-			this.writeBatchToStream();
+			// Graceful local close after the final flush above. The runtime sends
+			// EOF; handleStreamGone reopens after a delay so future ops are not
+			// silently dropped if the process keeps running.
 			try {
 				this.stream?.end();
 			} catch {
 				// Already torn down.
 			}
 		}
+	}
+
+	// releaseConfirmed commits only the items an ack actually proves were seen.
+	//
+	// TelemetryAck carries no batch identifier and the runtime emits it on a fixed
+	// ticker, so an ack cannot name what it confirms. What it does prove is that
+	// the runtime's receive loop had consumed everything that reached it before
+	// the ack was emitted. An item written during epoch E left this process before
+	// ack E arrived here, so the runtime had it at most one network delay after
+	// ack E was emitted — comfortably before the next ack goes out one ack
+	// interval later. Epoch E is therefore confirmed by the ack that raises
+	// ackEpoch to E+2, one ack of lag. Releasing the current epoch as well (what a
+	// whole-inflight commit does) would drop items written by a flush that raced
+	// the ack in transit: they would vanish from the ring having never arrived.
+	private releaseConfirmed(): void {
+		this.ackEpoch++;
+		if (this.inflight.length === 0) return;
+		const confirmed: RingItem[] = [];
+		const held: InflightEntry[] = [];
+		for (const entry of this.inflight) {
+			if (entry.epoch < this.ackEpoch - 1) confirmed.push(entry.item);
+			else held.push(entry);
+		}
+		if (confirmed.length === 0) return;
+		this.ring.commit(confirmed);
+		for (const it of confirmed) this.inflightIds.delete(it.id);
+		this.inflight = held;
 	}
 
 	private reportDrops(ack: TelemetryAck): void {

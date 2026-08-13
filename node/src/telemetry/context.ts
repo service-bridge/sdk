@@ -36,9 +36,17 @@ export async function* streamWithContext<T>(
 	gen: () => AsyncIterable<T>,
 ): AsyncIterable<T> {
 	const iter = gen()[Symbol.asyncIterator]();
-	while (true) {
-		const result = await als.run(ctx, () => iter.next());
-		if (result.done) break;
-		yield result.value;
+	try {
+		while (true) {
+			const result = await als.run(ctx, () => iter.next());
+			if (result.done) break;
+			yield result.value;
+		}
+	} finally {
+		// A consumer `break`/`return`/`throw` resumes this generator at the yield
+		// and unwinds it. Without forwarding return(), the source iterator stays
+		// parked on its own yield forever and the gRPC call underneath it is never
+		// cancelled — one leaked HTTP/2 stream per abandoned `for await`.
+		await als.run(ctx, () => iter.return?.());
 	}
 }

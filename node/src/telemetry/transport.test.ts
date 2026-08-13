@@ -187,7 +187,7 @@ describe("TelemetryTransport", () => {
 		expect(second.written[0]!.ops!.items[0]!.opId).toBe(makeOpParams().opId);
 	});
 
-	test("committed ops are NOT re-sent after a later stream drop", async () => {
+	test("confirmed ops are NOT re-sent after a later stream drop", async () => {
 		transport = new TelemetryTransport({
 			client,
 			ring,
@@ -200,15 +200,52 @@ describe("TelemetryTransport", () => {
 		OpHandle.start(ring, makeOpParams());
 		await transport.flushNow();
 		const first = client.current();
-		// Runtime acks → in-flight committed (released from the ring).
+		// The runtime acks on a fixed ticker and the ack names no batch, so a single
+		// ack cannot confirm a write that may have raced it in transit. The write is
+		// confirmed by the following ack, which is emitted an ack interval later.
+		first.ack();
 		first.ack();
 
 		first.emit("error", new Error("transport gone"));
 		await new Promise((r) => setTimeout(r, 5));
 
 		await transport.flushNow();
-		// Nothing left to send — the op was acked and released.
+		// Nothing left to send — the op was confirmed and released.
 		expect(totalOps(client.current().written)).toBe(0);
+	});
+
+	test("an ack does NOT release a write that raced it — the write survives the stream death", async () => {
+		transport = new TelemetryTransport({
+			client,
+			ring,
+			flushIntervalMs: 1000,
+			maxBatchItems: 100,
+			reconnectOpts: { ladder: [0], jitterRatio: 0 },
+		});
+		await transport.start();
+		const first = client.current();
+
+		// Op A is written and confirmed by two acks.
+		ring.push("ops", op("01900000-0000-7000-8000-0000000000a1"));
+		await transport.flushNow();
+		first.ack();
+
+		// Op B is written by a flush that slips out AFTER the runtime built its ack
+		// but BEFORE that ack lands here — the runtime has not seen B yet.
+		ring.push("ops", op("01900000-0000-7000-8000-0000000000b2"));
+		await transport.flushNow();
+		first.ack();
+
+		// Stream dies before any further ack. A was confirmed, B was not.
+		first.emit("error", new Error("transport gone"));
+		await new Promise((r) => setTimeout(r, 5));
+		await transport.flushNow();
+
+		const resent = client
+			.current()
+			.written.filter((b) => b.ops)
+			.flatMap((b) => b.ops!.items.map((i) => i.opId));
+		expect(resent).toEqual(["01900000-0000-7000-8000-0000000000b2"]);
 	});
 
 	test("backpressure level 2 does NOT pause the flusher (advisory only)", async () => {
@@ -442,6 +479,148 @@ describe("TelemetryTransport", () => {
 		client.current().ack();
 		expect(seen.length).toBe(1);
 		expect(seen[0]!.ring).toBeGreaterThan(0);
+	});
+
+	test("an ack immediately writes the next batch instead of waiting for the timer", async () => {
+		// flushIntervalMs is far longer than the test — anything written after the
+		// first flush can only come from the ack path.
+		transport = new TelemetryTransport({
+			client,
+			ring,
+			flushIntervalMs: 60_000,
+			maxBatchItems: 2,
+		});
+		await transport.start();
+		const stream = client.current();
+
+		// Ops produced after the flush cycle have no timer tick left to carry them.
+		for (let i = 0; i < 6; i++) {
+			ring.push("ops", op(`01900000-0000-7000-8000-00000000000${i}`));
+		}
+		expect(totalOps(stream.written)).toBe(0);
+
+		stream.ack();
+		expect(totalOps(stream.written)).toBe(6);
+	});
+
+	test("2000 frames drain in one flush cycle — throughput is not capped at one batch per tick", async () => {
+		// A single 256-item batch per 250ms tick caps the SDK near 1024 frames/s,
+		// i.e. ~512 ops/s once every op costs a START and an END frame. Worse, with
+		// in-flight items pinned at the ring head, a peek capped at the batch size
+		// returns nothing but in-flight and the transport stalls entirely until the
+		// next ack (2s on the runtime ticker). One flush cycle must move the whole
+		// backlog.
+		const frames = 2000;
+		ring = new TelemetryRing({ ops: 4 * 1024 * 1024 });
+		transport = new TelemetryTransport({
+			client,
+			ring,
+			flushIntervalMs: 60_000,
+			maxBatchItems: 256,
+		});
+		await transport.start();
+		const stream = client.current();
+
+		for (let i = 0; i < frames; i++) {
+			ring.push(
+				"ops",
+				op(`01900000-0000-7000-8000-${String(i).padStart(12, "0")}`),
+			);
+		}
+		expect(ring.dropCount("ops")).toBe(0);
+
+		await transport.flushNow();
+
+		expect(totalOps(stream.written)).toBe(frames);
+		// 2000 frames in one 250ms tick is ≥ 8000 frames/s ≥ 4000 ops/s.
+		expect(totalOps(stream.written) / (250 / 1000)).toBeGreaterThan(512 * 2);
+	});
+
+	test("sustained produce/ack cycles deliver every frame without loss", async () => {
+		const perCycle = 600;
+		const cycles = 5;
+		ring = new TelemetryRing({ ops: 4 * 1024 * 1024 });
+		transport = new TelemetryTransport({
+			client,
+			ring,
+			flushIntervalMs: 60_000,
+			maxBatchItems: 256,
+		});
+		await transport.start();
+		const stream = client.current();
+
+		const produced: string[] = [];
+		for (let c = 0; c < cycles; c++) {
+			for (let i = 0; i < perCycle; i++) {
+				const id = `01900000-0000-7000-8000-${String(c * perCycle + i).padStart(12, "0")}`;
+				produced.push(id);
+				ring.push("ops", op(id));
+			}
+			await transport.flushNow();
+			stream.ack();
+		}
+
+		expect(ring.dropCount("ops")).toBe(0);
+		const sent = stream.written
+			.filter((b) => b.ops)
+			.flatMap((b) => b.ops!.items.map((i) => i.opId));
+		expect(new Set(sent).size).toBe(produced.length);
+		expect([...new Set(sent)].sort()).toEqual([...produced].sort());
+	});
+
+	test("materialises accumulated metric series into the batch", async () => {
+		transport = new TelemetryTransport({
+			client,
+			ring,
+			flushIntervalMs: 60_000,
+			maxBatchItems: 100,
+		});
+		await transport.start();
+
+		// The aggregator holds series state, not points — nothing reaches the ring
+		// until a flush cycle closes the aggregation window.
+		const hits = ring.metrics.counter("inst-1", "http_hits");
+		hits.inc();
+		hits.inc(2);
+		ring.metrics.gauge("inst-1", "queue_depth").set(7);
+
+		await transport.flushNow();
+		const points = client
+			.current()
+			.written.filter((b) => b.metrics)
+			.flatMap((b) => b.metrics!.items);
+		expect(points.map((m) => m.name).sort()).toEqual([
+			"http_hits",
+			"queue_depth",
+		]);
+		// Three producer calls collapsed into one point per series.
+		expect(points.find((m) => m.name === "http_hits")?.value).toBe(3);
+		expect(points.find((m) => m.name === "queue_depth")?.value).toBe(7);
+	});
+
+	test("an unchanged series emits nothing on the next flush cycle", async () => {
+		transport = new TelemetryTransport({
+			client,
+			ring,
+			flushIntervalMs: 60_000,
+			maxBatchItems: 100,
+		});
+		await transport.start();
+
+		ring.metrics.counter("inst-1", "http_hits").inc();
+		await transport.flushNow();
+		const afterFirst = client
+			.current()
+			.written.filter((b) => b.metrics)
+			.flatMap((b) => b.metrics!.items).length;
+		expect(afterFirst).toBe(1);
+
+		await transport.flushNow();
+		const afterSecond = client
+			.current()
+			.written.filter((b) => b.metrics)
+			.flatMap((b) => b.metrics!.items).length;
+		expect(afterSecond).toBe(1);
 	});
 
 	test("stop() closes the stream and cancels timers", async () => {

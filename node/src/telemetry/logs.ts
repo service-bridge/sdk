@@ -2,7 +2,9 @@
 // @public — см. ./README.md
 
 import { type Log, LogLevel } from "../pb/servicebridge/v1/telemetry";
+import { currentTraceContext } from "./context";
 import type { TelemetryRing } from "./ring";
+import { ZERO_OP_ID } from "./trace-context";
 
 export { LogLevel };
 
@@ -34,13 +36,17 @@ function push(
 	message: string,
 	fields?: LogFields,
 ): void {
+	const ctx = currentTraceContext();
 	const entry: Log = {
 		atUnixMs: Date.now(),
 		level,
 		message,
 		fieldsJson: fields ? encode(fields) : Buffer.alloc(0),
-		traceId: "",
-		opId: "",
+		traceId: ctx?.traceId ?? "",
+		// parentOpId is the operation the log was emitted inside. ZERO_OP_ID is the
+		// "no enclosing op" sentinel, not an op that exists — send empty so the
+		// runtime stores NULL instead of a dangling id.
+		opId: ctx && ctx.parentOpId !== ZERO_OP_ID ? ctx.parentOpId : "",
 		instanceId,
 		source: "sdk",
 	};

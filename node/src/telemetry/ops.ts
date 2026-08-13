@@ -169,6 +169,15 @@ export class OpHandle {
 	}
 
 	/**
+	 * Whether serialising a payload for this op can produce anything. Reading the
+	 * already-resolved mode also honours a per-handler narrowing, which a caller
+	 * asking the channel's mode directly would miss.
+	 */
+	get capturing(): boolean {
+		return this.params.captureMode !== "none";
+	}
+
+	/**
 	 * Capture the inbound (request/input) payload for this op. Direction = IN.
 	 * "all" emits immediately; "errors" buffers until end; "none" is a no-op.
 	 */

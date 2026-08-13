@@ -11,6 +11,7 @@ import type {
 	OpReport,
 	PayloadAttachment,
 } from "../pb/servicebridge/v1/telemetry";
+import { MetricsAggregator } from "./metrics";
 
 export type RingKind = "ops" | "logs" | "metrics" | "payloads";
 
@@ -77,7 +78,10 @@ function estimateSize(kind: RingKind, msg: RingMessage[RingKind]): number {
 		}
 		case "metrics": {
 			const m = msg as MetricPoint;
-			return base + m.name.length + byteLen(m.bucketsJson);
+			let size = base + m.name.length + byteLen(m.bucketsJson);
+			for (const [k, v] of Object.entries(m.labels))
+				size += k.length + v.length;
+			return size;
 		}
 		case "payloads": {
 			const m = msg as PayloadAttachment;
@@ -90,9 +94,22 @@ function byteLen(b: Uint8Array | undefined): number {
 	return b ? b.byteLength : 0;
 }
 
+// Dead slots tolerated before a repack. Keeps small rings from repacking on
+// every removal while bounding the wasted array span to ~2x the live count.
+const COMPACT_SLACK = 64;
+
+// KindRing stores its live items in the half-open span [head, buf.length) of a
+// plain array. Removal nulls a slot and advances an index instead of splicing
+// or rebuilding the array, so both eviction and ack cost stay independent of
+// ring depth — the default ops budget holds ~2600 items, and an ack that
+// rebuilds the array pays (and allocates) 2600 slots four times a second.
+// The dead prefix and any holes left by a partial ack are reclaimed by an
+// amortized repack.
 class KindRing<K extends RingKind> {
 	private readonly budget: number;
-	private items: RingItem<K>[] = [];
+	private buf: (RingItem<K> | undefined)[] = [];
+	private head = 0;
+	private liveCount = 0;
 	private usedBytes = 0;
 	dropCount = 0;
 	readonly kind: K;
@@ -109,12 +126,11 @@ class KindRing<K extends RingKind> {
 			this.dropCount++;
 			return;
 		}
-		while (this.usedBytes + bytes > this.budget && this.items.length > 0) {
-			const dropped = this.items.shift()!;
-			this.usedBytes -= dropped.bytes;
-			this.dropCount++;
+		while (this.usedBytes + bytes > this.budget && this.liveCount > 0) {
+			this.dropOldest();
 		}
-		this.items.push({ id: _nextId++, kind: this.kind, message, bytes });
+		this.buf.push({ id: _nextId++, kind: this.kind, message, bytes });
+		this.liveCount++;
 		this.usedBytes += bytes;
 	}
 
@@ -123,30 +139,89 @@ class KindRing<K extends RingKind> {
 	// contract: a peeked batch stays in the ring (oldest-first) and is re-peeked
 	// on the next stream if the runtime never acks it.
 	peek(maxItems: number): RingItem<K>[] {
-		const take = Math.min(maxItems, this.items.length);
-		return this.items.slice(0, take);
+		const out: RingItem<K>[] = [];
+		if (maxItems <= 0) return out;
+		for (let i = this.head; i < this.buf.length; i++) {
+			const item = this.buf[i];
+			if (item === undefined) continue;
+			out.push(item);
+			if (out.length === maxItems) break;
+		}
+		return out;
 	}
 
 	// commit removes items whose ids are in the acked set, releasing the bytes.
 	commit(ackedIds: Set<number>): void {
-		if (ackedIds.size === 0) return;
-		const kept: RingItem<K>[] = [];
-		for (const item of this.items) {
-			if (ackedIds.has(item.id)) {
-				this.usedBytes -= item.bytes;
-			} else {
-				kept.push(item);
+		if (ackedIds.size === 0 || this.liveCount === 0) return;
+		let removed = 0;
+		// peek hands out oldest-first, so an ack almost always covers a head
+		// prefix. Walking the head first and stopping once the whole set is
+		// accounted for keeps the common case O(|ack|) instead of O(ring).
+		while (this.head < this.buf.length && removed < ackedIds.size) {
+			const item = this.buf[this.head];
+			if (item === undefined) {
+				this.head++;
+				continue;
+			}
+			if (!ackedIds.has(item.id)) break;
+			this.release(this.head);
+			removed++;
+		}
+		if (removed < ackedIds.size) {
+			for (let i = this.head; i < this.buf.length; i++) {
+				const item = this.buf[i];
+				if (item === undefined || !ackedIds.has(item.id)) continue;
+				this.release(i);
+				removed++;
+				if (removed === ackedIds.size) break;
 			}
 		}
-		this.items = kept;
+		this.advanceHead();
+		this.maybeCompact();
 	}
 
 	get size(): number {
-		return this.items.length;
+		return this.liveCount;
 	}
 
 	get bytes(): number {
 		return this.usedBytes;
+	}
+
+	private dropOldest(): void {
+		this.advanceHead();
+		this.release(this.head);
+		this.dropCount++;
+		this.advanceHead();
+		this.maybeCompact();
+	}
+
+	private release(index: number): void {
+		const item = this.buf[index] as RingItem<K>;
+		this.buf[index] = undefined;
+		this.liveCount--;
+		this.usedBytes -= item.bytes;
+	}
+
+	private advanceHead(): void {
+		while (this.head < this.buf.length && this.buf[this.head] === undefined) {
+			this.head++;
+		}
+	}
+
+	// maybeCompact repacks the live items to the front once dead slots outnumber
+	// live ones. Each repack costs O(buf) but needs at least `liveCount` removals
+	// to become due again, so removal stays amortized O(1).
+	private maybeCompact(): void {
+		const dead = this.buf.length - this.liveCount;
+		if (dead <= COMPACT_SLACK || dead <= this.liveCount) return;
+		const packed: (RingItem<K> | undefined)[] = [];
+		for (let i = this.head; i < this.buf.length; i++) {
+			const item = this.buf[i];
+			if (item !== undefined) packed.push(item);
+		}
+		this.buf = packed;
+		this.head = 0;
 	}
 }
 
@@ -160,6 +235,13 @@ export class TelemetryRing {
 		metrics: KindRing<"metrics">;
 		payloads: KindRing<"payloads">;
 	};
+
+	// Metric state is accumulated per series here and materialised into the
+	// metrics ring one point per series per aggregation window. The ring owns the
+	// aggregator but never drains it: the window boundary belongs to whoever
+	// drives the flush cycle (the transport calls `metrics.flush()` once per
+	// cycle, so a cycle's points land in one batch).
+	readonly metrics = new MetricsAggregator(this);
 
 	constructor(budgets?: RingBudgets) {
 		this.rings = {

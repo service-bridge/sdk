@@ -8,8 +8,21 @@ export {
 } from "./context";
 export type { LogFields } from "./logs";
 export { LogLevel, makeLogger } from "./logs";
-export type { Labels } from "./metrics";
-export { MetricKind, makeCounter, makeGauge, makeHistogram } from "./metrics";
+export type {
+	Counter,
+	Gauge,
+	Histogram,
+	HistogramBucket,
+	Labels,
+} from "./metrics";
+export {
+	DEFAULT_HISTOGRAM_BOUNDS,
+	MetricKind,
+	MetricsAggregator,
+	makeCounter,
+	makeGauge,
+	makeHistogram,
+} from "./metrics";
 export type { StartOpParams } from "./ops";
 export {
 	Channel,
