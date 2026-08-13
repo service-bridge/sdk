@@ -3,6 +3,7 @@ module github.com/service-bridge/sdk/go
 go 1.24.0
 
 require (
+	github.com/go-chi/chi/v5 v5.3.1
 	github.com/google/uuid v1.6.0
 	github.com/robfig/cron/v3 v3.0.1
 	golang.org/x/sync v0.19.0
@@ -13,7 +14,6 @@ require (
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/go-chi/chi/v5 v5.3.1 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
