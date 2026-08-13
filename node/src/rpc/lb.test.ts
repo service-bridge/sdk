@@ -113,31 +113,117 @@ describe("LoadBalancer P2C", () => {
 
 	it("P2C picks the candidate with fewer inflight", () => {
 		const cb = new CircuitBreakerRegistry();
-		// Random sequence drives p2c sampling: pick i=0, j=1 (no shift, since 1>=0 → j=2; we want a vs b)
-		// random() called twice: floor(0.0 * 3)=0 → i=0; floor(0.0 * 2)=0 → j=0, j>=i so j=1.
-		const lb = new LoadBalancer(cb, { random: scriptedRandom([0.0, 0.0]) });
+		const lb = new LoadBalancer(cb);
 		const a = cand("a", "h:1");
 		const b = cand("b", "h:2");
-		const c = cand("c", "h:3");
 
 		const release = lb.acquire("a"); // a has 1 inflight; b has 0
 		try {
-			const picked = lb.pick([a, b, c]);
-			// random pick samples a (i=0) and b (j=1); b has fewer inflight → b wins.
-			expect(picked.instance.instanceId).toBe("b");
+			// Exactly two eligible candidates → both fill the reservoir, no sampling.
+			expect(lb.pick([a, b]).instance.instanceId).toBe("b");
 		} finally {
 			release();
 		}
 	});
 
-	it("ties break toward the first sampled candidate", () => {
+	it("ties on inflight resolve by coin flip, not by candidate order", () => {
 		const cb = new CircuitBreakerRegistry();
-		const lb = new LoadBalancer(cb, { random: scriptedRandom([0.0, 0.0]) });
 		const a = cand("a", "h:1");
 		const b = cand("b", "h:2");
-		const picked = lb.pick([a, b]);
-		// Both at inflight=0 → ai <= bi true → a wins.
-		expect(picked.instance.instanceId).toBe("a");
+		// Both at inflight=0. The final draw orders the sampled pair, so neither
+		// position is privileged.
+		const heads = new LoadBalancer(cb, { random: scriptedRandom([0.1]) });
+		expect(heads.pick([a, b]).instance.instanceId).toBe("a");
+		const tails = new LoadBalancer(cb, { random: scriptedRandom([0.9]) });
+		expect(tails.pick([a, b]).instance.instanceId).toBe("b");
+	});
+
+	describe("two-slot reservoir sampling", () => {
+		const a = cand("a", "h:1");
+		const b = cand("b", "h:2");
+		const c = cand("c", "h:3");
+
+		// With three eligible candidates the draws are [slot, coin]: the third
+		// candidate replaces reservoir slot floor(slot * 3) when that lands on 0
+		// or 1, then the coin orders the pair.
+		it("third candidate takes the first slot when the draw is 0", () => {
+			const cb = new CircuitBreakerRegistry();
+			const lb = new LoadBalancer(cb, { random: scriptedRandom([0.0, 0.9]) });
+			const release = lb.acquire("b"); // reservoir becomes {c, b}; b is loaded
+			try {
+				expect(lb.pick([a, b, c]).instance.instanceId).toBe("c");
+			} finally {
+				release();
+			}
+		});
+
+		it("third candidate takes the second slot when the draw is 1", () => {
+			const cb = new CircuitBreakerRegistry();
+			const lb = new LoadBalancer(cb, { random: scriptedRandom([0.5, 0.9]) });
+			const release = lb.acquire("a"); // reservoir becomes {a, c}; a is loaded
+			try {
+				expect(lb.pick([a, b, c]).instance.instanceId).toBe("c");
+			} finally {
+				release();
+			}
+		});
+
+		it("reservoir is untouched when the draw falls outside both slots", () => {
+			const cb = new CircuitBreakerRegistry();
+			const lb = new LoadBalancer(cb, { random: scriptedRandom([0.9, 0.9]) });
+			const release = lb.acquire("a"); // reservoir stays {a, b}; a is loaded
+			try {
+				expect(lb.pick([a, b, c]).instance.instanceId).toBe("b");
+			} finally {
+				release();
+			}
+		});
+
+		it("every candidate in a large fleet stays reachable", () => {
+			const cb = new CircuitBreakerRegistry();
+			// Deterministic LCG so the distribution assertion cannot flake.
+			let seed = 0x2545f491;
+			const lb = new LoadBalancer(cb, {
+				random: () => {
+					seed = (seed * 1664525 + 1013904223) >>> 0;
+					return seed / 0x1_0000_0000;
+				},
+			});
+			const fleet = Array.from({ length: 50 }, (_, i) =>
+				cand(`i-${i}`, `h:${i}`),
+			);
+			const wins = new Map<string, number>();
+			for (let n = 0; n < 20_000; n++) {
+				const id = lb.pick(fleet).instance.instanceId;
+				wins.set(id, (wins.get(id) ?? 0) + 1);
+			}
+			expect(wins.size).toBe(fleet.length);
+			// All inflight counters stay at 0, so selection is pure sampling —
+			// no candidate may dominate the fleet.
+			for (const count of wins.values()) {
+				expect(count).toBeGreaterThan(20_000 / fleet.length / 4);
+				expect(count).toBeLessThan((20_000 / fleet.length) * 4);
+			}
+		});
+	});
+
+	it("pick does not materialise an intermediate array", () => {
+		const cb = new CircuitBreakerRegistry();
+		const lb = new LoadBalancer(cb);
+		const fleet = Array.from({ length: 200 }, (_, i) =>
+			cand(`i-${i}`, `h:${i}`),
+		);
+		// Any array-producing traversal on the candidate list is a per-call
+		// allocation on the RPC hot path — trap them all.
+		for (const method of ["filter", "map", "slice", "concat", "flatMap"]) {
+			Object.defineProperty(fleet, method, {
+				configurable: true,
+				value: () => {
+					throw new Error(`pick allocated via Array#${method}`);
+				},
+			});
+		}
+		expect(lb.pick(fleet).instance.instanceId).toMatch(/^i-\d+$/);
 	});
 
 	it("acquire / release symmetry", () => {
@@ -217,6 +303,28 @@ describe("LoadBalancer HALF_OPEN single-probe", () => {
 		clock.t += OPEN_DURATION_MS + 1;
 		const second = lb.pick([a]);
 		expect(second.instance.instanceId).toBe("a");
+	});
+
+	it("admits exactly one probe across many picks over a fleet", () => {
+		const clock = { t: 1_000_000 };
+		const cb = new CircuitBreakerRegistry(() => clock.t);
+		const lb = new LoadBalancer(cb, { now: () => clock.t });
+		const probing = cand("p", "h:0");
+		const peers = Array.from({ length: 5 }, (_, i) =>
+			cand(`peer-${i}`, `h:${i + 1}`),
+		);
+		driveHalfOpen(cb, clock, cbKey(probing.instance));
+
+		// More than two eligible candidates, so the reservoir sampling path runs.
+		// The probe slot must still be claimed at most once — nothing releases it
+		// because no caller records an outcome.
+		let probeWins = 0;
+		for (let n = 0; n < 200; n++) {
+			if (lb.pick([probing, ...peers]).instance.instanceId === "p") {
+				probeWins++;
+			}
+		}
+		expect(probeWins).toBeLessThanOrEqual(1);
 	});
 
 	it("closes the breaker on probe success and admits all callers again", () => {

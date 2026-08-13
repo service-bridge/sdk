@@ -15,6 +15,10 @@
 // until the probe completes or the probe window times out (probe ownership is
 // best-effort within a pod; ADR 0001 accepts duplicate probes across pods).
 //
+// Entry lifetime is bounded: instance ids are recycled on every rolling deploy,
+// so entries are dropped by `retain` when the registry snapshot no longer lists
+// the instance, and by an idle sweep after IDLE_TTL_MS as a backstop.
+//
 // @internal — см. ./README.md
 
 export const WINDOW_SIZE_MS = 10_000;
@@ -23,6 +27,13 @@ export const BUCKET_MS = WINDOW_SIZE_MS / BUCKET_COUNT;
 export const MIN_REQUESTS = 10;
 export const ERROR_THRESHOLD = 0.5;
 export const OPEN_DURATION_MS = 30_000;
+
+// IDLE_TTL_MS bounds how long an entry survives without being touched. The
+// registry is the authority on which instances still exist (see `retain`); this
+// TTL is the backstop for the window between snapshots. It must stay well above
+// OPEN_DURATION_MS — dropping an OPEN entry resets it to CLOSED and would
+// re-admit full traffic to an instance that is still broken.
+export const IDLE_TTL_MS = WINDOW_SIZE_MS * 6;
 
 type State = "CLOSED" | "OPEN" | "HALF_OPEN";
 
@@ -36,6 +47,7 @@ interface Entry {
 	state: State;
 	openedAt: number;
 	probeInFlight: boolean;
+	touchedAt: number;
 	buckets: Bucket[]; // ring buffer of length BUCKET_COUNT
 }
 
@@ -48,7 +60,13 @@ function newEntry(now: number): Entry {
 			errors: 0,
 		});
 	}
-	return { state: "CLOSED", openedAt: 0, probeInFlight: false, buckets };
+	return {
+		state: "CLOSED",
+		openedAt: 0,
+		probeInFlight: false,
+		touchedAt: now,
+		buckets,
+	};
 }
 
 // currentBucket rotates the ring buffer in place so that the head bucket
@@ -96,9 +114,11 @@ function windowTotals(
 export class CircuitBreakerRegistry {
 	private map = new Map<string, Entry>();
 	private now: () => number;
+	private lastSweepAt: number;
 
 	constructor(now: () => number = Date.now) {
 		this.now = now;
+		this.lastSweepAt = now();
 	}
 
 	// canCall returns true when the breaker is CLOSED, or when it has been
@@ -111,7 +131,9 @@ export class CircuitBreakerRegistry {
 	canCall(key: string): boolean {
 		const e = this.map.get(key);
 		if (!e) return true;
-		this.maybeHalfOpen(e);
+		const now = this.now();
+		e.touchedAt = now;
+		this.maybeHalfOpen(e, now);
 		if (e.state === "CLOSED") return true;
 		if (e.state === "HALF_OPEN") {
 			if (e.probeInFlight) return false;
@@ -127,7 +149,9 @@ export class CircuitBreakerRegistry {
 	probeAvailable(key: string): boolean {
 		const e = this.map.get(key);
 		if (!e) return true;
-		this.maybeHalfOpen(e);
+		const now = this.now();
+		e.touchedAt = now;
+		this.maybeHalfOpen(e, now);
 		if (e.state === "OPEN") return false;
 		if (e.state === "HALF_OPEN") return !e.probeInFlight;
 		return true;
@@ -166,12 +190,30 @@ export class CircuitBreakerRegistry {
 	state(key: string): State {
 		const e = this.map.get(key);
 		if (!e) return "CLOSED";
-		this.maybeHalfOpen(e);
+		const now = this.now();
+		e.touchedAt = now;
+		this.maybeHalfOpen(e, now);
 		return e.state;
 	}
 
-	reset(key: string): void {
+	evict(key: string): void {
 		this.map.delete(key);
+	}
+
+	// retain drops every entry whose key is absent from `liveKeys`. The registry
+	// snapshot is the only source of truth about which instances still exist, so
+	// the owner of that snapshot must call this whenever the instance set
+	// changes. Without it a rolling deploy leaks one entry per retired pod.
+	retain(liveKeys: ReadonlySet<string>): void {
+		for (const key of this.map.keys()) {
+			if (!liveKeys.has(key)) this.map.delete(key);
+		}
+		this.lastSweepAt = this.now();
+	}
+
+	// size reports the tracked instance count — for tests and metrics.
+	size(): number {
+		return this.map.size;
 	}
 
 	private entry(key: string, now: number): Entry {
@@ -180,12 +222,27 @@ export class CircuitBreakerRegistry {
 			e = newEntry(now);
 			this.map.set(key, e);
 		}
+		// Touch before sweeping so the entry this call is about can never be
+		// evicted and silently recreated as a fresh CLOSED breaker.
+		e.touchedAt = now;
+		this.maybeSweep(now);
 		return e;
 	}
 
-	private maybeHalfOpen(e: Entry): void {
+	// maybeSweep is the backstop for callers that never invoke `retain`. It runs
+	// at most once per IDLE_TTL_MS so the scan cost is amortised away from the
+	// per-call path.
+	private maybeSweep(now: number): void {
+		if (now - this.lastSweepAt < IDLE_TTL_MS) return;
+		this.lastSweepAt = now;
+		for (const [key, e] of this.map) {
+			if (now - e.touchedAt >= IDLE_TTL_MS) this.map.delete(key);
+		}
+	}
+
+	private maybeHalfOpen(e: Entry, now: number): void {
 		if (e.state !== "OPEN") return;
-		if (this.now() - e.openedAt >= OPEN_DURATION_MS) {
+		if (now - e.openedAt >= OPEN_DURATION_MS) {
 			e.state = "HALF_OPEN";
 			e.probeInFlight = false;
 		}

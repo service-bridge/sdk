@@ -18,17 +18,23 @@ export const GRPC_CODE_INTERNAL = 13;
 export const GRPC_CODE_ABORTED = 10;
 export const GRPC_CODE_UNKNOWN = 2;
 
-// Codes that are always safe to retry — transient by definition.
+// Codes that prove the callee did no work, so a replay cannot duplicate an
+// effect: UNAVAILABLE means the connection was never established, and
+// RESOURCE_EXHAUSTED means the request was rejected before execution (rate
+// limit). Safe without an idempotency key.
 const ALWAYS_RETRYABLE = new Set([
 	GRPC_CODE_UNAVAILABLE,
 	GRPC_CODE_RESOURCE_EXHAUSTED,
-	GRPC_CODE_DEADLINE_EXCEEDED,
 ]);
 
-// Codes safe to retry ONLY when the caller passed an idempotency_key — the
-// runtime de-dups replays so a second invocation cannot create a double effect
+// Codes that leave the outcome ambiguous — the callee may have completed the
+// effect and the caller cannot tell. DEADLINE_EXCEEDED belongs here: the
+// deadline expires on the caller side and says nothing about the handler, which
+// may have charged the payment and answered one second late. These retry ONLY
+// when the caller passed an idempotency_key, so the runtime de-dups the replay
 // (ADR 0001).
 const RETRYABLE_WITH_IDEMPOTENCY = new Set([
+	GRPC_CODE_DEADLINE_EXCEEDED,
 	GRPC_CODE_INTERNAL,
 	GRPC_CODE_ABORTED,
 	GRPC_CODE_UNKNOWN,

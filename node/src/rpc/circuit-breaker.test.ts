@@ -3,6 +3,7 @@ import {
 	BUCKET_MS,
 	CircuitBreakerRegistry,
 	ERROR_THRESHOLD,
+	IDLE_TTL_MS,
 	MIN_REQUESTS,
 	OPEN_DURATION_MS,
 	WINDOW_SIZE_MS,
@@ -114,11 +115,81 @@ describe("CircuitBreakerRegistry (sliding window)", () => {
 		expect(cb.state("svc:b")).toBe("CLOSED");
 	});
 
-	it("reset clears the entry", () => {
+	it("evict clears the entry", () => {
 		const { cb } = withClock();
 		for (let i = 0; i < MIN_REQUESTS; i++) cb.recordFailure("svc:i-1");
-		cb.reset("svc:i-1");
+		cb.evict("svc:i-1");
 		expect(cb.state("svc:i-1")).toBe("CLOSED");
+		expect(cb.size()).toBe(0);
+	});
+
+	describe("entry lifetime", () => {
+		it("retain drops entries for instances that left the registry", () => {
+			const { cb } = withClock();
+			for (let i = 0; i < MIN_REQUESTS; i++) cb.recordFailure("svc:gone");
+			cb.recordSuccess("svc:live");
+			expect(cb.size()).toBe(2);
+
+			cb.retain(new Set(["svc:live"]));
+
+			expect(cb.size()).toBe(1);
+			expect(cb.state("svc:gone")).toBe("CLOSED"); // entry rebuilt from scratch
+			expect(cb.state("svc:live")).toBe("CLOSED");
+		});
+
+		it("retain keeps OPEN state for instances that are still live", () => {
+			const { cb } = withClock();
+			for (let i = 0; i < MIN_REQUESTS; i++) cb.recordFailure("svc:i-1");
+			expect(cb.state("svc:i-1")).toBe("OPEN");
+			cb.retain(new Set(["svc:i-1"]));
+			expect(cb.state("svc:i-1")).toBe("OPEN");
+		});
+
+		it("idle sweep bounds the map when instance ids churn and retain is never called", () => {
+			const { cb, advance } = withClock();
+			// Simulate a long rolling-deploy sequence: every generation of pods
+			// gets fresh instance ids and the previous generation is never touched
+			// again. Without eviction this map grows by one entry per pod forever.
+			for (let gen = 0; gen < 20; gen++) {
+				for (let pod = 0; pod < 5; pod++) {
+					cb.recordSuccess(`svc:gen-${gen}-pod-${pod}`);
+				}
+				advance(IDLE_TTL_MS + 1);
+			}
+			// Only the last generation is younger than IDLE_TTL_MS; the sweep runs
+			// on the next entry creation, so at most two generations survive.
+			expect(cb.size()).toBeLessThanOrEqual(10);
+		});
+
+		it("idle sweep spares entries still receiving traffic", () => {
+			const { cb, advance } = withClock();
+			cb.recordSuccess("svc:hot");
+			for (let step = 0; step < 10; step++) {
+				advance(IDLE_TTL_MS / 4);
+				cb.recordSuccess("svc:hot");
+				cb.recordSuccess(`svc:cold-${step}`);
+			}
+			advance(IDLE_TTL_MS + 1);
+			cb.recordSuccess("svc:hot"); // triggers the sweep
+			expect(cb.state("svc:hot")).toBe("CLOSED");
+			expect(cb.size()).toBe(1);
+		});
+
+		it("idle sweep does not drop a breaker the LB keeps reading", () => {
+			const { cb, advance } = withClock();
+			for (let i = 0; i < MIN_REQUESTS; i++) cb.recordFailure("svc:broken");
+			expect(cb.state("svc:broken")).toBe("OPEN");
+			// The LB reads the breaker on every pick, which counts as a touch.
+			for (let i = 0; i < 8; i++) {
+				advance(IDLE_TTL_MS / 4);
+				cb.probeAvailable("svc:broken");
+			}
+			// Creating another entry after the interval elapsed runs the sweep.
+			cb.recordSuccess("svc:other");
+			expect(cb.size()).toBe(2);
+			// HALF_OPEN, not CLOSED — the entry survived instead of being recreated.
+			expect(cb.state("svc:broken")).toBe("HALF_OPEN");
+		});
 	});
 
 	describe("probeAvailable (read-only eligibility for the LB)", () => {

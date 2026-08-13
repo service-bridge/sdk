@@ -50,10 +50,10 @@ export class LoadBalancer {
 	//   - the runtime health hint is stale or absent
 	//   - the local circuit breaker is not OPEN, and — when HALF_OPEN — its single
 	//     probe slot is free
-	// Throws NoLiveInstanceError when no candidate is eligible. Picking is
-	// random when fewer than two eligible candidates exist or when inflight
-	// counters tie. Caller MUST pair every successful pick with a `release`
-	// call in a finally block so inflight stays balanced.
+	// Throws NoLiveInstanceError when no candidate is eligible. A tie on inflight
+	// counters resolves to the first sampled candidate. Caller MUST pair every
+	// successful pick with a `release` call in a finally block so inflight stays
+	// balanced.
 	//
 	// HALF_OPEN single-probe: a HALF_OPEN instance is eligible only while its
 	// probe slot is free (read-only `probeAvailable`). Once a winner is chosen,
@@ -62,30 +62,55 @@ export class LoadBalancer {
 	// dispatch. pick runs to completion synchronously, so a concurrent caller's
 	// later pick sees the claimed slot and routes elsewhere (or fails over) —
 	// exactly one probe in flight per HALF_OPEN instance.
+	//
+	// P2C needs exactly two eligible candidates, so eligibility and sampling run
+	// in a single pass with a two-slot reservoir. Materialising the eligible
+	// subset would allocate an array on every call — with a few hundred callee
+	// pods that is the dominant garbage the RPC path produces.
 	pick(candidates: Candidate[]): Candidate {
 		const now = this.now();
-		const live = candidates.filter((c) => {
-			if (!c.instance.callEndpoint) return false;
+		let eligible = 0;
+		let a: Candidate | undefined;
+		let b: Candidate | undefined;
+		for (const c of candidates) {
+			if (!c.instance.callEndpoint) continue;
 			const hintActive =
 				c.isUnhealthyAt !== null &&
 				now - c.isUnhealthyAt.getTime() < HEALTH_HINT_TTL_MS;
-			if (hintActive) return false;
-			return this.cb.probeAvailable(cbKey(c.instance));
-		});
-		if (live.length === 0) throw new NoLiveInstanceError();
-		const winner = live.length === 1 ? live[0]! : this.choose(live);
+			if (hintActive) continue;
+			if (!this.cb.probeAvailable(cbKey(c.instance))) continue;
+
+			eligible++;
+			if (eligible === 1) {
+				a = c;
+			} else if (eligible === 2) {
+				b = c;
+			} else {
+				// Reservoir sampling, k=2: the n-th eligible candidate takes a
+				// uniformly chosen slot with probability 2/n, which leaves every
+				// eligible pair equally likely without holding the whole subset.
+				const slot = Math.floor(this.random() * eligible);
+				if (slot === 0) a = c;
+				else if (slot === 1) b = c;
+			}
+		}
+		if (a === undefined) throw new NoLiveInstanceError();
+		let winner = a;
+		if (b !== undefined) {
+			// Reservoir sampling picks the pair uniformly but not its order: the
+			// second eligible candidate can only ever land in slot B. Since a tie
+			// on inflight resolves to slot A, an unshuffled reservoir would starve
+			// that candidate on an idle fleet. One coin flip restores uniformity.
+			winner =
+				this.random() < 0.5 ? this.leastLoaded(a, b) : this.leastLoaded(b, a);
+		}
 		// Claim the HALF_OPEN probe slot on the winner only. CLOSED instances
 		// always return true here without side effects.
 		this.cb.canCall(cbKey(winner.instance));
 		return winner;
 	}
 
-	private choose(live: Candidate[]): Candidate {
-		const i = Math.floor(this.random() * live.length);
-		let j = Math.floor(this.random() * (live.length - 1));
-		if (j >= i) j++;
-		const a = live[i]!;
-		const b = live[j]!;
+	private leastLoaded(a: Candidate, b: Candidate): Candidate {
 		const ai = this.inflight.get(a.instance.instanceId) ?? 0;
 		const bi = this.inflight.get(b.instance.instanceId) ?? 0;
 		return ai <= bi ? a : b;
@@ -115,6 +140,19 @@ export class LoadBalancer {
 	}
 }
 
+// keyCache memoises the derived breaker key per instance object. cbKey runs once
+// per candidate per pick plus twice per completed call, and the template literal
+// was allocating a short-lived string every time. Keying by the instance object
+// keeps the cache self-clearing: InstanceCache rebuilds instance objects on each
+// registry snapshot, so retired pods drop out with their objects and the cache
+// cannot grow without bound the way a Map<instanceId, string> would.
+const keyCache = new WeakMap<ServiceInstanceInfo, string>();
+
 export function cbKey(instance: ServiceInstanceInfo): string {
-	return `${instance.serviceId}:${instance.instanceId}`;
+	let key = keyCache.get(instance);
+	if (key === undefined) {
+		key = `${instance.serviceId}:${instance.instanceId}`;
+		keyCache.set(instance, key);
+	}
+	return key;
 }

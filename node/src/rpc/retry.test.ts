@@ -13,15 +13,32 @@ import {
 } from "./retry";
 
 describe("isRetryable", () => {
-	it("always-retryable codes return true regardless of idempotency", () => {
-		for (const code of [
-			GRPC_CODE_UNAVAILABLE,
-			GRPC_CODE_RESOURCE_EXHAUSTED,
-			GRPC_CODE_DEADLINE_EXCEEDED,
-		]) {
-			expect(isRetryable({ code }, false)).toBe(true);
-			expect(isRetryable({ code }, true)).toBe(true);
-		}
+	it("UNAVAILABLE retryable without an idempotency_key", () => {
+		// No connection was established — the callee provably did no work.
+		expect(isRetryable({ code: GRPC_CODE_UNAVAILABLE }, false)).toBe(true);
+		expect(isRetryable({ code: GRPC_CODE_UNAVAILABLE }, true)).toBe(true);
+	});
+
+	it("RESOURCE_EXHAUSTED retryable without an idempotency_key", () => {
+		// Rejected before execution by the rate limiter — no side effect.
+		expect(isRetryable({ code: GRPC_CODE_RESOURCE_EXHAUSTED }, false)).toBe(
+			true,
+		);
+		expect(isRetryable({ code: GRPC_CODE_RESOURCE_EXHAUSTED }, true)).toBe(
+			true,
+		);
+	});
+
+	it("DEADLINE_EXCEEDED NOT retryable without an idempotency_key", () => {
+		// The deadline expired on the caller side; the handler may have completed
+		// the effect and answered late. Retrying blind would double-charge.
+		expect(isRetryable({ code: GRPC_CODE_DEADLINE_EXCEEDED }, false)).toBe(
+			false,
+		);
+	});
+
+	it("DEADLINE_EXCEEDED retryable with an idempotency_key", () => {
+		expect(isRetryable({ code: GRPC_CODE_DEADLINE_EXCEEDED }, true)).toBe(true);
 	});
 
 	it("INTERNAL retryable only with idempotency_key", () => {
