@@ -21,6 +21,10 @@ import {
 	type TelemetryBatch,
 	type TelemetryClient,
 } from "../pb/servicebridge/v1/telemetry";
+import {
+	type ReconnectDelayOptions,
+	reconnectDelay,
+} from "../utils/reconnect-ladder";
 import type { RingItem, TelemetryRing } from "./ring";
 
 /**
@@ -82,15 +86,18 @@ export interface TelemetryTransportOptions {
 	flushIntervalMs?: number;
 	/** Max items per batch (per kind). Default 256. */
 	maxBatchItems?: number;
-	/** Reconnect backoff ladder in ms. Default [1000, 5000, 15000, 30000]. */
-	reconnectDelays?: number[];
+	/**
+	 * Reconnect backoff options, shared with the events/job/workflow
+	 * subscribers (see ../utils/reconnect-ladder.ts). Default: the shared
+	 * RECONNECT_LADDER_MS ladder with ±20% jitter.
+	 */
+	reconnectOpts?: ReconnectDelayOptions;
 	/** Called when server-side or ring drop counts rise. Optional. */
 	onDrop?: DropObserver;
 }
 
 const DEFAULT_FLUSH_INTERVAL_MS = 250;
 const DEFAULT_MAX_BATCH_ITEMS = 256;
-const DEFAULT_RECONNECT_DELAYS = [1_000, 5_000, 15_000, 30_000];
 
 /**
  * TelemetryTransport owns the lifecycle of the Telemetry.Report bidi stream:
@@ -110,7 +117,7 @@ export class TelemetryTransport {
 	private readonly ring: TelemetryRing;
 	private readonly flushIntervalMs: number;
 	private readonly maxBatchItems: number;
-	private readonly reconnectDelays: number[];
+	private readonly reconnectOpts?: ReconnectDelayOptions;
 	private readonly onDrop?: DropObserver;
 
 	private stream: ClientTelemetryStream | null = null;
@@ -135,7 +142,7 @@ export class TelemetryTransport {
 		this.ring = opts.ring;
 		this.flushIntervalMs = opts.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
 		this.maxBatchItems = opts.maxBatchItems ?? DEFAULT_MAX_BATCH_ITEMS;
-		this.reconnectDelays = opts.reconnectDelays ?? DEFAULT_RECONNECT_DELAYS;
+		this.reconnectOpts = opts.reconnectOpts;
 		this.onDrop = opts.onDrop;
 	}
 
@@ -286,12 +293,7 @@ export class TelemetryTransport {
 		this.draining = false;
 		this.stream = null;
 		if (this.stopped) return;
-		const delay =
-			this.reconnectDelays[
-				Math.min(this.reconnectAttempt, this.reconnectDelays.length - 1)
-			] ??
-			this.reconnectDelays[this.reconnectDelays.length - 1] ??
-			1000;
+		const delay = reconnectDelay(this.reconnectAttempt, this.reconnectOpts);
 		this.reconnectAttempt++;
 		if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
 		this.reconnectTimer = setTimeout(() => {

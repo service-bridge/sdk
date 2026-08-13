@@ -37,7 +37,7 @@ Per-kind ring buffers, примитивы для emit'а ops/logs/metrics, real 
 | `TelemetryTransportOptions.ring` | `TelemetryRing` | — (required) | Ring, из которого транспорт peek'ает батчи |
 | `TelemetryTransportOptions.flushIntervalMs` | `number?` | `250` | Период flush-таймера (ms) |
 | `TelemetryTransportOptions.maxBatchItems` | `number?` | `256` | Max items per kind в одном батче |
-| `TelemetryTransportOptions.reconnectDelays` | `number[]?` | `[1000, 5000, 15000, 30000]` | Reconnect backoff ladder (ms) |
+| `TelemetryTransportOptions.reconnectOpts` | `ReconnectDelayOptions?` | shared `RECONNECT_LADDER_MS` + ±20% jitter | Reconnect backoff options; тот же тип, что у events/job/workflow subscriber'ов (`../utils/reconnect-ladder.ts`) |
 | `TelemetryTransportOptions.onDrop` | `DropObserver?` | — | Хук наблюдаемости: вызывается при росте server-side или local ring drop-счётчиков |
 | `DropObserver` | `type` | — | `(info: {serverDrops, ringDrops, backpressureLevel}) => void` |
 | `adaptTelemetryClient(client)` | `TelemetryClientLike` | — | Wrap generated `TelemetryClient` for transport |
@@ -85,11 +85,12 @@ Per-kind ring buffers, примитивы для emit'а ops/logs/metrics, real 
 - **At-least-once доставка**: `peek` отдаёт КОПИЮ head'а, items остаются в ring (oldest-first). Transport помечает отправленный батч как in-flight (по id) и `commit`'ит (освобождает) его только по следующему ack от рантайма. Повторный flush до ack НЕ переотправляет уже-in-flight items (peek снова их видит, но они отфильтрованы по id) — иначе flush (250ms) гонял бы те же кадры до ack (2s). Если стрим умирает до ack — in-flight маркер сбрасывается, items остаются в ring и переотправляются на новом стриме. Рантайм идемпотентен по `op_id` (`ON CONFLICT`), так что дубль при переотправке безвреден. Сигнал подтверждения = ack от рантайма (минимально достаточный: ack означает, что рантайм получил батч).
 - **Backpressure — advisory, без клиентской паузы**: уровень от рантайма больше НЕ ставит flusher на паузу. Пауза при продолжающемся push'е продюсеров привела бы к oldest-drop START-фреймов в ring (хуже, чем отправить). Рантайм сам shedding'ит на своей стороне через windowed-level. `drainReason` → final flush + local end; reconnect ladder поднимет stream обратно.
 - **Reconnect backoff сбрасывается по первому ack**: `reconnectAttempt` обнуляется при первом успешном ack на новом стриме, а не сразу после `openStream`. Иначе ladder не растёт и получается reconnect-storm.
+- **Reconnect ladder — общий модуль, не локальная копия**: задержка считается через `reconnectDelay(reconnectAttempt, reconnectOpts)` из `../utils/reconnect-ladder.ts` — та же лестница `[1000, 5000, 15000, 30000, 60000]` + jitter, что у events/job/workflow subscriber'ов. Раньше здесь был отдельный 4-ступенчатый массив без jitter, рассинхронизированный с общим модулем (TD-13).
 - **Наблюдаемость потерь**: `onDrop` хук эмитит при росте server-side (`drop_count_server_side` из ack) или local ring drop-счётчиков — backpressure перестаёт быть тихим.
 - **Auto-mint opId**: `OpHandle.start` минит UUIDv7 если caller не передал — упрощает user-side API (`sb.telemetry.startOp({ ... })`).
 
 ## Зависимости
 
-Опирается на: `../pb/servicebridge/v1/telemetry` (generated proto), `node:async_hooks` (ALS), `@grpc/grpc-js` (stream types), npm-пакет `uuidv7` (генерация UUIDv7 opId/traceId в `ops.ts` и `trace-context.ts`; работает под Node и Bun).
+Опирается на: `../pb/servicebridge/v1/telemetry` (generated proto), `node:async_hooks` (ALS), `@grpc/grpc-js` (stream types), npm-пакет `uuidv7` (генерация UUIDv7 opId/traceId в `ops.ts` и `trace-context.ts`; работает под Node и Bun), `../utils/reconnect-ladder` (`reconnectDelay`/`ReconnectDelayOptions` для `TelemetryTransport`).
 
 Используется: `../rpc/server.ts` (RPC.HANDLE), `../http/*/plugin.ts` (HTTP.HANDLE + trace propagation), `../connection/service-bridge.ts` (lifecycle + `sb.telemetry` API).

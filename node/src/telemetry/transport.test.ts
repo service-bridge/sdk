@@ -3,7 +3,7 @@
 // drop, advisory (non-pausing) backpressure, reconnect backoff growth + reset on
 // first ack, graceful drain, and drop observability.
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import type {
 	Log,
@@ -13,6 +13,7 @@ import type {
 	TelemetryAck,
 	TelemetryBatch,
 } from "../pb/servicebridge/v1/telemetry";
+import { RECONNECT_LADDER_MS } from "../utils/reconnect-ladder";
 import { Channel, OpHandle, RpcCall, Status } from "./ops";
 import { TelemetryRing } from "./ring";
 import {
@@ -165,7 +166,7 @@ describe("TelemetryTransport", () => {
 			ring,
 			flushIntervalMs: 25,
 			maxBatchItems: 100,
-			reconnectDelays: [0],
+			reconnectOpts: { ladder: [0], jitterRatio: 0 },
 		});
 		await transport.start();
 
@@ -192,7 +193,7 @@ describe("TelemetryTransport", () => {
 			ring,
 			flushIntervalMs: 25,
 			maxBatchItems: 100,
-			reconnectDelays: [0],
+			reconnectOpts: { ladder: [0], jitterRatio: 0 },
 		});
 		await transport.start();
 
@@ -228,13 +229,48 @@ describe("TelemetryTransport", () => {
 		expect(totalOps(stream.written)).toBe(1);
 	});
 
+	test("reconnect ladder has 5 rungs sourced from RECONNECT_LADDER_MS, not a shorter local copy", async () => {
+		// The pre-fix transport.ts kept its own 4-rung DEFAULT_RECONNECT_DELAYS
+		// array, saturating at 30_000ms. A leftover local copy would silently cap
+		// growth one rung short of the shared ladder's 60_000ms top rung — this
+		// test only passes once transport.ts defers entirely to
+		// utils/reconnect-ladder for both rungs and jitter.
+		transport = new TelemetryTransport({
+			client,
+			ring,
+			flushIntervalMs: 1000,
+			maxBatchItems: 100,
+			// random()=0.5 → jitter offset 0, pinning each delay to the exact rung.
+			reconnectOpts: { random: () => 0.5 },
+		});
+		await transport.start();
+
+		const scheduled: number[] = [];
+		const setTimeoutSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+			fn: () => void,
+			ms?: number,
+		) => {
+			scheduled.push(ms ?? 0);
+			fn();
+			return 0 as unknown as ReturnType<typeof setTimeout>;
+		}) as typeof setTimeout);
+		try {
+			for (let i = 0; i < RECONNECT_LADDER_MS.length; i++) {
+				client.current().emit("error", new Error(`drop${i}`));
+			}
+			expect(scheduled).toEqual([...RECONNECT_LADDER_MS]);
+		} finally {
+			setTimeoutSpy.mockRestore();
+		}
+	});
+
 	test("reconnect backoff grows across consecutive drops without an ack", async () => {
 		transport = new TelemetryTransport({
 			client,
 			ring,
 			flushIntervalMs: 1000,
 			maxBatchItems: 100,
-			reconnectDelays: [10, 40, 120],
+			reconnectOpts: { ladder: [10, 40, 120], jitterRatio: 0 },
 		});
 		await transport.start();
 
@@ -257,7 +293,7 @@ describe("TelemetryTransport", () => {
 			ring,
 			flushIntervalMs: 1000,
 			maxBatchItems: 100,
-			reconnectDelays: [10, 200],
+			reconnectOpts: { ladder: [10, 200], jitterRatio: 0 },
 		});
 		await transport.start();
 
@@ -301,7 +337,7 @@ describe("TelemetryTransport", () => {
 			ring,
 			flushIntervalMs: 25,
 			maxBatchItems: 100,
-			reconnectDelays: [0, 0, 0],
+			reconnectOpts: { ladder: [0, 0, 0], jitterRatio: 0 },
 		});
 		await transport.start();
 		expect(client.streams.length).toBe(1);
