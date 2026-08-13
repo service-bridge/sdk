@@ -4,7 +4,6 @@ import { EventDomain } from "../events/domain";
 import { Drainer } from "../events/drainer";
 import type { SchemaIndex } from "../events/publisher";
 import { Publisher } from "../events/publisher";
-import type { EventHandler } from "../events/subscriber";
 import { Subscriber } from "../events/subscriber";
 import { JobDomain } from "../job/domain";
 import { JobSubscriber } from "../job/subscriber";
@@ -134,15 +133,17 @@ function randomJitter(maxMs: number): number {
 }
 
 /**
- * Build the TelemetryAPI surface. Identity is resolved lazily so user code
- * may emit before start() — instance_id will be the empty string until the
- * first Welcome.
+ * Build the TelemetryAPI surface. Identity is read at emission time, never
+ * captured at handle-construction time — user code may take a logger or a
+ * counter before start(), and those handles must follow the identity once it
+ * appears. Emissions made before the first Welcome carry an empty instance_id.
  * @internal
  */
 function makeTelemetryAPI(
 	ring: TelemetryRing,
 	getInstanceId: () => string,
 	_getServiceId: () => string,
+	getEnabled: () => boolean,
 	getCaptureModeForChannel: (channel: Channel) => CaptureMode,
 	getPayloadMaxBytes: () => number,
 ): TelemetryAPI {
@@ -155,17 +156,67 @@ function makeTelemetryAPI(
 				payloadMaxBytes: getPayloadMaxBytes(),
 			});
 		},
+		enabled: getEnabled,
 		captureModeForChannel: getCaptureModeForChannel,
 		log,
 		counter(name, labels) {
-			return makeCounter(ring, getInstanceId(), name, labels);
+			const series = lazySeries(getInstanceId, (id) =>
+				makeCounter(ring, id, name, labels),
+			);
+			return {
+				inc(amount) {
+					series().inc(amount);
+				},
+			};
 		},
 		gauge(name, labels) {
-			return makeGauge(ring, getInstanceId(), name, labels);
+			const series = lazySeries(getInstanceId, (id) =>
+				makeGauge(ring, id, name, labels),
+			);
+			return {
+				set(value) {
+					series().set(value);
+				},
+			};
 		},
 		histogram(name, unit, labels) {
-			return makeHistogram(ring, getInstanceId(), name, unit, labels);
+			const series = lazySeries(getInstanceId, (id) =>
+				makeHistogram(ring, id, name, unit, labels),
+			);
+			return {
+				observe(value) {
+					series().observe(value);
+				},
+			};
 		},
+	};
+}
+
+/**
+ * Binds a metric handle to the series of the *current* instance_id and rebinds
+ * whenever that identity changes (first Welcome, every cert rotation). The
+ * aggregator keys a series on (kind, name, instance_id, labels) and the handle
+ * it returns mutates that series object directly, so resolving once at
+ * construction pins a counter taken before start() to the empty instance_id
+ * forever — it would grow in a row parallel to the one the same counter gets
+ * after connecting, and the user would see two series for one counter. The
+ * resolved handle is cached until the identity actually changes, so the steady
+ * state costs one string comparison per emit rather than a series lookup.
+ * @internal
+ */
+function lazySeries<T>(
+	getInstanceId: () => string,
+	build: (instanceId: string) => T,
+): () => T {
+	let boundId: string | null = null;
+	let handle: T | null = null;
+	return () => {
+		const id = getInstanceId();
+		if (handle === null || boundId !== id) {
+			boundId = id;
+			handle = build(id);
+		}
+		return handle;
 	};
 }
 
@@ -230,6 +281,19 @@ function resolveAdvertise(
 export interface TelemetryAPI {
 	/** Start an op; returns a handle to `.end(status, message?)`. */
 	startOp(params: StartOpParams): OpHandle;
+	/**
+	 * Whether the runtime currently wants telemetry at all
+	 * (`CaptureModes.telemetry_enabled`). `true` until the first registry
+	 * snapshot arrives (fail-safe), and it flips on a live connection whenever
+	 * the operator changes the setting — so callers must invoke it per emission
+	 * rather than caching the result.
+	 *
+	 * Emission gate for hot paths: `startOp` builds a START frame and pushes it
+	 * into the ring regardless of this flag, so deferring the work inside
+	 * `startOp` saves nothing. Check this first and skip the whole op block —
+	 * including the meta the caller would otherwise serialize for it.
+	 */
+	enabled(): boolean;
 	/**
 	 * Runtime-pushed effective payload capture mode for the given op channel.
 	 * "none" until the first registry snapshot arrives (fail-safe). Read-only
@@ -342,6 +406,19 @@ export interface ServiceBridgeOptions {
 	eventsDrainerBatch?: number;
 	/** Max in-flight inbound events the subscriber processes concurrently. Default 32. */
 	eventsMaxInFlight?: number;
+	/**
+	 * Max inbound RPC handlers running concurrently on the Call server. Default
+	 * 256. Bounds callee-side memory: every admitted call holds a decoded request
+	 * plus whatever the handler allocates.
+	 */
+	rpcMaxConcurrentCalls?: number;
+	/**
+	 * Max inbound calls allowed to wait for a free execution slot. Defaults to
+	 * `rpcMaxConcurrentCalls`. Past this depth the caller gets
+	 * `RESOURCE_EXHAUSTED` — load is shed, not queued. `0` rejects any call that
+	 * cannot start immediately.
+	 */
+	rpcMaxQueuedCalls?: number;
 }
 
 /**
@@ -386,6 +463,11 @@ interface ResolvedOptions {
 	maxOutboxRows: number;
 	eventsDrainerBatch: number;
 	eventsMaxInFlight: number;
+	// undefined → CallServer applies its own defaults (256 / equal to
+	// concurrency). Kept unresolved so the bound lives in one place, next to the
+	// semaphore that enforces it, instead of being restated here.
+	rpcMaxConcurrentCalls: number | undefined;
+	rpcMaxQueuedCalls: number | undefined;
 	_disableTelemetryTransport: boolean;
 }
 
@@ -408,6 +490,11 @@ export class ServiceBridge {
 		Handler<keyof EventMap>[]
 	>();
 	private stopped = false;
+	// Bumped by stop(). Every async lifecycle path (connect → openSession →
+	// ensureRpcReady, rotateCert) captures it on entry and re-checks after each
+	// await: a stop() landing mid-flight must not let the resumed continuation
+	// rebuild the stack behind it.
+	private generation = 0;
 	private session: Session | null = null;
 	private controlClient: ControlClient | null = null;
 	// Registry channel of the current live session. Owned here (not by Session or
@@ -428,6 +515,14 @@ export class ServiceBridge {
 	private _started = false;
 	private _watchListenersRegistered = false;
 	private _callServer: CallServer | null = null;
+	// Address the inbound CallServer is actually bound to. Reused when the server
+	// is rebuilt on cert rotation so an advertise port of 0 does not move the
+	// endpoint callers already cached.
+	private _callServerAdvertise: AdvertiseConfig | null = null;
+	// ProvisionResult the cert-bound side channels were built from. Compared by
+	// identity: a transport reconnect reuses the cached ProvisionResult object, a
+	// fresh Provision or a rotation yields a new one.
+	private _rpcProvision: ProvisionResult | null = null;
 	private _proxyTransport: ProxyTransport | null = null;
 	private _directTransport: DirectTransport | null = null;
 	private _rpcClient: RpcClient | null = null;
@@ -455,11 +550,9 @@ export class ServiceBridge {
 	// lifecycle совпадает с lifecycle сессии (Welcome → start, stop → close).
 	// Ring создаётся в конструкторе, чтобы prod-код мог писать логи / ops до
 	// подключения; они буферятся в ring до старта transport'а.
-	// _telemetryEnabled tracks the runtime-pushed telemetry.enable value (default
-	// fail-safe: true until the first snapshot). Transport is started only when
-	// true and not yet running; when the pushed value changes to false the
-	// transport is stopped on the next reconnect cycle.
-	private _telemetryEnabled: boolean = true;
+	// Whether telemetry is wanted at all is not mirrored here: the runtime-pushed
+	// value lives in WatchStream and is read on demand, so the transport gate and
+	// `sb.telemetry.enabled()` can never drift apart.
 	private readonly _telemetryRing: TelemetryRing;
 	private readonly _telemetryApi: TelemetryAPI;
 	private _telemetryClient: TelemetryClient | null = null;
@@ -522,6 +615,8 @@ export class ServiceBridge {
 			eventsDrainerBatch: options.eventsDrainerBatch ?? DEFAULT_DRAINER_BATCH,
 			eventsMaxInFlight:
 				options.eventsMaxInFlight ?? DEFAULT_EVENTS_MAX_IN_FLIGHT,
+			rpcMaxConcurrentCalls: options.rpcMaxConcurrentCalls,
+			rpcMaxQueuedCalls: options.rpcMaxQueuedCalls,
 			_disableTelemetryTransport: hooks._disableTelemetryTransport ?? false,
 		};
 
@@ -534,16 +629,15 @@ export class ServiceBridge {
 			ops: DEFAULT_TELEMETRY_RING_SIZE,
 		});
 
-		// Telemetry API surface. Identity fields are resolved lazily — user code
-		// may call sb.telemetry.log() before start(), in which case instance_id
-		// will be empty (best-effort). After Welcome, all subsequent emits carry
-		// the real instanceId from currentIdentity.
-		// payloadMaxBytes is resolved live from the runtime-pushed value so ops
-		// always use the current runtime setting, not a stale constructor value.
+		// Telemetry API surface. Every runtime-pushed input is a getter, never a
+		// constructor-time copy: identity appears at the first Welcome and changes
+		// on cert rotation, while `enabled` and `payloadMaxBytes` change whenever
+		// the operator edits telemetry settings on a live connection.
 		this._telemetryApi = makeTelemetryAPI(
 			this._telemetryRing,
 			() => this._telemetryInstanceId,
 			() => this.currentIdentity?.serviceId ?? "",
+			() => this._watchStream.pushedTelemetryConfig().enabled,
 			(channel) => this._watchStream.captureModeForChannel(channel),
 			() => this._watchStream.pushedTelemetryConfig().payloadMaxBytes,
 		);
@@ -652,7 +746,7 @@ export class ServiceBridge {
 		// Start the inbound Call server if advertise is configured. We need the
 		// runtime-issued leaf cert + CA chain — those arrive from Bootstrap.Provision
 		// during connect(). Defer the actual bind until we have a ProvisionResult.
-		this._instanceCache.bind(this._watchStream);
+		this._instanceCache.bind(this._watchStream, this._cb);
 		this._proxyTransport = null;
 		this._directTransport = null;
 		this._rpcClient = null;
@@ -697,14 +791,12 @@ export class ServiceBridge {
 				void this.stop();
 			}
 		});
-		this._watchStream.onTelemetryConfig((cfg) => {
-			this._telemetryEnabled = cfg.enabled;
-		});
 	}
 
 	async stop(): Promise<void> {
 		this.stopped = true;
 		this._started = false;
+		this.generation++;
 		this.clearTimers();
 		this._watchStream.stop();
 		this.session?.close();
@@ -718,70 +810,86 @@ export class ServiceBridge {
 		this.registryClient = null;
 		this.currentIdentity = null;
 		this._instanceCache.dispose();
-		if (this._callServer) {
-			await this._callServer.stop();
-			this._callServer = null;
-		}
-		this._proxyTransport?.close();
-		this._proxyTransport = null;
+
+		await this.closeCertBoundResources();
+
 		this._directTransport?.close();
 		this._directTransport = null;
-		this._rpcClient = null;
+		this._rpcProvision = null;
+		this._callServerAdvertise = null;
 
-		// Telemetry teardown — before events teardown so any final logs from
-		// drainer/subscriber/storage close paths still have a sink (best-effort).
-		if (this._processSampler) {
-			this._processSampler.close();
-			this._processSampler = null;
-		}
-		if (this._telemetryTransport) {
-			await this._telemetryTransport.stop();
-			this._telemetryTransport = null;
-		}
-		if (this._telemetryClient) {
-			this._telemetryClient.close();
-			this._telemetryClient = null;
-		}
-
-		// Workflows teardown: subscriber → client. Subscriber owns the heartbeat
-		// timers and the long-lived Subscribe stream; close() stops both.
-		if (this._workflowSubscriber) {
-			this._workflowSubscriber.close();
-			this._workflowSubscriber = null;
-		}
-		if (this._workflowsClient) {
-			this._workflowsClient.close();
-			this._workflowsClient = null;
-		}
-
-		// Jobs teardown: subscriber → client.
-		if (this._jobSubscriber) {
-			await this._jobSubscriber.stop();
-			this._jobSubscriber = null;
-		}
-		if (this._jobsClient) {
-			this._jobsClient.close();
-			this._jobsClient = null;
-		}
-
-		// Events teardown: subscriber → drainer → events client → storage.
-		if (this._subscriber) {
-			await this._subscriber.stop();
-			this._subscriber = null;
-		}
-		if (this._drainer) {
-			await this._drainer.stop();
-			this._drainer = null;
-		}
-		if (this._eventsClient) {
-			this._eventsClient.close();
-			this._eventsClient = null;
-		}
 		if (this._storage) {
 			this._storage.close();
 			this._storage = null;
 		}
+	}
+
+	/**
+	 * Tears down every resource whose TLS material is pinned at construction
+	 * time. `grpc.credentials.createSsl` / `ServerCredentials.createSsl` copy the
+	 * PEM into the channel, so a rotated leaf cert reaches them only through a
+	 * rebuild. Subsystems that hold a client reference (drainer / publisher /
+	 * subscriber, workflow and job subscribers, telemetry transport) go down with
+	 * their channel and are rebuilt by `ensureRpcReady`.
+	 *
+	 * Order matters: CallServer first (stops accepting inbound work), telemetry
+	 * before events so late logs from the events close paths still have a sink.
+	 * DirectTransport is absent on purpose — it rotates in place via
+	 * `updateCredentials`.
+	 *
+	 * Every field is detached before the first await so a stop() racing a
+	 * rotation teardown cannot close the same resource twice.
+	 */
+	private async closeCertBoundResources(): Promise<void> {
+		const callServer = this._callServer;
+		const sampler = this._processSampler;
+		const telemetryTransport = this._telemetryTransport;
+		const telemetryClient = this._telemetryClient;
+		const workflowSubscriber = this._workflowSubscriber;
+		const workflowsClient = this._workflowsClient;
+		const jobSubscriber = this._jobSubscriber;
+		const jobsClient = this._jobsClient;
+		const subscriber = this._subscriber;
+		const drainer = this._drainer;
+		const eventsClient = this._eventsClient;
+		const proxyTransport = this._proxyTransport;
+
+		this._callServer = null;
+		this._processSampler = null;
+		this._telemetryTransport = null;
+		this._telemetryClient = null;
+		this._workflowSubscriber = null;
+		this._workflowsClient = null;
+		this._jobSubscriber = null;
+		this._jobsClient = null;
+		this._subscriber = null;
+		this._drainer = null;
+		this._eventsClient = null;
 		this._publisher = null;
+		this._proxyTransport = null;
+		this._rpcClient = null;
+
+		if (callServer) await callServer.stop();
+
+		sampler?.close();
+		if (telemetryTransport) await telemetryTransport.stop();
+		telemetryClient?.close();
+
+		// Workflows teardown: subscriber → client. Subscriber owns the heartbeat
+		// timers and the long-lived Subscribe stream; close() stops both.
+		workflowSubscriber?.close();
+		workflowsClient?.close();
+
+		// Jobs teardown: subscriber → client.
+		if (jobSubscriber) await jobSubscriber.stop();
+		jobsClient?.close();
+
+		// Events teardown: subscriber → drainer → events client.
+		if (subscriber) await subscriber.stop();
+		if (drainer) await drainer.stop();
+		eventsClient?.close();
+
+		proxyTransport?.close();
 	}
 
 	/**
@@ -972,8 +1080,16 @@ export class ServiceBridge {
 		}
 	}
 
+	// stale reports whether the lifecycle generation captured before an await is
+	// no longer current — stop() ran while the caller was suspended, so anything
+	// the continuation would build belongs to a torn-down bridge.
+	private stale(gen: number): boolean {
+		return this.stopped || gen !== this.generation;
+	}
+
 	private async connect(attempt: number): Promise<void> {
 		if (this.stopped) return;
+		const gen = this.generation;
 		try {
 			// Reuse the cached leaf cert on a transport-level reconnect instead of
 			// re-running the expensive Bootstrap.Provision (a 64 MiB argon2 hash on
@@ -983,8 +1099,10 @@ export class ServiceBridge {
 			const result =
 				this.reusableProvision() ??
 				(await this.opts.provisionFn(this.url, parseBootstrapKey(this.rawKey)));
-			await this.openSession(result, attempt);
+			if (this.stale(gen)) return;
+			await this.openSession(result, attempt, gen);
 		} catch (err) {
+			if (this.stale(gen)) return;
 			const sbErr = new ServiceBridgeError("provision", err);
 			if (!isRetryable(sbErr.code)) {
 				this.emit("disconnected", { reason: sbErr.message, error: sbErr });
@@ -1014,10 +1132,10 @@ export class ServiceBridge {
 	private async openSession(
 		prov: ProvisionResult,
 		attempt: number,
+		gen: number,
 	): Promise<void> {
 		const creds = this.buildMTLSCredentials(prov);
 		const client = this.opts.clientFactory(this.url, creds);
-		const stream = openControlStream(client);
 		// A transport-level reconnect lands here with the previous session's
 		// control/registry channels still referenced. grpc-js channels are not
 		// GC'd while their internal backoff timers live, so we must close the
@@ -1025,12 +1143,14 @@ export class ServiceBridge {
 		// reconnect permanently leaks two TLS channels (the production OOM).
 		this.controlClient?.close();
 		this.registryClient?.close();
+		this.registryClient = null;
 		this.controlClient = client;
 		this.lastProvision = prov;
 
 		// Wire up RPC infrastructure BEFORE building RegisterRequest — call_endpoint
 		// must be present in the very first registration so callers see it.
-		await this.ensureRpcReady(prov, creds);
+		await this.ensureRpcReady(prov, creds, gen);
+		if (this.stale(gen)) return;
 
 		const registryClient = this.opts.registryClientFactory(this.url, creds);
 		this.registryClient = registryClient;
@@ -1080,6 +1200,12 @@ export class ServiceBridge {
 			},
 		};
 
+		// Opened last and handed to Session in the same synchronous run: a
+		// ClientReadableStream is an EventEmitter, and an 'error' arriving while no
+		// listener is attached is an uncaught exception that kills the process
+		// instead of a `reconnecting` event. Nothing may await between these two
+		// statements.
+		const stream = openControlStream(client);
 		this.session = new Session(
 			stream,
 			callbacks,
@@ -1089,13 +1215,25 @@ export class ServiceBridge {
 	}
 
 	// ensureRpcReady starts the inbound CallServer (if advertise is set) and
-	// wires up the outbound ProxyTransport + DirectTransport + RpcClient.
-	// Called from openSession once a ProvisionResult is in hand. Idempotent
-	// across reconnects; refreshes DirectTransport creds on cert rotation.
+	// wires up the outbound ProxyTransport + DirectTransport + RpcClient plus the
+	// events / workflows / jobs / telemetry channels. Called from openSession and
+	// from rotateCert once a ProvisionResult is in hand. Reuses everything while
+	// the ProvisionResult is unchanged; rebuilds the cert-bound half when it is.
 	private async ensureRpcReady(
 		prov: ProvisionResult,
 		creds: grpc.ChannelCredentials,
+		gen: number,
 	): Promise<void> {
+		// grpc.credentials.createSsl copies the PEM material into the channel, so
+		// a rotated leaf cert reaches these channels only through a rebuild —
+		// otherwise they keep handshaking with the expired cert past notAfter while
+		// Control and Registry look healthy.
+		if (this._rpcProvision !== prov) {
+			this._rpcProvision = prov;
+			await this.closeCertBoundResources();
+			if (this.stale(gen)) return;
+		}
+
 		// Outbound side: proxy + direct transports.
 		if (!this._proxyTransport) {
 			this._proxyTransport = new ProxyTransport(this.url, creds);
@@ -1119,7 +1257,7 @@ export class ServiceBridge {
 				this._directTransport,
 				this._instanceCache,
 				this._schemaRegistry.asResolver(),
-				this.currentIdentity?.serviceId ?? "",
+				() => this.currentIdentity?.serviceId ?? "",
 				this._cb,
 				this._lb,
 				this,
@@ -1162,37 +1300,45 @@ export class ServiceBridge {
 			});
 		}
 
-		// Telemetry transport: idempotent across reconnects. Creds change on cert
-		// rotation but the gRPC channel underneath the TelemetryClient already
-		// re-resolves; we keep the same client + transport instance.
-		// _disableTelemetryTransport is a test hook; _telemetryEnabled is the
-		// runtime-pushed telemetry.enable value (default true until first snapshot).
+		// Telemetry transport. Built into locals and adopted only after start()
+		// resolves: a stop() racing the bind must not leave a started transport
+		// behind with no owner to close it.
+		// _disableTelemetryTransport is a test hook; the enable flag is the
+		// runtime-pushed telemetry.enable value (default true until first snapshot),
+		// read from the same place `sb.telemetry.enabled()` reads it.
 		if (
-			this._telemetryEnabled &&
+			this._telemetryApi.enabled() &&
 			!this._telemetryClient &&
 			!this.opts._disableTelemetryTransport
 		) {
-			this._telemetryClient = new TelemetryClient(this.url, creds);
-			this._telemetryTransport = new TelemetryTransport({
-				client: adaptTelemetryClient(this._telemetryClient),
+			const telemetryClient = new TelemetryClient(this.url, creds);
+			const transport = new TelemetryTransport({
+				client: adaptTelemetryClient(telemetryClient),
 				ring: this._telemetryRing,
 				// No default onDrop: a library must not spam the host's console on
 				// every drop-count tick. Drop observability is host opt-in via the
 				// TelemetryTransportOptions.onDrop hook.
 			});
-			await this._telemetryTransport.start();
-			this._processSampler = new ProcessSampler(
+			await transport.start();
+			if (this.stale(gen)) {
+				await transport.stop();
+				telemetryClient.close();
+				return;
+			}
+			this._telemetryClient = telemetryClient;
+			this._telemetryTransport = transport;
+			const sampler = new ProcessSampler(
 				this._telemetryRing,
 				() => this._telemetryInstanceId,
 			);
-			this._processSampler.start();
+			sampler.start();
+			this._processSampler = sampler;
 		}
 
 		// Workflows: WorkflowsClient is the single channel used by both caller-side
 		// ops (WorkflowDomain.start/signal/cancel/...) and the owner-side subscriber.
-		// Attached on every (re)connect — creds change on cert rotation, but we
-		// reuse the same client; gRPC re-resolves underneath. Subscriber starts
-		// only when this service has at least one workflow handler registered.
+		// Subscriber starts only when this service has at least one workflow
+		// handler registered.
 		if (!this._workflowsClient) {
 			this._workflowsClient = new WorkflowsClient(this.url, creds);
 			this.workflow._attachRpc(this._workflowsClient);
@@ -1213,7 +1359,7 @@ export class ServiceBridge {
 						? { serviceId: id.serviceId, instanceId: id.instanceId }
 						: null;
 				},
-				handlers: () => this.handlersForSubscriber(),
+				handlers: (name) => this._registry._handle.eventHandlers(name),
 				maxInFlight: this.opts.eventsMaxInFlight,
 				logger: { warn: console.warn, error: console.error },
 				runWithTrace: this.runHandlerWithTrace,
@@ -1222,8 +1368,11 @@ export class ServiceBridge {
 			this._subscriber.start();
 		}
 
-		// Inbound side — only when advertise is configured.
+		// Inbound side — only when advertise is configured. On a rotation rebuild
+		// we re-bind the port the previous server actually got, so an advertise
+		// port of 0 does not move the endpoint callers already resolved.
 		if (!this.opts.advertise || this._callServer) return;
+		const advertise = this._callServerAdvertise ?? this.opts.advertise;
 		const cs = new CallServer(
 			this._registry._handle.asDispatchPort(),
 			{
@@ -1232,10 +1381,22 @@ export class ServiceBridge {
 				privateKeyDer: Buffer.from(prov.privateKeyDer),
 			},
 			() => this._watchStream.policyEvaluation(),
+			{
+				maxConcurrentCalls: this.opts.rpcMaxConcurrentCalls,
+				maxQueuedCalls: this.opts.rpcMaxQueuedCalls,
+			},
 		);
 		try {
-			const endpoint = await cs.start(this.opts.advertise);
+			const endpoint = await cs.start(advertise);
+			if (this.stale(gen)) {
+				await cs.stop();
+				return;
+			}
 			this._callServer = cs;
+			this._callServerAdvertise = {
+				host: advertise.host,
+				port: Number(endpoint.slice(endpoint.lastIndexOf(":") + 1)),
+			};
 			this._registry.setCallEndpoint(endpoint);
 		} catch (err) {
 			// CallServer bind failed — treat as fatal for this attempt, surface as
@@ -1282,8 +1443,7 @@ export class ServiceBridge {
 		const telemetryApi = this._telemetryApi;
 		const sub = new WorkflowSubscriber({
 			rpc,
-			serviceId: id.serviceId,
-			instanceId: id.instanceId,
+			identity: () => this.currentIdentity,
 			deps: {
 				sb: { rpc: this.rpc, event: this.event, workflow: this.workflow },
 				ops: makeRuntimeOps(rpc, () => this.currentIdentity?.instanceId ?? ""),
@@ -1384,15 +1544,6 @@ export class ServiceBridge {
 		this._jobSubscriber = sub;
 	}
 
-	private handlersForSubscriber(): EventHandler[] {
-		return this._registry._handle._entries
-			.filter((e) => e.type === MethodType.METHOD_TYPE_EVENT)
-			.map((e) => ({
-				pattern: e.name,
-				fn: e.fn as (payload: unknown) => Promise<void> | void,
-			}));
-	}
-
 	private scheduleCertRefresh(prov: ProvisionResult): void {
 		if (this.certRefreshTimer) {
 			clearTimeout(this.certRefreshTimer);
@@ -1424,6 +1575,7 @@ export class ServiceBridge {
 	 */
 	private async rotateCert(): Promise<void> {
 		if (this.stopped) return;
+		const gen = this.generation;
 		if (!this.controlClient || !this.lastProvision) {
 			// No live session — nothing to refresh from. Let reconnect handle it.
 			this.scheduleReconnect(1, "rotation: no live session");
@@ -1437,6 +1589,7 @@ export class ServiceBridge {
 				this.lastProvision,
 			);
 		} catch (err) {
+			if (this.stale(gen)) return;
 			const sbErr = new ServiceBridgeError("rotation refresh", err);
 			if (!isRetryable(sbErr.code)) {
 				this.emit("disconnected", { reason: sbErr.message, error: sbErr });
@@ -1447,13 +1600,14 @@ export class ServiceBridge {
 			return;
 		}
 
+		if (this.stale(gen)) return;
+
 		const newCreds = this.buildMTLSCredentials(newProv);
 		const newRegistryClient = this.opts.registryClientFactory(
 			this.url,
 			newCreds,
 		);
 		const newClient = this.opts.clientFactory(this.url, newCreds);
-		const newStream = openControlStream(newClient);
 		const oldSession = this.session;
 		const oldControlClient = this.controlClient;
 		const oldRegistryClient = this.registryClient;
@@ -1473,6 +1627,10 @@ export class ServiceBridge {
 					// closed by the success block once the swap completes.
 					this.controlClient = newClient;
 					this.registryClient = newRegistryClient;
+					// The rotated cert becomes the cache the next transport-level
+					// reconnect reuses; without this, reusableProvision() keeps judging
+					// freshness by the evicted cert and forces a full argon2 Provision.
+					this.lastProvision = newProv;
 					this.scheduleCertRefresh(newProv);
 					this.currentIdentity = {
 						sessionId: welcome.sessionId,
@@ -1481,8 +1639,6 @@ export class ServiceBridge {
 						instanceId: newProv.instanceId,
 					};
 					this._telemetryInstanceId = newProv.instanceId;
-					this.maybeStartWorkflowSubscriber();
-					this.maybeStartJobSubscriber();
 					this.emit("connected", {
 						sessionId: welcome.sessionId,
 						serviceId: welcome.serviceId,
@@ -1495,17 +1651,32 @@ export class ServiceBridge {
 					if (!this.stopped)
 						this.emit("disconnected", { reason: `drain: ${reason}` });
 				},
+				// Both callbacks branch on `welcomed`: before Welcome they settle the
+				// swap promise (rollback path), after it the promise is already
+				// resolved and they are the only supervision the live session has —
+				// без этого ротация оставляла сессию без надзора и обрыв стрима уходил
+				// в тишину.
 				onError: (err) => {
-					clearTimeout(timer);
-					reject(err);
+					if (!welcomed) {
+						clearTimeout(timer);
+						reject(err);
+						return;
+					}
+					if (!this.stopped) this.scheduleReconnect(1, err.message);
 				},
 				onEnd: () => {
 					if (!welcomed) {
 						clearTimeout(timer);
 						reject(new Error("rotation: new stream ended before welcome"));
+						return;
 					}
+					this.clearTimers();
+					if (!this.stopped) this.scheduleReconnect(1, "stream ended");
 				},
 			};
+			// Opened and adopted in one synchronous run — see openSession for why an
+			// unlistened 'error' on this stream is fatal.
+			const newStream = openControlStream(newClient);
 			const newSession = new Session(
 				newStream,
 				cbs,
@@ -1516,22 +1687,8 @@ export class ServiceBridge {
 
 		try {
 			await swapPromise;
-			// Close the old session only after the new one is fully usable, then
-			// release the old session's channels (Session.close cancels the stream
-			// but not the underlying channel).
-			oldSession?.close();
-			oldControlClient?.close();
-			oldRegistryClient?.close();
-			this._watchStream.restart(
-				this._registry.buildRegisterRequest(),
-				newRegistryClient,
-				(err) => {
-					console.warn(
-						`[ServiceBridge] registry watch stream error (auto-restarts): ${err.message}`,
-					);
-				},
-			);
 		} catch (err) {
+			if (this.stale(gen)) return;
 			// Roll back to the previous session: keep oldSession alive and tear
 			// down the partially-built new one. The new channels were never adopted
 			// (no Welcome) so close them here, then schedule a reconnect to retry.
@@ -1547,7 +1704,42 @@ export class ServiceBridge {
 				1,
 				`rotation: ${err instanceof Error ? err.message : String(err)}`,
 			);
+			return;
 		}
+
+		if (this.stale(gen)) return;
+
+		// Close the old session only after the new one is fully usable, then
+		// release the old session's channels (Session.close cancels the stream
+		// but not the underlying channel).
+		oldSession?.close();
+		oldControlClient?.close();
+		oldRegistryClient?.close();
+		this._watchStream.restart(
+			this._registry.buildRegisterRequest(),
+			newRegistryClient,
+			(err) => {
+				console.warn(
+					`[ServiceBridge] registry watch stream error (auto-restarts): ${err.message}`,
+				);
+			},
+		);
+
+		// Rebuild every channel that pinned the previous leaf cert. Control and
+		// Registry alone are not the connection: RPC, events, workflows, jobs,
+		// telemetry and the inbound CallServer each hold their own TLS material.
+		try {
+			await this.ensureRpcReady(newProv, newCreds, gen);
+		} catch (err) {
+			this.scheduleReconnect(
+				1,
+				`rotation: rpc rewire: ${err instanceof Error ? err.message : String(err)}`,
+			);
+			return;
+		}
+		if (this.stale(gen)) return;
+		this.maybeStartWorkflowSubscriber();
+		this.maybeStartJobSubscriber();
 	}
 
 	private scheduleReconnect(attempt: number, reason: string): void {
