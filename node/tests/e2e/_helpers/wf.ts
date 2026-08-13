@@ -4,8 +4,9 @@
 // policy-seeding utilities the workflow e2e files share.
 
 import type { ServiceBridge } from "../../../src/connection/service-bridge";
+import type { WorkflowsClient } from "../../../src/pb/servicebridge/v1/workflows";
 import { sleep } from "./fixtures";
-import { addRule } from "./policy-db";
+import { addRule, withDb } from "./policy-db";
 
 // FAST_WF_OPTS — tight reconnect for fast test failures.
 export const FAST_WF_OPTS = {
@@ -69,6 +70,128 @@ export async function awaitRunStatus(
 	throw new Error(
 		`awaitRunStatus(${runId}): timed out after ${timeoutMs}ms, last status="${last.status}"`,
 	);
+}
+
+// LeaseRow — the lease-bearing columns of a workflow_runs row. Lease state has
+// no wire representation (Query returns status + steps only), so the lease
+// tests read it straight from Postgres.
+export interface LeaseRow {
+	status: string;
+	leaseEpoch: number;
+	leaseHolderInstanceId: string | null;
+	leaseExpiresAtMs: number | null;
+}
+
+export async function leaseOf(runId: string): Promise<LeaseRow> {
+	return withDb(async (sql) => {
+		const rows = (await sql`
+			SELECT status,
+			       lease_epoch,
+			       lease_holder_instance_id,
+			       lease_expires_at
+			  FROM workflow_runs
+			 WHERE id = ${runId}
+		`) as Array<{
+			status: string;
+			lease_epoch: string | number;
+			lease_holder_instance_id: string | null;
+			lease_expires_at: Date | null;
+		}>;
+		const row = rows[0];
+		if (!row) throw new Error(`leaseOf(${runId}): run not in DB`);
+		return {
+			status: row.status,
+			leaseEpoch: Number(row.lease_epoch),
+			leaseHolderInstanceId: row.lease_holder_instance_id,
+			leaseExpiresAtMs: row.lease_expires_at
+				? row.lease_expires_at.getTime()
+				: null,
+		};
+	});
+}
+
+// stepStatus returns a workflow_steps row status, or null when the step row
+// does not exist yet. Steps the runner never reached have no row.
+export async function stepStatus(
+	runId: string,
+	stepId: string,
+): Promise<string | null> {
+	return withDb(async (sql) => {
+		const rows = (await sql`
+			SELECT status FROM workflow_steps
+			 WHERE run_id = ${runId} AND step_id = ${stepId}
+		`) as Array<{ status: string }>;
+		return rows[0]?.status ?? null;
+	});
+}
+
+// forceLeaseReclaim expires the lease in place, leaving status and holder
+// untouched. This is what a dead holder looks like to the runtime: the
+// LeaseManager sweep (running/waiting) and the dispatcher's stale-compensating
+// sweep both key off lease_expires_at <= now(), so this drives the real reclaim
+// paths instead of simulating their outcome.
+export async function forceLeaseReclaim(runId: string): Promise<void> {
+	await withDb(async (sql) => {
+		await sql`
+			UPDATE workflow_runs
+			   SET lease_expires_at = now() - interval '1 minute'
+			 WHERE id = ${runId}
+		`;
+	});
+}
+
+// reclaimLeaseNow applies the LeaseManager's running-run reclaim outcome
+// synchronously: bump lease_epoch (fencing the current holder), drop the holder
+// and hand the run back to the dispatcher as 'pending'. Used where the test must
+// observe the fenced holder BEFORE the reclaim sweep's own interval elapses.
+export async function reclaimLeaseNow(runId: string): Promise<void> {
+	await withDb(async (sql) => {
+		await sql`
+			UPDATE workflow_runs
+			   SET lease_epoch              = lease_epoch + 1,
+			       lease_holder_instance_id = NULL,
+			       lease_expires_at         = NULL,
+			       status                   = 'pending'
+			 WHERE id = ${runId}
+			   AND status IN ('running', 'waiting')
+		`;
+	});
+}
+
+// workflowsWire exposes the WorkflowsClient a connected ServiceBridge already
+// owns. The checkpoint RPCs (BeginStep/CompleteStep/FailStep/Heartbeat) carry
+// lease_epoch and are the surface fencing acts on, but the SDK only ever calls
+// them from inside its runner — a fencing test has to issue them itself.
+export function workflowsWire(sb: ServiceBridge): WorkflowsClient {
+	const client = (sb as unknown as { _workflowsClient: WorkflowsClient | null })
+		._workflowsClient;
+	if (!client) {
+		throw new Error("workflowsWire: client absent — connect the SDK first");
+	}
+	return client;
+}
+
+// GRPC_ABORTED — the code the runtime answers a fenced checkpoint with
+// (ErrLeaseFenced → codes.Aborted).
+export const GRPC_ABORTED = 10;
+
+// grpcCodeOf runs `call` and returns the gRPC status code it failed with, or
+// null when it succeeded.
+export async function grpcCodeOf(
+	call: () => Promise<unknown>,
+): Promise<number | null> {
+	try {
+		await call();
+		return null;
+	} catch (err) {
+		const code = (err as { code?: unknown }).code;
+		if (typeof code !== "number") {
+			throw new Error(
+				`grpcCodeOf: expected a gRPC ServiceError, got ${String(err)}`,
+			);
+		}
+		return code;
+	}
 }
 
 // addWorkflowRule seeds the minimal policy rules needed for a workflow run:
