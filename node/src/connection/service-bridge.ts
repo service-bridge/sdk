@@ -1,5 +1,6 @@
 import "reflect-metadata";
 import * as grpc from "@grpc/grpc-js";
+import { ConfigurationError, ServiceBridgeError } from "../errors";
 import { EventDomain } from "../events/domain";
 import { Drainer } from "../events/drainer";
 import type { SchemaIndex } from "../events/publisher";
@@ -336,7 +337,7 @@ export interface ReconnectingEvent {
 
 export interface DisconnectedEvent {
 	reason: string;
-	error?: ConnectionError;
+	error?: ServiceBridgeError;
 }
 
 /**
@@ -619,6 +620,18 @@ export class ServiceBridge {
 			rpcMaxQueuedCalls: options.rpcMaxQueuedCalls,
 			_disableTelemetryTransport: hooks._disableTelemetryTransport ?? false,
 		};
+
+		// A bad bound is caught here rather than where the semaphore is built:
+		// that happens inside the connect path, where a throw is classified as a
+		// transport failure and retried forever. The defaults themselves stay in
+		// the semaphore — this only rejects values that can never be valid.
+		assertPositiveInt("rpcMaxConcurrentCalls", options.rpcMaxConcurrentCalls);
+		assertPositiveInt("rpcMaxQueuedCalls", options.rpcMaxQueuedCalls, 0);
+		assertPositiveInt("maxOutboxRows", options.maxOutboxRows);
+		assertPositiveInt("eventsDrainerBatch", options.eventsDrainerBatch);
+		assertPositiveInt("eventsMaxInFlight", options.eventsMaxInFlight);
+		assertPositiveInt("reconnectAttempts", options.reconnectAttempts, 0);
+		assertPositiveInt("reconnectIntervalMs", options.reconnectIntervalMs, 0);
 
 		// Telemetry wiring (ADR-0007). Ring is owned by the bridge so user code
 		// may emit logs/ops/metrics before start(); they buffer in the ring and
@@ -1103,6 +1116,14 @@ export class ServiceBridge {
 			await this.openSession(result, attempt, gen);
 		} catch (err) {
 			if (this.stale(gen)) return;
+			// A bad option is not a transport failure and no amount of retrying
+			// fixes it. Left to the classifier below it would read as code -1,
+			// i.e. transient, and loop forever blaming provisioning.
+			if (err instanceof ConfigurationError) {
+				this.emit("disconnected", { reason: err.message, error: err });
+				void this.stop();
+				throw err;
+			}
 			const sbErr = new ConnectionError("provision", err);
 			if (!isRetryable(sbErr.code)) {
 				this.emit("disconnected", { reason: sbErr.message, error: sbErr });
@@ -1787,5 +1808,21 @@ export class ServiceBridge {
 			clearTimeout(this.reconnectTimer);
 			this.reconnectTimer = null;
 		}
+	}
+}
+
+// assertPositiveInt rejects an option value that can never be valid. `min`
+// defaults to 1; pass 0 where zero carries a meaning (unlimited attempts, no
+// queue). Undefined passes — the option is simply not set.
+function assertPositiveInt(
+	name: string,
+	value: number | undefined,
+	min = 1,
+): void {
+	if (value === undefined) return;
+	if (!Number.isInteger(value) || value < min) {
+		throw new ConfigurationError(
+			`ServiceBridge: ${name} must be an integer >= ${min}, got ${value}`,
+		);
 	}
 }

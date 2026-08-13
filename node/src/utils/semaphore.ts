@@ -1,3 +1,4 @@
+import { ConfigurationError } from "../errors";
 // Domain-neutral counting semaphore with a bounded wait queue. No I/O, no
 // domain knowledge — see ./README.md.
 
@@ -47,10 +48,10 @@ export class Semaphore {
 		private readonly maxQueued: number = limit,
 	) {
 		if (!Number.isInteger(limit) || limit < 1) {
-			throw new Error(`semaphore: limit must be an integer >= 1, got ${limit}`);
+			throw new ConfigurationError(`semaphore: limit must be an integer >= 1, got ${limit}`);
 		}
 		if (!Number.isInteger(maxQueued) || maxQueued < 0) {
-			throw new Error(
+			throw new ConfigurationError(
 				`semaphore: maxQueued must be an integer >= 0, got ${maxQueued}`,
 			);
 		}

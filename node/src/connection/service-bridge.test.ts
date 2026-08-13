@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { ConfigurationError } from "../errors";
 import { EventEmitter } from "node:events";
 import { status as GrpcStatus } from "@grpc/grpc-js";
 import { BootstrapKeyPayload } from "../pb/servicebridge/v1/bootstrap";
@@ -509,6 +510,41 @@ describe("ServiceBridge telemetry identity", () => {
 		latest().emitEvent(snapshotWithTelemetry(true));
 		await tick();
 		expect(sb.telemetry.enabled()).toBe(true);
+	});
+
+	test("an invalid option is rejected at construction, not retried as a transport error", () => {
+		// A bad bound is a typo, not an outage. Reaching the connect path it would
+		// be classified by gRPC status, come out as code -1 — transient — and
+		// reconnect forever blaming a provisioning failure that never happened.
+		for (const bad of [
+			{ rpcMaxConcurrentCalls: 0 },
+			{ rpcMaxConcurrentCalls: -1 },
+			{ rpcMaxConcurrentCalls: 2.5 },
+			{ rpcMaxQueuedCalls: -1 },
+			{ maxOutboxRows: 0 },
+			{ eventsDrainerBatch: 0 },
+			{ reconnectAttempts: -1 },
+		]) {
+			expect(
+				() =>
+					new ServiceBridge("localhost:0", VALID_KEY, {
+						advertise: false,
+						_disableTelemetryTransport: true,
+						...bad,
+					}),
+			).toThrow(ConfigurationError);
+		}
+
+		// Zero is meaningful where it means "no bound", so it must pass.
+		expect(
+			() =>
+				new ServiceBridge("localhost:0", VALID_KEY, {
+					advertise: false,
+					_disableTelemetryTransport: true,
+					reconnectAttempts: 0,
+					rpcMaxQueuedCalls: 0,
+				}),
+		).not.toThrow();
 	});
 
 	test("a metric handle taken before Welcome rebinds to the real instance_id", async () => {
@@ -1340,7 +1376,9 @@ describe("ServiceBridge non-retryable errors (H11)", () => {
 		expect(disconnects.length).toBe(1);
 		const unauth0 = disconnects[0];
 		expect(unauth0?.error).toBeInstanceOf(ConnectionError);
-		expect(unauth0?.error?.code).toBe(GrpcStatus.UNAUTHENTICATED);
+		expect((unauth0?.error as ConnectionError).code).toBe(
+			GrpcStatus.UNAUTHENTICATED,
+		);
 		expect(reconnects.length).toBe(0);
 		expect(provisionCalls).toBe(1);
 	});

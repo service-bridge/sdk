@@ -19,7 +19,7 @@ export {
 	type WorkflowHandlerOpts,
 } from "./src/connection/service-bridge";
 export { ConnectionError } from "./src/connection/service-bridge-error";
-export { ServiceBridgeError } from "./src/errors";
+export { ConfigurationError, ServiceBridgeError } from "./src/errors";
 export type { EventDomain } from "./src/events/domain";
 export { InvalidEventNameError, OutboxFullError } from "./src/events/errors";
 export type { PublishOpts } from "./src/events/publisher";
