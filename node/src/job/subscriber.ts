@@ -64,6 +64,7 @@ export interface SubscriberDeps {
 export class JobSubscriber {
 	private _stream: ClientReadableStream<JobExecution> | null = null;
 	private _closed = false;
+	private _reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 	private _heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 	private _heartbeatFailures = 0;
 	private readonly _semaphores = new Map<string, Semaphore>();
@@ -85,6 +86,10 @@ export class JobSubscriber {
 		this._closed = true;
 		this.stopHeartbeat();
 		this._stream?.cancel();
+		if (this._reconnectTimer) {
+			clearTimeout(this._reconnectTimer);
+			this._reconnectTimer = null;
+		}
 	}
 
 	private async connectLoop(attempt: number): Promise<void> {
@@ -99,7 +104,12 @@ export class JobSubscriber {
 				);
 			}
 			const delay = reconnectDelay(attempt++);
-			await new Promise((r) => setTimeout(r, delay));
+			await new Promise<void>((resolve) => {
+				this._reconnectTimer = setTimeout(() => {
+					this._reconnectTimer = null;
+					resolve();
+				}, delay);
+			});
 		}
 	}
 

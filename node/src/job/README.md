@@ -47,7 +47,7 @@ SDK-сторона интеграции с рантайм-подсистемой
 - **Lookup через `JobDomain._byName`**, а не через `Handle._entries`: handlers есть в Handle entries для общего finalize/debugging, но per-job opts (`maxConcurrent` и т.д.) нужны для семафора — JobDomain держит их в своей мапе.
 - Cron строго 5-field: 6-field cron отклоняется на стороне SDK до отправки на рантайм.
 - Heartbeat 5 с, порог 3 — соответствует lease reclaim логике рантайма.
-- Reconnect ladder `[1, 5, 15, 30, 60]` с — идентично `workflow/subscriber.ts`.
+- Reconnect ladder `[1, 5, 15, 30, 60]` с — идентично `workflow/subscriber.ts`. Таймер ожидания между попытками хранится в `_reconnectTimer` и отменяется в `stop()` — непрокинутый таймер держал бы event loop живым до следующей ступени лестницы после закрытия сабскрайбера.
 - `error.retryable = false` — пользователь может явно отправить в DLQ.
 
 ## Зависимости

@@ -52,6 +52,7 @@ interface FrozenPlan {
 export class WorkflowSubscriber {
 	private stream: ClientReadableStream<RunAssignment> | null = null;
 	private closed = false;
+	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 	private heartbeats = new Map<
 		string,
 		{ timer: NodeJS.Timeout; leaseEpoch: number }
@@ -68,6 +69,10 @@ export class WorkflowSubscriber {
 		this.stream?.cancel();
 		for (const t of this.heartbeats.values()) clearInterval(t.timer);
 		this.heartbeats.clear();
+		if (this.reconnectTimer) {
+			clearTimeout(this.reconnectTimer);
+			this.reconnectTimer = null;
+		}
 	}
 
 	private async connectLoop(attempt: number): Promise<void> {
@@ -83,7 +88,12 @@ export class WorkflowSubscriber {
 				);
 			}
 			const delay = reconnectDelay(attempt++);
-			await new Promise((r) => setTimeout(r, delay));
+			await new Promise<void>((resolve) => {
+				this.reconnectTimer = setTimeout(() => {
+					this.reconnectTimer = null;
+					resolve();
+				}, delay);
+			});
 		}
 	}
 

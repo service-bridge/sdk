@@ -40,3 +40,55 @@ describe("WorkflowSubscriber heartbeat", () => {
 		}
 	});
 });
+
+describe("WorkflowSubscriber reconnect timer", () => {
+	it("Close_ClearsPendingReconnectTimer", async () => {
+		// connectLoop() waits between reconnect attempts via setTimeout. If that
+		// timer is never tracked, close() cannot cancel it — the process stays
+		// alive up to the reconnect ladder's rung length after the subscriber is
+		// closed (same class of bug as BUG-17 in connection/service-bridge.ts).
+		const setSpy = spyOn(globalThis, "setTimeout");
+		const clearSpy = spyOn(globalThis, "clearTimeout");
+		try {
+			const listeners = new Map<string, Array<(...a: unknown[]) => void>>();
+			const stream = {
+				on(event: string, cb: (...a: unknown[]) => void) {
+					const list = listeners.get(event) ?? [];
+					list.push(cb);
+					listeners.set(event, list);
+				},
+				cancel() {},
+			};
+			const emit = (event: string, ...args: unknown[]) => {
+				for (const cb of listeners.get(event) ?? []) cb(...args);
+			};
+
+			const sub = new WorkflowSubscriber({
+				// biome-ignore lint/suspicious/noExplicitAny: minimal grpc stub
+				rpc: { subscribe: () => stream } as any,
+				serviceId: "svc-1",
+				instanceId: "inst-1",
+				// biome-ignore lint/suspicious/noExplicitAny: reconnect path never runs the runner
+				deps: {} as any,
+				logger: { warn: () => {}, error: () => {} },
+				lookupLocalGraph: () => null,
+			});
+			sub.start();
+
+			// Stream error → runOnce() rejects → connectLoop schedules a reconnect
+			// wait via setTimeout.
+			emit("error", new Error("boom"));
+			await Bun.sleep(5);
+
+			const timerHandle = setSpy.mock.results.at(-1)?.value;
+			expect(timerHandle).toBeDefined();
+
+			sub.close();
+
+			expect(clearSpy.mock.calls.some(([t]) => t === timerHandle)).toBe(true);
+		} finally {
+			setSpy.mockRestore();
+			clearSpy.mockRestore();
+		}
+	});
+});
