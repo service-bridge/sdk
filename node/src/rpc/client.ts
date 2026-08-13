@@ -81,7 +81,7 @@ export class RpcClient {
 	// stream invokes a server-side streaming method, returning an AsyncIterable
 	// of decoded chunks. Transport selection follows the same transport opt
 	// rules as call(). Retry is NOT applied — streams are single-pick by design
-	// (ADR 0004): mid-stream replay would re-deliver already-received chunks.
+	// (ADR 0001): mid-stream replay would re-deliver already-received chunks.
 	async *stream<Req = unknown, Chunk = unknown>(
 		serviceName: string,
 		methodName: string,
