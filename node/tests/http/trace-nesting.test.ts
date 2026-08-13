@@ -32,7 +32,13 @@ function makeSb(): { sb: ServiceBridge; started: StartedOp[] } {
 			startOp(p: { traceId?: string }) {
 				const op = { traceId: p.traceId ?? "", opId: uuidv7() };
 				started.push(op);
-				return { ...op, captureIn() {}, captureOut() {}, end() {} };
+				return {
+					...op,
+					capturing: false,
+					captureIn() {},
+					captureOut() {},
+					end() {},
+				};
 			},
 		},
 	} as unknown as ServiceBridge;

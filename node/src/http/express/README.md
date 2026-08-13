@@ -35,10 +35,9 @@
 
 Ставится автоматически внутри `attachExpress`. Отдельного публичного API нет.
 
-- Читает заголовок `x-sb-trace`, восстанавливает `TraceContext` (`contextFromXSbTrace`), стартует HTTP.HANDLE op и оборачивает downstream chain в `runWithTrace(childContext(ctx, handle.opId), () => next())`. Route handlers и их `sb.rpc.call` / `event.publish` видят через ALS контекст, где `traceId` един с HTTP.HANDLE, а `parentOpId` = `opId` этого op'а — downstream вложен под HTTP.HANDLE, а не отдельный корень.
-- Эмитит op `Channel.HTTP` / `HttpHandle`: `subject = "http.handle:${method}/${path}"`, `businessKey` = заголовок `Idempotency-Key` или `"${method} ${path}"`.
-- Захватывает тело запроса (IN) и ответа (OUT) как raw-JSON (`RAW_JSON_CONTRACT`); пустые тела не пишутся.
-- Завершает op статусом из единого словаря: `SUCCESS` (код < 400), `ERROR` (код ≥ 400), `TIMEOUT` (`client abort` — соединение закрылось без `res.end`).
+- Стартует HTTP.HANDLE через общий `startHttpOp` (`../_common/http-op`): заголовок `x-sb-trace` → `TraceContext`, `subject = "http.handle:${method}/${path}"`, `businessKey` = заголовок `Idempotency-Key` или `"${method} ${path}"`. Downstream chain идёт в `runWithTrace(op.scope, () => next())`. Route handlers и их `sb.rpc.call` / `event.publish` видят через ALS контекст, где `traceId` един с HTTP.HANDLE, а `parentOpId` = `opId` этого op'а — downstream вложен под HTTP.HANDLE, а не отдельный корень.
+- Захватывает тело запроса (IN) и ответа (OUT) как raw-JSON (`RAW_JSON_CONTRACT`); пустые тела не пишутся. Пока `op.capturing === false` (эффективный режим op'а — `none`), обёртка `res.json`/`res.send` не ставится и тела не сериализуются вовсе.
+- Завершает op статусом из единого словаря: `statusForHttpCode` даёт `SUCCESS` (код < 400) и `ERROR` (код ≥ 400); `TIMEOUT` (`client abort`) ставится, когда соединение закрылось без `res.end`.
 
 ### Пример использования
 
@@ -66,15 +65,16 @@ app.listen(3000);
 | `getRootRouter(app)` | `(Express) => { stack } \| null` | — | Runtime fallback на оба shape: `app._router ?? app.router`. |
 | `prefixFromLayer(layer)` | `(LayerLike) => string` | `""` | Best-effort извлечение префикса sub-router из `layer.regexp.source`. На Express 5 (path-to-regexp v8) `regexp` отсутствует — префикс не извлекается, sub-router routes регистрируются БЕЗ префикса. |
 | `collect(router, prefix, out)` | `(router, string, out[]) => void` | — | Рекурсивный обход stack с поддержкой sub-routers; раскладывает multi-method роуты, пропускает `_all`. |
-| `installTraceMiddleware(app, sb)` | `(Express, ServiceBridge) => void` | — | Ставит ровно один trace+telemetry middleware (флаг `TRACE_FLAG` на `app`) и поднимает его в начало router stack, чтобы он отрабатывал до роутов. |
+| `installTraceMiddleware(app, sb)` | `(Express, ServiceBridge) => void` | — | Ставит ровно один trace+telemetry middleware (флаг `TRACE_FLAG` на `app`) и зовёт `hoistTraceMiddleware`. |
+| `hoistTraceMiddleware(app)` | `(Express) => void` | — | Поднимает только что добавленный слой в начало router stack, чтобы он отрабатывал до роутов. Бросает, если root router недоступен. |
 | `TRACE_FLAG` | `const string` | `"__servicebridge_trace__"` | Маркер идемпотентности middleware на `app`. |
 | `Router` (re-export) | `type` | — | Реэкспорт типа `express.Router` для тестов. |
 
 ## Архитектурные решения и почему
 
 - **Синхронный сбор в `attachExpress`, а не patch `app.listen` и не first-request walk.** Пользователь сам знает `port` (особенно при bind на `0`) и передаёт его явно, поэтому endpoint и роуты собираются в момент вызова — детерминированно, без магии вокруг `listen` (которая ломка в Express 5). Симметрично `attachHono`.
-- **Middleware поднимается в начало stack.** `attachExpress` обычно зовут ПОСЛЕ `app.get(...)`. Express ставит `app.use(...)` в конец stack, где роуты уже завершили запрос. Поэтому только что добавленный слой переносится в начало — иначе trace/telemetry не отработал бы.
-- **Тело только читается, ответ не меняется.** `res.json`/`res.send` оборачиваются лишь чтобы запомнить OUT-тело; оригинальный вызов сохраняется. IN-тело читается в finalize, когда body-parser уже отработал. Захват — raw-JSON (`RAW_JSON_CONTRACT`), без proto-схемы.
+- **Middleware поднимается в начало stack, и провал подъёма — это ошибка.** `attachExpress` обычно зовут ПОСЛЕ `app.get(...)`. Express ставит `app.use(...)` в конец stack, где роуты уже завершили запрос. Поэтому только что добавленный слой переносится в начало — иначе trace/telemetry не отработал бы. `app.use(...)` обязан материализовать root router; если после него `getRootRouter` всё равно вернул `null`, стек не той формы, которую мы умеем читать, и HTTP.HANDLE молча не эмиттился бы вообще — поэтому `hoistTraceMiddleware` бросает, а не пропускает подъём.
+- **Тело только читается, ответ не меняется.** `res.json`/`res.send` оборачиваются лишь чтобы запомнить OUT-тело; оригинальный вызов сохраняется. IN-тело читается в finalize, когда body-parser уже отработал. Захват — raw-JSON (`RAW_JSON_CONTRACT`), без proto-схемы. Всё это включается только при `HttpOp.capturing`: в дефолтном режиме `none` `OpHandle` всё равно выбросил бы байты, а `JSON.stringify` ответа стоил бы дороже самой операции.
 - **Express 4 vs 5.** Поддержаны оба shape (`_router`/`router`). Sub-router prefix извлекается только на 4 (документированное ограничение). Для строгой публикации с префиксом — регистрируйте роуты top-level (`app.get("/v1/users/list", ...)`).
 - **Type-only import Express.** `import type { Express, ... }`. Пользователь без установленного express (`peerDependenciesMeta.optional`) не падает на resolve.
 
@@ -84,11 +84,10 @@ app.listen(3000);
 - `express` (peerDependency, optional) — type-only.
 - `../endpoint` — `resolveHttpAdvertiseHost`.
 - `../_common/body-capture` — `bodyToBytes`, `RAW_JSON_CONTRACT`.
-- `../_common/trace-wrap` — `contextFromXSbTrace`.
+- `../_common/http-op` — `startHttpOp`, `statusForHttpCode`.
 - `../route` — тип `Route` через `sb.routes`.
 - `../../connection/service-bridge` — type-only `ServiceBridge`.
-- `../../telemetry/context`, `../../telemetry/ops` — `runWithTrace`, `Channel`, `HttpHandle`, `Status`.
-- `../../telemetry/trace-context` — `childContext` (вложенность downstream под HTTP.HANDLE).
+- `../../telemetry/context`, `../../telemetry/ops` — `runWithTrace`, `Status` (только `TIMEOUT` на client abort).
 
 Используется в:
 - `sdk/node/tests/e2e/http-express.test.ts`.

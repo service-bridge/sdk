@@ -8,16 +8,10 @@ import type {
 import fp from "fastify-plugin";
 import type { ServiceBridge } from "../../connection/service-bridge";
 import { als } from "../../telemetry/context";
-import {
-	Channel,
-	HttpHandle,
-	type OpHandle,
-	Status,
-} from "../../telemetry/ops";
+import { type OpHandle, Status } from "../../telemetry/ops";
 import type { TraceContext } from "../../telemetry/trace-context";
-import { childContext } from "../../telemetry/trace-context";
 import { bodyToBytes, RAW_JSON_CONTRACT } from "../_common/body-capture";
-import { contextFromXSbTrace } from "../_common/trace-wrap";
+import { startHttpOp, statusForHttpCode } from "../_common/http-op";
 import { resolveHttpAdvertiseHost } from "../endpoint";
 
 /**
@@ -38,6 +32,7 @@ declare module "fastify" {
 	interface FastifyRequest {
 		sbTraceCtx?: TraceContext;
 		sbHttpHandle?: OpHandle;
+		sbHttpCapturing?: boolean;
 	}
 }
 
@@ -75,29 +70,22 @@ const plugin: FastifyPluginAsync<SbFastifyOptions> = async (
 	// childContext(ctx, handle.opId): downstream-операции вложены под HTTP.HANDLE
 	// (симметрично rpc-клиенту, который ставит CALL.op_id родителем для callee).
 	fastify.addHook("preHandler", async (req: FastifyRequest) => {
-		const header = req.headers["x-sb-trace"];
-		const value = Array.isArray(header) ? header[0] : header;
-		const ctx = contextFromXSbTrace(value ?? null);
-		req.sbTraceCtx = ctx;
-
-		const idempotencyHeader = req.headers["idempotency-key"];
-		const businessKey = Array.isArray(idempotencyHeader)
-			? idempotencyHeader[0]
-			: idempotencyHeader;
-		const subject = `http.handle:${req.method}/${req.routeOptions?.url ?? req.url}`;
-		const handle = sb.telemetry.startOp({
-			traceId: ctx.traceId,
-			parentOpId: ctx.parentOpId,
-			channel: Channel.HTTP,
-			kind: HttpHandle,
-			subject,
-			businessKey: businessKey ?? `${req.method} ${req.url}`,
+		const op = startHttpOp(sb, {
+			method: req.method,
+			subjectPath: req.routeOptions?.url ?? req.url,
+			keyPath: req.url,
+			traceHeader: req.headers["x-sb-trace"],
+			idempotencyKey: req.headers["idempotency-key"],
 		});
-		req.sbHttpHandle = handle;
-		als.enterWith(childContext(ctx, handle.opId));
+		req.sbTraceCtx = op.incoming;
+		req.sbHttpHandle = op.handle;
+		req.sbHttpCapturing = op.capturing;
+		als.enterWith(op.scope);
 		// Request body (IN) — Fastify has already parsed it by preHandler.
-		const inBytes = bodyToBytes(req.body);
-		if (inBytes) handle.captureIn(inBytes, RAW_JSON_CONTRACT);
+		if (op.capturing) {
+			const inBytes = bodyToBytes(req.body);
+			if (inBytes) op.handle.captureIn(inBytes, RAW_JSON_CONTRACT);
+		}
 	});
 
 	// onSend exposes the serialized response payload — capture it (OUT) before
@@ -105,6 +93,7 @@ const plugin: FastifyPluginAsync<SbFastifyOptions> = async (
 	fastify.addHook(
 		"onSend",
 		async (req: FastifyRequest, _reply: FastifyReply, payload: unknown) => {
+			if (!req.sbHttpCapturing) return payload;
 			const outBytes = bodyToBytes(payload);
 			if (outBytes) req.sbHttpHandle?.captureOut(outBytes, RAW_JSON_CONTRACT);
 			return payload;
@@ -116,10 +105,8 @@ const plugin: FastifyPluginAsync<SbFastifyOptions> = async (
 		async (req: FastifyRequest, reply: FastifyReply) => {
 			const handle = req.sbHttpHandle;
 			if (!handle) return;
-			const code = reply.statusCode;
-			if (code >= 500) handle.end(Status.ERROR, `HTTP ${code}`);
-			else if (code >= 400) handle.end(Status.ERROR, `HTTP ${code}`);
-			else handle.end(Status.SUCCESS);
+			const { status, message } = statusForHttpCode(reply.statusCode);
+			handle.end(status, message);
 		},
 	);
 

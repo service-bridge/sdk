@@ -1,41 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import { Hono } from "hono";
 import type { ServiceBridge } from "../../connection/service-bridge";
+import { Status } from "../../telemetry/ops";
+import { makeSbStub } from "../_common/sb-stub";
 import { RouteCollector } from "../route";
 import { attachHono, collectHonoRoutes } from "./plugin";
-
-interface SbStub {
-	sb: ServiceBridge;
-	routes: RouteCollector;
-	endpoint: string | null;
-	publishHits: number;
-}
-
-function makeSbStub(): SbStub {
-	const state = {
-		endpoint: null as string | null,
-		publishHits: 0,
-	};
-	const collector = new RouteCollector({
-		setEndpoint(ep: string) {
-			state.endpoint = ep;
-		},
-		triggerRestart() {
-			state.publishHits++;
-		},
-	});
-	const sb = { routes: collector } as unknown as ServiceBridge;
-	return {
-		sb,
-		routes: collector,
-		get endpoint() {
-			return state.endpoint;
-		},
-		get publishHits() {
-			return state.publishHits;
-		},
-	} as unknown as SbStub;
-}
 
 describe("collectHonoRoutes", () => {
 	it("collects routes after registration", () => {
@@ -134,5 +103,60 @@ describe("attachHono", () => {
 		expect(sink.endpoint).toBe("h:9090");
 		// triggerRestart called once (но это no-op в реальном ServiceBridge до start).
 		expect(sink.restartCalls).toBe(1);
+	});
+});
+
+describe("attachHono payload capture gating", () => {
+	async function roundtrip(mode: "none" | "all") {
+		const stub = makeSbStub(mode);
+		const app = new Hono();
+		app.post("/echo", (c) => c.json({ ok: true }));
+		attachHono(app, stub.sb, { port: 1 });
+
+		const req = new Request("http://localhost/echo", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ hello: "world" }),
+		});
+		// Клон стрима — самая дорогая часть захвата у Hono; считаем его напрямую.
+		let clones = 0;
+		const origClone = req.clone.bind(req);
+		Object.defineProperty(req, "clone", {
+			value: () => {
+				clones++;
+				return origClone();
+			},
+		});
+		await app.fetch(req);
+		return { stub, clones: () => clones };
+	}
+
+	it('does not clone or serialize bodies when capture mode is "none"', async () => {
+		const { stub, clones } = await roundtrip("none");
+		expect(clones()).toBe(0);
+		expect(stub.captures).toHaveLength(0);
+		expect(stub.endCalls).toEqual([
+			{ status: Status.SUCCESS, message: undefined },
+		]);
+	});
+
+	it('captures request and response bodies when capture mode is "all"', async () => {
+		const { stub, clones } = await roundtrip("all");
+		expect(clones()).toBe(1);
+		expect(stub.captures.map((c) => c.direction)).toEqual(["in", "out"]);
+	});
+
+	it("maps 4xx and 5xx alike to ERROR", async () => {
+		const stub = makeSbStub();
+		const app = new Hono();
+		app.get("/missing", (c) => c.json({}, 404));
+		app.get("/boom", (c) => c.json({}, 503));
+		attachHono(app, stub.sb, { port: 1 });
+		await app.fetch(new Request("http://localhost/missing"));
+		await app.fetch(new Request("http://localhost/boom"));
+		expect(stub.endCalls).toEqual([
+			{ status: Status.ERROR, message: "HTTP 404" },
+			{ status: Status.ERROR, message: "HTTP 503" },
+		]);
 	});
 });

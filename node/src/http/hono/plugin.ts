@@ -1,10 +1,9 @@
 import type { Hono } from "hono";
 import type { ServiceBridge } from "../../connection/service-bridge";
 import { runWithTrace } from "../../telemetry/context";
-import { Channel, HttpHandle, Status } from "../../telemetry/ops";
-import { childContext } from "../../telemetry/trace-context";
+import { Status } from "../../telemetry/ops";
 import { bodyToBytes, RAW_JSON_CONTRACT } from "../_common/body-capture";
-import { contextFromXSbTrace } from "../_common/trace-wrap";
+import { startHttpOp, statusForHttpCode } from "../_common/http-op";
 import { resolveHttpAdvertiseHost } from "../endpoint";
 
 /**
@@ -79,28 +78,28 @@ function installHonoTracing(app: Hono, sb: ServiceBridge): void {
 	const origFetch = app.fetch.bind(app);
 	// biome-ignore lint/suspicious/noExplicitAny: env/executionCtx — рантайм-зависимы
 	(app as any).fetch = async (req: Request, env?: any, executionCtx?: any) => {
-		const ctx = contextFromXSbTrace(req.headers.get("x-sb-trace"));
 		const url = new URL(req.url);
-		const businessKey =
-			req.headers.get("idempotency-key") ?? `${req.method} ${url.pathname}`;
-		// Clone the request up front so reading its body for capture never
-		// consumes the stream the route handler will read.
-		const reqClone = req.clone();
-		const handle = sb.telemetry.startOp({
-			traceId: ctx.traceId,
-			parentOpId: ctx.parentOpId,
-			channel: Channel.HTTP,
-			kind: HttpHandle,
-			subject: `http.handle:${req.method}/${url.pathname}`,
-			businessKey,
+		const op = startHttpOp(sb, {
+			method: req.method,
+			subjectPath: url.pathname,
+			keyPath: url.pathname,
+			traceHeader: req.headers.get("x-sb-trace"),
+			idempotencyKey: req.headers.get("idempotency-key"),
 		});
-		// downstream (handler + sb.rpc.call / event.publish) видит HTTP.HANDLE как
-		// родителя — childContext(ctx, handle.opId): traceId наследуется, op_id
-		// HTTP.HANDLE становится parentOpId для вложенных операций.
-		return runWithTrace(childContext(ctx, handle.opId), async () => {
-			const captureBodies = async (res: Response) => {
+		const handle = op.handle;
+		// Clone the request up front so reading its body for capture never
+		// consumes the stream the route handler will read. Cloning a stream is
+		// not free, so it happens only while capture is actually on.
+		const reqClone = op.capturing ? req.clone() : null;
+		return runWithTrace(op.scope, async () => {
+			// Клон типизирован структурно: глобальный `Request` в этом проекте
+			// резолвится в Bun-версию, а `req.clone()` — в undici-версию.
+			const captureBodies = async (
+				inClone: { text(): Promise<string> },
+				res: Response,
+			) => {
 				try {
-					const inBytes = bodyToBytes(await reqClone.text());
+					const inBytes = bodyToBytes(await inClone.text());
 					if (inBytes) handle.captureIn(inBytes, RAW_JSON_CONTRACT);
 				} catch {
 					// unreadable request body — skip IN capture
@@ -114,11 +113,9 @@ function installHonoTracing(app: Hono, sb: ServiceBridge): void {
 			};
 			try {
 				const res = (await origFetch(req, env, executionCtx)) as Response;
-				await captureBodies(res);
-				if (res.status >= 500) handle.end(Status.ERROR, `HTTP ${res.status}`);
-				else if (res.status >= 400)
-					handle.end(Status.ERROR, `HTTP ${res.status}`);
-				else handle.end(Status.SUCCESS);
+				if (reqClone) await captureBodies(reqClone, res);
+				const { status, message } = statusForHttpCode(res.status);
+				handle.end(status, message);
 				return res;
 			} catch (err) {
 				handle.end(Status.ERROR, (err as Error).message);

@@ -1,64 +1,8 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import Fastify from "fastify";
-import type { ServiceBridge } from "../../connection/service-bridge";
+import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import { Status } from "../../telemetry/ops";
-import { RouteCollector } from "../route";
+import { makeSbStub } from "../_common/sb-stub";
 import { sbFastify } from "./plugin";
-
-interface EndCall {
-	status: Status;
-	message?: string;
-}
-
-interface SbStub {
-	sb: ServiceBridge;
-	routes: RouteCollector;
-	endpoint: string | null;
-	publishHits: number;
-	endCalls: EndCall[];
-}
-
-function makeSbStub(): SbStub {
-	const state = {
-		endpoint: null as string | null,
-		publishHits: 0,
-		endCalls: [] as EndCall[],
-	};
-	const collector = new RouteCollector({
-		setEndpoint(ep: string) {
-			state.endpoint = ep;
-		},
-		triggerRestart() {
-			state.publishHits++;
-		},
-	});
-	const telemetry = {
-		startOp() {
-			return {
-				end(status: Status, message?: string) {
-					state.endCalls.push({ status, message });
-				},
-			};
-		},
-	};
-	const sb = {
-		routes: collector,
-		telemetry,
-	} as unknown as ServiceBridge;
-	return {
-		sb,
-		routes: collector,
-		get endpoint() {
-			return state.endpoint;
-		},
-		get publishHits() {
-			return state.publishHits;
-		},
-		get endCalls() {
-			return state.endCalls;
-		},
-	} as unknown as SbStub;
-}
 
 describe("sbFastify plugin", () => {
 	let app: ReturnType<typeof Fastify> | undefined;
@@ -197,5 +141,62 @@ describe("sbFastify plugin", () => {
 			.snapshot()
 			.filter((r) => r.method === "GET" && r.pattern === "/dup").length;
 		expect(count).toBe(1);
+	});
+
+	it("maps 4xx and 5xx alike to ERROR", async () => {
+		const stub = makeSbStub();
+		app = Fastify({ logger: false });
+		await app.register(sbFastify, { sb: stub.sb });
+		app.get("/missing", async (_req: FastifyRequest, reply: FastifyReply) =>
+			reply.code(404).send({}),
+		);
+		app.get("/boom", async (_req: FastifyRequest, reply: FastifyReply) =>
+			reply.code(503).send({}),
+		);
+		await app.ready();
+		await app.inject({ method: "GET", url: "/missing" });
+		await app.inject({ method: "GET", url: "/boom" });
+		expect(stub.endCalls).toEqual([
+			{ status: Status.ERROR, message: "HTTP 404" },
+			{ status: Status.ERROR, message: "HTTP 503" },
+		]);
+	});
+});
+
+describe("sbFastify payload capture gating", () => {
+	let app: ReturnType<typeof Fastify> | undefined;
+
+	afterEach(async () => {
+		if (app) {
+			await app.close();
+			app = undefined;
+		}
+	});
+
+	async function roundtrip(mode: "none" | "all") {
+		const stub = makeSbStub(mode);
+		app = Fastify({ logger: false });
+		await app.register(sbFastify, { sb: stub.sb });
+		app.post("/echo", async () => ({ ok: true }));
+		await app.ready();
+		await app.inject({
+			method: "POST",
+			url: "/echo",
+			payload: { hello: "world" },
+		});
+		return stub;
+	}
+
+	it('captures nothing when capture mode is "none"', async () => {
+		const stub = await roundtrip("none");
+		expect(stub.captures).toHaveLength(0);
+		expect(stub.endCalls).toEqual([
+			{ status: Status.SUCCESS, message: undefined },
+		]);
+	});
+
+	it('captures request and response bodies when capture mode is "all"', async () => {
+		const stub = await roundtrip("all");
+		expect(stub.captures.map((c) => c.direction)).toEqual(["in", "out"]);
 	});
 });

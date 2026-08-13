@@ -24,10 +24,10 @@
 
 - `X-SB-Trace` парсится в `TraceContext`; при отсутствии/невалидности минтится свежий root.
 - `businessKey` = заголовок `Idempotency-Key`, иначе `"<METHOD> <pathname>"`.
-- downstream-цепочка выполняется внутри `runWithTrace(childContext(ctx, handle.opId), …)`, чтобы handler и его `sb.rpc.call` / `event.publish` видели через ALS контекст, где `traceId` един с HTTP.HANDLE, а `parentOpId` = `opId` этого op'а (downstream вложен под HTTP.HANDLE, не отдельный корень).
-- эмитится HTTP.HANDLE-операция (`Channel.HTTP`, `kind: HttpHandle`).
-- тело запроса (через клон, чтобы не «съесть» стрим для handler) и тело ответа захватываются best-effort как raw-JSON (`contract: "raw/json"`); пустые/`{}`/`null` тела не пишутся.
-- статус операции: HTTP `>= 400` (включая `>= 500`) → `Status.ERROR` (с текстом `HTTP <code>`); исключение из цепочки → `Status.ERROR` с сообщением и ре-throw; иначе → `Status.SUCCESS`. На wire это единый словарь статусов (`success`/`error`).
+- downstream-цепочка выполняется внутри `runWithTrace(op.scope, …)`, чтобы handler и его `sb.rpc.call` / `event.publish` видели через ALS контекст, где `traceId` един с HTTP.HANDLE, а `parentOpId` = `opId` этого op'а (downstream вложен под HTTP.HANDLE, не отдельный корень).
+- эмитится HTTP.HANDLE-операция (`Channel.HTTP`, `kind: HttpHandle`) через общий `startHttpOp` (`../_common/http-op`).
+- тело запроса (через клон, чтобы не «съесть» стрим для handler) и тело ответа захватываются best-effort как raw-JSON (`contract: "raw/json"`); пустые/`{}`/`null` тела не пишутся. Пока `op.capturing === false`, ни `req.clone()`, ни `res.clone()` не вызываются вовсе.
+- статус операции: `statusForHttpCode` — HTTP `>= 400` (включая `>= 500`) → `Status.ERROR` (с текстом `HTTP <code>`), иначе `Status.SUCCESS`; исключение из цепочки → `Status.ERROR` с сообщением и ре-throw. На wire это единый словарь статусов (`success`/`error`).
 
 ### Пример использования (Bun)
 
@@ -76,7 +76,7 @@ serve({ fetch: app.fetch, port: 8080 });
 - **Обёртка `fetch`, а не `app.use`.** `Hono.use(...)` после регистрации роутов не догоняет уже сматченные роуты — порядок объявления матчит. Чтобы трейсинг и захват тел работали для всех роутов, оборачивается сам `app.fetch`.
 - **Pattern не нормализуется.** Сырой Hono-паттерн (`:id{[0-9]+}` и т. п.) уходит в registry as-is; нормализация — косметика на UI Service Map, а не задача SDK (`Route.pattern`).
 - **Вызов до `sb.start()` — рекомендованный flow.** Тогда endpoint попадает в первый `RegisterRequest` без restart. `publishHttp` безопасен до старта — `triggerRestart` тогда no-op.
-- **Тела захватываются через клон запроса/ответа.** Чтение тела для capture не должно «съедать» стрим, который прочитает handler или вернёт клиент.
+- **Тела захватываются через клон запроса/ответа — и только когда захват включён.** Чтение тела для capture не должно «съедать» стрим, который прочитает handler или вернёт клиент. Но клон стрима — самая дорогая часть захвата, поэтому он делается лишь при `HttpOp.capturing`: в дефолтном режиме `none` `OpHandle` всё равно выбросил бы байты, а клон и `text()` тела ответа платились бы на каждом запросе.
 
 ## Зависимости
 
@@ -84,10 +84,9 @@ serve({ fetch: app.fetch, port: 8080 });
 - `hono` (peerDependency, type-only) — тип `Hono`.
 - `../../connection/service-bridge` — тип `ServiceBridge` (`sb.routes`, `sb.telemetry`).
 - `../../telemetry/context` — `runWithTrace`.
-- `../../telemetry/ops` — `Channel`, `HttpHandle`, `Status`.
-- `../../telemetry/trace-context` — `childContext` (вложенность downstream под HTTP.HANDLE).
+- `../../telemetry/ops` — `Status` (только `ERROR` на исключение из цепочки).
 - `../_common/body-capture` — `bodyToBytes`, `RAW_JSON_CONTRACT`.
-- `../_common/trace-wrap` — `contextFromXSbTrace`.
+- `../_common/http-op` — `startHttpOp`, `statusForHttpCode`.
 - `../endpoint` — `resolveHttpAdvertiseHost`.
 
 Используется в:

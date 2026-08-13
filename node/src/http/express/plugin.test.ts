@@ -1,41 +1,8 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import express, { Router } from "express";
-import type { ServiceBridge } from "../../connection/service-bridge";
-import { RouteCollector } from "../route";
+import { Status } from "../../telemetry/ops";
+import { makeSbStub } from "../_common/sb-stub";
 import { attachExpress } from "./plugin";
-
-interface SbStub {
-	sb: ServiceBridge;
-	routes: RouteCollector;
-	endpoint: string | null;
-	publishHits: number;
-}
-
-function makeSbStub(): SbStub {
-	const state = {
-		endpoint: null as string | null,
-		publishHits: 0,
-	};
-	const collector = new RouteCollector({
-		setEndpoint(ep: string) {
-			state.endpoint = ep;
-		},
-		triggerRestart() {
-			state.publishHits++;
-		},
-	});
-	const sb = { routes: collector } as unknown as ServiceBridge;
-	return {
-		sb,
-		routes: collector,
-		get endpoint() {
-			return state.endpoint;
-		},
-		get publishHits() {
-			return state.publishHits;
-		},
-	} as unknown as SbStub;
-}
 
 describe("attachExpress", () => {
 	it("collects top-level routes and publishes endpoint", () => {
@@ -134,5 +101,75 @@ describe("attachExpress", () => {
 		attachExpress(app, stub.sb, { host: "h", port: 42 });
 		expect(stub.endpoint).toBe("h:42");
 		expect(stub.publishHits).toBe(1);
+	});
+
+	it("fails loudly when the root router is unreachable", () => {
+		// Без root router'а middleware остался бы за роутами и HTTP.HANDLE не
+		// эмиттился бы вовсе — молчать здесь нельзя.
+		const fake = { use() {} } as unknown as express.Express;
+		const stub = makeSbStub();
+		expect(() => attachExpress(fake, stub.sb, { host: "h", port: 1 })).toThrow(
+			/root router not found/,
+		);
+	});
+});
+
+describe("attachExpress payload capture gating", () => {
+	let server: ReturnType<express.Express["listen"]> | undefined;
+
+	afterEach(async () => {
+		if (server) {
+			await new Promise<void>((r) => server?.close(() => r()));
+			server = undefined;
+		}
+	});
+
+	async function roundtrip(mode: "none" | "all") {
+		const stub = makeSbStub(mode);
+		const app = express();
+		app.use(express.json());
+		// toJSON считает КАЖДУЮ сериализацию этого тела: одну делает сам
+		// res.json, вторую — payload capture. При mode="none" второй быть не должно.
+		let serializations = 0;
+		const payload = {
+			toJSON() {
+				serializations++;
+				return { ok: true };
+			},
+		};
+		app.post("/echo", (_req, res) => {
+			res.json(payload);
+		});
+		const port = await new Promise<number>((resolve) => {
+			server = app.listen(0, "127.0.0.1", () => {
+				resolve((server?.address() as { port: number }).port);
+			});
+		});
+		attachExpress(app, stub.sb, { port });
+		await (
+			await fetch(`http://127.0.0.1:${port}/echo`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ hello: "world" }),
+			})
+		).text();
+		// res "finish" срабатывает асинхронно относительно ответа клиенту.
+		await new Promise((r) => setTimeout(r, 30));
+		return { stub, serializations: () => serializations };
+	}
+
+	it('does not serialize bodies when capture mode is "none"', async () => {
+		const { stub, serializations } = await roundtrip("none");
+		expect(serializations()).toBe(1);
+		expect(stub.captures).toHaveLength(0);
+		expect(stub.endCalls).toEqual([
+			{ status: Status.SUCCESS, message: undefined },
+		]);
+	});
+
+	it('captures request and response bodies when capture mode is "all"', async () => {
+		const { stub, serializations } = await roundtrip("all");
+		expect(serializations()).toBe(2);
+		expect(stub.captures.map((c) => c.direction)).toEqual(["in", "out"]);
 	});
 });

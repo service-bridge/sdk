@@ -1,10 +1,9 @@
 import type { Express, NextFunction, Request, Response, Router } from "express";
 import type { ServiceBridge } from "../../connection/service-bridge";
 import { runWithTrace } from "../../telemetry/context";
-import { Channel, HttpHandle, Status } from "../../telemetry/ops";
-import { childContext } from "../../telemetry/trace-context";
+import { Status } from "../../telemetry/ops";
 import { bodyToBytes, RAW_JSON_CONTRACT } from "../_common/body-capture";
-import { contextFromXSbTrace } from "../_common/trace-wrap";
+import { startHttpOp, statusForHttpCode } from "../_common/http-op";
 import { resolveHttpAdvertiseHost } from "../endpoint";
 
 /**
@@ -135,60 +134,54 @@ function installTraceMiddleware(app: Express, sb: ServiceBridge): void {
 	tagged[TRACE_FLAG] = true;
 
 	app.use((req: Request, res: Response, next: NextFunction) => {
-		const header = req.headers["x-sb-trace"];
-		const value = Array.isArray(header) ? header[0] : header;
-		const ctx = contextFromXSbTrace(value ?? null);
-		const idempotencyHeader = req.headers["idempotency-key"];
-		const businessKey = Array.isArray(idempotencyHeader)
-			? idempotencyHeader[0]
-			: idempotencyHeader;
-		const handle = sb.telemetry.startOp({
-			traceId: ctx.traceId,
-			parentOpId: ctx.parentOpId,
-			channel: Channel.HTTP,
-			kind: HttpHandle,
-			subject: `http.handle:${req.method}/${req.path}`,
-			businessKey: businessKey ?? `${req.method} ${req.path}`,
+		const op = startHttpOp(sb, {
+			method: req.method,
+			subjectPath: req.path,
+			keyPath: req.path,
+			traceHeader: req.headers["x-sb-trace"],
+			idempotencyKey: req.headers["idempotency-key"],
 		});
-		// downstream (handler + sb.rpc.call / event.publish) видит HTTP.HANDLE как
-		// родителя — childContext(ctx, handle.opId). traceId наследуется, op_id op'а
-		// становится parentOpId для вложенных операций.
-		runWithTrace(childContext(ctx, handle.opId), () => {
+		const handle = op.handle;
+		runWithTrace(op.scope, () => {
 			// Capture the response body (OUT) by tapping res.json/res.send. The
 			// request body (IN) is read in finalize, by when any body-parser ran.
+			// Both are skipped while capture is off: the tap and the serialization
+			// exist only to feed OpHandle, which would drop the bytes anyway.
 			let outBody: unknown;
 			let outSet = false;
-			const origJson = res.json.bind(res);
-			res.json = ((body: unknown) => {
-				outBody = body;
-				outSet = true;
-				return origJson(body);
-			}) as typeof res.json;
-			const origSend = res.send.bind(res);
-			res.send = ((body: unknown) => {
-				if (!outSet) {
+			if (op.capturing) {
+				const origJson = res.json.bind(res);
+				res.json = ((body: unknown) => {
 					outBody = body;
 					outSet = true;
-				}
-				return origSend(body);
-			}) as typeof res.send;
+					return origJson(body);
+				}) as typeof res.json;
+				const origSend = res.send.bind(res);
+				res.send = ((body: unknown) => {
+					if (!outSet) {
+						outBody = body;
+						outSet = true;
+					}
+					return origSend(body);
+				}) as typeof res.send;
+			}
 			let ended = false;
 			const finalize = (status: Status, msg?: string) => {
 				if (ended) return;
 				ended = true;
-				const inBytes = bodyToBytes((req as { body?: unknown }).body);
-				if (inBytes) handle.captureIn(inBytes, RAW_JSON_CONTRACT);
-				if (outSet) {
-					const outBytes = bodyToBytes(outBody);
-					if (outBytes) handle.captureOut(outBytes, RAW_JSON_CONTRACT);
+				if (op.capturing) {
+					const inBytes = bodyToBytes((req as { body?: unknown }).body);
+					if (inBytes) handle.captureIn(inBytes, RAW_JSON_CONTRACT);
+					if (outSet) {
+						const outBytes = bodyToBytes(outBody);
+						if (outBytes) handle.captureOut(outBytes, RAW_JSON_CONTRACT);
+					}
 				}
 				handle.end(status, msg);
 			};
 			res.once("finish", () => {
-				const code = res.statusCode;
-				if (code >= 500) finalize(Status.ERROR, `HTTP ${code}`);
-				else if (code >= 400) finalize(Status.ERROR, `HTTP ${code}`);
-				else finalize(Status.SUCCESS);
+				const { status, message } = statusForHttpCode(res.statusCode);
+				finalize(status, message);
 			});
 			res.once("close", () => {
 				if (!res.writableEnded) finalize(Status.TIMEOUT, "client abort");
@@ -196,18 +189,31 @@ function installTraceMiddleware(app: Express, sb: ServiceBridge): void {
 			next();
 		});
 	});
-	// `attachExpress` обычно зовут ПОСЛЕ `app.get(...)`. Express middleware,
-	// добавленный через `app.use(...)` после роутов, идёт в конец router stack
-	// и не вызывается, потому что роуты завершают запрос раньше. Поднимаем
-	// последний слой (только что добавленный middleware) в начало.
+	hoistTraceMiddleware(app);
+}
+
+/**
+ * `attachExpress` обычно зовут ПОСЛЕ `app.get(...)`. Express middleware,
+ * добавленный через `app.use(...)` после роутов, идёт в конец router stack и не
+ * вызывается: роуты завершают запрос раньше. Поднимаем последний слой (только
+ * что добавленный middleware) в начало.
+ */
+function hoistTraceMiddleware(app: Express): void {
 	const router = getRootRouter(app);
-	if (router && router.stack.length > 1) {
-		const last = router.stack[router.stack.length - 1];
-		if (last) {
-			router.stack.splice(router.stack.length - 1, 1);
-			router.stack.unshift(last);
-		}
+	if (!router) {
+		// app.use() выше обязан был материализовать root router. Если его нет —
+		// стек Express не той формы, что мы умеем читать, и middleware остался бы
+		// за роутами: HTTP.HANDLE не эмиттился бы вообще, молча.
+		throw new Error(
+			"[servicebridge/express] root router not found after app.use() — " +
+				"unsupported Express build; HTTP tracing cannot be installed",
+		);
 	}
+	if (router.stack.length < 2) return;
+	const last = router.stack[router.stack.length - 1];
+	if (!last) return;
+	router.stack.splice(router.stack.length - 1, 1);
+	router.stack.unshift(last);
 }
 
 // Re-export Router-related type so tests can build fake apps cleanly.
