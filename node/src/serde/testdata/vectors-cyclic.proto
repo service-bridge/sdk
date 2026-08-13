@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package sb.vectors.cyclic;
+
+message Node {
+  string        id       = 1;
+  repeated Node children = 2;
+  Branch        branch   = 3;
+}
+
+message Branch {
+  Node head = 1;
+}
+
+message CyclicResponse {
+  int32 depth = 1;
+}

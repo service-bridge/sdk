@@ -1,0 +1,36 @@
+{
+	"input": {
+		"OrderRequest": {
+			"customerRef": { "type": "string", "fieldNumber": 1 },
+			"items": {
+				"type": "array",
+				"fieldNumber": 2,
+				"array": {
+					"type": "object",
+					"nested": {
+						"code": { "type": "string", "fieldNumber": 1 },
+						"count": { "type": "int32", "fieldNumber": 2 }
+					}
+				}
+			},
+			"metadata": {
+				"type": "object",
+				"fieldNumber": 3,
+				"nested": {
+					"origin": { "type": "string", "fieldNumber": 1 }
+				}
+			},
+			"labels": {
+				"type": "array",
+				"fieldNumber": 4,
+				"array": { "type": "string" }
+			}
+		}
+	},
+	"output": {
+		"OrderResponse": {
+			"reference": { "type": "string", "fieldNumber": 1 },
+			"total": { "type": "double", "fieldNumber": 2 }
+		}
+	}
+}

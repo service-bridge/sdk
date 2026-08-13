@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package sb.vectors.scalars;
+
+message ScalarsRequest {
+  double   alpha   = 1;
+  float    bravo   = 2;
+  int32    charlie = 3;
+  int64    delta   = 4;
+  uint32   echo    = 5;
+  uint64   foxtrot = 6;
+  sint32   golf    = 7;
+  sint64   hotel   = 8;
+  fixed32  india   = 9;
+  fixed64  juliett = 10;
+  sfixed32 kilo    = 11;
+  sfixed64 lima    = 12;
+  bool     mike    = 13;
+  string   november = 14;
+  bytes    oscar   = 15;
+}
+
+message ScalarsResponse {
+  bool accepted = 1;
+}

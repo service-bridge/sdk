@@ -1,4 +1,5 @@
 import protobuf from "protobufjs";
+import { attachWireDescriptor } from "./contract-hash";
 import {
 	buildSchemaPairFromJsonFile,
 	type JsonSchemaFileSpec,
@@ -33,7 +34,6 @@ function isProtoFileSpec(spec: SchemaSpec): spec is ProtoFileSpec {
 export interface Serializer {
 	encode(value: unknown): Uint8Array;
 	decode(bytes: Uint8Array): unknown;
-	contractHash(): string;
 	toJsonSchema(): Record<string, unknown>;
 }
 
@@ -142,12 +142,8 @@ function typeToSerializer(
 	}
 
 	const jsonSchema = type.toJSON() as unknown as Record<string, unknown>;
-	// The per-serializer hash here is informational only; the cross-side
-	// compatibility hash that LB filters on is computeContractHash(pair) from
-	// ./contract-hash.ts, which combines input + output.
-	const hash = perSerializerHash(jsonSchema);
 
-	return {
+	const serializer: Serializer = {
 		encode(value: unknown): Uint8Array {
 			const err = type.verify(value as object);
 			if (err) {
@@ -160,16 +156,10 @@ function typeToSerializer(
 			const msg = type.decode(bytes);
 			return type.toObject(msg, { defaults: true });
 		},
-		contractHash(): string {
-			return hash;
-		},
 		toJsonSchema(): Record<string, unknown> {
 			return jsonSchema;
 		},
 	};
+	attachWireDescriptor(serializer, type);
+	return serializer;
 }
-
-// perSerializerHash reuses the shared canonical-JSON algorithm from
-// contract-hash.ts so the per-serializer informational hash and the
-// SchemaPair compatibility hash stay in lockstep.
-import { computeSerializerHash as perSerializerHash } from "./contract-hash";

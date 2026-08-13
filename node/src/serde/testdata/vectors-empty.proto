@@ -1,0 +1,9 @@
+syntax = "proto3";
+
+package sb.vectors.empty;
+
+message EmptyRequest {}
+
+message EmptyResponse {
+  string note = 1;
+}

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { join } from "node:path";
+import { computeContractHash } from "./contract-hash";
 import { buildSchemaPair } from "./serializer";
 
 const protoFile = join(import.meta.dir, "testdata", "payment.proto");
@@ -41,7 +42,7 @@ describe("buildSchemaPair", () => {
 		expect(decoded.ok).toBe(true);
 	});
 
-	it("contractHash stable across formatting differences", async () => {
+	it("contract hash stable across formatting differences", async () => {
 		const a = await buildSchemaPair({
 			protoFile,
 			input: "ChargeRequest",
@@ -53,8 +54,7 @@ describe("buildSchemaPair", () => {
 			output: "ChargeResponse",
 		});
 
-		expect(a.input.contractHash()).toBe(b.input.contractHash());
-		expect(a.output.contractHash()).toBe(b.output.contractHash());
+		expect(computeContractHash(a)).toBe(computeContractHash(b));
 	});
 
 	it("toJsonSchema returns descriptor", async () => {

@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package sb.vectors.alias;
+
+enum Status {
+  option allow_alias = true;
+  STATUS_UNSPECIFIED = 0;
+  STATUS_OK          = 1;
+  STATUS_SUCCESS     = 1;
+  STATUS_FAILED      = 4;
+}
+
+message AliasRequest {
+  Status status = 1;
+}
+
+message AliasResponse {
+  bool ok = 1;
+}

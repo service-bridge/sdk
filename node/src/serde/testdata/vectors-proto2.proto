@@ -1,0 +1,13 @@
+syntax = "proto2";
+
+package sb.vectors.proto2;
+
+message Proto2Request {
+  required string id   = 1;
+  optional int32  n    = 2;
+  repeated string tags = 3;
+}
+
+message Proto2Response {
+  optional bool ok = 1;
+}

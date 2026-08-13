@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import protobuf from "protobufjs";
-import { computeSerializerHash } from "./contract-hash";
+import { attachWireDescriptor } from "./contract-hash";
 import type { SchemaPair, Serializer } from "./serializer";
 
 // JsonSchemaFileSpec references a .schema.json file describing both input and
@@ -81,6 +81,9 @@ export function buildSchemaPairFromJsonFile(
 	const outputType = buildType(root, "Output", firstMessage(parsed.output));
 	root.add(inputType);
 	root.add(outputType);
+	// The wire descriptor walks resolvedType, which only exists after the root
+	// links every field reference to its target.
+	root.resolveAll();
 
 	return {
 		input: typeToSerializer(inputType),
@@ -181,10 +184,7 @@ function buildType(
 
 function typeToSerializer(type: protobuf.Type): Serializer {
 	const jsonSchema = type.toJSON() as unknown as Record<string, unknown>;
-	// Per-serializer hash is informational only — LB uses the SchemaPair hash
-	// from contract-hash.ts:computeContractHash.
-	const hash = computeSerializerHash(jsonSchema);
-	return {
+	const serializer: Serializer = {
 		encode(value: unknown): Uint8Array {
 			const err = type.verify(value as object);
 			if (err) {
@@ -197,11 +197,10 @@ function typeToSerializer(type: protobuf.Type): Serializer {
 			const msg = type.decode(bytes);
 			return type.toObject(msg, { defaults: true });
 		},
-		contractHash(): string {
-			return hash;
-		},
 		toJsonSchema(): Record<string, unknown> {
 			return jsonSchema;
 		},
 	};
+	attachWireDescriptor(serializer, type);
+	return serializer;
 }

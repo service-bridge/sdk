@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package sb.vectors.sparse;
+
+message SparseRequest {
+  string label   = 100;
+  int32  attempt = 3;
+  bool   flag    = 70000;
+}
+
+message SparseResponse {
+  string note = 536870911;
+}

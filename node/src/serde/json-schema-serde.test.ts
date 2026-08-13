@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { join } from "node:path";
+import { computeContractHash } from "./contract-hash";
 import { buildSchemaPair } from "./serializer";
 
 const simpleFile = join(import.meta.dir, "testdata", "payment.schema.json");
@@ -26,11 +27,10 @@ describe("JsonSchemaSerde — simple schema", () => {
 		expect(back.ok).toBe(true);
 	});
 
-	it("contractHash stable", async () => {
+	it("contract hash stable", async () => {
 		const a = await buildSchemaPair({ schemaFile: simpleFile });
 		const b = await buildSchemaPair({ schemaFile: simpleFile });
-		expect(a.input.contractHash()).toBe(b.input.contractHash());
-		expect(a.output.contractHash()).toBe(b.output.contractHash());
+		expect(computeContractHash(a)).toBe(computeContractHash(b));
 	});
 });
 
