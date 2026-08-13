@@ -28,7 +28,7 @@ export interface InvokeRequest {
   payload: Buffer;
   requestId: string;
   idempotencyKey: string;
-  /** X-SB-Trace propagation: carried via gRPC metadata "x-sb-trace" (T-017). */
+  /** X-SB-Trace propagation: carried via gRPC metadata "x-sb-trace" (ADR 0006 §3). */
   xSbTrace: string;
   /**
    * Caller-side contract hash for (method input, output) schemas. Resolver

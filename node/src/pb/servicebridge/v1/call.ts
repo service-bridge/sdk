@@ -29,7 +29,7 @@ export interface CallRequest {
   idempotencyKey: string;
   /**
    * X-SB-Trace propagation: trace_id and parent_op_id are carried via gRPC
-   * metadata under "x-sb-trace" key (T-017). Not in the wire message itself.
+   * metadata under "x-sb-trace" key (ADR 0006 §3). Not in the wire message itself.
    */
   xSbTrace: string;
 }

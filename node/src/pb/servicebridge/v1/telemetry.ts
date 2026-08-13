@@ -95,7 +95,7 @@ export interface PayloadBatch {
 
 /**
  * OpReport is a single operation lifecycle event.
- * finished_at_ms absent = START frame; present = END frame (T-014).
+ * finished_at_ms absent = START frame; present = END frame (ADR 0007 §2).
  * actor identity is taken from the mTLS cert on the server side (ADR-0006).
  * @public — см. ./README.md
  */
@@ -109,7 +109,7 @@ export interface OpReport {
   channel: Channel;
   /** per-channel kind value; see enums.go */
   kind: number;
-  /** T-019 format: "channel.kind:actor/target" */
+  /** ADR 0007 §4 format: "channel.kind:actor/target" */
   subject: string;
   /** UUID canonical string, optional */
   peerServiceId: string;

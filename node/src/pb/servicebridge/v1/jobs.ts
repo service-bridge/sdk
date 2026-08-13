@@ -35,7 +35,7 @@ export interface JobExecution {
   attempt: number;
   leaseEpoch: number;
   idempotencyKey: string;
-  /** "traceID-parentOpID" canonical format (T-017) */
+  /** "traceID-parentOpID" canonical format (ADR 0006 §3) */
   xSbTrace: string;
 }
 
