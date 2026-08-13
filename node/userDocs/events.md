@@ -383,7 +383,7 @@ Runtime gRPC `Events`:
 
 ## 11. Schema versioning
 
-Каждая published-схема идентифицируется `contract_hash` (SHA-256 hex от канонического описания schema pair, считается на SDK-стороне). Несколько версий одного события могут жить одновременно — keep-history:
+Каждая published-схема идентифицируется `contract_hash` — отпечатком protobuf-провода вида `v2:<sha256 hex>`, который считается на SDK-стороне (алгоритм — в [rpc.md](./rpc.md#алгоритм-хеша)). Несколько версий одного события могут жить одновременно — keep-history:
 
 ```proto
 // payment-v1.proto
