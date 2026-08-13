@@ -82,7 +82,7 @@ function mkStreamingInstanceCache(
 		isUnhealthyAt: null,
 	};
 	return {
-		pickAll: () => [candidate],
+		candidatesFor: () => [candidate],
 		descriptorFor: () => candidate.descriptor,
 		bind: () => {},
 		dispose: () => {},
@@ -99,7 +99,7 @@ function mkInstanceCache(
 		isUnhealthyAt: null,
 	};
 	return {
-		pickAll: () => [candidate],
+		candidatesFor: () => [candidate],
 		descriptorFor: () => candidate.descriptor,
 		bind: () => {},
 		dispose: () => {},
@@ -175,7 +175,7 @@ describe("RpcClient trace-context propagation", () => {
 			null as unknown as DirectTransport,
 			instances,
 			schemas.asResolver(),
-			"caller-svc-id",
+			() => "caller-svc-id",
 			cb,
 			lb,
 			makeStubSb({ ring }),
@@ -244,7 +244,7 @@ describe("RpcClient trace-context propagation", () => {
 			null as unknown as DirectTransport,
 			instances,
 			schemas.asResolver(),
-			"caller-svc-id",
+			() => "caller-svc-id",
 			cb,
 			lb,
 			makeStubSb({ ring }),
@@ -300,7 +300,7 @@ describe("RpcClient trace-context propagation", () => {
 			null as unknown as DirectTransport,
 			instances,
 			schemas.asResolver(),
-			"caller-svc-id",
+			() => "caller-svc-id",
 			cb,
 			lb,
 			makeStubSb({ ring }),
@@ -364,7 +364,7 @@ describe("RpcClient trace-context propagation", () => {
 			null as unknown as DirectTransport,
 			instances,
 			schemas.asResolver(),
-			"caller-svc-id",
+			() => "caller-svc-id",
 			cb,
 			lb,
 			makeStubSb({ ring }),

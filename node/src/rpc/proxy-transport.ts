@@ -27,6 +27,15 @@ function buildTraceMetadata(header: string): Metadata {
 	return md;
 }
 
+// asBuffer reinterprets an already-owned Uint8Array as a Buffer without
+// copying. The generated stubs type wire bytes as Buffer, and Buffer.from(view)
+// copies — a second full copy of every request payload on every call.
+function asBuffer(bytes: Uint8Array): Buffer {
+	return Buffer.isBuffer(bytes)
+		? bytes
+		: Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+}
+
 // ProxyTransport routes outbound RPC calls through the runtime's Invoke service.
 // Reuses the SDK's mTLS credentials to the runtime — same URL and creds as the
 // Control/Registry streams. The caller-side contract hash is forwarded so the
@@ -54,7 +63,7 @@ export class ProxyTransport {
 		requestId: string,
 		idempotencyKey: string,
 		deadlineMs: number,
-		contractHash: string,
+		contractHash: Buffer,
 	): AsyncIterable<Uint8Array> {
 		const deadline = new Date(Date.now() + deadlineMs);
 		const traceHeader = currentTraceHeader();
@@ -62,10 +71,10 @@ export class ProxyTransport {
 			{
 				targetServiceId,
 				method,
-				payload: Buffer.from(payload),
+				payload: asBuffer(payload),
 				requestId,
 				idempotencyKey,
-				contractHash: Buffer.from(contractHash, "utf8"),
+				contractHash,
 				xSbTrace: traceHeader,
 			},
 			buildTraceMetadata(traceHeader),
@@ -77,7 +86,10 @@ export class ProxyTransport {
 				err.name = chunk.errorCode;
 				throw err;
 			}
-			yield new Uint8Array(chunk.payload);
+			// The decoder already copied the chunk out of the wire buffer, so the
+			// payload is owned — handing it straight to the caller avoids a second
+			// full copy of every chunk.
+			yield chunk.payload;
 		}
 	}
 
@@ -91,7 +103,7 @@ export class ProxyTransport {
 		requestId: string,
 		idempotencyKey: string,
 		deadlineMs: number,
-		contractHash: string,
+		contractHash: Buffer,
 	): Promise<Uint8Array> {
 		return new Promise((resolve, reject) => {
 			const deadline = new Date(Date.now() + deadlineMs);
@@ -100,10 +112,10 @@ export class ProxyTransport {
 				{
 					targetServiceId,
 					method,
-					payload: Buffer.from(payload),
+					payload: asBuffer(payload),
 					requestId,
 					idempotencyKey,
-					contractHash: Buffer.from(contractHash, "utf8"),
+					contractHash,
 					xSbTrace: traceHeader,
 				},
 				buildTraceMetadata(traceHeader),
@@ -119,7 +131,7 @@ export class ProxyTransport {
 						reject(appErr);
 						return;
 					}
-					resolve(new Uint8Array(resp.payload));
+					resolve(resp.payload);
 				},
 			);
 		});

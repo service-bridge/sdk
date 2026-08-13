@@ -78,11 +78,13 @@ function makeInstanceCache(
 	streaming = false,
 ): InstanceCache {
 	const cache = new InstanceCache();
-	// Override pickAll / descriptorFor without real WatchStream
+	// Override candidatesFor / descriptorFor without real WatchStream
 	(
-		cache as unknown as { pickAll: (s: string, m: string) => Candidate[] }
-	).pickAll = (s: string, m: string) => {
-		if (s === serviceName && m === methodName)
+		cache as unknown as {
+			candidatesFor: (s: string, m: string, h: string) => Candidate[];
+		}
+	).candidatesFor = (s: string, m: string, h: string) => {
+		if (s === serviceName && m === methodName && h === "hash-1")
 			return [makeCandidate(serviceName, methodName, streaming)];
 		return [];
 	};
@@ -136,6 +138,7 @@ function makeStubSb(
 	captureMode: "all" | "errors" | "none" = "none",
 ): ServiceBridge {
 	const telemetry: TelemetryAPI = {
+		enabled: () => true,
 		startOp(params) {
 			return OpHandle.start(ring, {
 				...params,
@@ -232,7 +235,7 @@ describe("RpcClient caller-side CALL emission", () => {
 			null, // no direct transport — forces proxy path
 			cache,
 			(_s, _m) => makeSchemaPair(),
-			"caller-svc",
+			() => "caller-svc",
 			cb,
 			lb,
 			sb,
@@ -287,7 +290,7 @@ describe("RpcClient caller-side CALL emission", () => {
 			null,
 			cache,
 			(_s, _m) => makeSchemaPair(),
-			"caller-svc",
+			() => "caller-svc",
 			cb,
 			lb,
 			captureSb,
@@ -317,7 +320,7 @@ describe("RpcClient caller-side CALL emission", () => {
 			null,
 			cache,
 			(_s, _m) => makeSchemaPair(),
-			"caller-svc",
+			() => "caller-svc",
 			cb,
 			lb,
 			sb,
@@ -389,7 +392,7 @@ describe("RpcClient caller-side CALL emission", () => {
 			null,
 			cache,
 			(_s, _m) => makeSchemaPair(),
-			"caller-svc",
+			() => "caller-svc",
 			cb,
 			lb,
 			sb,
@@ -448,7 +451,7 @@ describe("RpcClient caller-side CALL emission", () => {
 			null,
 			cache,
 			(_s, _m) => makeSchemaPair(),
-			"caller-svc",
+			() => "caller-svc",
 			cb,
 			lb,
 			sb,
@@ -506,7 +509,7 @@ describe("RpcClient caller-side CALL emission", () => {
 			null,
 			cache,
 			(_s, _m) => makeSchemaPair(),
-			"caller-svc",
+			() => "caller-svc",
 			cb,
 			lb,
 			sb,
@@ -565,7 +568,7 @@ describe("RpcClient caller-side CALL emission", () => {
 			null,
 			cache,
 			(_s, _m) => makeSchemaPair(),
-			"caller-svc",
+			() => "caller-svc",
 			cb,
 			lb,
 			sb,
@@ -624,7 +627,7 @@ describe("RpcClient caller-side CALL emission", () => {
 			null,
 			cache,
 			(_s, _m) => makeSchemaPair(),
-			"caller-svc",
+			() => "caller-svc",
 			cb,
 			lb,
 			sb,

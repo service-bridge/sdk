@@ -20,6 +20,7 @@ export function makeStubSb(opts?: {
 	const ring = opts?.ring ?? new TelemetryRing();
 	const effectiveCaptureMode = opts?.captureMode ?? "none";
 	const telemetry: TelemetryAPI = {
+		enabled: () => true,
 		startOp(params) {
 			return OpHandle.start(ring, {
 				...params,

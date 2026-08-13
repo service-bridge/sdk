@@ -14,7 +14,12 @@ import {
 	NoLiveInstanceError,
 } from "./lb";
 import type { ProxyTransport } from "./proxy-transport";
-import { backoffDelay, isRetryable, mergeRetryOpts } from "./retry";
+import {
+	backoffDelay,
+	GRPC_CODE_UNAVAILABLE,
+	isRetryable,
+	mergeRetryOpts,
+} from "./retry";
 
 // CallOpts is the per-call configuration accepted by ServiceBridge.call().
 // Defaults are sourced from ServiceBridge.options.callDefaults, then overridden
@@ -51,6 +56,10 @@ export interface RetryOpts {
 export interface CallerSchema {
 	pair: SchemaPair;
 	contractHash: string;
+	// contractHashBytes is the UTF-8 wire form the proxy transport puts on every
+	// InvokeRequest. The hash is fixed per method, so encoding the 64-char hex
+	// string per call was a constant re-encode on the hot path.
+	contractHashBytes: Buffer;
 }
 
 // SchemaResolver is invoked by RpcClient when a method's CallerSchema is not yet
@@ -70,7 +79,11 @@ export class RpcClient {
 		private readonly directTransport: DirectTransport | null,
 		private readonly instances: InstanceCache,
 		private readonly resolveSchema: SchemaResolver,
-		private readonly callerService: string,
+		// callerService is resolved per call, not captured at construction: the
+		// RpcClient is built from openSession before the first Welcome, so the
+		// session identity does not exist yet and the guard that keeps the client
+		// alive across reconnects would freeze the empty value forever.
+		private readonly callerService: () => string,
 		private readonly cb: CircuitBreakerRegistry,
 		private readonly lb: LoadBalancer,
 		// sb owns the instance identity and telemetry ring used for RPC.CALL emission.
@@ -126,14 +139,7 @@ export class RpcClient {
 			subject: formatRpcCallSubject(serviceName, methodName),
 			peerServiceId: candidate.instance.serviceId,
 			attempt: 0,
-			metaJson: Buffer.from(
-				JSON.stringify({
-					method: methodName,
-					via_proxy: !useDirect,
-					requestId,
-					idempotencyKey,
-				}),
-			),
+			metaJson: rpcCallMeta(methodName, !useDirect, requestId, idempotencyKey),
 		});
 
 		// Streaming captures only the request payload (IN). The response is a
@@ -145,7 +151,7 @@ export class RpcClient {
 		const childCtx = { traceId: callOp.traceId, parentOpId: callOp.opId };
 		const directTransport = this.directTransport;
 		const proxy = this.proxy;
-		const callerService = this.callerService;
+		const callerService = this.callerService();
 		const decoded = async function* (): AsyncIterable<Chunk> {
 			const source = useDirect
 				? directTransport!.callStream(
@@ -168,7 +174,7 @@ export class RpcClient {
 						requestId,
 						idempotencyKey,
 						timeoutMs,
-						schema.contractHash,
+						schema.contractHashBytes,
 					);
 			for await (const bytes of source) {
 				yield schema.pair.output.decode(bytes) as Chunk;
@@ -241,27 +247,18 @@ export class RpcClient {
 					transport,
 				);
 			} catch (err) {
-				const wrapped =
-					err instanceof NoLiveInstanceError
-						? Object.assign(
-								new Error(
-									`rpc: no instance of ${serviceName}/${methodName} matches caller contract ${schema.contractHash}`,
-								),
-								{ code: 14 },
-							)
-						: err;
-				lastErr = wrapped;
+				lastErr = err;
 				if (
 					attempt === retry.maxAttempts - 1 ||
-					!isRetryable(wrapped, hasIdempotency)
+					!isRetryable(err, hasIdempotency)
 				) {
 					// Close the CALL row if it was already started on a prior attempt.
 					callOp?.setAttempt(attempt);
 					callOp?.end(
 						Status.ERROR,
-						wrapped instanceof Error ? wrapped.message : String(wrapped),
+						err instanceof Error ? err.message : String(err),
 					);
-					throw wrapped;
+					throw err;
 				}
 				await sleep(backoffDelay(retry, attempt));
 				continue;
@@ -276,13 +273,11 @@ export class RpcClient {
 					subject: formatRpcCallSubject(serviceName, methodName),
 					peerServiceId: candidate.instance.serviceId,
 					attempt,
-					metaJson: Buffer.from(
-						JSON.stringify({
-							method: methodName,
-							via_proxy: !useDirect,
-							requestId,
-							idempotencyKey,
-						}),
+					metaJson: rpcCallMeta(
+						methodName,
+						!useDirect,
+						requestId,
+						idempotencyKey,
 					),
 				});
 				// Caller owns the RPC.CALL payloads: request (IN) once per logical
@@ -307,7 +302,7 @@ export class RpcClient {
 								},
 								methodName,
 								reqBytes,
-								this.callerService,
+								this.callerService(),
 								requestId,
 								idempotencyKey,
 								timeoutMs,
@@ -319,7 +314,7 @@ export class RpcClient {
 								requestId,
 								idempotencyKey,
 								timeoutMs,
-								schema.contractHash,
+								schema.contractHashBytes,
 							);
 					callOp?.captureOut(respBytes, schema.contractHash);
 					return schema.pair.output.decode(respBytes) as Res;
@@ -350,27 +345,38 @@ export class RpcClient {
 		throw lastErr as Error;
 	}
 
-	// pickCandidate resolves descriptor + instance via the instance cache,
-	// filters by contract hash, runs P2C through the LB, and surfaces the
-	// errors callers need to map onto retry decisions.
+	// pickCandidate reads the contract-matched candidate list from the instance
+	// cache, runs P2C through the LB, and surfaces the errors callers need to map
+	// onto retry decisions.
 	private pickCandidate(
 		serviceName: string,
 		methodName: string,
 		callerHash: string,
 		transport: "direct" | "proxy" | "auto",
 	): Candidate {
-		const all = this.instances
-			.pickAll(serviceName, methodName)
-			.filter((c) => c.descriptor.contractHash === callerHash);
+		const all = this.instances.candidatesFor(
+			serviceName,
+			methodName,
+			callerHash,
+		);
 		if (all.length === 0) {
-			throw Object.assign(
-				new Error(
-					`rpc: no instance of ${serviceName}/${methodName} matches caller contract ${callerHash}`,
-				),
-				{ code: 14 },
+			throw noLiveInstance(
+				`rpc: no instance of ${serviceName}/${methodName} matches caller contract ${callerHash}`,
 			);
 		}
-		const candidate = this.lb.pick(all);
+		let candidate: Candidate;
+		try {
+			candidate = this.lb.pick(all);
+		} catch (err) {
+			// The LB reports "everything is filtered out" without knowing which
+			// call it was serving; keep the type and add the coordinates.
+			if (err instanceof NoLiveInstanceError) {
+				throw noLiveInstance(
+					`rpc: no live instance of ${serviceName}/${methodName} matching contract ${callerHash} — all candidates unhealthy or circuit-open`,
+				);
+			}
+			throw err;
+		}
 		if (transport === "direct" && !candidate.instance.callEndpoint) {
 			throw new Error(
 				`rpc: transport="direct" requested but no endpoint for ${serviceName}/${methodName} matching contract ${callerHash}`,
@@ -395,6 +401,31 @@ export class RpcClient {
 // → "rpc.call:<svc>/<method>" (ADR-0007).
 function formatRpcCallSubject(serviceName: string, methodName: string): string {
 	return `rpc.call:${serviceName}/${methodName}`;
+}
+
+// noLiveInstance keeps the callee-fleet-is-empty condition on its own error
+// type while carrying gRPC UNAVAILABLE, so retry treats it as a connection that
+// never happened and callers can tell it apart from a callee that answered
+// UNAVAILABLE without matching on message text.
+function noLiveInstance(message: string): NoLiveInstanceError {
+	return Object.assign(new NoLiveInstanceError(message), {
+		code: GRPC_CODE_UNAVAILABLE,
+	});
+}
+
+// rpcCallMeta builds the RPC.CALL meta JSON. Written out instead of
+// JSON.stringify over an object literal: it runs on every call, and the literal
+// plus the generic object walk were short-lived garbage on the hot path.
+function rpcCallMeta(
+	methodName: string,
+	viaProxy: boolean,
+	requestId: string,
+	idempotencyKey: string,
+): Buffer {
+	return Buffer.from(
+		`{"method":${JSON.stringify(methodName)},"via_proxy":${viaProxy},` +
+			`"requestId":${JSON.stringify(requestId)},"idempotencyKey":${JSON.stringify(idempotencyKey)}}`,
+	);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -426,9 +457,11 @@ export class SchemaRegistry {
 	private map = new Map<string, CallerSchema>();
 
 	set(serviceName: string, methodName: string, pair: SchemaPair): void {
+		const contractHash = computeContractHash(pair);
 		this.map.set(`${serviceName}/${methodName}`, {
 			pair,
-			contractHash: computeContractHash(pair),
+			contractHash,
+			contractHashBytes: Buffer.from(contractHash, "utf8"),
 		});
 	}
 

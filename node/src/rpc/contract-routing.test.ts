@@ -5,14 +5,14 @@ import type {
 	ServiceInstanceInfo,
 } from "../pb/servicebridge/v1/registry";
 import { MethodType } from "../pb/servicebridge/v1/registry";
+import type { WatchStream } from "../registry/watch";
 import { computeContractHash } from "../serde/contract-hash";
 import { buildSchemaPair } from "../serde/serializer";
 import { CircuitBreakerRegistry } from "./circuit-breaker";
 import { RpcClient, SchemaRegistry } from "./client";
 import type { DirectTransport } from "./direct-transport";
-import type { InstanceCache } from "./instance-cache";
-import type { Candidate } from "./lb";
-import { LoadBalancer } from "./lb";
+import { InstanceCache } from "./instance-cache";
+import { LoadBalancer, NoLiveInstanceError } from "./lb";
 import type { ProxyTransport } from "./proxy-transport";
 import { makeStubSb } from "./test-helpers";
 
@@ -51,14 +51,26 @@ function mkDescriptor(instanceId: string, hash: string): MethodDescriptor {
 	};
 }
 
-// Mock InstanceCache returning fixed Candidates.
-function mkInstanceCache(candidates: Candidate[]): InstanceCache {
-	return {
-		pickAll: () => candidates,
-		descriptorFor: () => candidates[0]?.descriptor ?? null,
-		bind: () => {},
-		dispose: () => {},
-	} as unknown as InstanceCache;
+// mkInstanceCache binds a real InstanceCache to a stub registry snapshot, so the
+// contract-hash index under test is the production one.
+function mkInstanceCache(
+	entries: { instanceId: string; endpoint: string; hash: string }[],
+): InstanceCache {
+	const instances = entries.map((e) => mkInstance(e.instanceId, e.endpoint));
+	const methods = entries.map((e) => mkDescriptor(e.instanceId, e.hash));
+	const watch = {
+		instancesSnapshot: () =>
+			new Map(instances.map((i) => [i.instanceId, i] as const)),
+		snapshot: () =>
+			new Map(
+				methods.map((m) => [`${m.instanceId}:${m.type}:${m.name}`, m] as const),
+			),
+		onInstancesChange: () => () => {},
+	} as unknown as WatchStream;
+
+	const cache = new InstanceCache();
+	cache.bind(watch, { retain: () => {} });
+	return cache;
 }
 
 // Mock ProxyTransport that records the call for assertions.
@@ -73,7 +85,7 @@ class FakeProxy {
 }
 
 describe("contract-version routing", () => {
-	it("LB filters out instances whose contractHash differs", async () => {
+	it("routes only to instances whose contractHash matches the caller", async () => {
 		const pair = await buildSchemaPair({
 			protoFile,
 			input: "ChargeRequest",
@@ -82,24 +94,17 @@ describe("contract-version routing", () => {
 		const callerHash = computeContractHash(pair);
 		const otherHash = "f".repeat(64);
 
-		const candidates: Candidate[] = [
-			{
-				descriptor: mkDescriptor("inst-A", otherHash),
-				instance: mkInstance("inst-A", "h:1"),
-				isUnhealthyAt: null,
-			},
-			{
-				descriptor: mkDescriptor("inst-B", callerHash),
-				instance: mkInstance("inst-B", "h:2"),
-				isUnhealthyAt: null,
-			},
-			{
-				descriptor: mkDescriptor("inst-C", otherHash),
-				instance: mkInstance("inst-C", "h:3"),
-				isUnhealthyAt: null,
-			},
-		];
-		const instances = mkInstanceCache(candidates);
+		const instances = mkInstanceCache([
+			{ instanceId: "inst-A", endpoint: "h:1", hash: otherHash },
+			{ instanceId: "inst-B", endpoint: "h:2", hash: callerHash },
+			{ instanceId: "inst-C", endpoint: "h:3", hash: otherHash },
+		]);
+
+		expect(
+			instances
+				.candidatesFor("payment-svc", "charge", callerHash)
+				.map((c) => c.instance.instanceId),
+		).toEqual(["inst-B"]);
 
 		const cb = new CircuitBreakerRegistry();
 		const lb = new LoadBalancer(cb);
@@ -112,7 +117,7 @@ describe("contract-version routing", () => {
 			null as unknown as DirectTransport,
 			instances,
 			schemas.asResolver(),
-			"caller-svc-id",
+			() => "caller-svc-id",
 			cb,
 			lb,
 			makeStubSb(),
@@ -142,16 +147,9 @@ describe("contract-version routing", () => {
 			input: "ChargeRequest",
 			output: "ChargeResponse",
 		});
-		const otherHash = "e".repeat(64);
-
-		const candidates: Candidate[] = [
-			{
-				descriptor: mkDescriptor("inst-A", otherHash),
-				instance: mkInstance("inst-A", "h:1"),
-				isUnhealthyAt: null,
-			},
-		];
-		const instances = mkInstanceCache(candidates);
+		const instances = mkInstanceCache([
+			{ instanceId: "inst-A", endpoint: "h:1", hash: "e".repeat(64) },
+		]);
 
 		const cb = new CircuitBreakerRegistry();
 		const lb = new LoadBalancer(cb);
@@ -163,7 +161,7 @@ describe("contract-version routing", () => {
 			null as unknown as DirectTransport,
 			instances,
 			schemas.asResolver(),
-			"caller-svc-id",
+			() => "caller-svc-id",
 			cb,
 			lb,
 			makeStubSb(),
@@ -179,22 +177,61 @@ describe("contract-version routing", () => {
 		).rejects.toThrow(/no instance.*matches caller contract/);
 	});
 
+	it("surfaces an empty callee fleet as NoLiveInstanceError with UNAVAILABLE", async () => {
+		const pair = await buildSchemaPair({
+			protoFile,
+			input: "ChargeRequest",
+			output: "ChargeResponse",
+		});
+		const callerHash = computeContractHash(pair);
+		// Matching contract, but no reachable endpoint → the LB filters it out.
+		const instances = mkInstanceCache([
+			{ instanceId: "inst-A", endpoint: "", hash: callerHash },
+		]);
+
+		const cb = new CircuitBreakerRegistry();
+		const lb = new LoadBalancer(cb);
+		const schemas = new SchemaRegistry();
+		schemas.set("payment-svc", "charge", pair);
+
+		const client = new RpcClient(
+			new FakeProxy() as unknown as ProxyTransport,
+			null as unknown as DirectTransport,
+			instances,
+			schemas.asResolver(),
+			() => "caller-svc-id",
+			cb,
+			lb,
+			makeStubSb(),
+		);
+
+		const err = await client
+			.call(
+				"payment-svc",
+				"charge",
+				{ userId: "u", amount: 1 },
+				{ transport: "proxy", retry: { maxAttempts: 1 } },
+			)
+			.then(
+				() => null,
+				(e: unknown) => e,
+			);
+
+		// The type survives the caller path: "callee fleet is empty" stays
+		// distinguishable from "callee answered UNAVAILABLE" without regex on text.
+		expect(err).toBeInstanceOf(NoLiveInstanceError);
+		expect((err as { code?: number }).code).toBe(14);
+	});
+
 	it('transport="direct" with no matching instance throws', async () => {
 		const pair = await buildSchemaPair({
 			protoFile,
 			input: "ChargeRequest",
 			output: "ChargeResponse",
 		});
-		const otherHash = "d".repeat(64);
-
-		const candidates: Candidate[] = [
-			{
-				descriptor: mkDescriptor("inst-A", otherHash),
-				instance: mkInstance("inst-A", "h:1"),
-				isUnhealthyAt: null,
-			},
-		];
-		const instances = mkInstanceCache(candidates);
+		const instances = mkInstanceCache([
+			{ instanceId: "inst-A", endpoint: "h:1", hash: "d".repeat(64) },
+		]);
 
 		const cb = new CircuitBreakerRegistry();
 		const lb = new LoadBalancer(cb);
@@ -206,7 +243,7 @@ describe("contract-version routing", () => {
 			{} as unknown as DirectTransport, // direct enabled but never used
 			instances,
 			schemas.asResolver(),
-			"caller-svc-id",
+			() => "caller-svc-id",
 			cb,
 			lb,
 			makeStubSb(),
