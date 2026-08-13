@@ -31,7 +31,7 @@ function makeOps(): {
 		},
 		async failStep(args) {
 			fails.push(args);
-			return { nextAction: "fail" };
+			return { nextAction: "fail_run", retryDelaySec: 0 };
 		},
 		async park(args) {
 			parks.push(args);
@@ -369,7 +369,7 @@ describe("runner — beginStep cached output is honored (idempotency)", () => {
 				completes.push(args);
 			},
 			async failStep() {
-				return { nextAction: "fail" };
+				return { nextAction: "fail_run", retryDelaySec: 0 };
 			},
 			async park() {},
 			async completeRun() {},
@@ -601,6 +601,34 @@ describe("runner — step span emission + ALS nesting (Task 1/2)", () => {
 });
 
 describe("runner — compensation flow", () => {
+	// reserve → charge saga; both steps declare a compensating call.
+	const sagaSteps = (): Step[] => [
+		{
+			id: "reserve",
+			type: "call",
+			service: "inventory",
+			method: "items.reserve",
+			input: {},
+			compensate: {
+				service: "inventory",
+				method: "items.release",
+				input: { resId: "$.reserve.id" },
+			},
+		},
+		{
+			id: "charge",
+			type: "call",
+			service: "billing",
+			method: "card.charge",
+			input: {},
+			compensate: {
+				service: "billing",
+				method: "card.refund",
+				input: { txId: "$.charge.txId" },
+			},
+		},
+	];
+
 	it("compensating=true runs reverse-order compensate for completed call steps", async () => {
 		const { ops } = makeOps();
 		const { sb, calls } = makeSb();
@@ -651,5 +679,276 @@ describe("runner — compensation flow", () => {
 			"billing/card.refund",
 			"inventory/items.release",
 		]);
+	});
+
+	it("re-assigned compensation does not replay already-done compensations", async () => {
+		// The runtime re-assigns a compensating run whose lease expired; the
+		// reverse walk starts over. Compensations already checkpointed must not
+		// run a second time (a saga refund would be paid twice).
+		const done = new Set(["charge.compensate"]);
+		const begins: string[] = [];
+		const completes: string[] = [];
+		const ops: RuntimeOps = {
+			async beginStep(args) {
+				begins.push(args.stepId);
+				return { alreadyDone: done.has(args.stepId) };
+			},
+			async completeStep(args) {
+				completes.push(args.stepId);
+			},
+			async failStep() {
+				return { nextAction: "fail_run", retryDelaySec: 0 };
+			},
+			async park() {},
+			async completeRun() {},
+		};
+		const { sb, calls } = makeSb();
+		await run(
+			sagaSteps(),
+			{
+				runId: "r",
+				leaseEpoch: 2,
+				state: {
+					input: {},
+					reserve: { id: "res-1" },
+					charge: { txId: "tx-7" },
+				},
+				compensating: true,
+				maxParallelism: 0,
+			},
+			{ sb, ops },
+		);
+		expect(begins).toEqual(["charge.compensate", "reserve.compensate"]);
+		// Only the outstanding compensation reached the outside world.
+		expect(calls.map((c) => `${c[0]}/${c[1]}`)).toEqual([
+			"inventory/items.release",
+		]);
+		expect(completes).toEqual(["reserve.compensate"]);
+	});
+
+	it("failed compensation is reported, walk continues, run is not completed", async () => {
+		const { ops, fails, completes } = makeOps();
+		const calls: string[] = [];
+		const sb: SbDomains = {
+			rpc: {
+				async call(service, method) {
+					calls.push(`${service}/${method}`);
+					if (method === "card.refund") throw new Error("refund gateway down");
+					return null;
+				},
+			},
+			event: {
+				async publish() {
+					return null;
+				},
+			},
+			workflow: {
+				async start() {
+					return { runId: "" };
+				},
+				async await() {
+					return null;
+				},
+			},
+		};
+		await expect(
+			run(
+				sagaSteps(),
+				{
+					runId: "r",
+					leaseEpoch: 1,
+					state: {
+						input: {},
+						reserve: { id: "res-1" },
+						charge: { txId: "tx-7" },
+					},
+					compensating: true,
+					maxParallelism: 0,
+				},
+				{ sb, ops },
+			),
+		).rejects.toThrow("refund gateway down");
+		// The earlier step was still compensated.
+		expect(calls).toEqual(["billing/card.refund", "inventory/items.release"]);
+		expect(fails).toHaveLength(1);
+		expect((fails[0] as { stepId: string }).stepId).toBe("charge.compensate");
+		expect((fails[0] as { retriable: boolean }).retriable).toBe(false);
+		expect(completes).toHaveLength(1);
+	});
+});
+
+describe("runner — FailStep decision is executed (retry / fail_run)", () => {
+	it("nextAction=retry re-executes the step; runtime decides when to stop", async () => {
+		const fails: Array<{ retriable: boolean }> = [];
+		let attempts = 0;
+		const ops: RuntimeOps = {
+			async beginStep() {
+				return { alreadyDone: false };
+			},
+			async completeStep() {},
+			async failStep(args) {
+				fails.push(args);
+				// Budget of 2 attempts: retry once, then hand the run over.
+				return fails.length < 2
+					? { nextAction: "retry", retryDelaySec: 0 }
+					: { nextAction: "compensate", retryDelaySec: 0 };
+			},
+			async park() {},
+			async completeRun() {},
+		};
+		const sb: SbDomains = {
+			rpc: {
+				async call() {
+					attempts += 1;
+					throw new Error("flaky");
+				},
+			},
+			event: {
+				async publish() {
+					return null;
+				},
+			},
+			workflow: {
+				async start() {
+					return { runId: "" };
+				},
+				async await() {
+					return null;
+				},
+			},
+		};
+		const plan: Step[] = [
+			{
+				id: "a",
+				type: "call",
+				service: "s",
+				method: "m",
+				input: {},
+				retry: { maxAttempts: 2 },
+			},
+		];
+		await expect(
+			run(
+				plan,
+				{
+					runId: "r",
+					leaseEpoch: 1,
+					state: { input: {} },
+					compensating: false,
+					maxParallelism: 0,
+				},
+				{ sb, ops },
+			),
+		).rejects.toThrow("flaky");
+		expect(attempts).toBe(2);
+		expect(fails).toHaveLength(2);
+		// A declared retry policy is what makes the step retriable for the runtime.
+		expect(fails.every((f) => f.retriable)).toBe(true);
+	});
+
+	it("step without a retry policy reports retriable=false and is not re-executed", async () => {
+		const { ops, fails } = makeOps();
+		let attempts = 0;
+		const sb: SbDomains = {
+			rpc: {
+				async call() {
+					attempts += 1;
+					throw new Error("boom");
+				},
+			},
+			event: {
+				async publish() {
+					return null;
+				},
+			},
+			workflow: {
+				async start() {
+					return { runId: "" };
+				},
+				async await() {
+					return null;
+				},
+			},
+		};
+		await expect(
+			run(
+				[{ id: "a", type: "call", service: "s", method: "m", input: {} }],
+				{
+					runId: "r",
+					leaseEpoch: 1,
+					state: { input: {} },
+					compensating: false,
+					maxParallelism: 0,
+				},
+				{ sb, ops },
+			),
+		).rejects.toThrow("boom");
+		expect(attempts).toBe(1);
+		expect((fails[0] as { retriable: boolean }).retriable).toBe(false);
+	});
+});
+
+describe("runner — a failing step stops its level", () => {
+	it("sibling does not dispatch or checkpoint once another step failed", async () => {
+		const completes: string[] = [];
+		const ops: RuntimeOps = {
+			async beginStep(args) {
+				// 'slow' is still checkpointing when 'fast' fails.
+				if (args.stepId === "slow") {
+					await new Promise((r) => setTimeout(r, 20));
+				}
+				return { alreadyDone: false };
+			},
+			async completeStep(args) {
+				completes.push(args.stepId);
+			},
+			async failStep() {
+				return { nextAction: "compensate", retryDelaySec: 0 };
+			},
+			async park() {},
+			async completeRun() {},
+		};
+		const calls: string[] = [];
+		const sb: SbDomains = {
+			rpc: {
+				async call(_service, method) {
+					calls.push(method);
+					if (method === "fails") throw new Error("nope");
+					return null;
+				},
+			},
+			event: {
+				async publish() {
+					return null;
+				},
+			},
+			workflow: {
+				async start() {
+					return { runId: "" };
+				},
+				async await() {
+					return null;
+				},
+			},
+		};
+		const plan: Step[] = [
+			{ id: "fast", type: "call", service: "s", method: "fails", input: {} },
+			{ id: "slow", type: "call", service: "s", method: "ok", input: {} },
+		];
+		await expect(
+			run(
+				plan,
+				{
+					runId: "r",
+					leaseEpoch: 1,
+					state: { input: {} },
+					compensating: false,
+					maxParallelism: 0,
+				},
+				{ sb, ops },
+			),
+		).rejects.toThrow("nope");
+		expect(calls).toEqual(["fails"]);
+		expect(completes).toEqual([]);
 	});
 });

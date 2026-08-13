@@ -132,6 +132,9 @@ export class WatchStream {
 	private instanceListeners = new Set<
 		(added: ServiceInstanceInfo[], removed: ServiceInstanceInfo[]) => void
 	>();
+	private methodListeners = new Set<
+		(added: MethodDescriptor[], removed: MethodDescriptor[]) => void
+	>();
 	private policyListeners = new Set<(policy: PolicyEvaluation) => void>();
 	private peersChangeListeners = new Set<
 		(added: string[], removed: string[]) => void
@@ -227,8 +230,12 @@ export class WatchStream {
 		}
 	}
 
+	// snapshot exposes the live descriptor cache read-only. Copying it here
+	// allocated a full map of every mesh descriptor on every RegistryUpdate —
+	// i.e. on every scaling event and every rolling-deploy step — for consumers
+	// that only iterate it. Consumers that need a stable view copy it themselves.
 	snapshot(): ReadonlyMap<string, MethodDescriptor> {
-		return new Map(this.cache);
+		return this.cache;
 	}
 
 	instancesSnapshot(): Map<string, ServiceInstanceInfo> {
@@ -308,11 +315,25 @@ export class WatchStream {
 		for (const fn of this.telemetryConfigListeners) fn(next);
 	}
 
+	// onInstancesChange fires with the instances to upsert and the instances that
+	// are gone. `added` carries every instance the frame described (a snapshot
+	// re-describes all of them), `removed` only the ones no longer present — so a
+	// listener can apply the delta without rebuilding its whole index.
 	onInstancesChange(
 		fn: (added: ServiceInstanceInfo[], removed: ServiceInstanceInfo[]) => void,
 	): () => void {
 		this.instanceListeners.add(fn);
 		return () => this.instanceListeners.delete(fn);
+	}
+
+	// onMethodsChange is the descriptor-side twin of onInstancesChange: `added`
+	// are descriptors to upsert, `removed` are the ones evicted (by an update,
+	// by a snapshot that no longer lists them, or by a policy peer removal).
+	onMethodsChange(
+		fn: (added: MethodDescriptor[], removed: MethodDescriptor[]) => void,
+	): () => void {
+		this.methodListeners.add(fn);
+		return () => this.methodListeners.delete(fn);
 	}
 
 	// onPolicyEvaluation fires every time a fresh PolicyEvaluation lands on the
@@ -339,20 +360,41 @@ export class WatchStream {
 		for (const fn of this.instanceListeners) fn(added, removed);
 	}
 
+	private emitMethods(
+		added: MethodDescriptor[],
+		removed: MethodDescriptor[],
+	): void {
+		if (added.length === 0 && removed.length === 0) return;
+		for (const fn of this.methodListeners) fn(added, removed);
+	}
+
 	private emitPolicy(policy: PolicyEvaluation): void {
 		for (const fn of this.policyListeners) fn(policy);
 	}
 
 	private handleEvent(evt: RegistryEvent): void {
 		if (evt.snapshot) {
+			// A snapshot replaces the world. `added` re-describes everything it
+			// lists (an upsert covers both new and changed rows), `removed` holds
+			// only what the new world no longer has — a listener that applied the
+			// previous frame stays consistent without a full rebuild.
+			const prevMethods = new Map(this.cache);
 			this.cache.clear();
 			for (const m of evt.snapshot.methods) {
 				this.cache.set(cacheKey(m), m);
 			}
-			const prev = Array.from(this.instances.values());
+			const removedMethods: MethodDescriptor[] = [];
+			for (const [k, m] of prevMethods) {
+				if (!this.cache.has(k)) removedMethods.push(m);
+			}
+			const prevInstances = new Map(this.instances);
 			this.instances.clear();
 			for (const i of evt.snapshot.instances) {
 				this.instances.set(i.instanceId, i);
+			}
+			const removedInstances: ServiceInstanceInfo[] = [];
+			for (const [id, inst] of prevInstances) {
+				if (!this.instances.has(id)) removedInstances.push(inst);
 			}
 			this.eventSubs.clear();
 			for (const es of evt.snapshot.eventSubscriptions ?? []) {
@@ -370,7 +412,8 @@ export class WatchStream {
 				channelCaptureModesFromProto(evt.snapshot.captureModes),
 			);
 			this.applyTelemetryConfig(evt.snapshot.captureModes);
-			this.emitInstances(evt.snapshot.instances, prev);
+			this.emitMethods(evt.snapshot.methods, removedMethods);
+			this.emitInstances(evt.snapshot.instances, removedInstances);
 		} else if (evt.update) {
 			for (const m of evt.update.added) {
 				this.cache.set(cacheKey(m), m);
@@ -400,12 +443,16 @@ export class WatchStream {
 			// (e.g. rule revoked), runtime emits the peer's serviceId in
 			// removedPeers. SDK must drop every cached entry tied to that peer
 			// so serviceMap loses the entry within the same propagation window.
+			const removedMethods: MethodDescriptor[] = [...evt.update.removed];
 			const removedPeers = evt.update.removedPeers ?? [];
 			if (removedPeers.length > 0) {
 				const removedSet = new Set(removedPeers);
 				const removedInstancesByPeer: ServiceInstanceInfo[] = [];
 				for (const [k, m] of this.cache) {
-					if (removedSet.has(m.serviceId)) this.cache.delete(k);
+					if (removedSet.has(m.serviceId)) {
+						removedMethods.push(m);
+						this.cache.delete(k);
+					}
 				}
 				for (const [k, inst] of this.instances) {
 					if (removedSet.has(inst.serviceId)) {
@@ -437,6 +484,7 @@ export class WatchStream {
 					fn(addedPeers, removedPeers);
 				}
 			}
+			this.emitMethods(evt.update.added, removedMethods);
 			this.emitInstances(
 				evt.update.addedInstances,
 				evt.update.removedInstances,

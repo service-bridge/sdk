@@ -125,6 +125,126 @@ describe("WatchStream snapshot", () => {
 	});
 });
 
+describe("WatchStream change notifications are incrementally applicable", () => {
+	function makeInstance(instanceId: string, serviceId = "svc") {
+		return {
+			instanceId,
+			serviceId,
+			serviceName: "svc",
+			callEndpoint: `${instanceId}:1000`,
+			status: "connected",
+			httpEndpoint: "",
+			isUnhealthySinceUnixMs: 0,
+		};
+	}
+
+	function instanceSnapshot(
+		instances: ReturnType<typeof makeInstance>[],
+		methods: ReturnType<typeof makeDesc>[] = [],
+	): RegistryEvent {
+		return {
+			snapshot: {
+				methods,
+				instances,
+				eventSubscriptions: [],
+				outgoingCalls: [],
+			},
+		} as RegistryEvent;
+	}
+
+	it("snapshot() hands out the live cache — no per-tick copy", () => {
+		const stream = new FakeStream();
+		const ws = new WatchStream();
+		ws.start(emptyReq, makeClient(stream));
+		stream.emit("data", snapshot([makeDesc("inst-1", "charge")]));
+
+		const first = ws.snapshot();
+		stream.emit("data", update([makeDesc("inst-2", "refund")], []));
+		expect(ws.snapshot()).toBe(first);
+		expect(first.size).toBe(2);
+	});
+
+	it("a re-sent instance is not reported as removed", () => {
+		const stream = new FakeStream();
+		const ws = new WatchStream();
+		const events: Array<{ added: string[]; removed: string[] }> = [];
+		ws.onInstancesChange((added, removed) => {
+			events.push({
+				added: added.map((i) => i.instanceId),
+				removed: removed.map((i) => i.instanceId),
+			});
+		});
+		ws.start(emptyReq, makeClient(stream));
+
+		stream.emit("data", instanceSnapshot([makeInstance("a")]));
+		// Scale-out: 'a' stays, 'b' joins.
+		stream.emit(
+			"data",
+			instanceSnapshot([makeInstance("a"), makeInstance("b")]),
+		);
+		// Rolling deploy: 'a' is gone.
+		stream.emit("data", instanceSnapshot([makeInstance("b")]));
+
+		expect(events[1]).toEqual({ added: ["a", "b"], removed: [] });
+		expect(events[2]).toEqual({ added: ["b"], removed: ["a"] });
+	});
+
+	it("onMethodsChange reports descriptors to upsert and descriptors evicted", () => {
+		const stream = new FakeStream();
+		const ws = new WatchStream();
+		const events: Array<{ added: string[]; removed: string[] }> = [];
+		ws.onMethodsChange((added, removed) => {
+			events.push({
+				added: added.map((m) => m.name),
+				removed: removed.map((m) => m.name),
+			});
+		});
+		ws.start(emptyReq, makeClient(stream));
+
+		stream.emit("data", snapshot([makeDesc("inst-1", "charge")]));
+		expect(events[0]).toEqual({ added: ["charge"], removed: [] });
+
+		stream.emit(
+			"data",
+			update([makeDesc("inst-1", "refund")], [makeDesc("inst-1", "charge")]),
+		);
+		expect(events[1]).toEqual({ added: ["refund"], removed: ["charge"] });
+
+		// A snapshot that no longer lists a descriptor evicts it.
+		stream.emit("data", snapshot([makeDesc("inst-1", "pay")]));
+		expect(events[2]).toEqual({ added: ["pay"], removed: ["refund"] });
+	});
+
+	it("removedPeers eviction is reported to method listeners", () => {
+		const stream = new FakeStream();
+		const ws = new WatchStream();
+		const removedNames: string[] = [];
+		ws.onMethodsChange((_added, removed) => {
+			for (const m of removed) removedNames.push(m.name);
+		});
+		ws.start(emptyReq, makeClient(stream));
+		stream.emit("data", snapshot([makeDesc("inst-1", "charge")]));
+
+		stream.emit("data", {
+			update: {
+				added: [],
+				removed: [],
+				addedInstances: [],
+				removedInstances: [],
+				addedEventSubscriptions: [],
+				removedEventSubscriptions: [],
+				addedOutgoingCalls: [],
+				removedOutgoingCalls: [],
+				addedPeers: [],
+				removedPeers: ["svc"],
+			},
+		} as RegistryEvent);
+
+		expect(removedNames).toEqual(["charge"]);
+		expect(ws.snapshot().size).toBe(0);
+	});
+});
+
 describe("WatchStream per-channel capture modes (runtime authority)", () => {
 	it("defaults every channel to none before any snapshot (fail-safe)", () => {
 		const ws = new WatchStream();

@@ -57,6 +57,11 @@ export type RpcStreamHandlerFn<Req = unknown, Chunk = unknown> = (
 	req: Req,
 ) => AsyncIterable<Chunk>;
 
+// EventHandlerFn is the function shape accepted by Handle.event().
+export type EventHandlerFn = (payload: unknown) => Promise<void> | void;
+
+const NO_EVENT_HANDLERS: readonly EventHandlerFn[] = [];
+
 interface HandlerEntry {
 	type: MethodType;
 	name: string;
@@ -110,11 +115,46 @@ export class Handle {
 	// schema loading is async, finalized() must await before serialization.
 	readonly _published: PublishedEntry[] = [];
 
+	// Lookup indexes maintained on every registration. `_entries` mixes RPC,
+	// EVENT, WORKFLOW, JOB and HTTP rows, and dispatch/publish/delivery are per
+	// message: scanning the array there costs O(handlers) on every inbound call.
+	// Every mutation funnels through addEntry / publishEvent so the indexes
+	// cannot drift from the arrays.
+	private readonly rpcByName = new Map<string, HandlerEntry>();
+	private readonly eventsByPattern = new Map<string, EventHandlerFn[]>();
+	private readonly publishedByName = new Map<string, PublishedEntry>();
+
 	// Pending registrations awaiting their async SchemaPair to load. Covers
 	// rpc / stream handlers AND publishEvent declarations.
 	// finalize() resolves all of them before incomingMethods() /
 	// publishedEvents() are called.
 	private pending: Promise<void>[] = [];
+
+	private addEntry(entry: HandlerEntry): void {
+		this._entries.push(entry);
+		if (entry.type === MethodType.METHOD_TYPE_RPC) {
+			// First registration of a name wins, as with the previous find().
+			if (!this.rpcByName.has(entry.name)) {
+				this.rpcByName.set(entry.name, entry);
+			}
+			return;
+		}
+		if (entry.type === MethodType.METHOD_TYPE_EVENT) {
+			const fn = entry.fn as EventHandlerFn;
+			const bucket = this.eventsByPattern.get(entry.name);
+			if (bucket) bucket.push(fn);
+			else this.eventsByPattern.set(entry.name, [fn]);
+		}
+	}
+
+	// trackPending registers an async schema load. The no-op catch is what keeps
+	// a bad .proto from surfacing as an unhandled rejection between handler
+	// registration and start(): the real error is re-thrown from finalize(),
+	// which is the only place that can report it to the caller.
+	private trackPending(load: Promise<void>): void {
+		this.pending.push(load);
+		load.catch(() => {});
+	}
 
 	rpc<Req = unknown, Res = unknown>(
 		name: string,
@@ -143,7 +183,7 @@ export class Handle {
 	//
 	// @internal — см. ./README.md
 	_declareForTests(name: string, streaming = false): void {
-		this._entries.push({
+		this.addEntry({
 			type: MethodType.METHOD_TYPE_RPC,
 			name,
 			inputSchemaJson: null,
@@ -168,7 +208,7 @@ export class Handle {
 			streaming,
 			captureMode: opts.captureMode,
 		};
-		this._entries.push(entry);
+		this.addEntry(entry);
 
 		// For ProtoFileSpec without explicit input/output, propagate the method
 		// name so buildSchemaPair can look it up in the .proto service block.
@@ -187,7 +227,7 @@ export class Handle {
 				);
 			}),
 		);
-		this.pending.push(load);
+		this.trackPending(load);
 	}
 
 	// publishEvent declares a published event (publisher-side). `spec` is the
@@ -200,7 +240,7 @@ export class Handle {
 	// with a different SchemaSpec throws — there must be one canonical schema
 	// per (process, event-name).
 	publishEvent(name: string, spec?: SchemaSpec): void {
-		const existing = this._published.find((p) => p.name === name);
+		const existing = this.publishedByName.get(name);
 		if (existing) {
 			if (existing.spec === spec) return; // idempotent re-define with same spec
 			if (existing.spec === undefined && spec === undefined) return;
@@ -216,6 +256,7 @@ export class Handle {
 			spec,
 		};
 		this._published.push(entry);
+		this.publishedByName.set(name, entry);
 
 		if (!spec) return; // schema-less event — registered name only
 
@@ -235,7 +276,7 @@ export class Handle {
 			);
 			entry.contractHash = computeContractHash(pair);
 		});
-		this.pending.push(load);
+		this.trackPending(load);
 	}
 
 	// getPublishedEvent — schema lookup for Publisher / Subscriber. Returns the
@@ -244,7 +285,7 @@ export class Handle {
 	getPublishedEvent(
 		name: string,
 	): { contractHash: string; pair: SchemaPair } | undefined {
-		const entry = this._published.find((e) => e.name === name);
+		const entry = this.publishedByName.get(name);
 		if (!entry?.schemaPair) return undefined;
 		return { contractHash: entry.contractHash, pair: entry.schemaPair };
 	}
@@ -255,12 +296,14 @@ export class Handle {
 	// publishEvent(name, spec) with an explicit schema.
 	// @internal
 	_declarePublishedEventForTests(name: string): void {
-		if (this._published.find((p) => p.name === name)) return;
-		this._published.push({
+		if (this.publishedByName.has(name)) return;
+		const entry: PublishedEntry = {
 			name,
 			inputSchemaJson: null,
 			contractHash: "",
-		});
+		};
+		this._published.push(entry);
+		this.publishedByName.set(name, entry);
 	}
 
 	// event registers a durable event subscription. Pattern может быть точным
@@ -268,13 +311,20 @@ export class Handle {
 	// и используется и для encode, и для decode — handler-side schema смысла не
 	// имеет (один pattern матчит много событий с разными схемами).
 	event(name: string, fn: unknown): void {
-		this._entries.push({
+		this.addEntry({
 			type: MethodType.METHOD_TYPE_EVENT,
 			name,
 			inputSchemaJson: null,
 			outputSchemaJson: null,
 			fn,
 		});
+	}
+
+	// eventHandlers returns the handlers registered for an exact pattern, in
+	// registration order — the in-process fan-out set for one delivered event.
+	// The returned array is the live bucket; callers must not mutate it.
+	eventHandlers(pattern: string): readonly EventHandlerFn[] {
+		return this.eventsByPattern.get(pattern) ?? NO_EVENT_HANDLERS;
 	}
 
 	workflow(
@@ -288,7 +338,7 @@ export class Handle {
 		graphJson?: Buffer,
 		contractHash?: string,
 	): void {
-		this._entries.push({
+		this.addEntry({
 			type: MethodType.METHOD_TYPE_WORKFLOW,
 			name,
 			inputSchemaJson: graphJson ?? schemaToBuffer(opts?.input),
@@ -304,7 +354,7 @@ export class Handle {
 	// fn is the handler — it is stored locally and not sent over the wire.
 	// @internal — used by JobDomain.handle.
 	job(name: string, contractHash: string, specJson: string, fn: unknown): void {
-		this._entries.push({
+		this.addEntry({
 			type: MethodType.METHOD_TYPE_JOB,
 			name,
 			inputSchemaJson: Buffer.from(specJson, "utf8"),
@@ -362,9 +412,7 @@ export class Handle {
 	// CallServer uses this instead of reaching into private _entries.
 	asDispatchPort(): DispatchPort {
 		const findRpc = (method: string): HandlerEntry | undefined =>
-			this._entries.find(
-				(e) => e.type === MethodType.METHOD_TYPE_RPC && e.name === method,
-			);
+			this.rpcByName.get(method);
 
 		const handle = this;
 
@@ -542,11 +590,22 @@ export class Registry {
 
 		const published: PbPublishedEvent[] = this._handle.publishedEvents();
 
-		const outgoing: PbOutgoingDep[] = this._outgoing.map((o) => ({
-			serviceName: o.serviceName,
-			methodName: o.methodName,
-			type: o.type,
-		}));
+		// Dedup outgoing deps. `sb.client("svc", proto)` and an explicit
+		// `service("svc", {...})` for the same target both append a row, and the
+		// runtime's outgoing_calls upsert drops the duplicate anyway — sending it
+		// only inflates the register frame.
+		const seenOutgoing = new Set<string>();
+		const outgoing: PbOutgoingDep[] = [];
+		for (const o of this._outgoing) {
+			const key = `${o.serviceName}|${o.methodName}|${o.type}`;
+			if (seenOutgoing.has(key)) continue;
+			seenOutgoing.add(key);
+			outgoing.push({
+				serviceName: o.serviceName,
+				methodName: o.methodName,
+				type: o.type,
+			});
+		}
 
 		// Dedup event subscriptions by pattern. Multiple `event.handle(name, fn)`
 		// calls with the same pattern produce multiple HandlerEntry rows (so the

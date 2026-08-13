@@ -70,6 +70,63 @@ describe("WorkflowDomain.handle", () => {
 		).toThrow(/duplicate step id/);
 	});
 
+	it("workflow-level retry lands on every operation step that has none", () => {
+		const registry = new Registry();
+		new WorkflowDomain(registry).handle("wf", {
+			retry: { maxAttempts: 5 },
+			steps: [
+				{ id: "a", type: "call", service: "s", method: "m", input: {} },
+				{
+					id: "b",
+					type: "call",
+					service: "s",
+					method: "m",
+					input: {},
+					retry: { maxAttempts: 2 },
+				},
+				{ id: "napping", type: "sleep", durationSec: 1 },
+				{
+					id: "group",
+					type: "parallel",
+					steps: [{ id: "inner", type: "publish", event: "e", input: {} }],
+				},
+			],
+		});
+		const graph = JSON.parse(
+			Buffer.from(
+				registry._handle.incomingMethods()[0]!.inputSchemaJson,
+			).toString("utf8"),
+		) as {
+			graph: Array<{
+				id: string;
+				retry?: { maxAttempts: number };
+				steps?: Array<{ retry?: { maxAttempts: number } }>;
+			}>;
+		};
+		const byId = new Map(graph.graph.map((s) => [s.id, s]));
+		// The runtime seeds workflow_steps.max_attempts from the per-step block.
+		expect(byId.get("a")?.retry?.maxAttempts).toBe(5);
+		// An explicit per-step policy wins.
+		expect(byId.get("b")?.retry?.maxAttempts).toBe(2);
+		// A park is resumed, not retried; a group is not an operation.
+		expect(byId.get("napping")?.retry).toBeUndefined();
+		expect(byId.get("group")?.retry).toBeUndefined();
+		expect(byId.get("group")?.steps?.[0]?.retry?.maxAttempts).toBe(5);
+	});
+
+	it("workflow-level retry changes the fingerprint", () => {
+		const a = new Registry();
+		const b = new Registry();
+		new WorkflowDomain(a).handle("wf", TRIVIAL);
+		new WorkflowDomain(b).handle("wf", {
+			...TRIVIAL,
+			retry: { maxAttempts: 4 },
+		});
+		expect(a._handle.incomingMethods()[0]!.contractHash).not.toBe(
+			b._handle.incomingMethods()[0]!.contractHash,
+		);
+	});
+
 	it("fingerprint stable under property reorder", () => {
 		const a = new Registry();
 		const b = new Registry();

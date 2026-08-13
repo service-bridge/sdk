@@ -73,6 +73,9 @@ export interface RuntimeOps {
 		output: unknown;
 		leaseEpoch: number;
 	}): Promise<void>;
+	// failStep reports a failed step and returns the runtime's decision for it:
+	// "retry" (budget left — re-execute after retryDelaySec), "compensate" or
+	// "fail_run" (the runtime has taken the run over).
 	failStep(args: {
 		runId: string;
 		stepId: string;
@@ -80,7 +83,7 @@ export interface RuntimeOps {
 		errorMessage: string;
 		leaseEpoch: number;
 		retriable: boolean;
-	}): Promise<{ nextAction: string }>;
+	}): Promise<{ nextAction: string; retryDelaySec: number }>;
 	park(args: {
 		runId: string;
 		stepId: string;
@@ -137,6 +140,16 @@ export interface RunnerDeps {
 	wrapStep?: <T>(info: StepSpanInfo, fn: () => Promise<T>) => Promise<T>;
 }
 
+// AbortFlag stops the rest of a run once one step has failed terminally. Shared
+// by every step of a run, including the ones nested inside parallel/sequence
+// groups.
+interface AbortFlag {
+	aborted: boolean;
+}
+
+// Runtime decisions returned by FailStep (runtime/internal/workflow/server.go).
+const NEXT_ACTION_RETRY = "retry";
+
 // run executes a frozen plan to completion (or until a Park happens, which
 // surrenders control back to runtime). Returns the final state.
 export async function run(
@@ -149,10 +162,9 @@ export async function run(
 		return ctx.state;
 	}
 
-	const byId = new Map<string, Step>();
-	indexById(steps, byId);
 	const completed = new Set<string>(Object.keys(ctx.state));
 	completed.delete("input"); // input is not a step id
+	const abort: AbortFlag = { aborted: false };
 
 	// Dependency-based scheduling — repeatedly find steps whose waitFor is
 	// satisfied and run them, honoring maxParallelism.
@@ -171,19 +183,41 @@ export async function run(
 				: ready.length;
 		const batch = ready.slice(0, cap);
 
-		await Promise.all(batch.map((s) => executeStep(s, ctx, deps, completed)));
+		await settleAll(
+			batch.map((s) => executeStep(s, ctx, deps, completed, abort)),
+		);
 	}
 
 	return ctx.state;
 }
 
-function indexById(steps: Step[], out: Map<string, Step>): void {
-	for (const s of steps) {
-		out.set(s.id, s);
-		if (s.type === "parallel" || s.type === "sequence") {
-			indexById(s.steps, out);
+// settleAll awaits every unit of a concurrent level before re-throwing. With
+// Promise.all the first rejection returns control while the siblings kept
+// running: they dispatched their rpc.call / publish and checkpointed against a
+// run the runtime had already moved to compensating.
+async function settleAll(work: Promise<void>[]): Promise<void> {
+	const results = await Promise.allSettled(work);
+	const failure = pickFailure(results);
+	if (failure !== undefined) throw failure;
+}
+
+// pickFailure prefers a real step error over the two control-flow signals: a
+// park surrenders the run to the runtime, and an abort only ever happens
+// because some sibling failed — that sibling's error is the one worth raising.
+function pickFailure(results: PromiseSettledResult<void>[]): unknown {
+	let signal: unknown;
+	for (const r of results) {
+		if (r.status !== "rejected") continue;
+		if (
+			r.reason instanceof RunnerParkedError ||
+			r.reason instanceof StepAbortedError
+		) {
+			if (signal === undefined) signal = r.reason;
+			continue;
 		}
+		return r.reason;
 	}
+	return signal;
 }
 
 async function executeStep(
@@ -191,7 +225,10 @@ async function executeStep(
 	ctx: RunContext,
 	deps: RunnerDeps,
 	completed: Set<string>,
+	abort: AbortFlag,
 ): Promise<void> {
+	if (abort.aborted) throw new StepAbortedError(step.id);
+
 	// `when` predicate — skip if false.
 	if (
 		step.when !== undefined &&
@@ -202,68 +239,109 @@ async function executeStep(
 		return;
 	}
 
-	const begin = await deps.ops.beginStep({
-		runId: ctx.runId,
-		stepId: step.id,
-		parentStepId: "",
-		kind: step.type,
-		inputSnapshot: snapshotInput(step, ctx.state),
-		leaseEpoch: ctx.leaseEpoch,
-	});
+	// The retry budget belongs to the runtime: it seeds workflow_steps
+	// .max_attempts from the step's declared retry policy and answers every
+	// FailStep with retry / compensate / fail_run. The loop below executes that
+	// answer — it is not a runner-owned retry policy (ADR-W-018).
+	while (true) {
+		const begin = await deps.ops.beginStep({
+			runId: ctx.runId,
+			stepId: step.id,
+			parentStepId: "",
+			kind: step.type,
+			inputSnapshot: snapshotInput(step, ctx.state),
+			leaseEpoch: ctx.leaseEpoch,
+		});
 
-	if (begin.alreadyDone) {
-		ctx.state[step.id] = begin.cachedOutput ?? null;
-		completed.add(step.id);
-		return;
-	}
-
-	try {
-		// One USER.SUBOP step span per executed unit. Group steps
-		// (parallel/sequence) get role "group" so dispatchGroup's branch spans
-		// nest under it; everything else is a plain "step". The span scope
-		// established by wrapStep is what makes the step's nested rpc/event/
-		// sub-workflow ops parent to the span instead of the run root.
-		const role: StepSpanInfo["role"] =
-			step.type === "parallel" || step.type === "sequence" ? "group" : "step";
-		const runStep = () => dispatch(step, ctx, deps);
-		const output = deps.wrapStep
-			? await deps.wrapStep(
-					{
-						runId: ctx.runId,
-						stepId: step.id,
-						stepName: step.id,
-						role,
-					},
-					runStep,
-				)
-			: await runStep();
-		// Park-typed steps surrender control; they have no synchronous output.
-		// dispatch returns the sentinel `PARKED` and the runtime will resume
-		// the run after the timer/event/signal fires.
-		if (output === PARKED) {
-			throw new RunnerParkedError(step.id);
+		if (begin.alreadyDone) {
+			ctx.state[step.id] = begin.cachedOutput ?? null;
+			completed.add(step.id);
+			return;
 		}
-		await deps.ops.completeStep({
-			runId: ctx.runId,
-			stepId: step.id,
-			output,
-			leaseEpoch: ctx.leaseEpoch,
-		});
-		ctx.state[step.id] = output ?? null;
-		completed.add(step.id);
-	} catch (err) {
-		if (err instanceof RunnerParkedError) throw err;
-		const { code, message } = unpackError(err);
-		await deps.ops.failStep({
-			runId: ctx.runId,
-			stepId: step.id,
-			errorCode: code,
-			errorMessage: message,
-			leaseEpoch: ctx.leaseEpoch,
-			retriable: false,
-		});
-		throw err;
+
+		// A sibling failed while this step was checkpointing — its operation must
+		// not reach the outside world any more.
+		if (abort.aborted) throw new StepAbortedError(step.id);
+
+		try {
+			// One USER.SUBOP step span per executed unit. Group steps
+			// (parallel/sequence) get role "group" so dispatchGroup's branch spans
+			// nest under it; everything else is a plain "step". The span scope
+			// established by wrapStep is what makes the step's nested rpc/event/
+			// sub-workflow ops parent to the span instead of the run root.
+			const role: StepSpanInfo["role"] =
+				step.type === "parallel" || step.type === "sequence" ? "group" : "step";
+			const runStep = () => dispatch(step, ctx, deps, abort);
+			const output = deps.wrapStep
+				? await deps.wrapStep(
+						{
+							runId: ctx.runId,
+							stepId: step.id,
+							stepName: step.id,
+							role,
+						},
+						runStep,
+					)
+				: await runStep();
+			// Park-typed steps surrender control; they have no synchronous output.
+			// dispatch returns the sentinel `PARKED` and the runtime will resume
+			// the run after the timer/event/signal fires.
+			if (output === PARKED) {
+				throw new RunnerParkedError(step.id);
+			}
+			await deps.ops.completeStep({
+				runId: ctx.runId,
+				stepId: step.id,
+				output,
+				leaseEpoch: ctx.leaseEpoch,
+			});
+			ctx.state[step.id] = output ?? null;
+			completed.add(step.id);
+			return;
+		} catch (err) {
+			if (err instanceof RunnerParkedError || err instanceof StepAbortedError) {
+				throw err;
+			}
+			const { code, message } = unpackError(err);
+			let decision: { nextAction: string; retryDelaySec: number };
+			try {
+				decision = await deps.ops.failStep({
+					runId: ctx.runId,
+					stepId: step.id,
+					errorCode: code,
+					errorMessage: message,
+					leaseEpoch: ctx.leaseEpoch,
+					retriable: isRetriable(step),
+				});
+			} catch (failErr) {
+				// The checkpoint itself failed (fenced lease, dead channel) — the
+				// run is no longer ours to drive.
+				abort.aborted = true;
+				throw failErr;
+			}
+			if (decision.nextAction === NEXT_ACTION_RETRY) {
+				await sleep(decision.retryDelaySec * 1000);
+				continue;
+			}
+			// compensate / fail_run — the runtime owns the run from here.
+			abort.aborted = true;
+			throw err;
+		}
 	}
+}
+
+// isRetriable reports whether the step declared a retry policy asking for more
+// than one attempt. It mirrors what the runtime seeded into
+// workflow_steps.max_attempts, so retriable=false never wastes a budget the
+// user did not ask for, and retriable=true never claims one that does not exist.
+function isRetriable(step: Step): boolean {
+	const maxAttempts = step.retry?.maxAttempts;
+	return typeof maxAttempts === "number" && maxAttempts > 1;
+}
+
+function sleep(ms: number): Promise<void> {
+	if (ms <= 0) return Promise.resolve();
+	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 const PARKED = Symbol("workflow.parked");
@@ -272,6 +350,15 @@ export class RunnerParkedError extends Error {
 	constructor(public readonly stepId: string) {
 		super(`workflow/runner: parked at step "${stepId}" — runtime will resume`);
 		this.name = "RunnerParkedError";
+	}
+}
+
+// StepAbortedError marks a step that never ran because another step of the same
+// run failed terminally.
+class StepAbortedError extends Error {
+	constructor(public readonly stepId: string) {
+		super(`workflow/runner: step "${stepId}" aborted — run is already failing`);
+		this.name = "StepAbortedError";
 	}
 }
 
@@ -296,6 +383,7 @@ async function dispatch(
 	step: Step,
 	ctx: RunContext,
 	deps: RunnerDeps,
+	abort: AbortFlag,
 ): Promise<unknown> {
 	switch (step.type) {
 		case "call":
@@ -312,7 +400,7 @@ async function dispatch(
 			return dispatchWaitSignal(step, ctx, deps);
 		case "parallel":
 		case "sequence":
-			return dispatchGroup(step, ctx, deps);
+			return dispatchGroup(step, ctx, deps, abort);
 		case "local":
 			return dispatchLocal(step, ctx, deps);
 		default: {
@@ -425,6 +513,7 @@ async function dispatchGroup(
 	step: ParallelStep | SequenceStep,
 	ctx: RunContext,
 	deps: RunnerDeps,
+	abort: AbortFlag,
 ): Promise<unknown> {
 	// Iterations: each one is a (template-steps[], extra state bindings) pair.
 	const iterations: { steps: Step[]; bindings: State; suffix: string }[] = [];
@@ -454,15 +543,15 @@ async function dispatchGroup(
 		const subCtx: RunContext = { ...ctx, state: subState };
 		const runBranchBody = async (): Promise<void> => {
 			if (step.type === "parallel") {
-				await Promise.all(
+				await settleAll(
 					it.steps.map((s) =>
-						executeStep(s, subCtx, deps, new Set(Object.keys(subState))),
+						executeStep(s, subCtx, deps, new Set(Object.keys(subState)), abort),
 					),
 				);
 			} else {
 				const completed = new Set<string>(Object.keys(subState));
 				for (const s of it.steps) {
-					await executeStep(s, subCtx, deps, completed);
+					await executeStep(s, subCtx, deps, completed, abort);
 				}
 			}
 		};
@@ -490,7 +579,7 @@ async function dispatchGroup(
 	};
 
 	if (step.type === "parallel") {
-		await Promise.all(iterations.map(runIteration));
+		await settleAll(iterations.map(runIteration));
 	} else {
 		for (const it of iterations) await runIteration(it);
 	}
@@ -553,6 +642,7 @@ async function runCompensation(
 	const flat: Step[] = [];
 	flatten(steps, flat);
 	const reversed = [...flat].reverse();
+	let firstFailure: unknown;
 	for (const step of reversed) {
 		if (!(step.type === "call" || step.type === "publish")) continue;
 		const comp = (step as { compensate?: CompensateSpec }).compensate;
@@ -562,7 +652,7 @@ async function runCompensation(
 		}
 		const input = evalLiteralOrPath(comp.input, ctx.state);
 		const compStepId = `${step.id}.compensate`;
-		await deps.ops.beginStep({
+		const begin = await deps.ops.beginStep({
 			runId: ctx.runId,
 			stepId: compStepId,
 			parentStepId: step.id,
@@ -570,6 +660,12 @@ async function runCompensation(
 			inputSnapshot: input,
 			leaseEpoch: ctx.leaseEpoch,
 		});
+		// The reverse walk restarts from the top every time the runtime
+		// re-assigns a compensating run (expired lease → bumped lease_epoch, see
+		// ListStaleCompensating). Without honoring the checkpoint, every
+		// compensation already executed runs a second time — one more refund per
+		// reassignment.
+		if (begin.alreadyDone) continue;
 		const kind = comp.type ?? step.type;
 		// Forward CompensateSpec fields as opts to the owner-module op. The
 		// runner itself does NOT implement any policy loop — it only transports
@@ -593,27 +689,53 @@ async function runCompensation(
 			);
 		};
 
-		const output = deps.wrapStep
-			? await deps.wrapStep(
-					{
-						runId: ctx.runId,
-						stepId: compStepId,
-						stepName: `compensate ${step.id}`,
-						role: "compensation",
-						isCompensation: true,
-						compensatesForStepId: step.id,
-					},
-					executeCompensateOp,
-				)
-			: await executeCompensateOp();
+		try {
+			const output = deps.wrapStep
+				? await deps.wrapStep(
+						{
+							runId: ctx.runId,
+							stepId: compStepId,
+							stepName: `compensate ${step.id}`,
+							role: "compensation",
+							isCompensation: true,
+							compensatesForStepId: step.id,
+						},
+						executeCompensateOp,
+					)
+				: await executeCompensateOp();
 
-		await deps.ops.completeStep({
-			runId: ctx.runId,
-			stepId: compStepId,
-			output,
-			leaseEpoch: ctx.leaseEpoch,
-		});
+			await deps.ops.completeStep({
+				runId: ctx.runId,
+				stepId: compStepId,
+				output,
+				leaseEpoch: ctx.leaseEpoch,
+			});
+		} catch (err) {
+			// One failed compensation must not strand the steps before it: the
+			// reverse walk keeps going so their compensations still run. The
+			// failure is reported so the compensation step lands terminal instead
+			// of hanging in_flight — retriable=false because the compensating
+			// operation's own retry budget lives in CompensateSpec.retry, which
+			// sb.rpc.call / sb.event.publish already applied. The runtime's
+			// nextAction is meaningless here: the run is compensating already.
+			// A failing FailStep (fenced lease) is not caught — the run has been
+			// handed to another holder and nothing more may be checkpointed.
+			const { code, message } = unpackError(err);
+			await deps.ops.failStep({
+				runId: ctx.runId,
+				stepId: compStepId,
+				errorCode: code,
+				errorMessage: message,
+				leaseEpoch: ctx.leaseEpoch,
+				retriable: false,
+			});
+			if (firstFailure === undefined) firstFailure = err;
+		}
 	}
+	// Raised after the full walk so the caller does not complete the run as
+	// compensated. The runtime re-assigns it; the already-done checkpoints above
+	// make the second pass skip everything that did succeed.
+	if (firstFailure !== undefined) throw firstFailure;
 }
 
 function flatten(steps: Step[], out: Step[]): void {

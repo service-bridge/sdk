@@ -74,7 +74,10 @@ export function makeRuntimeOps(
 					},
 					(err, resp) => {
 						if (err) return reject(err);
-						resolve({ nextAction: resp.nextAction });
+						resolve({
+							nextAction: resp.nextAction,
+							retryDelaySec: resp.retryDelaySec,
+						});
 					},
 				);
 			});

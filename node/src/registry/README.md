@@ -4,6 +4,8 @@
 
 Клиентская сторона Registry: хранит декларации входящих хендлеров (rpc, stream, event, workflow, job) и исходящих зависимостей, строит `RegisterRequest` для gRPC, управляет стримом `RegisterAndWatch`, кешем `MethodDescriptor` и snapshot'ами enrichment'а (instances, event-subscriptions, outgoing-calls, policy, per-channel capture modes). Не содержит логики маршрутизации, не диспетчит вызовы сам (отдаёт `DispatchPort`) и не знает о транспорте.
 
+Здесь же живёт `StreamSupervisor` — конечный автомат жизненного цикла долгоживущего gRPC-стрима (open → listen → break → лестница → reopen), общий для подписчиков events / job / workflow.
+
 ## Публичный контракт
 
 Реэкспортируется наружу через `ServiceBridge` (top-level `index.ts`). Сами классы `Registry`, `Handle`, `WatchStream` наружу НЕ экспортируются — они встроены в `ServiceBridge` и доступны прикладному коду только через domain namespaces (`sb.rpc`, `sb.event`, `sb.workflow`, `sb.job`).
@@ -81,10 +83,26 @@
 | `WatchStream.onInstancesChange(fn)` | `() => void` | — | Подписка на add/remove инстансов; возвращает unsubscribe |
 | `WatchStream.onPolicyEvaluation(fn)` | `() => void` | — | Подписка на свежую `PolicyEvaluation` (snapshot + live policy update); возвращает unsubscribe |
 | `WatchStream.onPeersChange(fn)` | `() => void` | — | Подписка на `added_peers`/`removed_peers` из update; возвращает unsubscribe |
+| `StreamSupervisor<S, M>` | class @internal | — | Автомат жизненного цикла одного долгоживущего gRPC-стрима. Владеет флагом остановки, единственным pending-таймером реконнекта, identity-guard'ом стрима и счётчиком попыток на лестнице `utils/reconnect-ladder`. Доменный код даёт только `open` (как открыть стрим) и `onData` (что значит фрейм) |
+| `StreamSupervisorDeps<S, M>` | interface @internal | — | `{ open: () => S \| null, onData: (msg: M, stream: S) => void, onError: (err: Error) => void, reconnectOpts?: ReconnectDelayOptions }` |
+| `StreamSupervisorDeps.open` | `() => S \| null` | — | Открывает свежий стрим. `null` = предусловие не выполнено (нет identity) и трактуется как обрыв: повтор по лестнице. Синхронный throw ловится, уходит в `onError` и тоже даёт повтор |
+| `StreamSupervisorDeps.onData` | `(msg, stream) => void` | — | Каждый фрейм текущего стрима; сам стрим передаётся, чтобы обработчик мог писать ответ в тот же вызов |
+| `StreamSupervisorDeps.onError` | `(err) => void` | — (обязателен) | Нотификация об ошибке стрима. Решение о реконнекте принимает супервизор, не потребитель |
+| `StreamSupervisorDeps.reconnectOpts` | `ReconnectDelayOptions?` | общая лестница + ±20% jitter | Тестовый hook: пиннит лестницу/jitter, чтобы reconnect наблюдался за миллисекунды |
+| `StreamSupervisor.start()` | `() => void` | — | Сбрасывает stop-флаг и счётчик попыток, гасит pending-таймер, открывает стрим |
+| `StreamSupervisor.stop()` | `() => void` | — | Ставит stop-флаг, гасит таймер, `cancel()` текущего стрима. Дальнейшие события мёртвого стрима игнорируются |
+| `StreamSupervisor.restart()` | `() => void` | — | Сбрасывает текущий стрим и открывает новый немедленно, с нулевой ступени. Для протухших параметров стрима (ротация instance_id) и внешнего доказательства смерти (пропущенные heartbeat'ы). No-op после `stop()` |
+| `StreamSupervisor.current()` | `S \| null` | `null` | Живой стрим для записи; `null` между обрывом и следующим успешным open |
+| `SupervisedStream` | interface @internal | — | Минимальная поверхность grpc-стрима, которой достаточно супервизору: `on(event, listener)` + опциональный `cancel()` |
 
 ## Архитектурные решения и почему
 
 - **`"error"` handler в WatchStream**: gRPC-стрим эмитит `"error"` при CANCELLED/UNIMPLEMENTED. Без handler'а в Node.js это unhandled error и краш. `onError` callback позволяет caller'у логировать без пробрасывания.
+- **Автомат реконнекта — один на SDK (`StreamSupervisor`)**: раньше он был написан по-своему в каждом подписчике (события против while-цикла по промисам), и каждая копия ошибалась по-своему. Три инварианта, которые копии теряли:
+  - **Счётчик попыток сбрасывает только прогресс** (пришедший data-фрейм), никогда — чистое закрытие стрима. Копии на промисах резолвили `runOnce()` по `"end"` и обнуляли счётчик, поэтому рантайм, штатно закрывающий стримы (перезагрузка настроек, graceful drain), получал реконнект раз в секунду вечно.
+  - **Identity-guard на каждом листенере.** grpc-js сливает буферизованные фреймы перед `"end"`, поэтому мёртвый стрим переживает целую ступень лестницы. Без guard'а поздний `"end"` от стрима A обнуляет ссылку на живой стрим B (его больше нельзя отменить в `stop()`) и открывает третий, который рантайм отвергает с ALREADY_EXISTS.
+  - **Один pending-таймер.** На одном обрыве grpc-js эмитит и `"error"`, и `"end"`; второй таймер удваивал бы число живых reconnect-циклов на каждом обрыве.
+- **`WatchStream` держит свою копию автомата**: он рестартует не просто стрим, а пару `(req, client)`, которую подменяет ротация сессии; его состояние — кеши дескрипторов, а не подписка. Слияние с `StreamSupervisor` дало бы супервизору доменные знания без выигрыша.
 - **Per-channel capture modes**: runtime — единственный источник истины по payload-capture и пушит весь набор `CaptureModes` (rpc/http/event/workflow) на каждый snapshot/update. SDK берёт режим для канала операции как эффективный. Job-канала нет (jobs не несут payload — поле 5 в proto reserved). Per-handler `captureMode` может только сужать runtime-режим.
 - **Кеш — `Map<string, MethodDescriptor>`**: snapshot полностью заменяет кеш; update делает точечные set/delete. Удаление несуществующего ключа — no-op (гонка дисконнект-до-снепшота). `removed_peers` чистит все кеши (methods/instances/event-subs/outgoing), привязанные к выпавшему из scope peer'у.
 - **`Handle` внутри `Registry`**: все декларации (RPC, stream, события, workflow, jobs, HTTP-роуты) едут единым `RegisterRequest` через `Registry.RegisterAndWatch`. `Handle` владеет всеми async-loadable декларациями (incoming + published) в одном `pending[]`; `finalize()` ждёт их перед сериализацией. `Registry` хранит outgoing-deps (`service()`), роуты (`routes`) и endpoints.
@@ -97,9 +115,11 @@
 - `src/http/route` — `RouteCollector` для HTTP-интеграций
 - `src/serde/serializer`, `src/serde/contract-hash` — async-загрузка `SchemaPair`, contract-hash
 - `src/rpc/dispatch-port`, `src/telemetry/payload-capture` — типы `DispatchPort` / `CaptureMode`
+- `src/utils/reconnect-ladder` — `reconnectDelay`, `ReconnectDelayOptions` (лестница + jitter для `WatchStream` и `StreamSupervisor`)
 
 Используется в:
 - `src/connection/service-bridge.ts` — `Registry`, `WatchStream`, `Handle` встроены в `ServiceBridge`
 - `src/connection/session.ts`, `src/rpc/instance-cache.ts` — типы `WatchStream`
+- `src/events/subscriber.ts`, `src/job/subscriber.ts`, `src/workflow/subscriber.ts` — `StreamSupervisor`
 - `src/{rpc,events,workflow,job}/domain.ts` — типы `Registry`, `RpcHandlerFn`, `RpcStreamHandlerFn`, `WorkflowHandlerOpts`
 - top-level `index.ts` (через `ServiceBridge`) — re-export `MethodType`, `MethodDescriptor`, `RpcHandlerOpts`, `WorkflowHandlerOpts`, `ServiceDeps`

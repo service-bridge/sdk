@@ -63,7 +63,12 @@ Domain namespace для durable workflows. Покрывает обе сторо�
 | `RunnerDeps.wrapStep` | `<T>(info: StepSpanInfo, fn) => Promise<T>` (optional) | Hook вокруг КАЖДОЙ исполняемой единицы: каждый step, каждая fanout-группа (`role:"group"`), каждая ветка fanout (`role:"branch"`, только при `forEach`), каждая компенсация (`role:"compensation"`). Subscriber открывает один `USER.SUBOP` op (parent = текущий trace context) и выполняет `fn` в `childContext(parent, spanOpId)` — это превращает плоский trace в дерево `run → step → op`. Meta: `step_id`, `step_name`; для компенсации `is_compensation`+`compensates_for_step_id=<forward step.id>`. Без hook'а единица выполняется без span/scope. |
 | `StepSpanInfo` | `{runId, stepId, stepName, role, isCompensation?, compensatesForStepId?}` | Идентичность step span, передаваемая в `wrapStep`. `role`: `step`\|`group`\|`branch`\|`compensation`. |
 | `RunnerParkedError` | класс | Сигнал раннера, что step запарковался (sleep/wait_event/wait_signal) — runtime возобновит run. |
-| `WorkflowSubscriber` | класс (`@internal`) | Long-poll `Workflows.Subscribe`, per-run heartbeat (10s) с `leaseEpoch`. Reconnect ladder `[1s,5s,15s,30s,60s]`; таймер ожидания между попытками хранится в `reconnectTimer` и отменяется в `close()` — непрокинутый таймер держал бы event loop живым до следующей ступени лестницы после закрытия сабскрайбера. Подменяет wire-`frozenPlan` локально зарегистрированным графом (восстановить `local.fn`). Парсит `RunAssignment.xSbTrace` через `parseXSbTrace` и оборачивает выполнение в `runWithTrace(parsed, fn)` (ALS seed run-root scope). По завершении вычисляет `terminalStatus`: forward → `success`; `compensating` + `cancelReason === "step_failure"` → `failed_compensated`; иначе → `cancelled`; и шлёт `CompleteRun`. WORKFLOW.RUN op эмитит runtime сам (ADR 0007 §5/ADR 0003 §1). |
+| `WorkflowSubscriber` | класс (`@internal`) | Консьюмер `Workflows.Subscribe` + lease-heartbeat'ы. Жизненный цикл стрима держит `registry/StreamSupervisor` (лестница `[1s,5s,15s,30s,60s]`, ±20% jitter). Подменяет wire-`frozenPlan` локально зарегистрированным графом (восстановить `local.fn`). Парсит `RunAssignment.xSbTrace` через `parseXSbTrace` и оборачивает выполнение в `runWithTrace(parsed, fn)` (ALS seed run-root scope). По завершении вычисляет `terminalStatus`: forward → `success`; `compensating` + `cancelReason === "step_failure"` → `failed_compensated`; иначе → `cancelled`; и шлёт `CompleteRun`. WORKFLOW.RUN op эмитит runtime сам (ADR 0007 §5/ADR 0003 §1). |
+| `WorkflowSubscriber.start()` | `() => void` | Открывает стрим через supervisor и запускает единственный sweep-таймер (10 с, `unref`), который сверяет identity и рассылает heartbeat по всем живым lease. |
+| `WorkflowSubscriber.close()` | `() => void` | Гасит sweep-таймер и pending-таймер реконнекта, `cancel()` стрима, сбрасывает все lease. |
+| `SubscriberDeps.identity` | `() => SubscriberIdentity \| null` | Резолвится на КАЖДЫЙ `Subscribe` и КАЖДЫЙ heartbeat. `null` → стрим не открывается, повтор по лестнице. |
+| `SubscriberDeps.reconnectOpts` | `ReconnectDelayOptions?` | Тестовый hook: пиннит лестницу/jitter, чтобы reconnect наблюдался за миллисекунды. |
+| `SubscriberIdentity` | `{serviceId, instanceId}` (`@internal`) | Идентичность сессии, к которой привязаны стрим и lease-heartbeat'ы. |
 | `makeRuntimeOps(rpc, getInstanceId)` | функция (`@internal`) | Адаптер `WorkflowsClient` → `RuntimeOps`. Весь JSON-encoding bridge без бизнес-логики. |
 
 ## Архитектурные решения и почему
@@ -107,12 +112,37 @@ Domain namespace для durable workflows. Покрывает обе сторо�
   получают канонический X-SB-Trace в свои wire-headers — runtime эмиттит
   RPC.CALL / EVENT.PUBLISH / WORKFLOW.RUN op'ы с правильным `parent_op_id`.
   WORKFLOW.RUN op (root) пишет runtime сам — SDK не дублирует.
+- **Автомат реконнекта — `registry/StreamSupervisor`**, общий с events- и
+  job-подписчиками. Свой while-цикл по промисам сбрасывал счётчик попыток на
+  `resolve()` из `stream.on("end")`, то есть на ЧИСТОМ закрытии стрима — рантайм,
+  штатно закрывающий стримы, получал реконнект раз в секунду вечно. Счётчик
+  сбрасывает только пришедший `RunAssignment`.
+- **`identity` — замыкание, а не значение.** `Control.RefreshCert` выдаёт новый
+  `instance_id` на каждую ротацию сертификата. Зафиксированный при
+  конструировании id уходил бы в heartbeat'ы инстанса, который рантайм уже
+  снёс: lease истекает, `ReclaimExpiredLeases` переназначает прогон, шаги
+  выполняются второй раз параллельно с первым раннером. Sweep сверяет
+  `instanceId` с тем, с которым открыт стрим, и при расхождении делает
+  `supervisor.restart()`.
+- **Один sweep-таймер на все прогоны.** `setInterval` на каждый активный прогон
+  давал 500 таймеров на 500 прогонов, делающих одно и то же с одним периодом.
+  Sweep проходит по map lease'ов; таймер `unref`-нут — heartbeat не должен быть
+  причиной, по которой процесс не завершается.
+- **`stopHeartbeat(runId, leaseEpoch)` сверяет эпоху.** Переназначение того же
+  `runId`, пока предыдущий exec ещё разматывается, поднимает `leaseEpoch`. Без
+  сверки `finally` старого exec гасил heartbeat НОВОГО назначения: lease
+  истекает → переназначение → живая блокировка.
+- **Отказ heartbeat не снимает lease.** И ошибка в callback, и синхронный throw
+  логируются, lease остаётся: транзиентный отказ канала не должен молча
+  оставлять прогон на реклейм по таймауту без единой строки диагностики.
 
 ## Зависимости
 
 Зависит от:
 - `registry/registry` — `Registry`, `WorkflowHandlerOpts`,
   `Registry._handle.workflow(...)` (запись graph+hash в Registry).
+- `registry/stream-supervisor` — `StreamSupervisor` (жизненный цикл
+  Subscribe-стрима); `utils/reconnect-ladder` — тип `ReconnectDelayOptions`.
 - `pb/servicebridge/v1/workflows` — gRPC stubs `WorkflowsClient` + все
   request/response типы.
 - `rpc/client` — `CallOpts`, `RetryOpts` (база для templatable step opts).
@@ -123,6 +153,7 @@ Domain namespace для durable workflows. Покрывает обе сторо�
 Используется:
 - `connection/service-bridge` — конструирует `WorkflowDomain`, в `start()`
   привязывает `WorkflowsClient` через `_attachRpc`, строит `RuntimeOps` через
-  `makeRuntimeOps`, передаёт `wrapStep`-hook и запускает `WorkflowSubscriber`
-  после первого Welcome (если есть хотя бы один workflow handler).
+  `makeRuntimeOps`, передаёт `wrapStep`-hook и `identity: () => currentIdentity`,
+  запускает `WorkflowSubscriber` после первого Welcome (если есть хотя бы один
+  workflow handler).
 </content>

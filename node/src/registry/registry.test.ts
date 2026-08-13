@@ -117,6 +117,98 @@ describe("Handle.rpc", () => {
 	});
 });
 
+describe("Handle — hot-path lookups are indexed, not scanned", () => {
+	// `_entries` / `_published` mix every declaration type, and dispatch runs per
+	// inbound call. Shadowing `find` proves the lookup never walks the array:
+	// a scan would both flip the flag and lose the handler.
+	function trapScan(arr: unknown[]): () => boolean {
+		let scanned = false;
+		(arr as unknown as { find: () => undefined }).find = () => {
+			scanned = true;
+			return undefined;
+		};
+		return () => scanned;
+	}
+
+	it("dispatchUnary + captureMode resolve the RPC entry without scanning _entries", async () => {
+		const h = new Handle();
+		for (let i = 0; i < 20; i++) h.event(`noise.${i}`, () => {});
+		h.rpc("charge", () => ({ transactionId: "tx", ok: true }), {
+			schema: { protoFile, input: "ChargeRequest", output: "ChargeResponse" },
+			captureMode: "errors",
+		});
+		await h.finalize();
+
+		const { buildSchemaPair } = await import("../serde/serializer");
+		const pair = await buildSchemaPair({
+			protoFile,
+			input: "ChargeRequest",
+			output: "ChargeResponse",
+		});
+		const reqBytes = pair.input.encode({ userId: "u", amount: 1 });
+
+		const port = h.asDispatchPort();
+		const didScan = trapScan(h._entries);
+		const result = await port.dispatchUnary("charge", reqBytes);
+		expect(result.errorCode ?? "").toBe("");
+		expect(port.captureMode("charge")).toBe("errors");
+		expect(didScan()).toBe(false);
+	});
+
+	it("getPublishedEvent resolves without scanning _published", async () => {
+		const h = new Handle();
+		for (let i = 0; i < 20; i++) h._declarePublishedEventForTests(`noise.${i}`);
+		h.publishEvent("payments.failed", {
+			protoFile,
+			input: "ChargeRequest",
+			output: "ChargeResponse",
+		});
+		await h.finalize();
+
+		const didScan = trapScan(h._published);
+		const found = h.getPublishedEvent("payments.failed");
+		expect(found?.contractHash.length).toBeGreaterThan(0);
+		expect(h.getPublishedEvent("nope")).toBeUndefined();
+		expect(didScan()).toBe(false);
+	});
+
+	it("eventHandlers returns the fan-out set for a pattern in registration order", () => {
+		const h = new Handle();
+		const seen: string[] = [];
+		h.event("order.created", () => {
+			seen.push("first");
+		});
+		h.event("order.created", () => {
+			seen.push("second");
+		});
+		h.event("order.shipped", () => {});
+
+		const handlers = h.eventHandlers("order.created");
+		expect(handlers).toHaveLength(2);
+		for (const fn of handlers) fn({});
+		expect(seen).toEqual(["first", "second"]);
+		expect(h.eventHandlers("order.shipped")).toHaveLength(1);
+		expect(h.eventHandlers("unknown")).toHaveLength(0);
+	});
+});
+
+describe("Handle.finalize — schema load failures", () => {
+	it("bad .proto is reported by finalize(), not as an unhandled rejection", async () => {
+		const h = new Handle();
+		h.rpc("broken", () => ({}), {
+			schema: {
+				protoFile: join(import.meta.dir, "no-such-file.proto"),
+				input: "A",
+				output: "B",
+			},
+		});
+		// Let the failing load settle before anything awaits it — that is the
+		// window where an unhandled rejection would fire.
+		await new Promise((r) => setTimeout(r, 10));
+		await expect(h.finalize()).rejects.toThrow();
+	});
+});
+
 describe("Handle.event", () => {
 	it("EVENT entries NOT emitted via incomingMethods (event_subscriptions only)", () => {
 		const h = new Handle();
@@ -200,6 +292,20 @@ describe("Registry.service", () => {
 		r.service("billing", { rpc: ["*"] });
 		const req = r.buildRegisterRequest();
 		expect(req.outgoing[0]!.methodName).toBe("*");
+	});
+
+	it("duplicate outgoing deps are collapsed", () => {
+		const r = new Registry();
+		r.service("payments", { rpc: ["charge", "charge"] });
+		r.service("payments", { rpc: ["charge"] });
+		const req = r.buildRegisterRequest();
+		expect(req.outgoing).toHaveLength(1);
+	});
+
+	it("same method name under different types stays separate", () => {
+		const r = new Registry();
+		r.service("svc", { rpc: ["op"], workflows: ["op"] });
+		expect(r.buildRegisterRequest().outgoing).toHaveLength(2);
 	});
 
 	it("multiple dep types", () => {

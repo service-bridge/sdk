@@ -13,7 +13,7 @@ import {
 	WorkflowNotFoundError,
 	WorkflowTerminalError,
 } from "./errors";
-import type { WorkflowDef, WorkflowStartOpts } from "./types";
+import type { Step, WorkflowDef, WorkflowStartOpts } from "./types";
 import { validate } from "./validate";
 
 export type { WorkflowDef } from "./types";
@@ -69,8 +69,11 @@ export class WorkflowDomain {
 		validate(def, { workflowName: name });
 
 		const inputSchema = opts?.input ?? def.input;
+		const steps = def.retry
+			? withRetryDefault(def.steps, def.retry)
+			: def.steps;
 		const canonical: CanonicalGraph = {
-			graph: def.steps,
+			graph: steps,
 			retry: def.retry,
 			maxParallelism: def.maxParallelism,
 			timeoutSec: def.timeoutSec,
@@ -82,7 +85,7 @@ export class WorkflowDomain {
 
 		this.registry._handle.workflow(
 			name,
-			def.steps,
+			steps,
 			inputSchema ? { input: inputSchema } : undefined,
 			graphBuf,
 			fp,
@@ -256,6 +259,36 @@ export class WorkflowDomain {
 		}
 		return this.rpc;
 	}
+}
+
+// Step types a retry policy can apply to. A group is not an operation — its
+// failure is one of its children's, already retried on its own budget — and a
+// parked step is resumed by the runtime rather than re-executed.
+const RETRIABLE_STEP_TYPES: ReadonlySet<Step["type"]> = new Set([
+	"call",
+	"publish",
+	"workflow",
+	"local",
+]);
+
+// withRetryDefault pushes the workflow-level retry policy down onto every
+// operation step that did not declare its own. The runtime seeds
+// workflow_steps.max_attempts from the per-step `retry` block only
+// (runtime/internal/workflow/register.go), so a policy that stays at the top of
+// the graph is a declaration nothing reads.
+function withRetryDefault(
+	steps: Step[],
+	retry: NonNullable<WorkflowDef["retry"]>,
+): Step[] {
+	return steps.map((step) => {
+		if (step.type === "parallel" || step.type === "sequence") {
+			return { ...step, steps: withRetryDefault(step.steps, retry) };
+		}
+		if (!RETRIABLE_STEP_TYPES.has(step.type) || step.retry !== undefined) {
+			return step;
+		}
+		return { ...step, retry };
+	});
 }
 
 function mapStartError(
