@@ -4,12 +4,47 @@ import { PublishStatus } from "../pb/servicebridge/v1/events";
 import type { Storage } from "../sqlite/storage";
 import type { Logger } from "./publisher";
 
-// BACKOFF_MS is the retry delay ladder after network failures (±25% jitter applied).
+// MAX_BACKOFF_MS is the delay every attempt past the ladder reuses: transient
+// failures retry forever, the ladder only caps the rate.
 // @internal
-const BACKOFF_MS = [1_000, 5_000, 30_000, 120_000, 600_000] as const;
-// MAX_ATTEMPTS before an outbox row is permanently failed.
+const MAX_BACKOFF_MS = 600_000;
+// BACKOFF_MS is the retry delay ladder for transient failures (±25% jitter
+// applied).
 // @internal
-const MAX_ATTEMPTS = 5;
+const BACKOFF_MS: readonly number[] = [
+	1_000,
+	5_000,
+	30_000,
+	120_000,
+	MAX_BACKOFF_MS,
+];
+
+// SELECT_DUE_SQL reads the next batch of deliverable rows. Column order matches
+// event_outbox_pending_order_idx, so SQLite walks the index in ORDER BY order
+// and LIMIT stops the scan — no temp b-tree sort of the whole backlog.
+// @internal — см. ./README.md
+export const SELECT_DUE_SQL = `SELECT * FROM event_outbox
+  WHERE status='pending' AND next_attempt_at_ms <= ?
+  ORDER BY enqueued_at_ms ASC, id ASC
+  LIMIT ?`;
+
+// SELECT_NEXT_ATTEMPT_SQL finds when the earliest deferred row becomes due, so
+// the idle wait lasts exactly that long instead of polling.
+// @internal
+const SELECT_NEXT_ATTEMPT_SQL = `SELECT MIN(next_attempt_at_ms) AS next_at_ms
+  FROM event_outbox WHERE status='pending'`;
+
+// RETRY_SQL re-arms a row for a later attempt.
+// @internal
+const RETRY_SQL = `UPDATE event_outbox
+  SET status='pending', attempts=?, last_error=?, next_attempt_at_ms=?
+  WHERE id=?`;
+
+// FAIL_SQL parks a row that no retry can fix.
+// @internal
+const FAIL_SQL = `UPDATE event_outbox
+  SET status='failed', attempts=?, last_error=?
+  WHERE id=?`;
 
 // OutboxRow is a row selected from event_outbox.
 // @internal
@@ -40,7 +75,7 @@ export interface DrainerDeps {
 	batchSize: number;
 	logger: Logger;
 	clockFn?: () => number;
-	sleepFn?: (ms: number) => Promise<void>;
+	sleepFn?: (ms: number, signal: AbortSignal) => Promise<void>;
 	// Invoked when the runtime rejects a publish for policy reasons
 	// (PUBLISH_STATUS_REJECTED_FORBIDDEN). Lets the owner surface a
 	// `policy_violation` event for an async (outbox) denial that can't be
@@ -60,7 +95,7 @@ export interface DrainerDeps {
 export class Drainer {
 	private readonly deps: DrainerDeps;
 	private readonly clockFn: () => number;
-	private readonly sleepFn: (ms: number) => Promise<void>;
+	private readonly sleepFn: (ms: number, signal: AbortSignal) => Promise<void>;
 
 	private running = false;
 	private pendingKick = false;
@@ -70,8 +105,7 @@ export class Drainer {
 	constructor(deps: DrainerDeps) {
 		this.deps = deps;
 		this.clockFn = deps.clockFn ?? (() => Date.now());
-		this.sleepFn =
-			deps.sleepFn ?? ((ms) => new Promise<void>((r) => setTimeout(r, ms)));
+		this.sleepFn = deps.sleepFn ?? defaultSleep;
 	}
 
 	// start begins the background drain loop.
@@ -107,29 +141,12 @@ export class Drainer {
 
 			// Select pending rows whose next_attempt_at_ms is due.
 			const rows = storage
-				.prepare(
-					`SELECT * FROM event_outbox
-          WHERE status='pending' AND next_attempt_at_ms <= ?
-          ORDER BY enqueued_at_ms ASC, id ASC
-          LIMIT ?`,
-				)
+				.prepare(SELECT_DUE_SQL)
 				.all(now, batchSize) as OutboxRow[];
 
 			if (rows.length === 0) {
 				if (!this.running) break;
-				// Edge-triggered wait: consume pendingKick or wait for kick()/1s timer.
-				if (this.pendingKick) {
-					this.pendingKick = false;
-					continue;
-				}
-				await Promise.race([
-					new Promise<void>((resolve) => {
-						this.wakeResolve = resolve;
-					}),
-					this.sleepFn(1_000),
-				]);
-				this.wakeResolve = null;
-				this.pendingKick = false;
+				await this.waitForWork();
 				continue;
 			}
 
@@ -202,121 +219,107 @@ export class Drainer {
 			}
 
 			if (netError) {
-				// Network error: retry all inflight rows with backoff.
-				const nowRetry = this.clockFn();
-				for (const row of rows) {
-					const newAttempts = row.attempts + 1;
-					if (newAttempts >= MAX_ATTEMPTS) {
-						storage
-							.prepare(
-								`UPDATE event_outbox
-                SET status='failed', attempts=?, last_error='max_attempts'
-                WHERE id=?`,
-							)
-							.run(newAttempts, row.id);
-					} else {
-						const baseDelay =
-							BACKOFF_MS[Math.min(newAttempts - 1, 4)] ?? 600_000;
-						const jitter = Math.floor(
-							baseDelay * 0.25 * (Math.random() * 2 - 1),
-						);
-						const nextAt = nowRetry + baseDelay + jitter;
-						storage
-							.prepare(
-								`UPDATE event_outbox
-                SET status='pending', attempts=?, last_error=?, next_attempt_at_ms=?
-                WHERE id=?`,
-							)
-							.run(newAttempts, netError.message, nextAt, row.id);
+				// The runtime is unreachable. Transport failure says nothing about
+				// the event itself, so it never burns a terminal budget: rows are
+				// re-armed with the (saturating) backoff ladder and retried for as
+				// long as the outbox lives. That is the whole point of the outbox.
+				const message = netError.message;
+				storage.transaction(() => {
+					for (const row of rows) {
+						this.rearm(row, message);
 					}
-				}
+				});
+				this.deps.logger.error(
+					`drainer: publish of ${rows.length} event(s) failed, will retry — ${message}`,
+				);
 				// Continue loop — will respect backoff via next_attempt_at_ms filter.
 				continue;
 			}
 
-			// Process per-event results.
+			// Process per-event results. One transaction for the whole batch: a
+			// per-row autocommit would append a WAL frame and a commit record per
+			// event.
 			const resultMap = new Map(results.map((r) => [r.eventId, r]));
-			for (const row of rows) {
-				const entry = resultMap.get(row.id);
-				const status =
-					entry?.status ?? PublishStatus.PUBLISH_STATUS_UNSPECIFIED;
+			const doneIds: string[] = [];
+			const violations: {
+				declaration: string;
+				value: string;
+				denySide: string;
+				reason: string;
+			}[] = [];
+			let transientCount = 0;
 
-				switch (status) {
-					case PublishStatus.PUBLISH_STATUS_ACCEPTED:
-					case PublishStatus.PUBLISH_STATUS_REJECTED_DUPLICATE:
-						// Success or idempotent duplicate — delete from outbox.
-						storage.prepare("DELETE FROM event_outbox WHERE id=?").run(row.id);
-						break;
+			storage.transaction(() => {
+				for (const row of rows) {
+					const entry = resultMap.get(row.id);
+					const status =
+						entry?.status ?? PublishStatus.PUBLISH_STATUS_UNSPECIFIED;
 
-					case PublishStatus.PUBLISH_STATUS_REJECTED_INVALID_NAME:
-						// Terminal failures — mark as failed.
-						storage
-							.prepare(
-								`UPDATE event_outbox
-                SET status='failed', attempts=?, last_error=?
-                WHERE id=?`,
-							)
-							.run(row.attempts + 1, `rejected:${status}`, row.id);
-						break;
+					switch (status) {
+						case PublishStatus.PUBLISH_STATUS_ACCEPTED:
+						case PublishStatus.PUBLISH_STATUS_REJECTED_DUPLICATE:
+							// Success or idempotent duplicate — delete from outbox.
+							doneIds.push(row.id);
+							break;
 
-					case PublishStatus.PUBLISH_STATUS_REJECTED_FORBIDDEN: {
-						// Policy denial (event.publish gate). Terminal — retrying
-						// won't help; mark failed and surface a policy_violation so
-						// the async denial is observable (publish() is fire-and-forget
-						// into the outbox, so it can't be thrown back to the caller).
-						const reason = entry?.message || "event.publish denied by policy";
-						storage
-							.prepare(
-								`UPDATE event_outbox
-                SET status='failed', attempts=?, last_error=?
-                WHERE id=?`,
-							)
-							.run(row.attempts + 1, `forbidden:${reason}`, row.id);
-						this.deps.logger.warn(
-							`drainer: event ${row.name} (${row.id}) rejected — ${reason}`,
-						);
-						this.deps.onPolicyViolation?.({
-							declaration: "event.publish",
-							value: row.name,
-							denySide: "self_egress",
-							reason,
-						});
-						break;
-					}
+						case PublishStatus.PUBLISH_STATUS_REJECTED_INVALID_NAME:
+							// Terminal: the name will not become valid on a retry.
+							storage
+								.prepare(FAIL_SQL)
+								.run(row.attempts + 1, `rejected:${status}`, row.id);
+							break;
 
-					default:
-						// Transient unspecified — treat as retryable.
-						this.deps.logger.warn(
-							`drainer: UNSPECIFIED status for event ${row.id} — treating as transient`,
-						);
-						{
-							const newAttempts = row.attempts + 1;
-							if (newAttempts >= MAX_ATTEMPTS) {
-								storage
-									.prepare(
-										`UPDATE event_outbox
-                    SET status='failed', attempts=?, last_error='max_attempts'
-                    WHERE id=?`,
-									)
-									.run(newAttempts, row.id);
-							} else {
-								const baseDelay =
-									BACKOFF_MS[Math.min(newAttempts - 1, 4)] ?? 600_000;
-								const jitter = Math.floor(
-									baseDelay * 0.25 * (Math.random() * 2 - 1),
-								);
-								const nextAt = this.clockFn() + baseDelay + jitter;
-								storage
-									.prepare(
-										`UPDATE event_outbox
-                    SET status='pending', attempts=?, last_error='unspecified', next_attempt_at_ms=?
-                    WHERE id=?`,
-									)
-									.run(newAttempts, nextAt, row.id);
-							}
+						case PublishStatus.PUBLISH_STATUS_REJECTED_FORBIDDEN: {
+							// Policy denial (event.publish gate). Terminal — retrying
+							// won't help; mark failed and surface a policy_violation so
+							// the async denial is observable (publish() is fire-and-forget
+							// into the outbox, so it can't be thrown back to the caller).
+							const reason = entry?.message || "event.publish denied by policy";
+							storage
+								.prepare(FAIL_SQL)
+								.run(row.attempts + 1, `forbidden:${reason}`, row.id);
+							violations.push({
+								declaration: "event.publish",
+								value: row.name,
+								denySide: "self_egress",
+								reason,
+							});
+							break;
 						}
-						break;
+
+						default:
+							// Unspecified means the runtime could not say anything about
+							// this event — transient, same infinite-retry treatment as a
+							// transport failure.
+							transientCount++;
+							this.rearm(row, "unspecified");
+							break;
+					}
 				}
+
+				if (doneIds.length > 0) {
+					const donePlaceholders = doneIds.map(() => "?").join(",");
+					storage
+						.prepare(
+							`DELETE FROM event_outbox WHERE id IN (${donePlaceholders})`,
+						)
+						.run(...doneIds);
+					storage.adjustOutboxRowCount(-doneIds.length);
+				}
+			});
+
+			// Observers run after commit: onPolicyViolation publishes an event of
+			// its own, which would re-enter storage.transaction().
+			if (transientCount > 0) {
+				this.deps.logger.warn(
+					`drainer: UNSPECIFIED status for ${transientCount} event(s) — treating as transient`,
+				);
+			}
+			for (const violation of violations) {
+				this.deps.logger.warn(
+					`drainer: event ${violation.value} rejected — ${violation.reason}`,
+				);
+				this.deps.onPolicyViolation?.(violation);
 			}
 
 			// If kick was requested during this iteration, loop immediately.
@@ -325,4 +328,63 @@ export class Drainer {
 			}
 		}
 	}
+
+	// rearm schedules the row for another attempt on the backoff ladder. The
+	// last rung repeats forever — the runtime being down must not consume a
+	// delivery budget.
+	private rearm(row: OutboxRow, lastError: string): void {
+		const attempts = row.attempts + 1;
+		const base = BACKOFF_MS[attempts - 1] ?? MAX_BACKOFF_MS;
+		const jitter = Math.floor(base * 0.25 * (Math.random() * 2 - 1));
+		this.deps.storage
+			.prepare(RETRY_SQL)
+			.run(attempts, lastError, this.clockFn() + base + jitter, row.id);
+	}
+
+	// waitForWork blocks until kick() fires or the earliest deferred row is due.
+	// With nothing pending it waits for kick() alone — an idle SDK schedules no
+	// timers at all.
+	private async waitForWork(): Promise<void> {
+		if (this.pendingKick) {
+			this.pendingKick = false;
+			return;
+		}
+
+		const next = this.deps.storage.prepare(SELECT_NEXT_ATTEMPT_SQL).get() as {
+			next_at_ms: number | null;
+		} | null;
+		const nextAtMs = next?.next_at_ms ?? null;
+		if (nextAtMs !== null && nextAtMs <= this.clockFn()) return;
+
+		const controller = new AbortController();
+		await new Promise<void>((resolve) => {
+			this.wakeResolve = resolve;
+			if (nextAtMs !== null) {
+				void this.sleepFn(nextAtMs - this.clockFn(), controller.signal).then(
+					resolve,
+				);
+			}
+		});
+		// Cancels the pending timer when kick() won the race.
+		controller.abort();
+		this.wakeResolve = null;
+		this.pendingKick = false;
+	}
+}
+
+// defaultSleep resolves after ms, or immediately when the signal aborts,
+// clearing the timer either way.
+// @internal
+function defaultSleep(ms: number, signal: AbortSignal): Promise<void> {
+	return new Promise<void>((resolve) => {
+		const timer = setTimeout(resolve, ms);
+		signal.addEventListener(
+			"abort",
+			() => {
+				clearTimeout(timer);
+				resolve();
+			},
+			{ once: true },
+		);
+	});
 }

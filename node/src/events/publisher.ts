@@ -141,11 +141,7 @@ export class Publisher {
 		const now = Date.now();
 
 		storage.transaction(() => {
-			const row = storage
-				.prepare("SELECT COUNT(*) AS count FROM event_outbox")
-				.get() as { count: number } | null;
-			const count = row?.count ?? 0;
-			if (count >= maxOutboxRows) {
+			if (storage.outboxRowCount() >= maxOutboxRows) {
 				throw new OutboxFullError(maxOutboxRows);
 			}
 
@@ -170,6 +166,7 @@ export class Publisher {
 					now,
 					xSbTrace,
 				);
+			storage.adjustOutboxRowCount(1);
 		});
 
 		this.deps.drainer.kick();

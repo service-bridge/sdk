@@ -197,6 +197,42 @@ describe("Publisher", () => {
 		);
 	});
 
+	it("tracks the outbox row count without scanning the table", async () => {
+		const p = new Publisher(makeDeps({ maxOutboxRows: 3 }));
+		await p.publish("payment.charged", { n: 1 });
+		await p.publish("payment.charged", { n: 2 });
+		expect(storage.outboxRowCount()).toBe(2);
+
+		await p.publish("payment.charged", { n: 3 });
+		await expect(p.publish("payment.charged", { n: 4 })).rejects.toBeInstanceOf(
+			OutboxFullError,
+		);
+		// The rejected publish rolled back — the count must not drift.
+		expect(storage.outboxRowCount()).toBe(3);
+		expect(
+			storage.prepare("SELECT COUNT(*) AS c FROM event_outbox").get(),
+		).toMatchObject({ c: 3 });
+	});
+
+	it("sends payload_json on the fireAndForget path too", async () => {
+		let captured: Uint8Array | undefined;
+		const rpcClient = makeRpcClient((req, cb) => {
+			const events = (req as { events: { payloadJson: Uint8Array }[] }).events;
+			captured = events[0]?.payloadJson;
+			cb(null, { results: [] });
+		});
+		const p = new Publisher(makeDeps({ rpcClient }));
+
+		await p.publish("payment.charged", { amount: 7 }, { fireAndForget: true });
+
+		// The runtime feeds payload_json to workflow wait_event filters for every
+		// ingested event, fire-and-forget included.
+		expect(captured).toBeDefined();
+		expect(Buffer.from(captured as Uint8Array).toString()).toBe(
+			JSON.stringify({ amount: 7 }),
+		);
+	});
+
 	it("propagates idempotencyKey and partitionKey to outbox row", async () => {
 		const p = new Publisher(makeDeps());
 		const { eventId } = await p.publish(

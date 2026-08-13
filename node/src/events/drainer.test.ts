@@ -12,7 +12,7 @@ import type {
 import { PublishStatus } from "../pb/servicebridge/v1/events";
 import { Storage } from "../sqlite/storage";
 import type { DrainerDeps } from "./drainer";
-import { Drainer } from "./drainer";
+import { Drainer, SELECT_DUE_SQL } from "./drainer";
 
 // Insert a row into event_outbox with status='pending'.
 function insertPending(
@@ -42,6 +42,7 @@ function insertPending(
 			nextAtMs,
 			xSbTrace,
 		);
+	storage.adjustOutboxRowCount(1);
 }
 
 // Fetch a row from event_outbox by id.
@@ -206,7 +207,7 @@ describe("Drainer", () => {
 			value: "billing.charge",
 			denySide: "self_egress",
 		});
-		expect(violations[0].reason).toContain("billing.charge");
+		expect(violations[0]?.reason).toContain("billing.charge");
 	});
 
 	it("network error → status='pending', attempts++, next_attempt_at_ms in backoff range", async () => {
@@ -247,9 +248,11 @@ describe("Drainer", () => {
 		expect(row.next_attempt_at_ms).toBeLessThanOrEqual(expectedMax);
 	});
 
-	it("5 network errors → status='failed' with last_error='max_attempts'", async () => {
-		// Insert with attempts=4 (next attempt will be #5 = MAX)
-		insertPending(storage, "ev-7", "test.event", 4);
+	it("backoff ladder saturates at its last rung instead of failing the row", async () => {
+		// attempts=20 is far past the ladder length — the row must still be
+		// re-armed, at the last rung.
+		insertPending(storage, "ev-7", "test.event", 20);
+		const t = Date.now();
 
 		const rpc = makeRpcClient((_req, cb) => {
 			const err = Object.assign(new Error("timeout"), {
@@ -257,15 +260,221 @@ describe("Drainer", () => {
 			}) as ServiceError;
 			cb(err);
 		});
+		const drainer = new Drainer(makeDeps(rpc, { clockFn: () => t }));
+		drainer.start();
+		await new Promise<void>((r) => setTimeout(r, 100));
+		await drainer.stop();
+
+		const row = storage
+			.prepare(
+				"SELECT status, attempts, last_error, next_attempt_at_ms FROM event_outbox WHERE id=?",
+			)
+			.get("ev-7") as {
+			status: string;
+			attempts: number;
+			last_error: string;
+			next_attempt_at_ms: number;
+		};
+		expect(row.status).toBe("pending");
+		expect(row.attempts).toBe(21);
+		expect(row.last_error).toBe("timeout");
+		expect(row.next_attempt_at_ms).toBeGreaterThanOrEqual(
+			t + 600_000 - 150_000,
+		);
+		expect(row.next_attempt_at_ms).toBeLessThanOrEqual(t + 600_000 + 150_000);
+	});
+
+	it("logs transport failure at error level", async () => {
+		insertPending(storage, "ev-log");
+		const errors: string[] = [];
+
+		const rpc = makeRpcClient((_req, cb) => {
+			cb(
+				Object.assign(new Error("connection refused"), {
+					code: 14,
+				}) as ServiceError,
+			);
+		});
+		const drainer = new Drainer(
+			makeDeps(rpc, {
+				logger: {
+					warn() {},
+					error(msg) {
+						errors.push(msg);
+					},
+				},
+			}),
+		);
+		drainer.start();
+		await new Promise<void>((r) => setTimeout(r, 100));
+		await drainer.stop();
+
+		expect(errors.length).toBeGreaterThan(0);
+		expect(errors[0]).toContain("connection refused");
+	});
+
+	it("5 minutes of runtime downtime keeps events pending and delivers on recovery", async () => {
+		insertPending(storage, "ev-downtime");
+
+		// Virtual clock: sleepFn advances it instead of waiting, so five minutes
+		// of downtime pass within the test.
+		const start = 1_700_000_000_000;
+		let now = start;
+		let reachable = false;
+		let publishCalls = 0;
+
+		const rpc = makeRpcClient((_req, cb) => {
+			publishCalls++;
+			if (!reachable) {
+				cb(
+					Object.assign(new Error("14 UNAVAILABLE: no connection"), {
+						code: 14,
+					}) as ServiceError,
+				);
+				return;
+			}
+			cb(null, {
+				results: [
+					{
+						eventId: "ev-downtime",
+						status: PublishStatus.PUBLISH_STATUS_ACCEPTED,
+						message: "",
+					},
+				],
+			});
+		});
+
+		const drainer = new Drainer(
+			makeDeps(rpc, {
+				clockFn: () => now,
+				// Advances the virtual clock and yields a macrotask, so the
+				// assertions below get a turn between drain iterations.
+				sleepFn: (ms) => {
+					now += ms;
+					return new Promise<void>((r) => setTimeout(r, 0));
+				},
+			}),
+		);
+		drainer.start();
+
+		const downtimeDeadline = Date.now() + 5_000;
+		while (now - start < 300_000 && Date.now() < downtimeDeadline) {
+			await new Promise<void>((r) => setTimeout(r, 5));
+		}
+		expect(now - start).toBeGreaterThanOrEqual(300_000);
+
+		const during = getRow(storage, "ev-downtime");
+		expect(during?.status).toBe("pending");
+		expect(during?.attempts).toBeGreaterThanOrEqual(5);
+		expect(publishCalls).toBeGreaterThanOrEqual(5);
+
+		reachable = true;
+		const recoveryDeadline = Date.now() + 5_000;
+		while (
+			getRow(storage, "ev-downtime") !== null &&
+			Date.now() < recoveryDeadline
+		) {
+			await new Promise<void>((r) => setTimeout(r, 5));
+		}
+		await drainer.stop();
+
+		expect(getRow(storage, "ev-downtime")).toBeNull();
+	});
+
+	it("UNSPECIFIED status never fails the row, however many times it repeats", async () => {
+		insertPending(storage, "ev-unspec", "test.event", 42);
+
+		const rpc = makeRpcClient((_req, cb) => {
+			cb(null, {
+				results: [
+					{
+						eventId: "ev-unspec",
+						status: PublishStatus.PUBLISH_STATUS_UNSPECIFIED,
+						message: "",
+					},
+				],
+			});
+		});
 		const drainer = new Drainer(makeDeps(rpc));
 		drainer.start();
 		await new Promise<void>((r) => setTimeout(r, 100));
 		await drainer.stop();
 
-		const row = getRow(storage, "ev-7");
-		expect(row?.status).toBe("failed");
-		expect(row?.last_error).toBe("max_attempts");
-		expect(row?.attempts).toBe(5);
+		const row = getRow(storage, "ev-unspec");
+		expect(row?.status).toBe("pending");
+		expect(row?.attempts).toBe(43);
+		expect(row?.last_error).toBe("unspecified");
+	});
+
+	it("processes a batch in a single transaction", async () => {
+		for (let i = 0; i < 20; i++) {
+			insertPending(storage, `ev-tx-${String(i).padStart(2, "0")}`);
+		}
+
+		let txCalls = 0;
+		const realTransaction = storage.transaction.bind(storage);
+		(storage as unknown as { transaction: unknown }).transaction = <T>(
+			fn: () => T,
+		): T => {
+			txCalls++;
+			return realTransaction(fn);
+		};
+
+		const rpc = makeRpcClient((req, cb) => {
+			cb(null, {
+				results: req.events.map((e) => ({
+					eventId: e.id,
+					status: PublishStatus.PUBLISH_STATUS_ACCEPTED,
+					message: "",
+				})),
+			});
+		});
+		const drainer = new Drainer(makeDeps(rpc, { batchSize: 20 }));
+		drainer.start();
+		await new Promise<void>((r) => setTimeout(r, 100));
+		await drainer.stop();
+
+		expect(
+			storage.prepare("SELECT COUNT(*) AS c FROM event_outbox").get(),
+		).toMatchObject({ c: 0 });
+		expect(txCalls).toBe(1);
+		expect(storage.outboxRowCount()).toBe(0);
+	});
+
+	it("drain query is answered by the index without a temp b-tree sort", () => {
+		const plan = storage
+			.prepare(`EXPLAIN QUERY PLAN ${SELECT_DUE_SQL}`)
+			.all(Date.now(), 100) as { detail: string }[];
+		const detail = plan.map((p) => p.detail).join("\n");
+
+		expect(detail.toUpperCase()).not.toContain("USE TEMP B-TREE FOR ORDER BY");
+		expect(detail).toContain("event_outbox_pending_order_idx");
+	});
+
+	it("drain query stays fast with a 100k row backlog", () => {
+		const insert = storage.prepare(
+			`INSERT INTO event_outbox
+        (id, name, payload, contract_hash, partition_key, idempotency_key,
+         fire_and_forget, headers, occurred_at_ms, enqueued_at_ms, status,
+         attempts, last_error, next_attempt_at_ms, x_sb_trace)
+        VALUES (?, 'bench.event', x'00', 'h', '', '', 0, '{}', 0, ?, 'pending', 0, '', 0, '')`,
+		);
+		const total = 100_000;
+		storage.transaction(() => {
+			for (let i = 0; i < total; i++) {
+				insert.run(`bench-${String(i).padStart(6, "0")}`, i);
+			}
+			storage.adjustOutboxRowCount(total);
+		});
+
+		const select = storage.prepare(SELECT_DUE_SQL);
+		const startedAt = performance.now();
+		const rows = select.all(Date.now(), 100) as { id: string }[];
+		const elapsedMs = performance.now() - startedAt;
+
+		expect(rows).toHaveLength(100);
+		expect(rows[0]?.id).toBe("bench-000000");
+		expect(elapsedMs).toBeLessThan(50);
 	});
 
 	it("mixed batch: ACCEPTED + REJECTED_INVALID_NAME in same response", async () => {

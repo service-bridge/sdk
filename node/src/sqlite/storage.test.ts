@@ -6,6 +6,16 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Storage } from "./storage";
 
+function insertRow(storage: Storage, id: string): void {
+	storage
+		.prepare(
+			`INSERT INTO event_outbox
+        (id, name, payload, contract_hash, occurred_at_ms, enqueued_at_ms, status)
+        VALUES (?, 'test.event', x'01', 'h', 1, 1, 'pending')`,
+		)
+		.run(id);
+}
+
 function countOutbox(storage: Storage): number {
 	const row = storage
 		.prepare("SELECT COUNT(*) AS c FROM event_outbox")
@@ -51,6 +61,7 @@ describe("Storage", () => {
 			"id",
 			"name",
 			"payload",
+			"payload_json",
 			"contract_hash",
 			"partition_key",
 			"idempotency_key",
@@ -124,6 +135,100 @@ describe("Storage", () => {
 		}).toThrow("rollback me");
 
 		expect(countOutbox(storage)).toBe(0);
+		storage.close();
+	});
+
+	it("rejects a database file written with another schema version", () => {
+		const dataDir = path.join(tmpDir, "data");
+		const s1 = Storage.open({ dataDir });
+		s1.prepare("PRAGMA user_version = 0").run();
+		s1.close();
+
+		expect(() => Storage.open({ dataDir })).toThrow(/outbox schema v0/);
+	});
+
+	it("counts outbox rows from disk on open", () => {
+		const dataDir = path.join(tmpDir, "data");
+		const s1 = Storage.open({ dataDir });
+		expect(s1.outboxRowCount()).toBe(0);
+
+		insertRow(s1, "row-1");
+		insertRow(s1, "row-2");
+		s1.adjustOutboxRowCount(2);
+		expect(s1.outboxRowCount()).toBe(2);
+		s1.close();
+
+		const s2 = Storage.open({ dataDir });
+		expect(s2.outboxRowCount()).toBe(2);
+		s2.close();
+	});
+
+	it("row count follows commits, not rolled back work", () => {
+		const dataDir = path.join(tmpDir, "data");
+		const storage = Storage.open({ dataDir });
+
+		storage.transaction(() => {
+			insertRow(storage, "kept");
+			storage.adjustOutboxRowCount(1);
+		});
+		expect(storage.outboxRowCount()).toBe(1);
+
+		expect(() => {
+			storage.transaction(() => {
+				insertRow(storage, "rolled-back");
+				storage.adjustOutboxRowCount(1);
+				throw new Error("rollback me");
+			});
+		}).toThrow("rollback me");
+
+		expect(storage.outboxRowCount()).toBe(1);
+		expect(countOutbox(storage)).toBe(1);
+		storage.close();
+	});
+
+	it("reports the pending delta inside an open transaction", () => {
+		const dataDir = path.join(tmpDir, "data");
+		const storage = Storage.open({ dataDir });
+
+		storage.transaction(() => {
+			insertRow(storage, "row-1");
+			storage.adjustOutboxRowCount(1);
+			expect(storage.outboxRowCount()).toBe(1);
+		});
+		expect(storage.outboxRowCount()).toBe(1);
+		storage.close();
+	});
+
+	it("reuses the prepared statement for identical SQL", () => {
+		const dataDir = path.join(tmpDir, "data");
+		const storage = Storage.open({ dataDir });
+		const sql = "SELECT COUNT(*) AS c FROM event_outbox";
+		expect(storage.prepare(sql)).toBe(storage.prepare(sql));
+		storage.close();
+	});
+
+	it("rejects a nested transaction", () => {
+		const dataDir = path.join(tmpDir, "data");
+		const storage = Storage.open({ dataDir });
+
+		expect(() => {
+			storage.transaction(() => {
+				storage.transaction(() => undefined);
+			});
+		}).toThrow(/not reentrant/);
+		storage.close();
+	});
+
+	it("indexes pending rows by delivery order", () => {
+		const dataDir = path.join(tmpDir, "data");
+		const storage = Storage.open({ dataDir });
+		const indexes = storage
+			.prepare(
+				"SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='event_outbox'",
+			)
+			.all() as { name: string }[];
+		const names = indexes.map((i) => i.name);
+		expect(names).toContain("event_outbox_pending_order_idx");
 		storage.close();
 	});
 

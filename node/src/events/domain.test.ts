@@ -29,7 +29,7 @@ describe("EventDomain.define", () => {
 		expect(req.published).toHaveLength(1);
 		expect(req.published[0]!.name).toBe("orders_created");
 		expect(req.published[0]!.schemaJson.length).toBeGreaterThan(0);
-		expect(req.published[0]!.contractHash).toMatch(/^[0-9a-f]{64}$/);
+		expect(req.published[0]!.contractHash).toMatch(/^v2:[0-9a-f]{64}$/);
 	});
 
 	it("define without spec — schemaJson empty, contractHash empty", async () => {
@@ -52,7 +52,7 @@ describe("EventDomain.define", () => {
 
 		const entry = registry._handle.getPublishedEvent("orders_created");
 		expect(entry).toBeDefined();
-		expect(entry!.contractHash).toMatch(/^[0-9a-f]{64}$/);
+		expect(entry!.contractHash).toMatch(/^v2:[0-9a-f]{64}$/);
 		// Protobuf round-trip works.
 		const bytes = entry!.pair.input.encode({
 			orderId: "o-1",
@@ -120,7 +120,7 @@ describe("EventDomain.define", () => {
 		const hashes = req.published.map((p) => p.contractHash);
 		expect(hashes).toHaveLength(2);
 		expect(hashes[0]).not.toBe(hashes[1]);
-		for (const h of hashes) expect(h).toMatch(/^[0-9a-f]{64}$/);
+		for (const h of hashes) expect(h).toMatch(/^v2:[0-9a-f]{64}$/);
 	});
 });
 
