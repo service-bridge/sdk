@@ -180,6 +180,42 @@ describe("sb.job.handle — registry side effects (IncomingMethod{type=JOB})", (
 		expect(spec.maxConcurrent).toBe(1);
 	});
 
+	test("retry block uses the snake_case keys the runtime decodes", () => {
+		const { domain, registry } = newDomain();
+		domain.handle(
+			"flaky",
+			{
+				trigger: { interval: 60_000 },
+				retry: {
+					initialMs: 2_000,
+					maxMs: 120_000,
+					multiplier: 3,
+					jitter: 0.4,
+				},
+			},
+			noop,
+		);
+
+		const m = registry._handle.incomingMethods()[0];
+		expect(m).toBeDefined();
+		if (!m) return;
+		const spec = JSON.parse(
+			new TextDecoder().decode(m.inputSchemaJson),
+		) as Record<string, unknown>;
+
+		// The retry block is snake_case while the document around it is camelCase:
+		// it decodes into jobs.RetryPolicy, whose tags come from database columns.
+		// Sending initialMs/maxMs leaves both zero, and a zero initial reads as
+		// "no policy given" — the runtime then substitutes its own default and the
+		// declared policy is discarded without a word.
+		expect(spec.retry).toEqual({
+			initial_ms: 2_000,
+			max_ms: 120_000,
+			multiplier: 3,
+			jitter: 0.4,
+		});
+	});
+
 	test("delayed trigger serialises as runAtUnixMs", () => {
 		const { domain, registry } = newDomain();
 		const at = new Date("2026-06-01T12:00:00.000Z");

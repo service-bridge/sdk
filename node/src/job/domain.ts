@@ -70,7 +70,19 @@ interface CanonicalJobSpec {
 	maxAttempts?: number;
 	leaseTtlMs?: number;
 	maxConcurrent?: number;
-	retry?: RetryPolicy;
+	retry?: CanonicalRetryPolicy;
+}
+
+// The retry block is snake_case while the document around it is camelCase: on
+// the runtime it decodes into jobs.RetryPolicy, whose tags come from its
+// database columns. Sending initialMs/maxMs leaves both at zero, and the
+// runtime reads a zero initial as "no policy given" and substitutes its
+// default — so a declared retry policy is silently discarded.
+interface CanonicalRetryPolicy {
+	initial_ms: number;
+	max_ms: number;
+	multiplier: number;
+	jitter: number;
 }
 
 interface CanonicalTrigger {
@@ -91,7 +103,14 @@ function canonicalJobSpec(opts: JobOpts): CanonicalJobSpec {
 	if (opts.maxAttempts !== undefined) out.maxAttempts = opts.maxAttempts;
 	if (opts.leaseTtlMs !== undefined) out.leaseTtlMs = opts.leaseTtlMs;
 	if (opts.maxConcurrent !== undefined) out.maxConcurrent = opts.maxConcurrent;
-	if (opts.retry) out.retry = opts.retry;
+	if (opts.retry) {
+		out.retry = {
+			initial_ms: opts.retry.initialMs,
+			max_ms: opts.retry.maxMs,
+			multiplier: opts.retry.multiplier,
+			jitter: opts.retry.jitter,
+		};
+	}
 	return out;
 }
 
