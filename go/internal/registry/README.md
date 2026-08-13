@@ -1,0 +1,162 @@
+# registry
+
+## Зона ответственности
+
+Всё, что сервис объявляет о себе до старта (`Declarations` → `RegisterRequest`), и живой вид меша, который рантайм присылает обратно (`Watch` → `Cache`). Пакет держит стрим `Registry.RegisterAndWatch` открытым, применяет снапшоты и дельты и отдаёт кандидатов для вызова по индексу `(service, method, contract_hash)`.
+
+Не делает: не открывает соединение и не владеет каналом (это `internal/connection`), не решает, когда переоткрывать стрим (это `internal/stream`), не выбирает инстанс для вызова и не шлёт трафик — только отдаёт кандидатов.
+
+## Публичный контракт
+
+Публичный для других пакетов SDK; наружу через корневой `servicebridge` не реэкспортируется.
+
+### `type Declarations`
+
+Накапливает контракт сервиса и собирает `RegisterRequest`. Потокобезопасен: хендлеры регистрируются из любого места приложения.
+
+| Имя | Тип | По умолчанию | Что делает |
+|-----|-----|--------------|------------|
+| `NewDeclarations()` | `*Declarations` | — | Пустой набор объявлений. |
+| `AddIncoming(spec IncomingSpec)` | `error` | — | Объявляет один входящий хендлер. Отклоняет формы, на которые рантайм отвечает `InvalidArgument`. |
+| `AddHTTPRoute(httpMethod, pattern string)` | `error` | — | Объявляет роут собственного HTTP-сервера приложения. Имя = `"<METHOD> <pattern>"`, без схем и contract hash. |
+| `PublishEvent(name string, schemaJSON []byte, contractHash string)` | `error` | — | Объявляет событие, которое сервис публикует. |
+| `SubscribeEvent(pattern string, durable bool)` | `error` | — | Объявляет подписку. Повторный тот же `pattern` схлопывается в одну строку. |
+| `AddOutgoing(serviceName, methodName string, typ pb.MethodType)` | `error` | — | Объявляет зависимость от чужого метода. Дубли по `(service, method, type)` схлопываются. |
+| `SetCallEndpoint(endpoint string)` | — | пусто | Адрес, по которому пиры дозваниваются для Direct RPC. |
+| `SetHTTPEndpoint(endpoint string)` | — | пусто | Адрес собственного HTTP-сервера приложения. |
+| `BuildRegisterRequest()` | `*pb.RegisterRequest` | — | Собирает независимый кадр из текущего набора. |
+
+### `type IncomingSpec`
+
+| Имя | Тип | По умолчанию | Что делает |
+|-----|-----|--------------|------------|
+| `Type` | `pb.MethodType` | — (обязательный) | `RPC`, `WORKFLOW`, `JOB` или `HTTP`. `EVENT` запрещён. |
+| `Name` | `string` | — (обязательный) | Имя метода. |
+| `InputSchemaJSON` | `[]byte` | `nil` | Схема входа. Для `JOB` — каноническая спецификация job'а, обязательна. |
+| `OutputSchemaJSON` | `[]byte` | `nil` | Схема выхода. Запрещена для `JOB` и `HTTP`. |
+| `Streaming` | `bool` | `false` | Стримовый ли хендлер. |
+| `ContractHash` | `string` | пусто | Хеш контракта для маршрутизации по версии. |
+
+### Ошибки объявлений
+
+Все возвращаются обёрнутыми в `fmt.Errorf("registry: <action>: %w", …)`; проверяются через `errors.Is`.
+
+| Имя | Тип | По умолчанию | Что делает |
+|-----|-----|--------------|------------|
+| `ErrEmptyName` | `error` | — | Пустое имя метода, события, паттерна или цели зависимости. |
+| `ErrUnspecifiedType` | `error` | — | Тип объявления не задан. |
+| `ErrEventAsIncoming` | `error` | — | Подписка на событие приехала в `incoming` вместо `event_subscriptions`. |
+| `ErrOutgoingType` | `error` | — | Исходящая зависимость типа `EVENT` или `JOB` (разрешены `RPC`, `WORKFLOW`, `HTTP`). |
+| `ErrOutputSchema` | `error` | — | `JOB`/`HTTP` объявляет `output_schema_json`. |
+| `ErrEmptyJobSpec` | `error` | — | `JOB` без канонической спецификации в `input_schema_json`. |
+| `ErrEmptyHTTPPattern` | `error` | — | HTTP-роут без метода или без паттерна. |
+
+### `type Cache`
+
+Живой вид меша. Все чтения не копируют: возвращается общий read-only слайс, менять его нельзя.
+
+| Имя | Тип | По умолчанию | Что делает |
+|-----|-----|--------------|------------|
+| `NewCache()` | `*Cache` | — | Пустой кэш с fail-safe состоянием захвата. |
+| `Candidates(service, method, contractHash string)` | `[]*pb.MethodDescriptor` | `nil` | Дескрипторы, обслуживающие пару, при непустом хеше — только этой версии контракта. Индексный доступ, без скана. |
+| `InstancesOf(service string)` | `[]*pb.ServiceInstanceInfo` | `nil` | Известные инстансы сервиса. |
+| `Instance(instanceID string)` | `(*pb.ServiceInstanceInfo, bool)` | — | Поиск инстанса по id. |
+| `Policy()` | `*pb.PolicyEvaluation` | `nil` | Последняя оценка политики. `nil` до первого снапшота. |
+| `Capture()` | `CaptureState` | `DefaultCaptureState()` | Пришедшая от рантайма авторизация телеметрии. |
+| `EachMethod(fn func(*pb.MethodDescriptor) bool)` | — | — | Обход всех дескрипторов; `false` останавливает. Колбэк работает под read-lock. |
+| `EachInstance(fn func(*pb.ServiceInstanceInfo) bool)` | — | — | То же для инстансов. |
+| `EachEventSubscription(fn func(*pb.EventSubscriptionDescriptor) bool)` | — | — | То же для подписок. |
+| `EachOutgoingCall(fn func(*pb.OutgoingCallDescriptor) bool)` | — | — | То же для исходящих рёбер. |
+| `ApplySnapshot(s *pb.RegistrySnapshot)` | `Change` | — | Заменяет кэш целиком. |
+| `ApplyUpdate(u *pb.RegistryUpdate)` | `Change` | — | Накладывает инкрементальный кадр. |
+
+### `type Change`
+
+Что один кадр сделал с кэшем. Применяется буквально: сначала `Added*`, потом `Removed*`; на снапшоте состояние сбрасывается. `Removed*` содержит только реально ушедшие строки — живые в него не попадают.
+
+| Имя | Тип | По умолчанию | Что делает |
+|-----|-----|--------------|------------|
+| `Snapshot` | `bool` | `false` | Кадр заменил весь мир. |
+| `AddedMethods` / `RemovedMethods` | `[]*pb.MethodDescriptor` | `nil` | Появившиеся и исчезнувшие дескрипторы. |
+| `AddedInstances` / `RemovedInstances` | `[]*pb.ServiceInstanceInfo` | `nil` | Появившиеся и исчезнувшие инстансы. |
+| `AddedPeers` / `RemovedPeers` | `[]string` | `nil` | Пиры, вошедшие в scope политики и вышедшие из него. |
+| `Policy` | `*pb.PolicyEvaluation` | `nil` | Не-nil, когда приехала новая оценка. Приходит целиком. |
+| `Capture` | `*CaptureState` | `nil` | Не-nil, когда авторизация телеметрии изменилась. |
+
+### `type CaptureState`
+
+| Имя | Тип | По умолчанию | Что делает |
+|-----|-----|--------------|------------|
+| `RPC` / `HTTP` / `Event` / `Workflow` | `pb.CaptureMode` | `CAPTURE_MODE_NONE` | Режим захвата payload'ов по каналу. |
+| `TelemetryEnabled` | `bool` | `true` | Общий выключатель телеметрии. |
+| `PayloadMaxBytes` | `int32` | `DefaultPayloadMaxBytes` | Потолок захватываемого payload'а. |
+| `ForChannel(ch pb.Channel)` | `pb.CaptureMode` | — | Режим для канала операции. `JOB`/`USER` не захватываются никогда. |
+| `DefaultCaptureState()` | `CaptureState` | — | Fail-safe состояние до первого снапшота. |
+| `DefaultPayloadMaxBytes` | `int32` | `65536` | Потолок, пока рантайм не прислал свой. |
+
+### `type Watch` и `WatchConfig`
+
+| Имя | Тип | По умолчанию | Что делает |
+|-----|-----|--------------|------------|
+| `NewWatch(cfg WatchConfig)` | `(*Watch, error)` | — | Строит watch поверх одного `stream.Supervisor`. |
+| `Watch.Cache()` | `*Cache` | — | Живой вид меша; доступен сразу после конструктора. |
+| `Watch.Start(ctx context.Context)` | `error` | — | Открывает стрим и держит его до отмены `ctx` или `Stop`. Повторный вызов — `stream.ErrAlreadyStarted`. |
+| `Watch.Stop()` | — | — | Закрывает стрим и освобождает горутины. Терминально. |
+| `Watch.Restart()` | — | — | Немедленно переоткрывает стрим (ротация сертификата, изменение объявлений после старта). |
+| `Watch.Ready(ctx context.Context)` | `error` | — | Блокируется до первого снапшота, т.е. до подтверждённой регистрации. |
+| `cfg.Clients` | `ClientSource` | — (обязательный) | Источник стаба `Registry` на каждое открытие. |
+| `cfg.Request` | `func() *pb.RegisterRequest` | — (обязательный) | Строит кадр регистрации на каждое открытие. |
+| `cfg.OnChange` | `func(Change)` | `nil` | Что сделал каждый кадр. Выполняется на горутине watch. |
+| `cfg.OnPolicyWarnings` | `func([]*pb.PolicyViolation)` | `nil` | Нарушения, о которых рантайм сообщает вместо отказа в регистрации. |
+| `cfg.OnError` | `func(error)` | `nil` | Сбои стрима. Переподключение идёт в любом случае. |
+| `cfg.Backoff` | `stream.Backoff` | `stream.NewBackoff()` | Лестница переподключения. |
+| `cfg.Logger` | `*slog.Logger` | `slog.Default()` | Логгер. |
+| `ClientSource` | интерфейс | — | `RegistryClient(ctx context.Context) (pb.RegistryClient, error)`. |
+| `ErrProtocol` | `error` | — | Стрим нарушил собственный контракт (дельта до снапшота, неизвестный вид кадра). |
+| `ErrInvalidConfig` | `error` | — | В `WatchConfig` нет обязательной зависимости. |
+
+## Приватный контракт
+
+Не экспортируется, помечено `@internal`, тестируется через публичное поведение.
+
+| Имя | Тип | По умолчанию | Что делает |
+|-----|-----|--------------|------------|
+| `outgoingDepKey` | struct | — | Ключ дедупа исходящих зависимостей: `(service, method, type)`. |
+| `methodKey` | struct | — | Ключ строки дескриптора: `(instance_id, type, name, published)`. |
+| `eventSubKey` / `outgoingKey` | struct | — | Ключи подписок и исходящих рёбер, повторяют ключи рантайма. |
+| `keyOfMethod` / `keyOfOutgoing` | функции | — | Строят ключ из дескриптора. |
+| `methodBucket` | struct | — | Read-view одной пары `(service, method)`: `all` + `byHash`. Заменяется целиком, никогда не мутируется на месте. |
+| `dirty` / `newDirty` | struct | — | Копит инвалидированные кадром бакеты, чтобы каждый пересобрался один раз. |
+| `putMethod` / `dropMethod` / `putInstance` / `dropInstance` / `detachInstance` | методы `*Cache` | — | Мутации под write-lock; `drop*` возвращают реально хранившуюся строку — именно её видит потребитель. |
+| `rebuild` | метод `*Cache` | — | Пересобирает инвалидированные read-view, сортируя по `instance_id`. |
+| `purgePeers` | метод `*Cache` | — | Вычищает всё, привязанное к ушедшему пиру; пиры по `service_id`, индексы по имени, поэтому обход полный. |
+| `normalizeMode` | функция | — | Неизвестное или незаданное wire-значение режима → `NONE`. |
+| `nextCaptureState` | функция | — | Складывает присланный `CaptureModes` с текущим состоянием. |
+| `Watch.open` / `onData` / `emit` / `raisePolicyWarnings` / `reportError` | методы `*Watch` | — | Хуки супервизора. |
+| `Watch.curStream` / `awaitingSnapshot` | поля | — | Трогаются только с горутины супервизора; переключение стрима снова требует снапшот первым кадром. |
+
+## Архитектурные решения и почему
+
+**Правила рантайма продублированы на клиенте.** `AddIncoming`/`AddOutgoing` отклоняют ровно те формы, на которые `runtime/internal/registry/server.go` отвечает `InvalidArgument` (события в `incoming`, `output_schema_json` у `JOB`/`HTTP`, `JOB` без спецификации, `EVENT`/`JOB` в исходящих зависимостях). Плохое объявление падает там, где оно написано, а не через round trip на старте. Тест `TestBuildRegisterRequestNeverProducesAFrameTheRuntimeRejects` держит эти два списка синхронными.
+
+**Дедуп на стороне объявлений.** У `event_subscriptions` на сервере `PRIMARY KEY (subscriber_id, pattern)`: второй ряд с тем же паттерном откатывает всю регистрацию. Fan-out по нескольким хендлерам одного паттерна — внутреннее дело SDK. Исходящие зависимости схлопываются по `(service, method, type)`, чтобы сгенерированный клиент и ручное объявление не раздували кадр.
+
+**`BuildRegisterRequest` отдаёт независимый кадр.** Watch пересобирает запрос на каждое открытие, а интеграции продолжают объявлять HTTP-роуты. Кадр, уже улетевший в стрим, не должен вырасти под собой.
+
+**Первый кадр стрима — всегда снапшот.** После реконнекта кэш может быть сколь угодно устаревшим, поэтому наложить дельту на него небезопасно: ушедшие пиры остались бы живыми навсегда. Дельта до снапшота — это сломанный стрим (`ErrProtocol`), а не состояние для слияния. Флаг сбрасывается на каждое переключение стрима, а не один раз на старте.
+
+**Дельты применимы буквально.** `Removed*` содержит строку, которая реально хранилась, а не то, что перечислил кадр: снапшот не отдаёт живые инстансы как удалённые, а удаление неизвестной строки не порождает фантомного события. Потребитель, складывающий `Added*` и `Removed*` как есть, сходится с кэшем — это ровно тот баг, на котором сгорел Node SDK.
+
+**Чтения не копируют.** Бакеты `(service, method)` пересобираются на изменении и заменяются целиком, а не мутируются, поэтому наружу отдаётся общий слайс без копии и без аллокации. Копирование всего меша на каждом событии масштабирования — вторая ошибка Node SDK. Порядок кандидатов задан сортировкой по `instance_id`, чтобы балансировка не зависела от порядка обхода map.
+
+**Политика и режимы захвата приходят целиком.** Слияние по полям означало бы, что отозванная capability или снятый режим захвата останутся в силе. Исключение — телеметрические глобалы: `payload_max_bytes == 0` в proto3 неотличим от «не задано», поэтому нуль читается как «оставь безопасный дефолт», а не «режь всё в ноль».
+
+**Предупреждения политики поднимаются наружу.** Рантайм молча пропускает регистрацию хендлера, если capability запрещена, и регистрирует остальное — на проводе это выглядит как полный успех. `OnPolicyWarnings` плюс лог уровня `Warn` — единственный сигнал, что часть сервиса не подключена.
+
+**Fail-safe до первого снапшота.** Все режимы захвата — `NONE`, потолок — 64 KiB, телеметрия включена. SDK не захватывает payload, который рантайм не разрешал.
+
+## Зависимости
+
+Опирается на: `internal/pb/servicebridge/v1` (контракт `Registry`), `internal/stream` (супервизор и лестница переподключения), stdlib (`sync`, `sort`, `log/slog`, `context`).
+
+На него опираются: `internal/connection` (поднимает watch после провижининга идентичности и дёргает `Restart` на ротации), будущий call-путь (кандидаты для Direct RPC), телеметрия (`Capture()` как источник авторизации захвата).
