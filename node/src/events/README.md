@@ -33,7 +33,7 @@ SDK-сторона Durable Events: domain namespace (`EventDomain`), публи�
 | `SubscriberDeps` | interface | — | Зависимости Subscriber. Поля: `rpcClient`, `schemaIndex`, `identity`, `handlers`, `maxInFlight?`, `logger?`, `sb?`, `reconnectOpts?`, `runWithTrace`. |
 | `SubscriberDeps.maxInFlight` | `number?` | `32` (`ServiceBridgeOptions.eventsMaxInFlight`) | Макс. параллельных доставок (объявляется серверу в `SubscribeInit.max_in_flight`). |
 | `SubscriberDeps.logger` | `Logger?` | `{ warn: console.warn, error: console.error }` | Логгер для ошибок stream/ack/nack. |
-| `SubscriberDeps.sb` | `ServiceBridge?` | `undefined` | Reserved. EVENT.DELIVER op пишет runtime (T-015); SDK только ack/nack обратно. |
+| `SubscriberDeps.sb` | `ServiceBridge?` | `undefined` | Reserved. EVENT.DELIVER op пишет runtime (ADR 0007 §5); SDK только ack/nack обратно. |
 | `SubscriberDeps.runWithTrace` | `(xSbTrace, fn) => Promise<void>` | — (обязателен) | Оборачивает handler в ALS trace scope из `envelope.x_sb_trace`, чтобы вложенные RPC/event-публикации наследовали trace. |
 | `uuidv7()` | `() => string` | — | Реэкспорт `uuidv7()` из npm-пакета `uuidv7` (монотонна в пределах ms через внутренний counter; работает под Node и Bun). |
 | `InvalidEventNameError` | class | — | Бросается при невалидном имени события. |
@@ -46,8 +46,8 @@ SDK-сторона Durable Events: domain namespace (`EventDomain`), публи�
 |-----|-----|--------------|------------|
 | `PublisherDeps` | interface (`@internal`) | — | Зависимости Publisher: `storage`, `rpcClient`, `schemaIndex`, `drainer`, `identity`, `maxOutboxRows`, `logger`, `sb?`, `xSbTraceFn`. Граф собирается в `connection/service-bridge.ts`. |
 | `PublisherDeps.maxOutboxRows` | `number` | `100000` (`ServiceBridgeOptions.maxOutboxRows`) | Cap строк в outbox; при достижении — `OutboxFullError`. |
-| `PublisherDeps.sb` | `ServiceBridge?` | `undefined` | Reserved; событийные ops пишет сам runtime (T-015). |
-| `PublisherDeps.xSbTraceFn` | `() => string` | — (обязателен) | Возвращает текущий X-SB-Trace header (из ALS) для каждого publish. Пустая строка → runtime минтит свежий root trace на ingest (T-017). |
+| `PublisherDeps.sb` | `ServiceBridge?` | `undefined` | Reserved; событийные ops пишет сам runtime (ADR 0007 §5). |
+| `PublisherDeps.xSbTraceFn` | `() => string` | — (обязателен) | Возвращает текущий X-SB-Trace header (из ALS) для каждого publish. Пустая строка → runtime минтит свежий root trace на ingest (ADR 0006 §3). |
 | `SchemaIndex` | interface (`@internal`) | — | `{ get(name): { contractHash, pair } \| undefined }` — schema-lookup для Publisher. |
 | `DrainerHandle` | interface (`@internal`) | — | `{ kick() }` — edge-triggered wakeup, который Publisher дёргает после INSERT в outbox. |
 | `SubscriberDeps.runWithTrace` | callback | — | (описан в публичном контракте; реализация — `@internal` hook composition root'а.) |
@@ -89,7 +89,7 @@ SDK-сторона Durable Events: domain namespace (`EventDomain`), публи�
 
 **Reconnect по общей лестнице** `utils/reconnect-ladder` (1s, 5s, 15s, 30s, 60s + удержание максимума) с ±20% jitter против thundering-herd. Та же лестница у job- и workflow-подписчиков — единый источник вместо трёх копий. Один pending-таймер на Subscriber: grpc-js на одном обрыве стрима эмитит и `error`, и `end`, и второй таймер удваивал бы число живых reconnect-циклов на каждом обрыве — экспоненциальная лавина (гигабайты heap за час); guard в `scheduleReconnect` пропускает планирование при живом таймере.
 
-**Trace propagation (T-015, T-017).** Publisher кладёт текущий X-SB-Trace в `EventEnvelope.x_sb_trace` ("traceID-parentOpID"); runtime связывает EVENT.PUBLISH op в существующее trace-дерево, либо минтит свежий root при пустом trace. Subscriber читает `envelope.x_sb_trace` (DELIVER-level header от runtime) и оборачивает handler в `runWithTrace`, чтобы вложенные `sb.rpc.call` / `sb.event.publish` / `sb.workflow.start` наследовали trace. EVENT.DELIVER op-строку пишет runtime.
+**Trace propagation (ADR 0007 §5, ADR 0006 §3).** Publisher кладёт текущий X-SB-Trace в `EventEnvelope.x_sb_trace` ("traceID-parentOpID"); runtime связывает EVENT.PUBLISH op в существующее trace-дерево, либо минтит свежий root при пустом trace. Subscriber читает `envelope.x_sb_trace` (DELIVER-level header от runtime) и оборачивает handler в `runWithTrace`, чтобы вложенные `sb.rpc.call` / `sb.event.publish` / `sb.workflow.start` наследовали trace. EVENT.DELIVER op-строку пишет runtime.
 
 ## Зависимости
 

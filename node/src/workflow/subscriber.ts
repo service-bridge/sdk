@@ -4,7 +4,7 @@
 // Reconnect backoff is the shared utils/reconnect-ladder (jittered ladder),
 // same as events and job subscribers.
 //
-// Telemetry (T-022): the runtime owns the WORKFLOW.RUN root op. The SDK wraps
+// Telemetry (ADR 0003 §1): the runtime owns the WORKFLOW.RUN root op. The SDK wraps
 // dispatch in runWithTrace(parent = run root) to establish the run-root trace
 // scope; the runner then opens one USER.SUBOP step span per executed unit
 // (step / fanout group / branch / compensation) inside that scope, so nested
@@ -145,7 +145,7 @@ export class WorkflowSubscriber {
 
 		this.startHeartbeat(a.runId, a.leaseEpoch);
 
-		// T-017/T-022: trace context arrives in `a.xSbTrace` formatted as
+		// ADR 0006 §3/ADR 0003 §1: trace context arrives in `a.xSbTrace` formatted as
 		// "<traceId>-<rootOpId>". Wrap plan execution in runWithTrace to seed the
 		// run-root trace scope; the runner's per-step USER.SUBOP spans nest under
 		// it so each step's child rpc/event/sub-workflow ops emit X-SB-Trace

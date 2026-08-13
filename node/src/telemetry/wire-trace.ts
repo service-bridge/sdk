@@ -1,6 +1,6 @@
 // wire-trace.ts — X-SB-Trace header parse and format.
 // Format: "<traceId>-<parentOpId>" where both are canonical RFC 9562 UUID
-// strings. Matches runtime/internal/telemetry/header.go (T-017 / proto
+// strings. Matches runtime/internal/telemetry/header.go (ADR 0006 §3 / proto
 // contract). UUID itself contains '-', so the separator is identified by
 // position (36) rather than indexOf.
 // @internal — см. ./README.md

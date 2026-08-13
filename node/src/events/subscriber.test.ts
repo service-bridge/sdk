@@ -39,7 +39,7 @@ function makeFakeStream() {
 }
 
 // makeTraceCtx returns a valid trace context for test envelopes.
-// Per ADR-T-005 runtime always injects trace context into EventEnvelope.
+// Per ADR 0006 §3 runtime always injects trace context into EventEnvelope.
 function makeTraceCtx(): {
 	traceId: Uint8Array;
 	spanId: Uint8Array;

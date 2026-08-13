@@ -63,7 +63,7 @@ Domain namespace для durable workflows. Покрывает обе сторо�
 | `RunnerDeps.wrapStep` | `<T>(info: StepSpanInfo, fn) => Promise<T>` (optional) | Hook вокруг КАЖДОЙ исполняемой единицы: каждый step, каждая fanout-группа (`role:"group"`), каждая ветка fanout (`role:"branch"`, только при `forEach`), каждая компенсация (`role:"compensation"`). Subscriber открывает один `USER.SUBOP` op (parent = текущий trace context) и выполняет `fn` в `childContext(parent, spanOpId)` — это превращает плоский trace в дерево `run → step → op`. Meta: `step_id`, `step_name`; для компенсации `is_compensation`+`compensates_for_step_id=<forward step.id>`. Без hook'а единица выполняется без span/scope. |
 | `StepSpanInfo` | `{runId, stepId, stepName, role, isCompensation?, compensatesForStepId?}` | Идентичность step span, передаваемая в `wrapStep`. `role`: `step`\|`group`\|`branch`\|`compensation`. |
 | `RunnerParkedError` | класс | Сигнал раннера, что step запарковался (sleep/wait_event/wait_signal) — runtime возобновит run. |
-| `WorkflowSubscriber` | класс (`@internal`) | Long-poll `Workflows.Subscribe`, per-run heartbeat (10s) с `leaseEpoch`. Reconnect ladder `[1s,5s,15s,30s,60s]`; таймер ожидания между попытками хранится в `reconnectTimer` и отменяется в `close()` — непрокинутый таймер держал бы event loop живым до следующей ступени лестницы после закрытия сабскрайбера. Подменяет wire-`frozenPlan` локально зарегистрированным графом (восстановить `local.fn`). Парсит `RunAssignment.xSbTrace` через `parseXSbTrace` и оборачивает выполнение в `runWithTrace(parsed, fn)` (ALS seed run-root scope). По завершении вычисляет `terminalStatus`: forward → `success`; `compensating` + `cancelReason === "step_failure"` → `failed_compensated`; иначе → `cancelled`; и шлёт `CompleteRun`. WORKFLOW.RUN op эмитит runtime сам (T-015/T-022). |
+| `WorkflowSubscriber` | класс (`@internal`) | Long-poll `Workflows.Subscribe`, per-run heartbeat (10s) с `leaseEpoch`. Reconnect ladder `[1s,5s,15s,30s,60s]`; таймер ожидания между попытками хранится в `reconnectTimer` и отменяется в `close()` — непрокинутый таймер держал бы event loop живым до следующей ступени лестницы после закрытия сабскрайбера. Подменяет wire-`frozenPlan` локально зарегистрированным графом (восстановить `local.fn`). Парсит `RunAssignment.xSbTrace` через `parseXSbTrace` и оборачивает выполнение в `runWithTrace(parsed, fn)` (ALS seed run-root scope). По завершении вычисляет `terminalStatus`: forward → `success`; `compensating` + `cancelReason === "step_failure"` → `failed_compensated`; иначе → `cancelled`; и шлёт `CompleteRun`. WORKFLOW.RUN op эмитит runtime сам (ADR 0007 §5/ADR 0003 §1). |
 | `makeRuntimeOps(rpc, getInstanceId)` | функция (`@internal`) | Адаптер `WorkflowsClient` → `RuntimeOps`. Весь JSON-encoding bridge без бизнес-логики. |
 
 ## Архитектурные решения и почему
@@ -100,7 +100,7 @@ Domain namespace для durable workflows. Покрывает обе сторо�
 - **`timeoutSec` user-facing в секундах.** Wire-поле `timeout_sec` (uint32,
   ADR-0006 исключение для user-API) — отличается от wall-clock unix-ms
   внутренних полей.
-- **Trace propagation (T-017, T-022).** `start()` пушит `X-SB-Trace` из ALS
+- **Trace propagation (ADR 0006 §3, ADR 0003 §1).** `start()` пушит `X-SB-Trace` из ALS
   в `StartRunRequest.x_sb_trace`. Subscriber парсит `RunAssignment.xSbTrace`
   через `parseXSbTrace` и оборачивает выполнение в `runWithTrace`. Cross-step
   `sb.rpc.call` / `sb.event.publish` / nested `sb.workflow.start` через ALS

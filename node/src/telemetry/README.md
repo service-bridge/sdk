@@ -45,7 +45,7 @@ Per-kind ring buffers, примитивы для emit'а ops/logs/metrics, real 
 | `ClientTelemetryStream` | interface | — | Minimal bidi-stream shape (`write`/`end`/`on('data'\|'end'\|'error')`), тип реэкспортируется для интеграторов/моков |
 | `runWithTrace(ctx, fn)` | `T` | — | ALS scope для trace propagation |
 | `currentTraceContext()` | `TraceContext \| undefined` | — | Active trace inside `runWithTrace` |
-| `parseXSbTrace(value)` | `ParsedXSbTrace \| null` | — | Parse `<traceId>-<parentOpId>` wire format (T-017) |
+| `parseXSbTrace(value)` | `ParsedXSbTrace \| null` | — | Parse `<traceId>-<parentOpId>` wire format (ADR 0006 §3) |
 | `formatXSbTrace(traceId, parentOpId)` | `string` | — | Format trace context as `<traceId>-<parentOpId>` (matches runtime) |
 | `makeLogger(ring, instanceId)` | logger object | — | `debug`/`info`/`warn`/`error(message, fields?)` → logs ring. `source="sdk"`, `atUnixMs=Date.now()` |
 | `LogFields` | `Record<string, unknown>` | — | Структурные поля лога; сериализуются в `fields_json` (JSON) |

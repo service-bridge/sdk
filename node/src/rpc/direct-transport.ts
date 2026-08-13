@@ -7,7 +7,7 @@ import { currentTraceContext } from "../telemetry/context";
 import { formatXSbTrace } from "../telemetry/wire-trace";
 
 // X_SB_TRACE_HEADER is the gRPC metadata key the runtime + callee read for
-// trace context propagation (T-017). Keep in sync with rpc/server.go.
+// trace context propagation (ADR 0006 §3). Keep in sync with rpc/server.go.
 const X_SB_TRACE_HEADER = "x-sb-trace";
 
 // currentTraceHeader returns the X-SB-Trace wire value for the active ALS

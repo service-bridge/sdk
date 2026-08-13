@@ -97,7 +97,7 @@ export class WorkflowDomain {
 		opts?: WorkflowStartOpts,
 	): Promise<{ runId: string }> {
 		const rpc = this.requireRpc();
-		// Trace context propagation (T-017 X-SB-Trace): when an active trace
+		// Trace context propagation (ADR 0006 §3 X-SB-Trace): when an active trace
 		// context exists in ALS, format it into x_sb_trace so a nested workflow
 		// run inherits the parent trace and root-op linkage. Empty string when
 		// no scope is active — runtime mints a fresh root in that case.

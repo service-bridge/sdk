@@ -51,7 +51,7 @@ export interface PublisherDeps {
 	// xSbTraceFn returns the current X-SB-Trace header to attach to outbound
 	// envelopes, read from the active AsyncLocalStorage trace scope. Returns ""
 	// when no trace context is active, in which case the runtime mints a fresh
-	// root trace on ingest (T-017). Mandatory: a missing hook would silently
+	// root trace on ingest (ADR 0006 §3). Mandatory: a missing hook would silently
 	// break trace propagation across the publish boundary.
 	// @internal
 	xSbTraceFn: () => string;
