@@ -34,7 +34,7 @@ export interface StartRunRequest {
   /**
    * parent_run_id — when non-empty, the request originates from a workflow
    * step on an in-flight parent run. Runtime enforces dynamic cycle
-   * detection (ADR-W-019) by walking the ancestor chain via this id.
+   * detection (ADR 0003 §7) by walking the ancestor chain via this id.
    * Empty for top-level starts initiated by external callers.
    */
   parentRunId: string;
