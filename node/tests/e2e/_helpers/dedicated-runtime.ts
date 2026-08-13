@@ -16,7 +16,7 @@
 
 import { createConnection } from "node:net";
 import { join } from "node:path";
-import { sleep } from "./events";
+import { sleep } from "./fixtures";
 
 const RUNTIME_DIR = join(import.meta.dir, "../../../../../runtime");
 

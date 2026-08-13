@@ -12,10 +12,10 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import type { ServiceBridge } from "../../src/connection/service-bridge";
-import { ORDER_EVENT_PROTO } from "./_helpers/events";
 import {
 	connect,
 	dedicated,
+	ORDER_EVENT_PROTO,
 	sleep,
 	uniqueName,
 	waitFor,

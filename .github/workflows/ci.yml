@@ -3,6 +3,8 @@ name: CI
 on:
   push:
   pull_request:
+  # Lets the e2e job be re-run on its own without pushing a commit.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -24,6 +26,107 @@ jobs:
       - run: bun test src/
       # Non-e2e regression suites (no runtime needed): build-output invariant
       # (single AsyncLocalStorage across entry bundles) + HTTP→downstream trace
-      # nesting. e2e/ and showcase/ are excluded — they require a live runtime.
+      # nesting. e2e/ and showcase/ are excluded — they need a live runtime.
       - run: bun test tests/build tests/http
       - run: bun run build
+
+  # Independent of the `node` job so a red e2e run is visible on its own and can
+  # be re-run alone. This is the only job that exercises the SDK↔runtime wire
+  # contract; without it CI stays green while the two sides drift apart.
+  e2e:
+    name: e2e against live runtime
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: servicebridge
+          POSTGRES_PASSWORD: servicebridge
+          POSTGRES_DB: service-bridge
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U servicebridge -d service-bridge"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PG_URL: postgres://servicebridge:servicebridge@localhost:5433/service-bridge?sslmode=disable
+    steps:
+      # Two checkouts side by side: the e2e helpers and bootstrap script resolve
+      # the runtime as ../runtime relative to this repo's root.
+      - uses: actions/checkout@v4
+        with:
+          path: sdk
+      - uses: actions/checkout@v4
+        with:
+          repository: service-bridge/runtime
+          ref: main
+          path: runtime
+          token: ${{ secrets.RUNTIME_REPO_TOKEN || github.token }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: runtime/go.mod
+          cache-dependency-path: runtime/go.sum
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+
+      - name: Install SDK deps
+        working-directory: sdk/node
+        run: bun install --frozen-lockfile
+
+      - name: Build runtime
+        working-directory: runtime
+        run: go build -o "$GITHUB_WORKSPACE/sb-runtime" ./cmd/runtime
+
+      - name: Apply migrations
+        working-directory: runtime
+        run: '"$GITHUB_WORKSPACE/sb-runtime" -pg-url "$PG_URL" -migrate'
+
+      - name: Start runtime
+        working-directory: runtime
+        run: |
+          nohup "$GITHUB_WORKSPACE/sb-runtime" -pg-url "$PG_URL" \
+            > "$GITHUB_WORKSPACE/runtime.log" 2>&1 &
+          for i in $(seq 1 60); do
+            if bash -c '</dev/tcp/127.0.0.1/14445' 2>/dev/null \
+               && bash -c '</dev/tcp/127.0.0.1/14444' 2>/dev/null; then
+              echo "runtime up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "runtime did not open :14444 + :14445 within 60s" >&2
+          cat "$GITHUB_WORKSPACE/runtime.log" >&2
+          exit 1
+
+      # PG_MODE=direct: Postgres is a service container here, so there is no
+      # container to `docker exec` into — the runner's own psql talks to it.
+      - name: Provision e2e service keys
+        working-directory: sdk
+        env:
+          PG_MODE: direct
+          POSTGRES_DSN: ${{ env.PG_URL }}
+        run: bash scripts/bootstrap-e2e-keys.sh
+
+      - name: Run e2e suite
+        working-directory: sdk
+        env:
+          TEST_DATABASE_URL: ${{ env.PG_URL }}
+        run: bash scripts/e2e-parallel.sh
+
+      - name: Collect logs
+        if: always()
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/e2e-logs"
+          cp "$GITHUB_WORKSPACE/runtime.log" "$GITHUB_WORKSPACE/e2e-logs/" 2>/dev/null || true
+          cp /tmp/e2e-*.log "$GITHUB_WORKSPACE/e2e-logs/" 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-logs
+          path: e2e-logs
+          if-no-files-found: ignore

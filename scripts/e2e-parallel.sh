@@ -28,7 +28,7 @@ PARALLEL_LANES=(
   "events:events.test.ts events-lifecycle.test.ts"
   "jobs:jobs.test.ts jobs-lifecycle.test.ts"
   "rpc:rpc.test.ts"
-  "workflow:workflow.test.ts workflow-lifecycle.test.ts workflow-access-policy.test.ts"
+  "workflow:workflow.test.ts workflow-access-policy.test.ts"
 )
 # Sequential settings-mutating lane (run inside one backgrounded subshell).
 SETTINGS_LANE=(

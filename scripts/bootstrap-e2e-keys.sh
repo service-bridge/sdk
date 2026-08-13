@@ -27,8 +27,12 @@
 #       docker rm -f servicebridge2-pg 2>/dev/null
 #       docker run -d --name servicebridge2-pg -p 5433:5432 \
 #         -e POSTGRES_PASSWORD=postgres postgres:18-alpine
-#   - `docker` available so we can run psql via the servicebridge2-pg
-#     container (no system psql required).
+#   - psql reachable one of two ways, chosen by PG_MODE:
+#       docker (default) — run psql inside the $PG_CONTAINER container, so a
+#         developer machine needs no system psql;
+#       direct — run the system psql against $POSTGRES_DSN, for CI where
+#         Postgres is a service container reachable on localhost and there is
+#         no container to exec into.
 #
 # The CA lives in Postgres (table runtime_ca), created on first runtime boot.
 # `sb service create` embeds the CA into the key for the SDK; there are no CA
@@ -44,6 +48,9 @@
 #   SB_USER        default: admin (UI account used to create services)
 #   SB_PASSWORD    default: admin (dev account; created on first boot)
 #   PG_CONTAINER   default: servicebridge2-pg (docker container name for psql)
+#   PG_MODE        default: docker — how to reach psql; `direct` uses system
+#                  psql against POSTGRES_DSN (CI)
+#   RUNTIME_DIR    default: <repo>/../runtime (checkout of the runtime repo)
 
 set -euo pipefail
 
@@ -51,7 +58,7 @@ REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$REPO_ROOT"
 
 # The runtime is a sibling repo in the workspace (../runtime), not under sdk/.
-RUNTIME_DIR="$REPO_ROOT/../runtime"
+RUNTIME_DIR=${RUNTIME_DIR:-"$REPO_ROOT/../runtime"}
 
 POSTGRES_DSN=${POSTGRES_DSN:-'postgres://servicebridge:servicebridge@localhost:5433/service-bridge?sslmode=disable'}
 RUNTIME_URL=${RUNTIME_URL:-localhost:14445}
@@ -59,6 +66,7 @@ GW_ADDR=${GW_ADDR:-http://127.0.0.1:14444}
 SB_USER=${SB_USER:-admin}
 SB_PASSWORD=${SB_PASSWORD:-admin}
 PG_CONTAINER=${PG_CONTAINER:-servicebridge2-pg}
+PG_MODE=${PG_MODE:-docker}
 
 # Per-domain service identities. Each e2e domain runs as its own process
 # against its own three identities (e2e-<domain>-1/2/3, pool.ts roles
@@ -66,15 +74,32 @@ PG_CONTAINER=${PG_CONTAINER:-servicebridge2-pg}
 # identity. Tests namespace their own work within a domain.
 DOMAINS="access-policy events jobs rpc workflow http misc"
 
-if ! docker ps --format '{{.Names}}' | grep -qx "$PG_CONTAINER"; then
-  echo "error: postgres container '$PG_CONTAINER' is not running." >&2
-  echo "       start the local Postgres or override with PG_CONTAINER=<name>." >&2
-  exit 2
-fi
-
-psql_cmd() {
-  docker exec -i "$PG_CONTAINER" psql -U servicebridge -d service-bridge -v ON_ERROR_STOP=1 -q -t -A "$@"
-}
+case "$PG_MODE" in
+  docker)
+    if ! docker ps --format '{{.Names}}' | grep -qx "$PG_CONTAINER"; then
+      echo "error: postgres container '$PG_CONTAINER' is not running." >&2
+      echo "       start the local Postgres, override with PG_CONTAINER=<name>," >&2
+      echo "       or use PG_MODE=direct to talk to \$POSTGRES_DSN via system psql." >&2
+      exit 2
+    fi
+    psql_cmd() {
+      docker exec -i "$PG_CONTAINER" psql -U servicebridge -d service-bridge -v ON_ERROR_STOP=1 -q -t -A "$@"
+    }
+    ;;
+  direct)
+    if ! command -v psql >/dev/null 2>&1; then
+      echo "error: PG_MODE=direct requires psql on PATH (install postgresql-client)." >&2
+      exit 2
+    fi
+    psql_cmd() {
+      psql "$POSTGRES_DSN" -v ON_ERROR_STOP=1 -q -t -A "$@"
+    }
+    ;;
+  *)
+    echo "error: PG_MODE must be 'docker' or 'direct', got '$PG_MODE'." >&2
+    exit 2
+    ;;
+esac
 
 # Step 1+2 — quiesce any prior occurrences of the test service names so the
 # new SDK session lands cleanly. Uses parameterised psql to avoid sql injection

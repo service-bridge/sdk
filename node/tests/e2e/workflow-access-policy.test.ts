@@ -20,6 +20,7 @@ import {
 	addWorkflowRule,
 	awaitRunStatus,
 	FAST_WF_OPTS,
+	startWorkflowWhenAllowed,
 } from "./_helpers/wf.ts";
 
 const TERMINAL_WITH_COMP = (s: string) =>
@@ -27,6 +28,10 @@ const TERMINAL_WITH_COMP = (s: string) =>
 	s === "failed" ||
 	s === "cancelled" ||
 	s === "failed_compensated";
+
+// A run stopped by a denied step lands in one of these. `cancelled` is an
+// operator action and must never be accepted as evidence of a policy denial.
+const DENIED_RUN_STATUSES = ["failed", "failed_compensated"];
 
 // waitForWarning polls policyEvaluation() until a warning matches the predicate.
 async function waitForWarning(
@@ -185,26 +190,32 @@ describe("workflow-access-policy", () => {
 			parentOwnerID,
 			parentWf,
 		);
-		// The sub-step's bilateral acceptance is evaluated when the run reaches it,
-		// not at start. Retry the whole run until the freshly-seeded rules are live
-		// AND the nested run completes — NOTIFY→snapshot propagation and sub-workflow
-		// dispatch are both slower under parallel load. Unique wf name makes each
-		// re-run independent; orphaned failed/slow runs are harmless.
+		// The sub-step's bilateral acceptance is evaluated when the run reaches the
+		// step, not at start, so a run that starts before the freshly-seeded
+		// subOwner rule reaches the runtime snapshot fails ON THE SUB-STEP. That —
+		// and only that — is the retryable condition: a run that never reaches a
+		// terminal state is a real failure and propagates out of awaitRunStatus.
+		// Unique wf name makes each re-run independent.
 		let status1 = "";
 		const deadline = Date.now() + 45_000;
-		while (Date.now() < deadline) {
-			const { runId } = await parentOwner.workflow.start(parentWf, {});
-			try {
-				status1 = await awaitRunStatus(
-					parentOwner,
-					runId,
-					TERMINAL_WITH_COMP,
-					30_000,
+		for (;;) {
+			const { runId } = await startWorkflowWhenAllowed(
+				parentOwner,
+				parentWf,
+				{},
+			);
+			status1 = await awaitRunStatus(
+				parentOwner,
+				runId,
+				TERMINAL_WITH_COMP,
+				25_000,
+			);
+			if (status1 === "success" || Date.now() >= deadline) break;
+			if (!DENIED_RUN_STATUSES.includes(status1)) {
+				throw new Error(
+					`parent run ended "${status1}" — not a policy-propagation delay, not retryable`,
 				);
-			} catch {
-				status1 = "timeout"; // still running under load — re-run
 			}
-			if (status1 === "success") break;
 			await sleep(500);
 		}
 		expect(status1).toBe("success");
@@ -220,20 +231,25 @@ describe("workflow-access-policy", () => {
 		);
 		await sleep(800);
 
-		try {
+		// The parent's own rules are untouched, so start() must still succeed; the
+		// denial has to surface as the run's terminal status. Mirror image of
+		// CASE 1: retry only while the tightened rule is still propagating (run
+		// still succeeds), and assert the exact denied status at the end.
+		let status2 = "";
+		const denyDeadline = Date.now() + 20_000;
+		for (;;) {
 			const { runId: runId2 } = await parentOwner.workflow.start(parentWf, {});
-			const status2 = await awaitRunStatus(
+			status2 = await awaitRunStatus(
 				parentOwner,
 				runId2,
 				TERMINAL_WITH_COMP,
 				15_000,
 			);
-			// Sub-workflow step denied → run must not be success.
-			expect(status2).not.toBe("success");
-		} catch (e) {
-			expect(String(e)).toMatch(/denied|PermissionDenied|access/i);
+			if (status2 !== "success" || Date.now() >= denyDeadline) break;
+			await sleep(500);
 		}
-	}, 90_000);
+		expect(DENIED_RUN_STATUSES).toContain(status2);
+	}, 120_000);
 
 	test("access-policy: mid-flight rule tightening surfaces in policyEvaluation() within 5s", async () => {
 		const wfName = uniqueName("ap-live");
@@ -322,23 +338,31 @@ describe("workflow-access-policy", () => {
 		const disconnects: Array<{ reason: string }> = [];
 		caller.on("disconnected", (e) => disconnects.push(e));
 
+		// start() may reject: the policy handler calls stop() from inside the first
+		// PolicyEvaluation frame, which can land mid-connect. The rejection alone
+		// proves nothing (stale keys, unreachable runtime and a bad dataDir all
+		// produce one), so it is only carried into the failure message — the
+		// assertion is on the `disconnected` payload the policy path emits.
 		let startError: Error | undefined;
 		try {
 			await caller.start();
-			await waitFor(
-				() => disconnects.length > 0,
-				5_000,
-				"disconnect due to policy violation",
-			);
 		} catch (e) {
 			startError = e as Error;
 		}
 
-		const hasDisconnect = disconnects.some(
-			(d) =>
-				d.reason.toLowerCase().includes("policy") ||
-				d.reason.toLowerCase().includes("violation"),
+		await waitFor(
+			() => disconnects.length > 0,
+			5_000,
+			startError
+				? `disconnect due to policy violation (start() rejected with: ${startError.message})`
+				: "disconnect due to policy violation",
 		);
-		expect(hasDisconnect || startError !== undefined).toBe(true);
+
+		// service-bridge.ts formats the reason as
+		// `policy: policy violations on start: <declaration> <value>: <reason>`.
+		const policyDisconnect = disconnects.find((d) => /policy/i.test(d.reason));
+		expect(policyDisconnect).toBeDefined();
+		expect(policyDisconnect!.reason).toContain("workflow.run");
+		expect(policyDisconnect!.reason).toContain(wfName);
 	}, 25_000);
 });

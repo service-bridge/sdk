@@ -20,8 +20,9 @@ visual acceptance gate for the Phase 5 tracing rebuild.
   and events the fixture uses.
 - `showcase-keys.ts` — provisions 8 distinct bootstrap keys via
   `runtime/cmd/sbkey-gen`, caches them in `<repo>/.env.showcase` (gitignored).
-- `policy-helpers.ts` — local copy of the e2e policy seeding helpers so the
-  fixture has no implicit cross-suite dependency.
+- `policy-helpers.ts` — showcase-shaped grants (`grantRpcWildcard`,
+  `grantEventFlow`, `grantWorkflowFlow`) over the shared SQL surface in
+  `../e2e/_helpers/policy-db.ts`.
 
 ## How to run
 

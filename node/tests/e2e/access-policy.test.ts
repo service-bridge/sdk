@@ -23,10 +23,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import type { ServiceBridge } from "../../src/connection/service-bridge";
-import { ORDER_EVENT_PROTO } from "./_helpers/events";
 import {
 	connect,
 	dedicated,
+	ORDER_EVENT_PROTO,
 	sleep,
 	uniqueId,
 	waitFor,

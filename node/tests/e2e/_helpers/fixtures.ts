@@ -8,8 +8,24 @@
 // policy-db.ts and an isolated-runtime harness in dedicated-runtime.ts — import
 // those directly where a domain needs them.
 
+import { join } from "node:path";
+
 export { uniqueId, uniqueName } from "./namespace";
 export { connect, dedicated, type Role, shared } from "./pool";
+
+// ORDER_EVENT_PROTO — absolute path to the shared protobuf fixture. Tests load
+// it via SchemaSpec.protoFile; it carries both `orders_created` (v1) and
+// `orders_created_v2` so schema-versioning tests need no second file.
+export const ORDER_EVENT_PROTO = join(
+	import.meta.dir,
+	"..",
+	"..",
+	"..",
+	"src",
+	"events",
+	"testdata",
+	"order-event.proto",
+);
 
 export function sleep(ms: number): Promise<void> {
 	return new Promise((r) => setTimeout(r, ms));

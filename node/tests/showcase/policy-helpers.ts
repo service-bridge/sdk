@@ -1,69 +1,20 @@
-// policy-helpers.ts — minimal policy seeding for the showcase fixture.
+// policy-helpers.ts — showcase-shaped grants on top of the shared policy SQL.
 //
-// Same SQL surface as tests/e2e/_helpers/policy-db.ts but extracted to a local
-// file so the showcase has no implicit dependency on the e2e harness layout.
-// Showcase rules are wide and stable for the whole run — we never clean them
-// up between scenarios; the goal is to leave traces in the DB for the owner to
+// The raw SQL surface (withDb, addRule) is the e2e one — a second copy drifted
+// from it silently, so there is exactly one now. What is showcase-specific are
+// the grants below: wide, stable for the whole run, never cleaned up between
+// scenarios, because the point is to leave traces in the DB for the owner to
 // inspect after the run completes.
 
-const PG_URL =
-	process.env.TEST_DATABASE_URL ??
-	"postgresql://servicebridge:servicebridge@localhost:5433/service-bridge";
+import { addRule } from "../e2e/_helpers/policy-db";
 
-export async function withDb<T>(
-	fn: (sql: typeof import("bun").sql) => Promise<T>,
-): Promise<T> {
-	const prev = process.env.DATABASE_URL;
-	process.env.DATABASE_URL = PG_URL;
-	try {
-		const { sql } = await import("bun");
-		return await fn(sql);
-	} finally {
-		if (prev === undefined) delete process.env.DATABASE_URL;
-		else process.env.DATABASE_URL = prev;
-	}
-}
-
-export type Direction = "E" | "A";
-export type Action =
-	| "rpc.call"
-	| "rpc.handle"
-	| "event.publish"
-	| "event.handle"
-	| "workflow.run"
-	| "workflow.handle";
-
-export async function addRule(
-	svcID: string,
-	direction: Direction,
-	action: Action,
-	peerService: string | null,
-	targetName: string,
-): Promise<void> {
-	await withDb(async (sql) => {
-		if (peerService === null) {
-			await sql`
-				INSERT INTO service_policy_rules
-					(service_id, direction, action, peer_service, target_name)
-				VALUES (${svcID}, ${direction}, ${action}, NULL, ${targetName})
-				ON CONFLICT DO NOTHING
-			`;
-		} else {
-			await sql`
-				INSERT INTO service_policy_rules
-					(service_id, direction, action, peer_service, target_name)
-				VALUES (${svcID}, ${direction}, ${action}, ${peerService}::uuid, ${targetName})
-				ON CONFLICT DO NOTHING
-			`;
-		}
-	});
-}
+export type { Action, Direction } from "../e2e/_helpers/policy-db";
+export { withDb } from "../e2e/_helpers/policy-db";
 
 /**
- * grantWildcardCallable: caller can call any method on any peer (E rpc.call * → *),
- * and the named provider accepts any caller for that method (A rpc.handle *).
- * Cheap blanket seed for fixture use — the showcase isn't testing the policy
- * surface, just exercising the channels.
+ * grantRpcWildcard: caller can call the method on the named provider, and the
+ * provider accepts that caller for it. Cheap blanket seed for fixture use —
+ * the showcase isn't testing the policy surface, just exercising the channels.
  */
 export async function grantRpcWildcard(
 	callerID: string,

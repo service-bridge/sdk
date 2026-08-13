@@ -26,24 +26,10 @@
  */
 
 import { afterAll, describe, expect, test } from "bun:test";
+import { withDb } from "../e2e/_helpers/policy-db";
 import { runShowcase } from "./showcase-workflow";
 
-const dbUrl =
-	process.env.TEST_DATABASE_URL ??
-	"postgresql://servicebridge:servicebridge@localhost:5433/service-bridge";
 const RUNTIME_URL = process.env.SERVICEBRIDGE_URL ?? "localhost:14445";
-
-async function withDb<T>(fn: (sql: typeof import("bun").sql) => Promise<T>) {
-	const prev = process.env.DATABASE_URL;
-	process.env.DATABASE_URL = dbUrl;
-	try {
-		const { sql } = await import("bun");
-		return await fn(sql);
-	} finally {
-		if (prev === undefined) delete process.env.DATABASE_URL;
-		else process.env.DATABASE_URL = prev;
-	}
-}
 
 describe.skipIf(!process.env.SERVICEBRIDGE_URL && !process.env.RUN_SHOWCASE)(
 	"showcase fixture — DB-level assertions",

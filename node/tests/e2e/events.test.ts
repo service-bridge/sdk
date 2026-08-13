@@ -23,10 +23,10 @@ import type {
 } from "../../src/pb/servicebridge/v1/events";
 import { computeContractHash } from "../../src/serde/contract-hash";
 import { buildSchemaPair } from "../../src/serde/serializer";
-import { ORDER_EVENT_PROTO } from "./_helpers/events";
 import {
 	connect,
 	dedicated,
+	ORDER_EVENT_PROTO,
 	type Role,
 	sleep,
 	uniqueId,
@@ -39,6 +39,20 @@ const V2_SCHEMA = { protoFile: ORDER_EVENT_PROTO, method: "orders_created_v2" };
 const UUID_RE = /^[0-9a-f-]{36}$/;
 
 type Order = { orderId: string; amount: number; currency: string };
+
+type DlqPage = { entries: DlqEntry[]; nextCursor: string };
+
+// EventsClientHolder — the one private member of ServiceBridge this suite
+// depends on, spelled out instead of cast to `any`. DLQ inspection has no
+// public API; see the note on listDlq() below.
+type EventsClientHolder = {
+	_eventsClient?: {
+		listDlq(
+			req: ListDlqRequest,
+			cb: (err: Error | null, res?: DlqPage) => void,
+		): void;
+	};
+};
 
 // Reads the runtime URL + the per-domain key for a role straight from env, the
 // same way pool.ts does, so a test can build an extra dedicated instance under a
@@ -602,27 +616,20 @@ describe("events", () => {
 		});
 		expect(eventId).toMatch(UUID_RE);
 
-		// listDlq is @internal on ServiceBridge — there is no public DLQ API.
-		function listDlq(
-			sb: ServiceBridge,
-			req: ListDlqRequest,
-		): Promise<{ entries: DlqEntry[]; nextCursor: string }> {
-			// biome-ignore lint/suspicious/noExplicitAny: intentional @internal access
-			const client = (sb as any)._eventsClient;
+		// listDlq is @internal on ServiceBridge — there is no public DLQ API, so
+		// the test reaches the gRPC stub through a named shape rather than `any`:
+		// the exact private surface it depends on stays visible and typechecked,
+		// and it breaks loudly if that surface ever moves.
+		function listDlq(sb: ServiceBridge, req: ListDlqRequest): Promise<DlqPage> {
+			const client = (sb as unknown as EventsClientHolder)._eventsClient;
 			if (!client) {
 				throw new Error("eventsClient not ready — call start() first");
 			}
 			return new Promise((resolve, reject) => {
-				client.listDlq(
-					req,
-					(
-						err: Error | null,
-						res: { entries: DlqEntry[]; nextCursor: string } | undefined,
-					) => {
-						if (err) reject(err);
-						else resolve(res ?? { entries: [], nextCursor: "" });
-					},
-				);
+				client.listDlq(req, (err, res) => {
+					if (err) reject(err);
+					else resolve(res ?? { entries: [], nextCursor: "" });
+				});
 			});
 		}
 

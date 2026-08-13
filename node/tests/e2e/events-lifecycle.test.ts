@@ -19,9 +19,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ServiceBridge } from "../../src/connection/service-bridge";
 import { Storage } from "../../src/sqlite/storage";
-import { ORDER_EVENT_PROTO } from "./_helpers/events";
 import {
 	connect,
+	ORDER_EVENT_PROTO,
 	type Role,
 	sleep,
 	uniqueName,

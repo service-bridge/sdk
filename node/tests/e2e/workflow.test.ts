@@ -9,15 +9,18 @@
 // per-test TRUNCATE, no clearRules of pooled identities.
 //
 // Owner re-registration is folded here (fingerprint coexistence). Access-policy
-// mutation tests live in the workflow-lifecycle sibling; compensation-chain,
-// sleep-survives-restart and lease-* live in their own dedicated-runtime /
-// two-instance files.
+// mutation tests live in workflow-access-policy.test.ts.
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import type { ServiceBridge } from "../../src/connection/service-bridge";
-import { ORDER_EVENT_PROTO } from "./_helpers/events";
-import { connect, dedicated, shared, uniqueName } from "./_helpers/fixtures";
+import {
+	connect,
+	dedicated,
+	ORDER_EVENT_PROTO,
+	shared,
+	uniqueName,
+} from "./_helpers/fixtures";
 import { addRule, allServiceIDs, withDb } from "./_helpers/policy-db";
 import {
 	addWorkflowRule,

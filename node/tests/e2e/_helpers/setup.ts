@@ -74,15 +74,8 @@ function isOverride(key: string): boolean {
 	return key === "SERVICEBRIDGE_URL" || key.startsWith("SB_E2E_");
 }
 
-// SB_DISABLE_E2E_PRELOAD=1 — set by the Go integration test
-// (runtime/tests/integration/connection_test.go::TestSDKE2E) which spawns its
-// own throwaway runtime and provisions its own keys directly via cmd.Env.
-// In that mode the preload must NOT overwrite SERVICEBRIDGE_URL/_KEY/_KEY2 —
-// otherwise the test SDK ends up pointed at the dev runtime with dev keys.
-const disablePreload = process.env.SB_DISABLE_E2E_PRELOAD === "1";
-
 const envPath = locateEnvFile();
-if (envPath && !disablePreload) {
+if (envPath) {
 	const parsed = parseDotEnv(readFileSync(envPath, "utf8"));
 	for (const [k, v] of Object.entries(parsed)) {
 		if (isOverride(k) || process.env[k] === undefined) {

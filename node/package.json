@@ -44,7 +44,10 @@
 		"lint": "biome check .",
 		"format": "biome format --write .",
 		"typecheck": "tsc --noEmit",
-		"check": "biome check --write . && tsc --noEmit"
+		"check": "biome check --write . && tsc --noEmit",
+		"test": "bun test src/ tests/build tests/http",
+		"test:e2e": "bash ../scripts/e2e-parallel.sh",
+		"test:all": "bun run test && bun run test:e2e"
 	},
 	"exports": {
 		".": {
