@@ -1,3 +1,4 @@
+import { ServiceBridgeError } from "../errors";
 // Workflow graph static validation.
 //
 // Per ADR-W-018, this validator covers ONLY graph control:
@@ -19,7 +20,7 @@ import type { JsonExpression } from "./jsonpath";
 import { evalPath, JsonPathError } from "./jsonpath";
 import type { CompensateSpec, Step, WorkflowDef } from "./types";
 
-export class WorkflowValidationError extends Error {
+export class WorkflowValidationError extends ServiceBridgeError {
 	constructor(message: string) {
 		super(`workflow/validate: ${message}`);
 		this.name = "WorkflowValidationError";

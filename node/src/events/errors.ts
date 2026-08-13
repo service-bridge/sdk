@@ -1,5 +1,7 @@
+import { ServiceBridgeError } from "../errors";
+
 // @public — см. ./README.md
-export class InvalidEventNameError extends Error {
+export class InvalidEventNameError extends ServiceBridgeError {
 	override readonly name = "InvalidEventNameError";
 
 	constructor(eventName: string) {
@@ -10,7 +12,7 @@ export class InvalidEventNameError extends Error {
 }
 
 // @public — см. ./README.md
-export class OutboxFullError extends Error {
+export class OutboxFullError extends ServiceBridgeError {
 	override readonly name = "OutboxFullError";
 
 	constructor(cap: number) {

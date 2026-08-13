@@ -18,7 +18,7 @@ import {
 	type ReconnectingEvent,
 	ServiceBridge,
 } from "./service-bridge";
-import { ServiceBridgeError } from "./service-bridge-error";
+import { ConnectionError } from "./service-bridge-error";
 
 // Minimal valid bootstrap key for tests using BootstrapKeyPayload proto format.
 const VALID_KEY = (() => {
@@ -1312,7 +1312,7 @@ describe("ServiceBridge cert rotation (overlap)", () => {
 });
 
 describe("ServiceBridge non-retryable errors (H11)", () => {
-	test("UNAUTHENTICATED provision error emits disconnected with ServiceBridgeError and does NOT reconnect", async () => {
+	test("UNAUTHENTICATED provision error emits disconnected with ConnectionError and does NOT reconnect", async () => {
 		const unauthErr = Object.assign(new Error("invalid key"), {
 			code: GrpcStatus.UNAUTHENTICATED,
 		});
@@ -1339,7 +1339,7 @@ describe("ServiceBridge non-retryable errors (H11)", () => {
 
 		expect(disconnects.length).toBe(1);
 		const unauth0 = disconnects[0];
-		expect(unauth0?.error).toBeInstanceOf(ServiceBridgeError);
+		expect(unauth0?.error).toBeInstanceOf(ConnectionError);
 		expect(unauth0?.error?.code).toBe(GrpcStatus.UNAUTHENTICATED);
 		expect(reconnects.length).toBe(0);
 		expect(provisionCalls).toBe(1);

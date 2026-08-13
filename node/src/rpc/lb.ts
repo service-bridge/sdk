@@ -1,3 +1,4 @@
+import { ServiceBridgeError } from "../errors";
 import type {
 	MethodDescriptor,
 	ServiceInstanceInfo,
@@ -25,7 +26,7 @@ export interface Candidate {
 	isUnhealthyAt: Date | null;
 }
 
-export class NoLiveInstanceError extends Error {
+export class NoLiveInstanceError extends ServiceBridgeError {
 	constructor(message?: string) {
 		super(message ?? "rpc: no live instance");
 		this.name = "NoLiveInstanceError";

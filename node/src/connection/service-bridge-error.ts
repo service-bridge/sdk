@@ -1,4 +1,5 @@
 import { status as GrpcStatus } from "@grpc/grpc-js";
+import { ServiceBridgeError } from "../errors";
 
 const NON_RETRYABLE = new Set([
 	GrpcStatus.UNAUTHENTICATED,
@@ -17,7 +18,7 @@ export function isRetryable(grpcCode: number): boolean {
 }
 
 /** @public см. ./README.md */
-export class ServiceBridgeError extends Error {
+export class ConnectionError extends ServiceBridgeError {
 	readonly code: number;
 
 	constructor(scope: string, cause: unknown) {
@@ -32,7 +33,7 @@ export class ServiceBridgeError extends Error {
 		const message = cause instanceof Error ? cause.message : String(cause);
 		super(`${scope}: ${message}`, { cause });
 
-		this.name = "ServiceBridgeError";
+		this.name = "ConnectionError";
 		this.code = grpcCode;
 	}
 }

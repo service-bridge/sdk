@@ -5,7 +5,7 @@ import { BootstrapClient } from "../pb/servicebridge/v1/bootstrap";
 import type { ControlClient } from "../pb/servicebridge/v1/control";
 import type { BootstrapKey } from "./key";
 import { derToPem } from "./pem";
-import { ServiceBridgeError } from "./service-bridge-error";
+import { ConnectionError } from "./service-bridge-error";
 
 /** @internal см. ./README.md */
 export interface Keypair {
@@ -118,7 +118,7 @@ export async function provision(
 				},
 				(err, response) => {
 					if (err) {
-						reject(new ServiceBridgeError("provision", err));
+						reject(new ConnectionError("provision", err));
 						return;
 					}
 					if (!response) {
@@ -168,7 +168,7 @@ export async function refresh(
 	return new Promise((resolve, reject) => {
 		client.refreshCert({ csrDer: Buffer.from(csrDer) }, (err, response) => {
 			if (err) {
-				reject(new ServiceBridgeError("refresh", err));
+				reject(new ConnectionError("refresh", err));
 				return;
 			}
 			if (!response) {

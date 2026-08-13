@@ -68,7 +68,7 @@ import { parseBootstrapKey } from "./key";
 import { derToPem } from "./pem";
 import type { ProvisionResult } from "./provision";
 import { provision as defaultProvision, refresh } from "./provision";
-import { isRetryable, ServiceBridgeError } from "./service-bridge-error";
+import { ConnectionError, isRetryable } from "./service-bridge-error";
 import type { SessionCallbacks } from "./session";
 import { openControlStream, Session } from "./session";
 
@@ -336,7 +336,7 @@ export interface ReconnectingEvent {
 
 export interface DisconnectedEvent {
 	reason: string;
-	error?: ServiceBridgeError;
+	error?: ConnectionError;
 }
 
 /**
@@ -778,12 +778,12 @@ export class ServiceBridge {
 				});
 			}
 			if (this.opts.failOnPolicyViolation && policy.warnings.length > 0) {
-				// Surface as a clear ServiceBridgeError; the connect loop catches
+				// Surface as a clear ConnectionError; the connect loop catches
 				// and emits 'disconnected'.
 				const message = policy.warnings
 					.map((w) => `${w.declaration} ${w.value}: ${w.reason}`)
 					.join("; ");
-				const err = new ServiceBridgeError(
+				const err = new ConnectionError(
 					"policy",
 					new Error(`policy violations on start: ${message}`),
 				);
@@ -1103,7 +1103,7 @@ export class ServiceBridge {
 			await this.openSession(result, attempt, gen);
 		} catch (err) {
 			if (this.stale(gen)) return;
-			const sbErr = new ServiceBridgeError("provision", err);
+			const sbErr = new ConnectionError("provision", err);
 			if (!isRetryable(sbErr.code)) {
 				this.emit("disconnected", { reason: sbErr.message, error: sbErr });
 				void this.stop();
@@ -1590,7 +1590,7 @@ export class ServiceBridge {
 			);
 		} catch (err) {
 			if (this.stale(gen)) return;
-			const sbErr = new ServiceBridgeError("rotation refresh", err);
+			const sbErr = new ConnectionError("rotation refresh", err);
 			if (!isRetryable(sbErr.code)) {
 				this.emit("disconnected", { reason: sbErr.message, error: sbErr });
 				void this.stop();

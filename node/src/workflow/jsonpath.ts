@@ -1,3 +1,4 @@
+import { ServiceBridgeError } from "../errors";
 // JSONPath-lite evaluator for workflow state expressions.
 //
 // Supported syntax (workflows.md §JSONPath-lite):
@@ -40,7 +41,7 @@ export type State = Record<string, unknown>;
 
 // JsonPathError is thrown for malformed path expressions. Missing paths are
 // NOT errors — they resolve to `undefined`.
-export class JsonPathError extends Error {
+export class JsonPathError extends ServiceBridgeError {
 	constructor(
 		message: string,
 		public readonly expr: string,
