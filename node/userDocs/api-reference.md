@@ -434,6 +434,23 @@ import { sbFastify } from "service-bridge/fastify";
 import { attachHono } from "service-bridge/hono";
 ```
 
+### Testing
+
+In-memory двойник `sb.rpc` + `sb.event` для юнит-тестов, без сети и без живого рантайма. Полный гайд — [Тестирование](./testing.md).
+
+```ts
+import {
+  createTestHarness,
+  type TestHarness,
+  TestRpcDomain,
+  type RpcCallRecord,
+  type RpcMockResponder,
+  TestEventDomain,
+  type PublishedEventRecord,
+  type EventDeliveryResult,
+} from "service-bridge/testing";
+```
+
 ## ServiceBridgeError
 
 ```ts

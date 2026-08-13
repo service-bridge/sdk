@@ -1,6 +1,6 @@
 # Integrations
 
-← [Jobs](./jobs.md) · Дальше: [Operations](./operations.md) →
+← [Тестирование](./testing.md) · Дальше: [Operations](./operations.md) →
 
 HTTP-интеграции для Express / Fastify / Hono. SDK не запускает HTTP-сервер сам — пользователь поднимает свой Express/Fastify/Hono, а интеграция читает зарегистрированные роуты и публикует их в runtime registry для Service Map и Service Discovery (ADR 0001).
 

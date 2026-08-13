@@ -1,6 +1,6 @@
 # Jobs
 
-← [Workflows](./workflows.md) · Дальше: [Integrations](./integrations.md) →
+← [Workflows](./workflows.md) · Дальше: [Тестирование](./testing.md) →
 
 Runtime-triggered scheduled tasks: cron, delayed, interval. Handler выполняется на стороне SDK-сервиса, триггер живёт в runtime.
 
@@ -338,4 +338,4 @@ sb.job.handle(
 await sb.start();
 ```
 
-→ Дальше: [Integrations](./integrations.md)
+→ Дальше: [Тестирование](./testing.md)

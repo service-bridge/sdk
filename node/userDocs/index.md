@@ -18,6 +18,7 @@ bun add service-bridge    # или npm install / yarn add
 | [Events](./events.md) | `event.handle` + `event.define` + `event.publish` + delivery semantics |
 | [Workflows](./workflows.md) | `sb.workflow.handle` — durable DAG-шаги с persistent state, compensation, replay |
 | [Jobs](./jobs.md) | `sb.job.handle` — cron / delayed / interval с at-least-once + heartbeat + DST |
+| [Тестирование](./testing.md) | `service-bridge/testing` — юнит-тест RPC/event-хендлеров без сети и без живого рантайма |
 | [Integrations](./integrations.md) | HTTP-фреймворки: Express / Fastify / Hono. Service Map для существующих REST API |
 | [Access Policy](./access-policy.md) | Гранулярные политики: capabilities, egress, acceptance. Default-allow |
 | [Operations](./operations.md) | lifecycle, identity, advertise, mTLS, ротация, env, troubleshooting |
@@ -37,3 +38,5 @@ bun add service-bridge    # или npm install / yarn add
 **«Как сгенерировать bootstrap-ключ?»** → [Operations §6](./operations.md#6-security-bootstrap-key-mtls-ротация).
 
 **«Какая сигнатура у `X`?»** → [API reference](./api-reference.md).
+
+**«Как юнит-тестировать хендлер без живого рантайма?»** → [Тестирование](./testing.md).

@@ -75,6 +75,7 @@ Dashboard at `http://localhost:14444` (create your admin account on first open, 
 | Multi-step orchestration (DAG, compensation, signals, replay) | `sb.workflow` | [reference/workflows.md](reference/workflows.md) |
 | Cron / delayed / interval scheduled work | `sb.job` | [reference/jobs.md](reference/jobs.md) |
 | Expose your Express/Fastify/Hono app to Service Map + discovery | `service-bridge/{express,fastify,hono}` | [reference/http-integrations.md](reference/http-integrations.md) |
+| Unit-test a registered RPC/event handler without a live runtime | `service-bridge/testing` | [reference/testing.md](reference/testing.md) |
 | Constructor options, error types, capacity tuning | `ServiceBridgeOptions` | [reference/configuration.md](reference/configuration.md) |
 
 Read the matching reference file before writing code for a domain — each has exact signatures, defaults, and a runnable recipe. When a task spans domains, the lifecycle rule above still holds: one `ServiceBridge` per process, declare everything, then `start()`.
