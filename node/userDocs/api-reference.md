@@ -11,7 +11,8 @@
 ```ts
 import {
   ServiceBridge,
-  ServiceBridgeError,
+  ServiceBridgeError,   // база всех ошибок SDK
+  ConnectionError,      // сбой подключения; .code = gRPC status
   RpcAccessDeniedError,
   WorkflowAccessDeniedError,
   WorkflowNotFoundError,
@@ -372,7 +373,7 @@ interface ReconnectingEvent {
 
 interface DisconnectedEvent {
   reason: string;        // "exhausted" | "drain: ..." | "policy ..." | текст ошибки
-  error?: ServiceBridgeError;
+  error?: ConnectionError;
 }
 
 interface PolicyViolationEvent {
@@ -451,14 +452,18 @@ import {
 } from "service-bridge/testing";
 ```
 
-## ServiceBridgeError
+## ServiceBridgeError / ConnectionError
 
 ```ts
-class ServiceBridgeError extends Error {
+class ServiceBridgeError extends Error {}   // база всех ошибок SDK
+
+class ConnectionError extends ServiceBridgeError {
   readonly code: number;   // gRPC status code; -1 если код не распознан
-  // name всегда "ServiceBridgeError"; message = "<scope>: <cause>"
+  // name всегда "ConnectionError"; message = "<scope>: <cause>"
 }
 ```
+
+`ServiceBridgeError` — общий предок: `catch (e) { if (e instanceof ServiceBridgeError) … }` ловит любую ошибку SDK, включая те, что появятся в следующих релизах. `ConnectionError` — конкретный сбой подключения или провижининга, единственный, кто несёт числовой `.code`.
 
 Не-retryable коды: `UNAUTHENTICATED`, `PERMISSION_DENIED`, `NOT_FOUND`, `INVALID_ARGUMENT` — всё остальное (включая `-1`) считается транзиентным и ведёт к reconnect. Подробности про codes и retry: [RPC §9 Ошибки](./rpc.md#9-ошибки), [RPC §6 Retry](./rpc.md#6-resilience-lb-cb-retry).
 

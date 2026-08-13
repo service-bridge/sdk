@@ -551,15 +551,16 @@ All configuration lives on the `ServiceBridge` constructor — `new ServiceBridg
 | `advertise` | `{ host, port } \| false` | `127.0.0.1` on a free port (with a warning) | Inbound RPC server address. Pass `{ host, port }` in containers / k8s; `false` for caller-only instances that never serve RPC. |
 | `callDefaults` | `CallOpts` | `{}` | Default `CallOpts` merged under every `sb.rpc.call()` / `sb.stream()`. |
 | `failOnPolicyViolation` | `boolean` | `false` | When `true`, any policy warning at registration makes `start()` surface a `disconnected` event and stop. Otherwise warnings are logged and emitted as `policy_violation`. |
-| `telemetry` | `boolean` | `true` | Emit ops/logs/metrics to the runtime. `false` fully disables the telemetry transport. |
-| `telemetryRingSize` | `number` | `262144` (256 KiB) | Byte budget for the in-memory ops ring buffer. |
 | `dataDir` | `string` | `"./.servicebridge"` | Directory for the local SQLite event outbox. |
 | `maxOutboxRows` | `number` | `100000` | Outbox rows before `publish` back-pressures with `OutboxFullError`. |
 | `eventsDrainerBatch` | `number` | `50` | Outbox rows drained to the runtime per tick. |
-| `eventsMaxInFlight` | `number` | `32` | Max concurrent inbound events processed by subscribers. |
-| `payloadMaxBytes` | `number` | `65536` | Per-direction cap on captured payload bytes. |
-| `reconnectIntervalMs` | `number` | `3000` | Delay between reconnect attempts. |
+| `eventsMaxInFlight` | `number` | `32` | In-flight window advertised to the runtime on subscribe. |
+| `rpcMaxConcurrentCalls` | `number` | `256` | Inbound RPC handlers running at once. |
+| `rpcMaxQueuedCalls` | `number` | = concurrency | Admission queue depth; past it callers get `RESOURCE_EXHAUSTED` rather than piling up. |
+| `reconnectIntervalMs` | `number` | jittered ladder | Fixed delay between reconnect attempts. Unset means the ladder `[1s, 5s, 15s, 30s, 60s]` ±20%. |
 | `reconnectAttempts` | `number` | `3` | Reconnect attempts before giving up. `0` = unlimited. |
+
+Telemetry is not configured here. Whether it runs at all, the payload capture mode per channel and the payload size cap are pushed by the runtime and changed from its dashboard — read the current verdict with `sb.telemetry.enabled()` and `sb.telemetry.captureModeForChannel(...)`.
 
 ```ts
 const sb = new ServiceBridge("localhost:14445", KEY, {
@@ -609,20 +610,25 @@ try {
   if (err instanceof RpcAccessDeniedError) {
     // denied by access policy: { serviceName, methodName, reason }
   } else if (err instanceof ServiceBridgeError) {
-    // connection / provisioning failure with a typed .code
+    // any other failure raised by the SDK
   }
 }
 ```
 
+Every error below extends `ServiceBridgeError`, so one `instanceof` separates an SDK failure from an application one — and an error added in a later release will not slip past that check.
+
 | Error | Thrown when |
 |---|---|
+| `ConnectionError` | Connection / provisioning failure; carries a typed `.code` (retryable ones drive auto-reconnect). |
 | `RpcAccessDeniedError` | An RPC call is denied by access policy. Also fires a `policy_violation` event. |
+| `NoLiveInstanceError` | No callee instance matches the caller's contract hash, or every one is shed by the breaker. |
 | `WorkflowAccessDeniedError` | A workflow `start()` is denied by access policy. |
 | `WorkflowNotFoundError` | Starting a workflow name the runtime doesn't know. |
 | `WorkflowTerminalError` | Signalling/cancelling a run that already finished. |
+| `WorkflowValidationError` | `workflow.handle()` is given a graph that fails validation. |
+| `JsonPathError` | A `$.` expression in a workflow step is malformed. |
 | `InvalidEventNameError` | Publishing/defining an event whose name fails the naming rule. |
 | `OutboxFullError` | The local event outbox is at `maxOutboxRows` (back-pressure). |
-| `ServiceBridgeError` | Connection / provisioning failures; carries a typed `.code` (retryable ones drive auto-reconnect). |
 
 ---
 

@@ -557,7 +557,7 @@ class RpcAccessDeniedError extends Error {  // export из index
 }
 ```
 
-Он бросается, когда access policy запретила вызов (маппится из gRPC `PERMISSION_DENIED` / code 7). `ServiceBridgeError` (тоже export из index) несёт только числовой `.code` и используется на уровне lifecycle-соединения, а не на каждом RPC-вызове — у него нет полей `name`-как-gRPC-имя или `retryable`.
+Он бросается, когда access policy запретила вызов (маппится из gRPC `PERMISSION_DENIED` / code 7). `ConnectionError` (тоже export из index) несёт только числовой `.code` и используется на уровне lifecycle-соединения, а не на каждом RPC-вызове — у него нет полей `name`-как-gRPC-имя или `retryable`.
 
 ### Базовая обработка
 

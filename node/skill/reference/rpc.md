@@ -60,7 +60,7 @@ await sb.rpc.call<Req, Res>(
 ): Promise<Res>
 ```
 
-When using `rpc.call` for a method whose schema the SDK doesn't yet know, register it first with `sb.useSchema(serviceName, methodName, spec)` (before `start()`), or declare the dependency with `sb.service(serviceName, { rpc: ["Method"] })`.
+When using `rpc.call` for a method whose schema the SDK doesn't yet know, do **both** before `start()`: declare the dependency with `sb.service(serviceName, { rpc: ["Method"] })` and register the schema with `sb.useSchema(serviceName, methodName, spec)`. They are separate: `service()` only tells the runtime you call the method, and without `useSchema` the call throws at dispatch time because there is nothing to encode with. `sb.client(service, protoFile)` does both in one step and is the better default.
 
 ```ts
 sb.service("payment-svc", { rpc: ["Charge"] });
@@ -137,7 +137,7 @@ type SchemaSpec =
 
 - `RpcAccessDeniedError` (`serviceName`, `methodName`, `reason`) — thrown from `rpc.call` when the runtime's bilateral access policy denies the call. Not retryable.
 - Handler exceptions surface to the caller as an error response.
-- Connection/auth failures surface via the `disconnected` event with a `ServiceBridgeError` (see [configuration.md](configuration.md)).
+- Connection/auth failures surface via the `disconnected` event with a `ConnectionError` (see [configuration.md](configuration.md)).
 
 ```ts
 import { RpcAccessDeniedError } from "service-bridge";

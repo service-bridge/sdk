@@ -52,7 +52,7 @@ const sb = new ServiceBridge(url, key, {
 });
 // При любом warning в первом снапшоте SDK не бросает исключение из start(),
 // а эмитит `disconnected` и сам останавливается (вызывает stop()).
-// reason начинается с "policy:", в error лежит ServiceBridgeError.
+// reason начинается с "policy:", в error лежит ConnectionError.
 sb.on('disconnected', ({ reason, error }) => {
   if (reason.startsWith('policy:')) {
     console.error('policy violations on start:', error);
