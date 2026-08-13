@@ -76,7 +76,7 @@ Every SDK speaks the same runtime over the same gRPC control plane, so the API s
 | Language | Status | Package | Directory |
 |---|---|---|---|
 | **Node.js / Bun** (TypeScript) | **Live** | [![npm](https://img.shields.io/npm/v/service-bridge?label=npm)](https://www.npmjs.com/package/service-bridge) `service-bridge` | [`./node`](./node) |
-| **Go** | Coming soon | — | `./go` |
+| **Go** | In development | — | [`./go`](./go) |
 | **Python** | Coming soon | — | `./python` |
 
 Each SDK directory holds its own README with install instructions, a quick start and the full API reference.
