@@ -221,8 +221,9 @@ func (MTLSDialer) Dial(_ context.Context, creds Credentials) (*grpc.ClientConn, 
 // CredentialRegistry like every other consumer, not from Start.
 type InboundServer interface {
 	// Start binds the listener and returns the address peers dial. It is called
-	// on every connect attempt and must be idempotent: a reconnect must not
-	// rebind the port or change the advertised address.
+	// on every connect attempt until one succeeds, after which the address is
+	// reused: a reconnect must not rebind the port or change the advertised
+	// address, or the mesh keeps dialling an endpoint nobody listens on.
 	Start(ctx context.Context) (string, error)
 	// Close releases the listener. Called once, from Lifecycle.Stop.
 	Close(ctx context.Context) error
@@ -288,8 +289,7 @@ type session struct {
 	// observed closed, so the channel close is the happens-before edge.
 	endErr error
 
-	expected atomic.Bool
-	closing  atomic.Bool
+	closing atomic.Bool
 }
 
 // newSession dials the runtime with creds and opens Control.Open. It returns as
@@ -381,32 +381,18 @@ func (s *session) awaitWelcome(ctx context.Context, timeout time.Duration) (*pb.
 	}
 }
 
-// dead reports whether the stream has already ended.
-func (s *session) dead() bool {
-	select {
-	case <-s.done:
-		return true
-	default:
-		return false
-	}
-}
-
 // shutdown tears the session down: registrar first, then the stream, then the
 // channel. It is idempotent and synchronous — when it returns, the reader
 // goroutine is gone and the channel is closed. An unclosed grpc.ClientConn
 // keeps its own reconnect goroutines and backoff timers alive for the life of
 // the process, so every path out of a session runs through here.
-//
-// expected tells the supervisor whether this close is a disconnect worth
-// reconnecting from: false makes the supervisor treat it as a lost session.
-func (s *session) shutdown(ctx context.Context, expected bool) {
+func (s *session) shutdown(ctx context.Context) {
 	if !s.closing.CompareAndSwap(false, true) {
 		<-s.gone
 		return
 	}
 	defer close(s.gone)
 
-	s.expected.Store(expected)
 	if s.registrar != nil {
 		if err := s.registrar.Close(ctx); err != nil {
 			s.log.Warn("connection: closing the registry stream", "error", err)
