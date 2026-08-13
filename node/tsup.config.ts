@@ -6,6 +6,7 @@ export default defineConfig({
 		"http/express/index": "src/http/express/index.ts",
 		"http/fastify/index": "src/http/fastify/index.ts",
 		"http/hono/index": "src/http/hono/index.ts",
+		"testing/index": "src/testing/index.ts",
 	},
 	format: ["esm"],
 	target: "node18",
