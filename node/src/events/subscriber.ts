@@ -9,25 +9,33 @@ import {
 	SubscribeClientMessage as SubscribeClientMessageFns,
 	SubscribeInit,
 } from "../pb/servicebridge/v1/events";
+import type { EventHandlerFn } from "../registry/registry";
+import { StreamSupervisor } from "../registry/stream-supervisor";
 import type { SchemaPair } from "../serde/serializer";
-import {
-	type ReconnectDelayOptions,
-	reconnectDelay,
-} from "../utils/reconnect-ladder";
+import type { ReconnectDelayOptions } from "../utils/reconnect-ladder";
 import type { Logger } from "./publisher";
+
+// EventStream is the bidi Subscribe call. Typed from the generated client so
+// the ack/nack writes stay on the same object the supervisor owns.
+type EventStream = ReturnType<EventsClient["subscribe"]>;
+
+// InboundDelivery is the only server frame the subscriber acts on.
+interface InboundDelivery {
+	deliveryId: string;
+	envelope?: {
+		id: string;
+		name: string;
+		payload: Uint8Array;
+		partitionKey?: string;
+		xSbTrace?: string;
+	};
+	attempt: number;
+}
 
 // @internal
 interface SubscriberIdentity {
 	serviceId: string;
 	instanceId: string;
-}
-
-// EventHandler is the registered handler for one event name. Dispatch is by
-// exact name match — wildcards are server-side only (ADR-0002).
-// @internal
-export interface EventHandler {
-	pattern: string;
-	fn: (payload: unknown) => Promise<void> | void;
 }
 
 // SchemaIndex for subscriber — maps event name to its schema pair.
@@ -43,7 +51,10 @@ export interface SubscriberDeps {
 	rpcClient: EventsClient;
 	schemaIndex: SubscriberSchemaIndex;
 	identity: () => SubscriberIdentity | null;
-	handlers: () => EventHandler[];
+	// handlers returns the in-process fan-out set for one exact event name.
+	// Lookup, not a scan: the registry keeps the bucket indexed by pattern, so a
+	// delivery costs a Map hit instead of rebuilding the whole handler list.
+	handlers: (pattern: string) => readonly EventHandlerFn[];
 	maxInFlight?: number;
 	logger?: Logger;
 	sb?: ServiceBridge;
@@ -72,11 +83,10 @@ export class Subscriber {
 		fn: () => Promise<void>,
 	) => Promise<void>;
 
-	private _stopped = false;
-	private _attempt = 0;
-	private _timer: ReturnType<typeof setTimeout> | null = null;
-	// biome-ignore lint/suspicious/noExplicitAny: grpc stream type is opaque
-	private _stream: any | null = null;
+	private readonly supervisor: StreamSupervisor<
+		EventStream,
+		{ delivery?: InboundDelivery }
+	>;
 
 	// Per-partition serial queues. Events that share a partition_key must reach
 	// their handlers in publication order — the server enforces «one in_flight
@@ -92,44 +102,31 @@ export class Subscriber {
 		this.maxInFlight = deps.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT;
 		this.logger = deps.logger ?? { warn: console.warn, error: console.error };
 		this.runWithTrace = deps.runWithTrace;
+		this.supervisor = new StreamSupervisor({
+			open: () => this.openStream(),
+			onData: (msg, stream) => this.handleFrame(msg, stream),
+			onError: (err) =>
+				this.logger.warn("events: subscriber: stream error", err.message),
+			reconnectOpts: deps.reconnectOpts,
+		});
 	}
 
 	start(): void {
-		if (this._stopped) return;
-		this.connect();
+		this.supervisor.start();
 	}
 
 	async stop(): Promise<void> {
-		this._stopped = true;
-		if (this._timer !== null) {
-			clearTimeout(this._timer);
-			this._timer = null;
-		}
-		if (this._stream) {
-			try {
-				this._stream.cancel?.();
-				this._stream.end?.();
-			} catch {
-				// ignore close errors
-			}
-			this._stream = null;
-		}
+		this.supervisor.stop();
 	}
 
-	private connect(): void {
-		if (this._stopped) return;
-
+	// openStream opens the bidi Subscribe call and sends SubscribeInit as its
+	// first frame. Null while identity is missing — the supervisor retries on
+	// the ladder.
+	private openStream(): EventStream | null {
 		const id = this.deps.identity();
-		if (!id) {
-			// Identity not yet available — schedule reconnect.
-			this.scheduleReconnect();
-			return;
-		}
+		if (!id) return null;
 
 		const stream = this.deps.rpcClient.subscribe();
-		this._stream = stream;
-
-		// Send SubscribeInit as the first message.
 		stream.write(
 			SubscribeClientMessageFns.create({
 				init: SubscribeInit.create({
@@ -139,87 +136,39 @@ export class Subscriber {
 				}),
 			}),
 		);
-
-		stream.on(
-			"data",
-			(msg: {
-				delivery?: {
-					deliveryId: string;
-					envelope?: {
-						id: string;
-						name: string;
-						payload: Uint8Array;
-						partitionKey?: string;
-						xSbTrace?: string;
-					};
-					attempt: number;
-				};
-			}) => {
-				if (msg.delivery) {
-					// A delivery arriving proves the stream is healthy. Reset the
-					// reconnect attempt here — the connect/reconnect owner — and not
-					// from the async handleDelivery ack path, which would race the
-					// synchronous ++this._attempt in the error/end handlers below.
-					this._attempt = 0;
-					const delivery = msg.delivery;
-					const key = delivery.envelope?.partitionKey ?? "";
-					const xSbTrace = delivery.envelope?.xSbTrace ?? "";
-					const work = () =>
-						this.runWithTrace(xSbTrace, () =>
-							this.handleDelivery(stream, delivery),
-						);
-					if (key === "") {
-						// No partition → parallel processing OK.
-						void work();
-						return;
-					}
-					// Chain onto the partition's queue so the next handler waits
-					// for the previous one's full handler→ack cycle to complete.
-					const prev = this.partitionQueues.get(key) ?? Promise.resolve();
-					const next = prev.then(work, work);
-					this.partitionQueues.set(key, next);
-					void next.finally(() => {
-						if (this.partitionQueues.get(key) === next) {
-							this.partitionQueues.delete(key);
-						}
-					});
-				}
-			},
-		);
-
-		stream.on("error", (err: Error) => {
-			this.logger.warn("events: subscriber: stream error", err.message);
-			this._stream = null;
-			this.scheduleReconnect();
-		});
-
-		stream.on("end", () => {
-			this._stream = null;
-			this.scheduleReconnect();
-		});
+		return stream;
 	}
 
-	// One pending timer at a time: grpc-js emits both "error" and "end" for a
-	// single broken stream, and a second timer here would double the number of
-	// live reconnect loops on every cycle — exponential runaway that grows the
-	// heap by gigabytes within the hour.
-	private scheduleReconnect(): void {
-		if (this._stopped || this._timer !== null) return;
-		const delay = reconnectDelay(++this._attempt, this.deps.reconnectOpts);
-		this._timer = setTimeout(() => {
-			this._timer = null;
-			this.connect();
-		}, delay);
+	private handleFrame(
+		msg: { delivery?: InboundDelivery },
+		stream: EventStream,
+	): void {
+		const delivery = msg.delivery;
+		if (!delivery) return;
+		const key = delivery.envelope?.partitionKey ?? "";
+		const xSbTrace = delivery.envelope?.xSbTrace ?? "";
+		const work = () =>
+			this.runWithTrace(xSbTrace, () => this.handleDelivery(stream, delivery));
+		if (key === "") {
+			// No partition → parallel processing OK.
+			void work();
+			return;
+		}
+		// Chain onto the partition's queue so the next handler waits for the
+		// previous one's full handler→ack cycle to complete.
+		const prev = this.partitionQueues.get(key) ?? Promise.resolve();
+		const next = prev.then(work, work);
+		this.partitionQueues.set(key, next);
+		void next.finally(() => {
+			if (this.partitionQueues.get(key) === next) {
+				this.partitionQueues.delete(key);
+			}
+		});
 	}
 
 	private async handleDelivery(
-		// biome-ignore lint/suspicious/noExplicitAny: grpc stream write
-		stream: any,
-		delivery: {
-			deliveryId: string;
-			envelope?: { id: string; name: string; payload: Uint8Array };
-			attempt: number;
-		},
+		stream: EventStream,
+		delivery: InboundDelivery,
 	): Promise<void> {
 		const { deliveryId, envelope } = delivery;
 		if (!envelope) {
@@ -236,7 +185,7 @@ export class Subscriber {
 
 		// Dispatch by exact name — server is the single source of truth for
 		// routing (ADR-0002). Handlers must be idempotent.
-		const handlers = this.deps.handlers().filter((h) => h.pattern === name);
+		const handlers = this.deps.handlers(name);
 		if (handlers.length === 0) {
 			this.sendAck(stream, deliveryId, eventId);
 			return;
@@ -258,7 +207,7 @@ export class Subscriber {
 
 		for (const handler of handlers) {
 			try {
-				await handler.fn(decoded);
+				await handler(decoded);
 			} catch (err) {
 				this.sendNack(stream, deliveryId, String(err), eventId);
 				return;
@@ -268,8 +217,11 @@ export class Subscriber {
 		this.sendAck(stream, deliveryId, eventId);
 	}
 
-	// biome-ignore lint/suspicious/noExplicitAny: grpc stream write
-	private sendAck(stream: any, deliveryId: string, eventId?: string): void {
+	private sendAck(
+		stream: EventStream,
+		deliveryId: string,
+		eventId?: string,
+	): void {
 		try {
 			const msg: SubscribeClientMessage = {
 				ack: Ack.create({
@@ -284,8 +236,7 @@ export class Subscriber {
 	}
 
 	private sendNack(
-		// biome-ignore lint/suspicious/noExplicitAny: grpc stream write
-		stream: any,
+		stream: EventStream,
 		deliveryId: string,
 		errorMessage: string,
 		eventId?: string,

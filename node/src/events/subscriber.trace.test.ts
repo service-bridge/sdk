@@ -35,13 +35,11 @@ function makeSchema() {
 		input: {
 			encode: (_v: unknown) => new Uint8Array(),
 			decode: (_b: Uint8Array) => ({ amount: 42 }),
-			contractHash: () => "h",
 			toJsonSchema: () => ({}),
 		},
 		output: {
 			encode: (_v: unknown) => new Uint8Array(),
 			decode: (_b: Uint8Array) => ({}),
-			contractHash: () => "h",
 			toJsonSchema: () => ({}),
 		},
 	};
@@ -99,7 +97,7 @@ function makeDeps(handlerFn: (p: unknown) => Promise<void>): {
 					: undefined,
 		},
 		identity: () => ({ serviceId: "svc-1", instanceId: "inst-1" }),
-		handlers: () => [{ pattern: "order.created", fn: handlerFn }],
+		handlers: (pattern) => (pattern === "order.created" ? [handlerFn] : []),
 		maxInFlight: 32,
 		logger: { warn: () => {}, error: () => {} },
 		runWithTrace: runHandlerWithTrace,

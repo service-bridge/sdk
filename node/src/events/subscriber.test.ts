@@ -1,22 +1,44 @@
-import { describe, expect, it, mock } from "bun:test";
+import { describe, expect, it, mock, spyOn } from "bun:test";
 import { EventEmitter } from "node:events";
+import type { EventHandlerFn } from "../registry/registry";
 import type { SubscriberDeps } from "./subscriber";
 import { Subscriber } from "./subscriber";
 
 // -- helpers --
+
+// handlersFor builds the pattern-indexed fan-out lookup the subscriber expects,
+// mirroring Handle.eventHandlers: exact-name buckets in registration order,
+// empty for anything unregistered. Wildcards never match locally (ADR-0002).
+function handlersFor(
+	entries: Array<{ pattern: string; fn: EventHandlerFn }>,
+): (pattern: string) => readonly EventHandlerFn[] {
+	const byPattern = new Map<string, EventHandlerFn[]>();
+	for (const e of entries) {
+		const bucket = byPattern.get(e.pattern);
+		if (bucket) bucket.push(e.fn);
+		else byPattern.set(e.pattern, [e.fn]);
+	}
+	return (pattern) => byPattern.get(pattern) ?? [];
+}
+
+// Captured before any spy replaces the global, so test waits never show up in
+// the recorded reconnect delays.
+const realSetTimeout = globalThis.setTimeout;
+const wait = (ms: number): Promise<void> =>
+	new Promise((resolve) => {
+		realSetTimeout(resolve, ms);
+	});
 
 function makeSchema() {
 	return {
 		input: {
 			encode: (_val: unknown) => new Uint8Array(),
 			decode: (_buf: Uint8Array) => ({ amount: 42 }),
-			contractHash: () => "hash-input",
 			toJsonSchema: () => ({}),
 		},
 		output: {
 			encode: (_val: unknown) => new Uint8Array(),
 			decode: (_buf: Uint8Array) => ({}),
-			contractHash: () => "hash-output",
 			toJsonSchema: () => ({}),
 		},
 	};
@@ -126,12 +148,12 @@ describe("Subscriber", () => {
 	it("HandlerSuccess_SendsAck", async () => {
 		const handlerFn = mock(async () => {});
 		const { deps, fake } = makeDeps({
-			handlers: () => [
+			handlers: handlersFor([
 				{
 					pattern: "order.created",
 					fn: handlerFn,
 				},
-			],
+			]),
 		});
 
 		const sub = new Subscriber(deps);
@@ -151,14 +173,14 @@ describe("Subscriber", () => {
 
 	it("HandlerThrows_SendsNack", async () => {
 		const { deps, fake } = makeDeps({
-			handlers: () => [
+			handlers: handlersFor([
 				{
 					pattern: "order.created",
 					fn: async () => {
 						throw new Error("processing failed");
 					},
 				},
-			],
+			]),
 		});
 
 		const sub = new Subscriber(deps);
@@ -179,10 +201,10 @@ describe("Subscriber", () => {
 		const fn1 = mock(async () => {});
 		const fn2 = mock(async () => {});
 		const { deps, fake } = makeDeps({
-			handlers: () => [
+			handlers: handlersFor([
 				{ pattern: "order.created", fn: fn1 },
 				{ pattern: "order.created", fn: fn2 },
-			],
+			]),
 		});
 
 		const sub = new Subscriber(deps);
@@ -201,7 +223,7 @@ describe("Subscriber", () => {
 		// longer dedups — handler contract requires idempotency.
 		const fn = mock(async () => {});
 		const { deps, fake } = makeDeps({
-			handlers: () => [{ pattern: "order.created", fn }],
+			handlers: handlersFor([{ pattern: "order.created", fn }]),
 		});
 
 		const sub = new Subscriber(deps);
@@ -221,12 +243,12 @@ describe("Subscriber", () => {
 
 	it("NoSchema_Nack", async () => {
 		const { deps, fake } = makeDeps({
-			handlers: () => [
+			handlers: handlersFor([
 				{
 					pattern: "unknown.event",
 					fn: async () => {},
 				},
-			],
+			]),
 		});
 
 		const sub = new Subscriber(deps);
@@ -275,7 +297,7 @@ describe("Subscriber", () => {
 		// Dispatch is by exact event-name match. Wildcards live on the server.
 		const handlerFn = mock(async () => {});
 		const { deps, fake } = makeDeps({
-			handlers: () => [{ pattern: "payment.charged", fn: handlerFn }],
+			handlers: handlersFor([{ pattern: "payment.charged", fn: handlerFn }]),
 		});
 
 		const sub = new Subscriber(deps);
@@ -296,7 +318,7 @@ describe("Subscriber", () => {
 	it("NameMismatch_AutoAck", async () => {
 		const handlerFn = mock(async () => {});
 		const { deps, fake } = makeDeps({
-			handlers: () => [{ pattern: "payment.charged", fn: handlerFn }],
+			handlers: handlersFor([{ pattern: "payment.charged", fn: handlerFn }]),
 		});
 
 		const sub = new Subscriber(deps);
@@ -318,7 +340,7 @@ describe("Subscriber", () => {
 	it("Ack_PopulatesEventId", async () => {
 		const handlerFn = mock(async () => {});
 		const { deps, fake } = makeDeps({
-			handlers: () => [{ pattern: "order.created", fn: handlerFn }],
+			handlers: handlersFor([{ pattern: "order.created", fn: handlerFn }]),
 		});
 
 		const sub = new Subscriber(deps);
@@ -341,14 +363,14 @@ describe("Subscriber", () => {
 
 	it("Nack_PopulatesEventId", async () => {
 		const { deps, fake } = makeDeps({
-			handlers: () => [
+			handlers: handlersFor([
 				{
 					pattern: "order.created",
 					fn: async () => {
 						throw new Error("fail");
 					},
 				},
-			],
+			]),
 		});
 
 		const sub = new Subscriber(deps);
@@ -385,7 +407,7 @@ describe("Subscriber", () => {
 			} as any,
 			schemaIndex: { get: () => undefined },
 			identity: () => ({ serviceId: "svc-1", instanceId: "inst-1" }),
-			handlers: () => [],
+			handlers: handlersFor([]),
 			maxInFlight: 32,
 			logger: { warn: () => {}, error: () => {} },
 			runWithTrace: (_x, fn) => fn(),
@@ -420,7 +442,7 @@ describe("Subscriber", () => {
 			} as any,
 			schemaIndex: { get: () => undefined },
 			identity: () => ({ serviceId: "svc-1", instanceId: "inst-1" }),
-			handlers: () => [],
+			handlers: handlersFor([]),
 			maxInFlight: 32,
 			logger: { warn: () => {}, error: () => {} },
 			runWithTrace: (_x, fn) => fn(),
@@ -441,6 +463,145 @@ describe("Subscriber", () => {
 			expect(connectCount).toBe(cycle + 2);
 		}
 
+		await sub.stop();
+	});
+
+	it("CleanCloses_ClimbTheLadder", async () => {
+		// A runtime that drains streams gracefully must not be reconnected to
+		// once per second forever: only a data frame proves progress, a clean
+		// close does not.
+		const fakes: ReturnType<typeof makeFakeStream>[] = [];
+		const { deps } = makeDeps();
+		const depsMod: SubscriberDeps = {
+			...deps,
+			rpcClient: {
+				subscribe: () => {
+					const f = makeFakeStream();
+					fakes.push(f);
+					return f.stream;
+				},
+				// biome-ignore lint/suspicious/noExplicitAny: minimal stub
+			} as any,
+			reconnectOpts: { ladder: [4, 12, 24], jitterRatio: 0 },
+		};
+
+		const sub = new Subscriber(depsMod);
+		const setSpy = spyOn(globalThis, "setTimeout");
+		let delays: number[];
+		try {
+			sub.start();
+			for (let i = 0; i < 3; i++) {
+				fakes[fakes.length - 1]?.emitter.emit("end");
+				await wait(30);
+			}
+			delays = setSpy.mock.calls.map((c) => c[1] as number);
+		} finally {
+			setSpy.mockRestore();
+		}
+		await sub.stop();
+
+		expect(delays.slice(0, 3)).toEqual([4, 12, 24]);
+	});
+
+	it("DataFrame_ResetsLadder", async () => {
+		const fakes: ReturnType<typeof makeFakeStream>[] = [];
+		const { deps } = makeDeps();
+		const depsMod: SubscriberDeps = {
+			...deps,
+			rpcClient: {
+				subscribe: () => {
+					const f = makeFakeStream();
+					fakes.push(f);
+					return f.stream;
+				},
+				// biome-ignore lint/suspicious/noExplicitAny: minimal stub
+			} as any,
+			reconnectOpts: { ladder: [4, 12, 24], jitterRatio: 0 },
+		};
+
+		const sub = new Subscriber(depsMod);
+		const setSpy = spyOn(globalThis, "setTimeout");
+		let delays: number[];
+		try {
+			sub.start();
+			fakes[fakes.length - 1]?.emitter.emit("end");
+			await wait(20);
+			fakes[fakes.length - 1]?.emitter.emit("data", makeDelivery("d-ladder"));
+			fakes[fakes.length - 1]?.emitter.emit("end");
+			await wait(20);
+			delays = setSpy.mock.calls.map((c) => c[1] as number);
+		} finally {
+			setSpy.mockRestore();
+		}
+		await sub.stop();
+
+		expect(delays.slice(0, 2)).toEqual([4, 4]);
+	});
+
+	it("LateEndFromReplacedStream_DoesNotOpenAThirdStream", async () => {
+		// grpc-js flushes buffered frames before "end", so a dead stream can
+		// outlive a ladder rung. Without the identity guard the late "end" from
+		// stream A drops the live stream B (stop() can no longer cancel it) and
+		// opens a third the runtime rejects with ALREADY_EXISTS.
+		const fakes: ReturnType<typeof makeFakeStream>[] = [];
+		const cancels: number[] = [];
+		const { deps } = makeDeps();
+		const depsMod: SubscriberDeps = {
+			...deps,
+			rpcClient: {
+				subscribe: () => {
+					const f = makeFakeStream();
+					const idx = fakes.push(f) - 1;
+					cancels[idx] = 0;
+					f.stream.cancel = () => {
+						cancels[idx] = (cancels[idx] ?? 0) + 1;
+					};
+					return f.stream;
+				},
+				// biome-ignore lint/suspicious/noExplicitAny: minimal stub
+			} as any,
+			reconnectOpts: { ladder: [4], jitterRatio: 0 },
+		};
+
+		const sub = new Subscriber(depsMod);
+		sub.start();
+		fakes[0]?.emitter.emit("error", new Error("broken"));
+		await wait(25);
+		expect(fakes).toHaveLength(2);
+
+		fakes[0]?.emitter.emit("end");
+		await wait(25);
+		expect(fakes).toHaveLength(2);
+
+		await sub.stop();
+		expect(cancels[1]).toBe(1);
+	});
+
+	it("NoIdentity_RetriesUntilAvailable", async () => {
+		const fakes: ReturnType<typeof makeFakeStream>[] = [];
+		let id: { serviceId: string; instanceId: string } | null = null;
+		const { deps } = makeDeps();
+		const depsMod: SubscriberDeps = {
+			...deps,
+			identity: () => id,
+			rpcClient: {
+				subscribe: () => {
+					const f = makeFakeStream();
+					fakes.push(f);
+					return f.stream;
+				},
+				// biome-ignore lint/suspicious/noExplicitAny: minimal stub
+			} as any,
+			reconnectOpts: { ladder: [4], jitterRatio: 0 },
+		};
+
+		const sub = new Subscriber(depsMod);
+		sub.start();
+		expect(fakes).toHaveLength(0);
+
+		id = { serviceId: "svc-1", instanceId: "inst-1" };
+		await wait(25);
+		expect(fakes).toHaveLength(1);
 		await sub.stop();
 	});
 });

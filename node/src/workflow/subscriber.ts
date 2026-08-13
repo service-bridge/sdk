@@ -1,8 +1,9 @@
-// Owner-side workflow subscriber: long-poll `Workflows.Subscribe`, hand each
-// RunAssignment to the thin runner, manage lease heartbeat.
+// Owner-side workflow subscriber: consume `Workflows.Subscribe`, hand each
+// RunAssignment to the thin runner, manage lease heartbeats.
 //
-// Reconnect backoff is the shared utils/reconnect-ladder (jittered ladder),
-// same as events and job subscribers.
+// Stream lifecycle (open / identity guard / reconnect ladder / cancellation)
+// belongs to registry/StreamSupervisor — same machine as events and job
+// subscribers.
 //
 // Telemetry (ADR 0003 §1): the runtime owns the WORKFLOW.RUN root op. The SDK wraps
 // dispatch in runWithTrace(parent = run root) to establish the run-root trace
@@ -13,25 +14,34 @@
 //
 // @internal — см. ./README.md
 
-import type { ClientReadableStream, ServiceError } from "@grpc/grpc-js";
+import type { ClientReadableStream } from "@grpc/grpc-js";
 import type { ServiceBridge } from "../connection/service-bridge";
 import type { Logger } from "../events/publisher";
 import type {
 	RunAssignment,
 	WorkflowsClient,
 } from "../pb/servicebridge/v1/workflows";
+import { StreamSupervisor } from "../registry/stream-supervisor";
 import { runWithTrace } from "../telemetry/context";
 import { parseXSbTrace } from "../telemetry/wire-trace";
-import { reconnectDelay } from "../utils/reconnect-ladder";
+import type { ReconnectDelayOptions } from "../utils/reconnect-ladder";
 import { type RunnerDeps, RunnerParkedError, run } from "./runner";
 import type { Step } from "./types";
 
 const HEARTBEAT_INTERVAL_MS = 10_000;
 
-interface SubscriberDeps {
-	rpc: WorkflowsClient;
+// SubscriberIdentity is the session identity the subscriber binds its stream
+// and its lease heartbeats to. Resolved per call — `Control.RefreshCert` mints
+// a fresh instance_id on every rotation.
+// @internal
+export interface SubscriberIdentity {
 	serviceId: string;
 	instanceId: string;
+}
+
+interface SubscriberDeps {
+	rpc: WorkflowsClient;
+	identity: () => SubscriberIdentity | null;
 	deps: RunnerDeps;
 	logger: Logger;
 	// lookupLocalGraph resolves a workflow name to the locally-registered
@@ -40,6 +50,10 @@ interface SubscriberDeps {
 	// has no handler for that name.
 	lookupLocalGraph: (workflowName: string) => Step[] | null;
 	sb?: ServiceBridge;
+	// reconnectOpts pins the backoff ladder/jitter; tests inject a short
+	// deterministic ladder so reconnect behaviour is observable in milliseconds.
+	// @internal
+	reconnectOpts?: ReconnectDelayOptions;
 }
 
 // FrozenPlan — on-wire JSON shape produced by `WorkflowDomain.handle` and
@@ -50,71 +64,101 @@ interface FrozenPlan {
 }
 
 export class WorkflowSubscriber {
-	private stream: ClientReadableStream<RunAssignment> | null = null;
 	private closed = false;
-	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-	private heartbeats = new Map<
-		string,
-		{ timer: NodeJS.Timeout; leaseEpoch: number }
-	>();
+	private readonly supervisor: StreamSupervisor<
+		ClientReadableStream<RunAssignment>,
+		RunAssignment
+	>;
+	// Leases in flight, keyed by runId. leaseEpoch pins the assignment a lease
+	// belongs to: a re-assignment of the same runId bumps the epoch, and only
+	// the matching exec may retire it.
+	private readonly leases = new Map<string, number>();
+	// One sweep timer drives every lease. A timer per run turns 500 concurrent
+	// runs into 500 timers, all doing the same thing on the same period.
+	private tickTimer: ReturnType<typeof setInterval> | null = null;
+	// instanceId the live stream was opened with. Cert rotation mints a new one;
+	// a stream still carrying the retired id keeps the runtime assigning runs to
+	// an instance it has already torn down.
+	private openedInstanceId: string | null = null;
 
-	constructor(private readonly d: SubscriberDeps) {}
-
-	start(): void {
-		void this.connectLoop(0);
-	}
-
-	close(): void {
-		this.closed = true;
-		this.stream?.cancel();
-		for (const t of this.heartbeats.values()) clearInterval(t.timer);
-		this.heartbeats.clear();
-		if (this.reconnectTimer) {
-			clearTimeout(this.reconnectTimer);
-			this.reconnectTimer = null;
-		}
-	}
-
-	private async connectLoop(attempt: number): Promise<void> {
-		while (!this.closed) {
-			try {
-				await this.runOnce();
-				attempt = 0;
-			} catch (err) {
-				if (this.closed) return;
-				this.d.logger.warn(
-					"workflow subscriber: stream error",
-					(err as Error).message,
-				);
-			}
-			const delay = reconnectDelay(attempt++);
-			await new Promise<void>((resolve) => {
-				this.reconnectTimer = setTimeout(() => {
-					this.reconnectTimer = null;
-					resolve();
-				}, delay);
-			});
-		}
-	}
-
-	private runOnce(): Promise<void> {
-		return new Promise((resolve, reject) => {
-			const stream = this.d.rpc.subscribe({
-				serviceId: this.d.serviceId,
-				instanceId: this.d.instanceId,
-			});
-			this.stream = stream;
-
-			stream.on("data", (a: RunAssignment) => {
+	constructor(private readonly d: SubscriberDeps) {
+		this.supervisor = new StreamSupervisor({
+			open: () => this.openStream(),
+			onData: (a) => {
 				void this.dispatch(a).catch((err) => {
 					this.d.logger.error(
 						`workflow run ${a.runId} dispatch failed: ${(err as Error).message}`,
 					);
 				});
-			});
-			stream.on("error", (err: ServiceError) => reject(err));
-			stream.on("end", () => resolve());
+			},
+			onError: (err) =>
+				this.d.logger.warn("workflow subscriber: stream error", err.message),
+			reconnectOpts: d.reconnectOpts,
 		});
+	}
+
+	start(): void {
+		this.closed = false;
+		this.supervisor.start();
+		const timer = setInterval(() => this.tick(), HEARTBEAT_INTERVAL_MS);
+		// Heartbeats must not be the reason a finished process stays alive; the
+		// reconnect timer (inside the supervisor) is the one that holds the loop.
+		timer.unref();
+		this.tickTimer = timer;
+	}
+
+	close(): void {
+		this.closed = true;
+		this.supervisor.stop();
+		this.leases.clear();
+		if (this.tickTimer !== null) {
+			clearInterval(this.tickTimer);
+			this.tickTimer = null;
+		}
+	}
+
+	private openStream(): ClientReadableStream<RunAssignment> | null {
+		const id = this.d.identity();
+		if (!id) return null;
+		this.openedInstanceId = id.instanceId;
+		return this.d.rpc.subscribe({
+			serviceId: id.serviceId,
+			instanceId: id.instanceId,
+		});
+	}
+
+	// tick reconciles identity and sends one heartbeat per live lease.
+	private tick(): void {
+		if (this.closed) return;
+		const id = this.d.identity();
+		if (!id) return;
+		if (
+			this.openedInstanceId !== null &&
+			this.openedInstanceId !== id.instanceId
+		) {
+			this.supervisor.restart();
+		}
+		for (const [runId, leaseEpoch] of this.leases) {
+			try {
+				this.d.rpc.heartbeat(
+					{ runId, instanceId: id.instanceId, leaseEpoch },
+					(err) => {
+						if (err) {
+							this.d.logger.warn(
+								`workflow heartbeat ${runId} failed: ${err.message}`,
+							);
+						}
+					},
+				);
+			} catch (err) {
+				// A synchronous throw means the channel is mid-teardown. Transient —
+				// dropping the lease here would silently strand the run until the
+				// runtime reclaims it, with nothing in the logs to explain why.
+				this.d.logger.warn(
+					`workflow heartbeat ${runId} threw: ${(err as Error).message}`,
+				);
+			}
+		}
 	}
 
 	private async dispatch(a: RunAssignment): Promise<void> {
@@ -191,7 +235,7 @@ export class WorkflowSubscriber {
 					);
 				}
 			} finally {
-				this.stopHeartbeat(a.runId);
+				this.stopHeartbeat(a.runId, a.leaseEpoch);
 				// Telemetry: WORKFLOW.RUN END is emitted by the runtime when
 				// CompleteRun/Cancel commits. SDK no longer owns root-op lifecycle.
 			}
@@ -209,38 +253,15 @@ export class WorkflowSubscriber {
 
 	private startHeartbeat(runId: string, leaseEpoch: number): void {
 		if (this.closed) return;
-		// A re-dispatched runId (lease expiry → re-assignment) must replace the
-		// old timer, not orphan it: an overwritten map entry leaks the interval
-		// and its closure forever.
-		this.stopHeartbeat(runId);
-		const timer = setInterval(() => {
-			if (this.closed) {
-				clearInterval(timer);
-				return;
-			}
-			try {
-				this.d.rpc.heartbeat(
-					{ runId, instanceId: this.d.instanceId, leaseEpoch },
-					(err) => {
-						if (err)
-							this.d.logger.warn(
-								`workflow heartbeat ${runId} failed: ${err.message}`,
-							);
-					},
-				);
-			} catch {
-				clearInterval(timer);
-				this.heartbeats.delete(runId);
-			}
-		}, HEARTBEAT_INTERVAL_MS);
-		this.heartbeats.set(runId, { timer, leaseEpoch });
+		this.leases.set(runId, leaseEpoch);
 	}
 
-	private stopHeartbeat(runId: string): void {
-		const t = this.heartbeats.get(runId);
-		if (t) {
-			clearInterval(t.timer);
-			this.heartbeats.delete(runId);
-		}
+	// stopHeartbeat retires a lease only if the caller still owns it. A run
+	// re-assigned while the previous exec is still unwinding bumps the epoch;
+	// without this check the old exec's `finally` kills the new assignment's
+	// heartbeat, the lease expires, the run is re-assigned again — livelock.
+	private stopHeartbeat(runId: string, leaseEpoch: number): void {
+		if (this.leases.get(runId) !== leaseEpoch) return;
+		this.leases.delete(runId);
 	}
 }

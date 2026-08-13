@@ -1,8 +1,10 @@
 // @internal — см. ./README.md
 
-import type { ClientReadableStream, ServiceError } from "@grpc/grpc-js";
+import type { ClientReadableStream } from "@grpc/grpc-js";
 import type { JobExecution, JobsClient } from "../pb/servicebridge/v1/jobs";
-import { reconnectDelay } from "../utils/reconnect-ladder";
+import { StreamSupervisor } from "../registry/stream-supervisor";
+import type { ReconnectDelayOptions } from "../utils/reconnect-ladder";
+import { Semaphore, SemaphoreAbortedError } from "../utils/semaphore";
 import type { JobDomain } from "./domain";
 import type { JobHandler, JobHandlerCtx, JobOpts } from "./types";
 
@@ -19,35 +21,6 @@ export interface IdentityProvider {
 	instanceId: string;
 }
 
-// Semaphore limits concurrent in-flight job executions.
-class Semaphore {
-	private _count: number;
-	private readonly _queue: Array<() => void> = [];
-
-	constructor(limit: number) {
-		this._count = limit;
-	}
-
-	acquire(): Promise<void> {
-		if (this._count > 0) {
-			this._count--;
-			return Promise.resolve();
-		}
-		return new Promise((resolve) => {
-			this._queue.push(resolve);
-		});
-	}
-
-	release(): void {
-		const next = this._queue.shift();
-		if (next) {
-			next();
-		} else {
-			this._count++;
-		}
-	}
-}
-
 // @public — см. ./README.md
 export interface SubscriberDeps {
 	rpcClient: JobsClient;
@@ -59,15 +32,24 @@ export interface SubscriberDeps {
 	// trace. Mandatory: a missing hook would silently drop trace propagation
 	// into the job handler.
 	runWithTrace: (xSbTrace: string, fn: () => Promise<void>) => Promise<void>;
+	// reconnectOpts pins the backoff ladder/jitter; tests inject a short
+	// deterministic ladder so reconnect behaviour is observable in milliseconds.
+	// @internal
+	reconnectOpts?: ReconnectDelayOptions;
 }
 
 export class JobSubscriber {
-	private _stream: ClientReadableStream<JobExecution> | null = null;
 	private _closed = false;
-	private _reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	// Released on stop() so executions still queued on a per-job semaphore are
+	// dropped instead of starting a handler after shutdown.
+	private _stopping = new AbortController();
 	private _heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 	private _heartbeatFailures = 0;
 	private readonly _semaphores = new Map<string, Semaphore>();
+	private readonly supervisor: StreamSupervisor<
+		ClientReadableStream<JobExecution>,
+		JobExecution
+	>;
 	private readonly runWithTrace: (
 		xSbTrace: string,
 		fn: () => Promise<void>,
@@ -75,66 +57,41 @@ export class JobSubscriber {
 
 	constructor(private readonly d: SubscriberDeps) {
 		this.runWithTrace = d.runWithTrace;
-	}
-
-	start(): void {
-		void this.connectLoop(0);
-		this.startHeartbeat();
-	}
-
-	async stop(): Promise<void> {
-		this._closed = true;
-		this.stopHeartbeat();
-		this._stream?.cancel();
-		if (this._reconnectTimer) {
-			clearTimeout(this._reconnectTimer);
-			this._reconnectTimer = null;
-		}
-	}
-
-	private async connectLoop(attempt: number): Promise<void> {
-		while (!this._closed) {
-			try {
-				await this.runOnce();
-				attempt = 0;
-			} catch (err) {
-				if (this._closed) return;
-				this.d.logger.warn(
-					`jobs subscriber: stream error: ${(err as Error).message}`,
-				);
-			}
-			const delay = reconnectDelay(attempt++);
-			await new Promise<void>((resolve) => {
-				this._reconnectTimer = setTimeout(() => {
-					this._reconnectTimer = null;
-					resolve();
-				}, delay);
-			});
-		}
-	}
-
-	private runOnce(): Promise<void> {
-		return new Promise((resolve, reject) => {
-			const id = this.d.identity();
-			if (!id) {
-				reject(new Error("jobs subscriber: no identity yet"));
-				return;
-			}
-			const stream = this.d.rpcClient.subscribe({
-				serviceId: id.serviceId,
-				instanceId: id.instanceId,
-			});
-			this._stream = stream;
-
-			stream.on("data", (exec: JobExecution) => {
+		this.supervisor = new StreamSupervisor({
+			open: () => this.openStream(),
+			onData: (exec) => {
 				void this.dispatch(exec).catch((err) => {
 					this.d.logger.error(
 						`jobs: dispatch error for execution ${exec.executionId}: ${(err as Error).message}`,
 					);
 				});
-			});
-			stream.on("error", (err: ServiceError) => reject(err));
-			stream.on("end", () => resolve());
+			},
+			onError: (err) =>
+				this.d.logger.warn(`jobs subscriber: stream error: ${err.message}`),
+			reconnectOpts: d.reconnectOpts,
+		});
+	}
+
+	start(): void {
+		this._closed = false;
+		this._stopping = new AbortController();
+		this.supervisor.start();
+		this.startHeartbeat();
+	}
+
+	async stop(): Promise<void> {
+		this._closed = true;
+		this._stopping.abort();
+		this.stopHeartbeat();
+		this.supervisor.stop();
+	}
+
+	private openStream(): ClientReadableStream<JobExecution> | null {
+		const id = this.d.identity();
+		if (!id) return null;
+		return this.d.rpcClient.subscribe({
+			serviceId: id.serviceId,
+			instanceId: id.instanceId,
 		});
 	}
 
@@ -158,7 +115,19 @@ export class JobSubscriber {
 		const maxConcurrent = reg.opts.maxConcurrent ?? 0;
 		const sem = this.getSemaphore(exec.jobName, maxConcurrent);
 
-		await sem.acquire();
+		try {
+			await sem.acquire(this._stopping.signal);
+		} catch (err) {
+			if (!(err instanceof SemaphoreAbortedError)) throw err;
+			// Without the signal a waiter queued behind a running handler would get
+			// its slot after stop() and run the handler on a subscriber that is
+			// already shut down. Dropping it is safe: the lease expires and the
+			// runtime re-assigns the execution.
+			this.d.logger.warn(
+				`jobs: stopped while queued, dropping execution ${exec.executionId}`,
+			);
+			return;
+		}
 		try {
 			await this.run(exec, reg.fn, reg.opts, id.instanceId);
 		} finally {
@@ -252,14 +221,19 @@ export class JobSubscriber {
 		const existing = this._semaphores.get(jobName);
 		if (existing) return existing;
 		const limit = maxConcurrent > 0 ? maxConcurrent : Number.MAX_SAFE_INTEGER;
-		const sem = new Semaphore(limit);
+		// Unbounded wait queue, unlike the inbound RPC path which sheds load on a
+		// full queue. An execution arriving here already holds a runtime-issued
+		// lease and the runtime is the one rate-limiting dispatch; shedding it
+		// client-side would not reject a request, it would abandon work the
+		// runtime believes this instance owns until the lease expires.
+		const sem = new Semaphore(limit, Number.MAX_SAFE_INTEGER);
 		this._semaphores.set(jobName, sem);
 		return sem;
 	}
 
 	private startHeartbeat(): void {
 		this._heartbeatFailures = 0;
-		this._heartbeatTimer = setInterval(() => {
+		const timer = setInterval(() => {
 			if (this._closed) {
 				this.stopHeartbeat();
 				return;
@@ -271,26 +245,34 @@ export class JobSubscriber {
 					{ serviceId: id.serviceId, instanceId: id.instanceId },
 					(err) => {
 						if (err) {
-							this._heartbeatFailures++;
-							this.d.logger.warn(
-								`jobs: heartbeat failed (${this._heartbeatFailures}/${HEARTBEAT_FAIL_THRESHOLD}): ${err.message}`,
-							);
-							if (this._heartbeatFailures >= HEARTBEAT_FAIL_THRESHOLD) {
-								this.d.logger.warn(
-									"jobs: heartbeat threshold reached, reconnecting",
-								);
-								this._stream?.cancel();
-								this._heartbeatFailures = 0;
-							}
+							this.onHeartbeatFailure(err.message);
 						} else {
 							this._heartbeatFailures = 0;
 						}
 					},
 				);
-			} catch {
-				this.stopHeartbeat();
+			} catch (err) {
+				// A synchronous throw means the channel is mid-teardown. Transient —
+				// killing the timer here would silently strand the lease until the
+				// runtime reclaims it, with nothing in the logs to explain why.
+				this.onHeartbeatFailure((err as Error).message);
 			}
 		}, HEARTBEAT_INTERVAL_MS);
+		// Heartbeat must not be the reason a finished process stays alive; the
+		// reconnect timer (inside the supervisor) is the one that holds the loop.
+		timer.unref();
+		this._heartbeatTimer = timer;
+	}
+
+	private onHeartbeatFailure(reason: string): void {
+		this._heartbeatFailures++;
+		this.d.logger.warn(
+			`jobs: heartbeat failed (${this._heartbeatFailures}/${HEARTBEAT_FAIL_THRESHOLD}): ${reason}`,
+		);
+		if (this._heartbeatFailures < HEARTBEAT_FAIL_THRESHOLD) return;
+		this.d.logger.warn("jobs: heartbeat threshold reached, reconnecting");
+		this._heartbeatFailures = 0;
+		this.supervisor.restart();
 	}
 
 	private stopHeartbeat(): void {
