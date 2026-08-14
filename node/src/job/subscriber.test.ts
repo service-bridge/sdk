@@ -52,6 +52,7 @@ interface Harness {
 	warns: string[];
 	domain: JobDomain;
 	results: unknown[];
+	delays: number[];
 	last(): FakeStream;
 	failHeartbeat(msg: string | null): void;
 }
@@ -63,6 +64,7 @@ function makeHarness(
 	} = {},
 ): Harness {
 	const streams: FakeStream[] = [];
+	const delays: number[] = [];
 	const requests: Array<{ serviceId: string; instanceId: string }> = [];
 	const heartbeats: Array<{ serviceId: string; instanceId: string }> = [];
 	const warns: string[] = [];
@@ -100,6 +102,7 @@ function makeHarness(
 		},
 		runWithTrace: (_xSbTrace, fn) => fn(),
 		reconnectOpts: opts.reconnectOpts ?? { ladder: [4], jitterRatio: 0 },
+		onSchedule: (ms) => delays.push(ms),
 	};
 
 	return {
@@ -110,6 +113,7 @@ function makeHarness(
 		warns,
 		domain,
 		results,
+		delays,
 		last: () => streams[streams.length - 1]!,
 		failHeartbeat: (msg) => {
 			heartbeatError = msg;
@@ -123,16 +127,6 @@ function makeHarness(
 async function waitForReconnect(h: Harness, closed: unknown): Promise<void> {
 	for (let i = 0; i < 400 && h.last() === closed; i++) {
 		await wait(5);
-	}
-}
-
-async function recordedDelays(body: () => Promise<void>): Promise<number[]> {
-	const setSpy = spyOn(globalThis, "setTimeout");
-	try {
-		await body();
-		return setSpy.mock.calls.map((c) => c[1] as number);
-	} finally {
-		setSpy.mockRestore();
 	}
 }
 
@@ -186,38 +180,34 @@ describe("JobSubscriber stream", () => {
 		const h = makeHarness({
 			reconnectOpts: { ladder: [4, 12, 24], jitterRatio: 0 },
 		});
-		const delays = await recordedDelays(async () => {
-			h.sub.start();
-			for (let i = 0; i < 3; i++) {
-				const closed = h.last();
-				closed.emit("end");
-				await waitForReconnect(h, closed);
-			}
-		});
+		h.sub.start();
+		for (let i = 0; i < 3; i++) {
+			const closed = h.last();
+			closed.emit("end");
+			await waitForReconnect(h, closed);
+		}
 		await h.sub.stop();
-		expect(delays.slice(0, 3)).toEqual([4, 12, 24]);
+		expect(h.delays.slice(0, 3)).toEqual([4, 12, 24]);
 	});
 
 	it("DataFrame_ResetsLadder", async () => {
 		const h = makeHarness({
 			reconnectOpts: { ladder: [4, 12, 24], jitterRatio: 0 },
 		});
-		const delays = await recordedDelays(async () => {
-			h.sub.start();
-			const first = h.last();
-			first.emit("end");
-			await waitForReconnect(h, first);
-			const second = h.last();
-			second.emit("data", {
-				executionId: "e-1",
-				jobName: "unregistered",
-				xSbTrace: "",
-			});
-			second.emit("end");
-			await waitForReconnect(h, second);
+		h.sub.start();
+		const first = h.last();
+		first.emit("end");
+		await waitForReconnect(h, first);
+		const second = h.last();
+		second.emit("data", {
+			executionId: "e-1",
+			jobName: "unregistered",
+			xSbTrace: "",
 		});
+		second.emit("end");
+		await waitForReconnect(h, second);
 		await h.sub.stop();
-		expect(delays.slice(0, 2)).toEqual([4, 4]);
+		expect(h.delays.slice(0, 2)).toEqual([4, 4]);
 	});
 
 	it("LateEndFromReplacedStream_DoesNotOpenAThirdStream", async () => {

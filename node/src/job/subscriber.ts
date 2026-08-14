@@ -36,6 +36,8 @@ export interface SubscriberDeps {
 	// deterministic ladder so reconnect behaviour is observable in milliseconds.
 	// @internal
 	reconnectOpts?: ReconnectDelayOptions;
+	// onSchedule observes each reconnect delay. See StreamSupervisorDeps.
+	onSchedule?: (delayMs: number) => void;
 }
 
 export class JobSubscriber {
@@ -69,6 +71,7 @@ export class JobSubscriber {
 			onError: (err) =>
 				this.d.logger.warn(`jobs subscriber: stream error: ${err.message}`),
 			reconnectOpts: d.reconnectOpts,
+			onSchedule: d.onSchedule,
 		});
 	}
 

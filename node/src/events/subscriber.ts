@@ -62,6 +62,8 @@ export interface SubscriberDeps {
 	// deterministic ladder so reconnect behaviour is observable in milliseconds.
 	// @internal
 	reconnectOpts?: ReconnectDelayOptions;
+	// onSchedule observes each reconnect delay. See StreamSupervisorDeps.
+	onSchedule?: (delayMs: number) => void;
 	// runWithTrace runs the handler inside an AsyncLocalStorage trace context
 	// derived from envelope.xSbTrace so nested RPC/event calls inherit the trace.
 	// Mandatory: a missing hook would silently drop trace propagation into the
@@ -108,6 +110,7 @@ export class Subscriber {
 			onError: (err) =>
 				this.logger.warn("events: subscriber: stream error", err.message),
 			reconnectOpts: deps.reconnectOpts,
+			onSchedule: deps.onSchedule,
 		});
 	}
 

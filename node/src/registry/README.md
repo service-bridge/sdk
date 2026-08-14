@@ -84,11 +84,12 @@
 | `WatchStream.onPolicyEvaluation(fn)` | `() => void` | — | Подписка на свежую `PolicyEvaluation` (snapshot + live policy update); возвращает unsubscribe |
 | `WatchStream.onPeersChange(fn)` | `() => void` | — | Подписка на `added_peers`/`removed_peers` из update; возвращает unsubscribe |
 | `StreamSupervisor<S, M>` | class @internal | — | Автомат жизненного цикла одного долгоживущего gRPC-стрима. Владеет флагом остановки, единственным pending-таймером реконнекта, identity-guard'ом стрима и счётчиком попыток на лестнице `utils/reconnect-ladder`. Доменный код даёт только `open` (как открыть стрим) и `onData` (что значит фрейм) |
-| `StreamSupervisorDeps<S, M>` | interface @internal | — | `{ open: () => S \| null, onData: (msg: M, stream: S) => void, onError: (err: Error) => void, reconnectOpts?: ReconnectDelayOptions }` |
+| `StreamSupervisorDeps<S, M>` | interface @internal | — | `{ open: () => S \| null, onData: (msg: M, stream: S) => void, onError: (err: Error) => void, reconnectOpts?: ReconnectDelayOptions, onSchedule?: (delayMs: number) => void }` |
 | `StreamSupervisorDeps.open` | `() => S \| null` | — | Открывает свежий стрим. `null` = предусловие не выполнено (нет identity) и трактуется как обрыв: повтор по лестнице. Синхронный throw ловится, уходит в `onError` и тоже даёт повтор |
 | `StreamSupervisorDeps.onData` | `(msg, stream) => void` | — | Каждый фрейм текущего стрима; сам стрим передаётся, чтобы обработчик мог писать ответ в тот же вызов |
 | `StreamSupervisorDeps.onError` | `(err) => void` | — (обязателен) | Нотификация об ошибке стрима. Решение о реконнекте принимает супервизор, не потребитель |
 | `StreamSupervisorDeps.reconnectOpts` | `ReconnectDelayOptions?` | общая лестница + ±20% jitter | Тестовый hook: пиннит лестницу/jitter, чтобы reconnect наблюдался за миллисекунды |
+| `StreamSupervisorDeps.onSchedule` | `((delayMs: number) => void)?` | нет | Тестовый hook: сообщает задержку, которую супервизор собирается выждать. Тест читает лестницу отсюда, а не со шпиона на глобальном `setTimeout` — в одном процессе тот ловит и таймеры супервизоров, оставшихся от предыдущих файлов |
 | `StreamSupervisor.start()` | `() => void` | — | Сбрасывает stop-флаг и счётчик попыток, гасит pending-таймер, открывает стрим |
 | `StreamSupervisor.stop()` | `() => void` | — | Ставит stop-флаг, гасит таймер, `cancel()` текущего стрима. Дальнейшие события мёртвого стрима игнорируются |
 | `StreamSupervisor.restart()` | `() => void` | — | Сбрасывает текущий стрим и открывает новый немедленно, с нулевой ступени. Для протухших параметров стрима (ротация instance_id) и внешнего доказательства смерти (пропущенные heartbeat'ы). No-op после `stop()` |

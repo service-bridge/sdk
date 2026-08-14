@@ -30,7 +30,7 @@ SDK-сторона Durable Events: domain namespace (`EventDomain`), публи�
 | `Subscriber` | class | — | Открывает long-lived bidi Subscribe stream; конструктор принимает `SubscriberDeps`. Жизненный цикл стрима держит `registry/StreamSupervisor`. |
 | `Subscriber.start()` | `() => void` | — | Запускает supervisor: открывает стрим и шлёт `SubscribeInit` первым фреймом. |
 | `Subscriber.stop()` | `async () => void` | — | Отменяет reconnect-таймер, `cancel()` стрима, глушит дальнейшие реконнекты. |
-| `SubscriberDeps` | interface | — | Зависимости Subscriber. Поля: `rpcClient`, `schemaIndex`, `identity`, `handlers`, `maxInFlight?`, `logger?`, `sb?`, `reconnectOpts?`, `runWithTrace`. |
+| `SubscriberDeps` | interface | — | Зависимости Subscriber. Поля: `rpcClient`, `schemaIndex`, `identity`, `handlers`, `maxInFlight?`, `logger?`, `sb?`, `reconnectOpts?`, `onSchedule?`, `runWithTrace`. |
 | `SubscriberDeps.maxInFlight` | `number?` | `32` (`ServiceBridgeOptions.eventsMaxInFlight`) | Макс. параллельных доставок (объявляется серверу в `SubscribeInit.max_in_flight`). |
 | `SubscriberDeps.logger` | `Logger?` | `{ warn: console.warn, error: console.error }` | Логгер для ошибок stream/ack/nack. |
 | `SubscriberDeps.sb` | `ServiceBridge?` | `undefined` | Reserved. EVENT.DELIVER op пишет runtime (ADR 0007 §5); SDK только ack/nack обратно. |
@@ -52,6 +52,7 @@ SDK-сторона Durable Events: domain namespace (`EventDomain`), публи�
 | `DrainerHandle` | interface (`@internal`) | — | `{ kick() }` — edge-triggered wakeup, который Publisher дёргает после INSERT в outbox. |
 | `SubscriberDeps.runWithTrace` | callback | — | (описан в публичном контракте; реализация — `@internal` hook composition root'а.) |
 | `SubscriberDeps.reconnectOpts` | `ReconnectDelayOptions?` (`@internal`) | общая лестница + ±20% jitter | Тестовый hook: пиннит лестницу/jitter, чтобы reconnect-поведение наблюдалось за миллисекунды. |
+| `SubscriberDeps.onSchedule` | `((delayMs: number) => void)?` (`@internal`) | нет | Тестовый hook: наблюдает каждую задержку reconnect. См. `registry/README.md`. |
 | `SubscriberSchemaIndex` | interface (`@internal`) | — | `{ get(name): { contractHash, pair } \| undefined }` — schema-lookup для Subscriber (decode входящих). |
 | `SubscriberDeps.handlers` | `(pattern: string) => readonly EventHandlerFn[]` | — (обязателен) | Fan-out set для одного точного имени события. Композиционный корень отдаёт сюда `Handle.eventHandlers(pattern)` — индекс по pattern, поддерживаемый на регистрации. |
 | `SubscriberIdentity` | interface (`@internal`) | — | `{ serviceId, instanceId }` — идентичность подписчика для `SubscribeInit`. |

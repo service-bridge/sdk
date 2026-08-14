@@ -68,6 +68,7 @@ Domain namespace для durable workflows. Покрывает обе сторо�
 | `WorkflowSubscriber.close()` | `() => void` | Гасит sweep-таймер и pending-таймер реконнекта, `cancel()` стрима, сбрасывает все lease. |
 | `SubscriberDeps.identity` | `() => SubscriberIdentity \| null` | Резолвится на КАЖДЫЙ `Subscribe` и КАЖДЫЙ heartbeat. `null` → стрим не открывается, повтор по лестнице. |
 | `SubscriberDeps.reconnectOpts` | `ReconnectDelayOptions?` | Тестовый hook: пиннит лестницу/jitter, чтобы reconnect наблюдался за миллисекунды. |
+| `SubscriberDeps.onSchedule` | `((delayMs: number) => void)?` | Тестовый hook: наблюдает каждую задержку reconnect. См. `registry/README.md`. |
 | `SubscriberIdentity` | `{serviceId, instanceId}` (`@internal`) | Идентичность сессии, к которой привязаны стрим и lease-heartbeat'ы. |
 | `makeRuntimeOps(rpc, getInstanceId)` | функция (`@internal`) | Адаптер `WorkflowsClient` → `RuntimeOps`. Весь JSON-encoding bridge без бизнес-логики. |
 

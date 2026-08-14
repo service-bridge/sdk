@@ -33,6 +33,11 @@ export interface StreamSupervisorDeps<S extends SupervisedStream, M> {
 	// reconnectOpts pins the backoff ladder/jitter; tests inject a short
 	// deterministic ladder so reconnect behaviour is observable in milliseconds.
 	reconnectOpts?: ReconnectDelayOptions;
+	// onSchedule reports the delay this supervisor is about to wait. Tests read
+	// the climbed ladder from here rather than from a spy on the global timer,
+	// which in one test process also catches the timers of every other
+	// supervisor still running from an earlier file.
+	onSchedule?: (delayMs: number) => void;
 }
 
 // @internal — см. ./README.md
@@ -127,6 +132,7 @@ export class StreamSupervisor<S extends SupervisedStream, M> {
 	private scheduleReconnect(): void {
 		if (this._stopped || this._timer !== null) return;
 		const delay = reconnectDelay(this._attempt++, this.d.reconnectOpts);
+		this.d.onSchedule?.(delay);
 		this._timer = setTimeout(() => {
 			this._timer = null;
 			this.open();
