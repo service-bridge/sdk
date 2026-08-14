@@ -105,7 +105,10 @@ describe("64-bit fields", () => {
 			output: "WideResponse",
 		});
 
-		const bytes = pair.input.encode({ amountMs: 1_700_000_000_000, counter: 42 });
+		const bytes = pair.input.encode({
+			amountMs: 1_700_000_000_000,
+			counter: 42,
+		});
 		const back = pair.input.decode(bytes) as {
 			amountMs: unknown;
 			counter: unknown;
