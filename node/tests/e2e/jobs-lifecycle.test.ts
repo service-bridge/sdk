@@ -277,9 +277,11 @@ describe("jobs-lifecycle: catchup after a runtime-down gap", () => {
 		);
 		await sb.start();
 		await waitFor(() => sb!.identity() !== null, 8_000, "reconnected");
+		const reconnectedAt = Date.now();
 
-		const gapDurationMs = Date.now() - gapStart;
+		const gapDurationMs = reconnectedAt - gapStart;
 		const expectedMissed = Math.floor(gapDurationMs / 500);
+		expect(expectedMissed).toBeGreaterThanOrEqual(8);
 
 		await waitFor(
 			() => callTimestamps.length > firesBefore + 1,
@@ -287,15 +289,15 @@ describe("jobs-lifecycle: catchup after a runtime-down gap", () => {
 			"fresh ticks after restart",
 		);
 
-		// catchup=skip: extra calls after restart are fresh ticks only, far below
-		// a backfill of the missed ticks.
-		const firesAfter = callTimestamps.length - firesBefore;
-		const budgetWithNoBackfill = 4;
-		const backfillThreshold = Math.max(
-			budgetWithNoBackfill,
-			expectedMissed / 2,
+		// Counted inside a wall-clock window, not as a running total: the total
+		// keeps growing while the assertion waits, so on a loaded machine fresh
+		// ticks alone can outrun any budget stated as a count. A backfill lands
+		// as a burst the moment the subscriber attaches, so the window separates
+		// the two: 1.5s holds 3 fresh ticks at interval=500, never 8+ missed ones.
+		const burst = callTimestamps.filter(
+			(t) => t >= reconnectedAt && t < reconnectedAt + 1_500,
 		);
-		expect(firesAfter).toBeLessThan(backfillThreshold);
+		expect(burst.length).toBeLessThanOrEqual(5);
 	}, 180_000);
 });
 
