@@ -128,7 +128,10 @@ func Subscribe[T any](s *Subscriber, name string, fn Handler[T]) error {
 	if fn == nil {
 		return fmt.Errorf("events: subscribe %q: nil handler: %w", name, ErrInvalidConfig)
 	}
-	if !ValidEventName(name) {
+	// A subscription may carry a wildcard where a publish may not: the runtime
+	// routes on the pattern, and refusing it here would drop a capability the
+	// wire contract offers.
+	if !ValidEventPattern(name) {
 		return fmt.Errorf("events: subscribe %q: %w", name, ErrInvalidName)
 	}
 	codec := s.cfg.Codec
@@ -176,10 +179,19 @@ func (s *Subscriber) addHandler(name string, h rawHandler) {
 	s.handlers[name] = append(s.handlers[name], h)
 }
 
+// handlersFor collects every handler whose subscription covers the delivered
+// name. Exact names hit the map directly; a wildcard subscription is stored
+// under its pattern and only a match finds it.
 func (s *Subscriber) handlersFor(name string) []rawHandler {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.handlers[name]
+	out := s.handlers[name]
+	for pattern, hs := range s.handlers {
+		if pattern != name && MatchEventPattern(pattern, name) {
+			out = append(out, hs...)
+		}
+	}
+	return out
 }
 
 // open builds one stream generation and sends the init frame on it. Identity is

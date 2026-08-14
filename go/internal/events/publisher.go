@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -42,6 +43,57 @@ var (
 
 // ValidEventName reports whether the runtime would accept name.
 func ValidEventName(name string) bool { return eventNameRE.MatchString(name) }
+
+// eventPatternRE accepts a subscription pattern: the same segments as a name,
+// plus `*` for exactly one segment and `#` for one or more. The runtime routes
+// on these (registry.proto, EventSubscription.pattern), so a subscription may
+// carry them where a publish may not.
+var eventPatternRE = regexp.MustCompile(`^([a-z0-9_-]+|\*|#)(\.([a-z0-9_-]+|\*|#))*$`)
+
+// ValidEventPattern reports whether the runtime would accept pattern as a
+// subscription.
+func ValidEventPattern(pattern string) bool { return eventPatternRE.MatchString(pattern) }
+
+// MatchEventPattern reports whether a delivered event name is covered by a
+// subscription pattern.
+//
+// The runtime already routed the delivery, so this decides only which local
+// handlers see it. Matching locally is what makes a wildcard subscription
+// actually work end to end: a pattern registered server-side delivers events
+// whose concrete names no exact-match lookup would ever find, and the delivery
+// would be acked with nothing run.
+func MatchEventPattern(pattern, name string) bool {
+	if pattern == name {
+		return true
+	}
+	return matchSegments(strings.Split(pattern, "."), strings.Split(name, "."))
+}
+
+func matchSegments(pat, seg []string) bool {
+	if len(pat) == 0 {
+		return len(seg) == 0
+	}
+	switch pat[0] {
+	case "#":
+		// `#` covers one or more segments, so try every split it could take.
+		for i := 1; i <= len(seg); i++ {
+			if matchSegments(pat[1:], seg[i:]) {
+				return true
+			}
+		}
+		return false
+	case "*":
+		if len(seg) == 0 {
+			return false
+		}
+		return matchSegments(pat[1:], seg[1:])
+	default:
+		if len(seg) == 0 || pat[0] != seg[0] {
+			return false
+		}
+		return matchSegments(pat[1:], seg[1:])
+	}
+}
 
 // Identity is the live session identity stamped on outgoing frames. Read per
 // use: instance_id changes on every certificate rotation.

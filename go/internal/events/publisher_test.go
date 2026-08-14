@@ -500,3 +500,58 @@ func TestPublishReportsAnIdentifierFailure(t *testing.T) {
 		t.Fatalf("Publish error = %v, want the id failure", err)
 	}
 }
+
+// A subscription may carry a wildcard where a publish may not, and the handler
+// has to be found locally too: the runtime routes the delivery, but a pattern
+// stored under itself is invisible to an exact-name lookup, so the delivery
+// would be acked with nothing run.
+func TestEventPatternsAcceptWildcardsAndMatchDeliveredNames(t *testing.T) {
+	t.Parallel()
+
+	for _, pattern := range []string{"order.created", "order.*", "order.#", "*", "#", "*.created"} {
+		if !ValidEventPattern(pattern) {
+			t.Errorf("pattern %q must be accepted for a subscription", pattern)
+		}
+	}
+	// A publish still refuses them: only a subscription routes on patterns.
+	for _, name := range []string{"order.*", "order.#", "*"} {
+		if ValidEventName(name) {
+			t.Errorf("name %q must be refused for a publish", name)
+		}
+	}
+	for _, bad := range []string{"", "Order.Created", "order..created", "order.*x"} {
+		if ValidEventPattern(bad) {
+			t.Errorf("pattern %q must be refused", bad)
+		}
+	}
+
+	match := []struct{ pattern, name string }{
+		{"order.created", "order.created"},
+		{"order.*", "order.created"},
+		{"*.created", "order.created"},
+		{"order.#", "order.created"},
+		{"order.#", "order.eu.created"},
+		{"#", "order.eu.created"},
+		{"*", "order"},
+	}
+	for _, c := range match {
+		if !MatchEventPattern(c.pattern, c.name) {
+			t.Errorf("%q must cover %q", c.pattern, c.name)
+		}
+	}
+
+	miss := []struct{ pattern, name string }{
+		{"order.created", "order.updated"},
+		// `*` is exactly one segment, so it cannot span two.
+		{"order.*", "order.eu.created"},
+		{"*", "order.created"},
+		// `#` is one or more, never zero.
+		{"order.#", "order"},
+		{"payment.*", "order.created"},
+	}
+	for _, c := range miss {
+		if MatchEventPattern(c.pattern, c.name) {
+			t.Errorf("%q must not cover %q", c.pattern, c.name)
+		}
+	}
+}
