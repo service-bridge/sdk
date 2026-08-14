@@ -154,7 +154,11 @@ function typeToSerializer(
 		},
 		decode(bytes: Uint8Array): unknown {
 			const msg = type.decode(bytes);
-			return type.toObject(msg, { defaults: true });
+			// Without longs, a 64-bit field decodes to a {low, high, unsigned}
+			// object, so arithmetic on it silently yields NaN and a Go peer sending
+			// the same field reads back a number. Values past 2^53 lose precision
+			// here — a narrower failure than every 64-bit field being unusable.
+			return type.toObject(msg, { defaults: true, longs: Number });
 		},
 		toJsonSchema(): Record<string, unknown> {
 			return jsonSchema;

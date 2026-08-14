@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package serde.test;
+
+// A 64-bit field decodes to a {low, high, unsigned} object unless the
+// serializer asks for numbers, which breaks arithmetic in handler code and
+// disagrees with what a Go peer sends for the same field.
+message WideRequest {
+  int64  amount_ms = 1;
+  uint64 counter   = 2;
+}
+
+message WideResponse {
+  int64 total_ms = 1;
+}

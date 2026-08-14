@@ -96,3 +96,27 @@ describe("buildSchemaPair", () => {
 		expect(() => pair.input.encode({ userId: 42 })).toThrow();
 	});
 });
+
+describe("64-bit fields", () => {
+	it("decode to numbers, not to Long objects", async () => {
+		const pair = await buildSchemaPair({
+			protoFile: `${import.meta.dir}/testdata/wide-ints.proto`,
+			input: "WideRequest",
+			output: "WideResponse",
+		});
+
+		const bytes = pair.input.encode({ amountMs: 1_700_000_000_000, counter: 42 });
+		const back = pair.input.decode(bytes) as {
+			amountMs: unknown;
+			counter: unknown;
+		};
+
+		// Without this the value arrives as {low, high, unsigned}: arithmetic on
+		// it silently yields NaN, and a Go peer sending the same field reads back
+		// a plain number.
+		expect(typeof back.amountMs).toBe("number");
+		expect(back.amountMs).toBe(1_700_000_000_000);
+		expect(typeof back.counter).toBe("number");
+		expect(back.counter).toBe(42);
+	});
+});

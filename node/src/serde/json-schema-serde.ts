@@ -195,7 +195,9 @@ function typeToSerializer(type: protobuf.Type): Serializer {
 		},
 		decode(bytes: Uint8Array): unknown {
 			const msg = type.decode(bytes);
-			return type.toObject(msg, { defaults: true });
+			// Same reason as the .proto path: a 64-bit field would otherwise arrive
+			// as a {low, high, unsigned} object and break arithmetic silently.
+			return type.toObject(msg, { defaults: true, longs: Number });
 		},
 		toJsonSchema(): Record<string, unknown> {
 			return jsonSchema;
