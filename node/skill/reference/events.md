@@ -11,6 +11,7 @@ sb.event.define(name: string, spec?: SchemaSpec): void
 - Call before `await sb.start()`, on **both** publisher and subscriber (each indexes schemas locally to encode/decode; there's no global decoder registry).
 - `name` must match `^[a-z0-9_-]+(\.[a-z0-9_-]+)*$` (dotted segments, lowercase). A bad name throws `InvalidEventNameError`.
 - **Schema:** the proto needs a `service` block, and you reference the message by `method` — the SDK resolves the input message from the rpc of that name. (Event names contain dots, so they can't be rpc names directly; pick a valid rpc identifier for `method`.) Alternatively pass explicit `input` **and** `output`. Passing `input` alone does **not** resolve.
+- **Only the payload is the contract.** The reply half the spec format demands is never encoded, decoded or hashed: an event's `contract_hash` pairs the payload with the empty message, exactly as the Go SDK derives it from `google.protobuf.Empty`. Pick any message for `output`; changing it reroutes nothing.
 
 ```proto
 // events.proto
@@ -18,7 +19,7 @@ syntax = "proto3";
 package billing;
 message ChargedEvent { string charge_id = 1; double amount = 2; }
 service BillingEvents {
-  // method for event.define; output is irrelevant for events but the block requires one.
+  // method for event.define; the block requires a reply type, the event identity ignores it.
   rpc billing_charged (ChargedEvent) returns (ChargedEvent);
 }
 ```

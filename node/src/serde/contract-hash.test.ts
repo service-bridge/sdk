@@ -7,14 +7,17 @@ import {
 	canonicalize,
 	canonicalMessageDescriptor,
 	computeContractHash,
+	computeEventContractHash,
+	emptyWireDescriptor,
 	wireDescriptor,
 } from "./contract-hash";
-import { buildSchemaPair } from "./serializer";
+import { buildSchemaPair, type SchemaPair } from "./serializer";
 
 const testdata = join(import.meta.dir, "testdata");
 const protoFile = join(testdata, "payment.proto");
 const protoFormatted = join(testdata, "payment_formatted.proto");
 const jsonFile = join(testdata, "payment.schema.json");
+const eventFile = join(testdata, "vectors-event.proto");
 
 const vectorsFile = join(
 	import.meta.dir,
@@ -26,6 +29,7 @@ const vectorsFile = join(
 
 interface Vector {
 	name: string;
+	kind: "rpc" | "event";
 	source: "proto" | "schema.json";
 	fixture: string;
 	inputMessage?: string;
@@ -59,6 +63,16 @@ const pairOf = (vector: Vector) =>
 			})
 		: buildSchemaPair({ schemaFile: fixturePath(vector) });
 
+// An event vector names a reply type only because the schema source demands a
+// pair; its identity replaces that half with the empty message.
+const hashOf = (vector: Vector, pair: SchemaPair): string =>
+	vector.kind === "event"
+		? computeEventContractHash(pair.input)
+		: computeContractHash(pair);
+
+const outputHalfOf = (vector: Vector, pair: SchemaPair): string =>
+	vector.kind === "event" ? emptyWireDescriptor() : wireDescriptor(pair.output);
+
 describe("golden vectors", () => {
 	it("file declares the v2 algorithm and a non-empty vector set", () => {
 		expect(goldens.version).toBe("v2");
@@ -66,12 +80,16 @@ describe("golden vectors", () => {
 		expect(goldens.properties.length).toBeGreaterThan(0);
 	});
 
+	it("covers the one-way identity, which is what drifts between SDKs", () => {
+		expect(goldens.vectors.some((v) => v.kind === "event")).toBe(true);
+	});
+
 	for (const vector of goldens.vectors) {
 		it(`${vector.name} reproduces its canonical descriptors and hash`, async () => {
 			const pair = await pairOf(vector);
 			expect(wireDescriptor(pair.input)).toBe(vector.canonicalInput);
-			expect(wireDescriptor(pair.output)).toBe(vector.canonicalOutput);
-			expect(computeContractHash(pair)).toBe(vector.contractHash);
+			expect(outputHalfOf(vector, pair)).toBe(vector.canonicalOutput);
+			expect(hashOf(vector, pair)).toBe(vector.contractHash);
 		});
 	}
 
@@ -90,7 +108,8 @@ describe("golden vectors", () => {
 			for (const name of property.vectors) {
 				const vector = goldens.vectors.find((v) => v.name === name);
 				expect(vector).toBeDefined();
-				hashes.push(computeContractHash(await pairOf(vector as Vector)));
+				const v = vector as Vector;
+				hashes.push(hashOf(v, await pairOf(v)));
 			}
 			const first = hashes[0] as string;
 			if (property.assert === "equal") {
@@ -158,6 +177,61 @@ describe("computeContractHash", () => {
 		expect(() => computeContractHash({ input: stub, output: stub })).toThrow(
 			/no wire descriptor/,
 		);
+	});
+});
+
+describe("computeEventContractHash", () => {
+	const eventPair = (output: string) =>
+		buildSchemaPair({
+			protoFile: eventFile,
+			input: "OrderPlaced",
+			output,
+		});
+
+	it("hashes the payload against the empty message", async () => {
+		const pair = await eventPair("OrderPlacedAck");
+		const digest = createHash("sha256")
+			.update(`${wireDescriptor(pair.input)}:{"f":[]}`)
+			.digest("hex");
+		expect(computeEventContractHash(pair.input)).toBe(`v2:${digest}`);
+	});
+
+	it("ignores the reply type the schema source demanded", async () => {
+		const declaredAck = await eventPair("OrderPlacedAck");
+		const declaredEcho = await eventPair("OrderPlaced");
+		expect(computeEventContractHash(declaredAck.input)).toBe(
+			computeEventContractHash(declaredEcho.input),
+		);
+		expect(computeContractHash(declaredAck)).not.toBe(
+			computeContractHash(declaredEcho),
+		);
+	});
+
+	it("moves when the payload shape moves", async () => {
+		const other = await buildSchemaPair({
+			protoFile,
+			input: "ChargeRequest",
+			output: "ChargeResponse",
+		});
+		const pair = await eventPair("OrderPlacedAck");
+		expect(computeEventContractHash(pair.input)).not.toBe(
+			computeEventContractHash(other.input),
+		);
+	});
+
+	it("rejects a serializer not built by buildSchemaPair", () => {
+		const stub = {
+			encode: () => new Uint8Array(),
+			decode: () => ({}),
+			toJsonSchema: () => ({}),
+		};
+		expect(() => computeEventContractHash(stub)).toThrow(/no wire descriptor/);
+	});
+});
+
+describe("emptyWireDescriptor", () => {
+	it("is the canonical descriptor of a message with no fields", () => {
+		expect(emptyWireDescriptor()).toBe('{"f":[]}');
 	});
 });
 

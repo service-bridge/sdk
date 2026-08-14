@@ -9,7 +9,7 @@ SDK-сторона Durable Events: domain namespace (`EventDomain`), публи�
 | Имя | Тип | По умолчанию | Что делает |
 |-----|-----|--------------|------------|
 | `EventDomain` | class | — | Domain namespace для событий. Доступен через `sb.event`. Реэкспортируется как type. |
-| `EventDomain.define(name, spec?)` | метод | — | Декларирует published event. `spec` — `SchemaSpec` (`.proto` файл или `.schema.json` c явными `fieldNumber`), тот же что у `sb.rpc.handle`. Повторный `define` с тем же объектом `spec` (или оба без spec) — no-op; с другим spec — throws. Без spec регистрируется только имя (schema-less): `publish` такого события бросает «no schema registered», а subscriber отвечает `Nack` `no_schema` — реальная публикация/доставка требует spec. |
+| `EventDomain.define(name, spec?)` | метод | — | Декларирует published event. `spec` — `SchemaSpec` (`.proto` файл или `.schema.json` c явными `fieldNumber`), тот же что у `sb.rpc.handle`; формат требует пару input/output, но событие использует только input — output не кодируется, не декодируется и не входит в `contract_hash`. Повторный `define` с тем же объектом `spec` (или оба без spec) — no-op; с другим spec — throws. Без spec регистрируется только имя (schema-less): `publish` такого события бросает «no schema registered», а subscriber отвечает `Nack` `no_schema` — реальная публикация/доставка требует spec. |
 | `EventDomain.handle(pattern, fn)` | метод | — | Регистрирует subscription (subscriber-side). `pattern` — точное имя или AMQP wildcard; матчинг выполняет сервер. |
 | `EventDomain.publish(name, payload, opts?)` | `async (...) => { eventId }` | — | Публикует event. Требует `sb.start()` (иначе throws — publisher не готов). Encode идёт через Protobuf serde — `type.verify()` бросает на невалидный payload до записи в outbox. |
 | `PublishOpts` | interface | — | Опции `publish`. Поля ниже. |
@@ -71,6 +71,8 @@ SDK-сторона Durable Events: domain namespace (`EventDomain`), публи�
 **payload_json рядом с canonical payload.** Publisher кладёт JSON-вид того же payload в `EventEnvelope.payload_json` (через `JSON.stringify`, пустые байты если payload не сериализуем). Runtime использует его только для JSON-path `wait_event` фильтров в workflow-роутере, не декодя protobuf-форму.
 
 **Schema loading async, finalize() ждёт.** `Registry._handle.publishEvent(name, spec)` синхронно регистрирует декларацию и кладёт promise в общий `pending[]`. `finalize()` (из `sb.start()`) await'ит все pending до построения `RegisterRequest`. Это унифицирует загрузку event- и rpc-схем.
+
+**Идентичность события считается только по payload.** `SchemaSpec` описывает пару input/output, но событию отвечать некому: encode и decode идут через `pair.input`, в `RegisterRequest` едет только `input_schema_json`, а объявленный output не участвует ни в чём. Поэтому `contract_hash` события — `computeEventContractHash(pair.input)`: payload против пустого message. Так же считает Go SDK (`serde.EventContractHash`, вторая половина — `google.protobuf.Empty`), поэтому одна и та же схема даёт один и тот же хеш в обоих SDK; общий golden-вектор — `event_payload` в `sdk/contract-hash-vectors.json`.
 
 **SchemaIndex backed by `getPublishedEvent`.** Publisher и Subscriber получают адаптер, читающий `Handle.getPublishedEvent(name)`. Локальная декларация — единственный источник правды для encode/decode pair; schemaIndex не делится между процессами. Подписчик чужого события сам объявляет `define(name, spec)` с той же схемой.
 

@@ -2,6 +2,11 @@ import { describe, expect, it, mock } from "bun:test";
 import path from "node:path";
 import { MethodType } from "../pb/servicebridge/v1/registry";
 import { Registry } from "../registry/registry";
+import {
+	computeContractHash,
+	computeEventContractHash,
+} from "../serde/contract-hash";
+import { buildSchemaPair } from "../serde/serializer";
 import { EventDomain } from "./domain";
 import type { Publisher } from "./publisher";
 
@@ -30,6 +35,28 @@ describe("EventDomain.define", () => {
 		expect(req.published[0]!.name).toBe("orders_created");
 		expect(req.published[0]!.schemaJson.length).toBeGreaterThan(0);
 		expect(req.published[0]!.contractHash).toMatch(/^v2:[0-9a-f]{64}$/);
+	});
+
+	it("stamps the one-way identity: payload against the empty message", async () => {
+		const { domain, registry } = makeDomain();
+		domain.define("orders_created", {
+			protoFile: PROTO_PATH,
+			method: "orders_created",
+		});
+		await registry._handle.finalize();
+
+		const pair = await buildSchemaPair({
+			protoFile: PROTO_PATH,
+			input: "OrderCreatedV1",
+			// A reply the identity must ignore: the service block points
+			// orders_created at OrderCreatedV1, this one has an extra field.
+			output: "OrderCreatedV2",
+		});
+		const req = registry.buildRegisterRequest();
+		expect(req.published[0]!.contractHash).toBe(
+			computeEventContractHash(pair.input),
+		);
+		expect(req.published[0]!.contractHash).not.toBe(computeContractHash(pair));
 	});
 
 	it("define without spec — schemaJson empty, contractHash empty", async () => {

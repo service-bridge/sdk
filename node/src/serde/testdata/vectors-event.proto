@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package sb.vectors.event;
+
+message OrderPlaced {
+  string order_id = 1;
+  double amount = 2;
+  string currency = 3;
+}
+
+// A schema source that insists on an input/output pair has to be given some
+// reply type for an event. This one exists to prove the event identity ignores
+// it: it carries a field, so an implementation that hashed the declared reply
+// instead of the empty message would miss the vector's hash.
+message OrderPlacedAck {
+  bool ok = 1;
+}

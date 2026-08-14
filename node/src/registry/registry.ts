@@ -268,13 +268,13 @@ export class Handle {
 		const load = Promise.all([
 			import("../serde/serializer"),
 			import("../serde/contract-hash"),
-		]).then(async ([{ buildSchemaPair }, { computeContractHash }]) => {
+		]).then(async ([{ buildSchemaPair }, { computeEventContractHash }]) => {
 			const pair = await buildSchemaPair(resolvedSpec);
 			entry.schemaPair = pair;
 			entry.inputSchemaJson = Buffer.from(
 				JSON.stringify(pair.input.toJsonSchema()),
 			);
-			entry.contractHash = computeContractHash(pair);
+			entry.contractHash = computeEventContractHash(pair.input);
 		});
 		this.trackPending(load);
 	}

@@ -88,7 +88,7 @@ sb.event.define("payment.charged", {
 
 ### Через `.schema.json` (если `.proto` не нужен)
 
-Файл обязан иметь на верхнем уровне два блока — `input` и `output` — в каждом ровно одно сообщение. Для события payload — это `input`; `output` обязателен по формату (события его не используют, но парсер требует оба блока).
+Файл обязан иметь на верхнем уровне два блока — `input` и `output` — в каждом ровно одно сообщение. Для события payload — это `input`; `output` обязателен по формату (парсер требует оба блока), но событие его не использует: им ничего не кодируется и в `contract_hash` он не входит — пиши что угодно.
 
 ```json
 {
@@ -110,7 +110,7 @@ sb.event.define("payment.charged", {
 sb.event.define("payment.charged", { schemaFile: "schemas/payment.json" });
 ```
 
-SDK строит Protobuf `Type` через `protobufjs`, считает `contract_hash` по структуре, регистрирует имя + хеш в runtime и хранит compiled `SchemaPair` локально. При `publish` payload кодируется в Protobuf binary, `type.verify()` ловит невалидный объект до записи в outbox — `await sb.event.publish(...)` rejected'ится этой ошибкой ещё до попадания в outbox.
+SDK строит Protobuf `Type` через `protobufjs`, считает `contract_hash` по структуре payload-а (у события нет ответа, поэтому вторую половину пары всегда занимает пустое сообщение — точно так же считает Go SDK), регистрирует имя + хеш в runtime и хранит compiled `SchemaPair` локально. При `publish` payload кодируется в Protobuf binary, `type.verify()` ловит невалидный объект до записи в outbox — `await sb.event.publish(...)` rejected'ится этой ошибкой ещё до попадания в outbox.
 
 ### Имя события
 
@@ -383,7 +383,7 @@ Runtime gRPC `Events`:
 
 ## 11. Schema versioning
 
-Каждая published-схема идентифицируется `contract_hash` — отпечатком protobuf-провода вида `v2:<sha256 hex>`, который считается на SDK-стороне (алгоритм — в [rpc.md](./rpc.md#алгоритм-хеша)). Несколько версий одного события могут жить одновременно — keep-history:
+Каждая published-схема идентифицируется `contract_hash` — отпечатком protobuf-провода вида `v2:<sha256 hex>`, который считается на SDK-стороне (алгоритм — в [rpc.md](./rpc.md#алгоритм-хеша)). У события хешируется только payload: ответа у него нет, поэтому вторую половину пары занимает пустое сообщение, а объявленный в spec `output` на хеш не влияет. Меняет идентичность события ровно то же, что ломает wire-совместимость payload-а: номер, тип или кардинальность поля — не его имя. Несколько версий одного события могут жить одновременно — keep-history:
 
 ```proto
 // payment-v1.proto
@@ -394,8 +394,9 @@ message PaymentCharged { string tx_id = 1; string user_id = 2; }
 ```
 
 ```ts
-// .proto без service-блока → input/output задаём явно (для события достаточно input;
-// output обязателен — укажи любое сообщение, в данном случае тот же PaymentCharged).
+// .proto без service-блока → input/output задаём явно. Смысл несёт только input:
+// output обязателен по формату spec и в contract_hash не входит, здесь это тот же
+// PaymentCharged.
 // publisher v1 (старый сервис)
 sb.event.define("payment.charged", {
   protoFile: "payment-v1.proto",

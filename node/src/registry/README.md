@@ -56,7 +56,7 @@
 | `Handle.rpc(name, fn, opts)` | — | — | Регистрирует unary RPC-хендлер; `opts.schema` async-грузит `SchemaPair` |
 | `Handle.stream(name, fn, opts)` | — | — | Регистрирует server-streaming RPC; `fn` — `AsyncIterable`/async-generator |
 | `Handle.event(pattern, fn)` | — | — | Регистрирует обработчик Durable Event; `pattern` — точное имя или AMQP wildcard. Схема payload-а живёт у publisher'а (`publishEvent`) |
-| `Handle.publishEvent(name, spec?)` | — | `spec` undefined | Объявляет published event (publisher-side). `spec` — `SchemaSpec`; async-загрузка в общий `pending[]`. Idempotent re-define по reference identity `spec`; иной spec — throws (ADR-0002) |
+| `Handle.publishEvent(name, spec?)` | — | `spec` undefined | Объявляет published event (publisher-side). `spec` — `SchemaSpec`; async-загрузка в общий `pending[]`. `contractHash` считается через `computeEventContractHash(pair.input)`: у события нет ответа, объявленный в spec output в идентичность не входит. Idempotent re-define по reference identity `spec`; иной spec — throws (ADR-0002) |
 | `Handle.getPublishedEvent(name)` | `{contractHash, pair} \| undefined` | — | Schema-lookup для Publisher / Subscriber. undefined для schema-less event или до finalize() |
 | `Handle.workflow(name, steps, opts?, graphJson?, contractHash?)` | — | — | Регистрирует workflow. `graphJson` (ADR-W-002) перекрывает schema-derived input; `contractHash` едет как `IncomingMethod.contract_hash` |
 | `Handle.job(name, contractHash, specJson, fn)` | — | — | Регистрирует scheduled job. `specJson` — canonical spec (CanonicalJobSpec); `fn` хранится локально, не едет по wire |

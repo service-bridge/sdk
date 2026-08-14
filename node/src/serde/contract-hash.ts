@@ -62,12 +62,35 @@ export function attachWireDescriptor(
 //
 // @public — см. ./README.md
 export function computeContractHash(pair: SchemaPair): string {
-	const input = wireDescriptor(pair.input);
-	const output = wireDescriptor(pair.output);
+	return hashPair(wireDescriptor(pair.input), wireDescriptor(pair.output));
+}
+
+// computeEventContractHash returns the identity of an event payload. An event
+// has no reply, so the empty message takes the output half — the same shape a
+// one-way method has, rather than a second hashing rule to keep in sync with
+// the other SDKs. Whatever reply type the schema source declares stays out of
+// the identity: an event never encodes or decodes it.
+//
+// @public — см. ./README.md
+export function computeEventContractHash(payload: Serializer): string {
+	return hashPair(wireDescriptor(payload), emptyWireDescriptor());
+}
+
+function hashPair(input: string, output: string): string {
 	const digest = createHash("sha256")
 		.update(`${input}:${output}`)
 		.digest("hex");
 	return `${HASH_PREFIX}:${digest}`;
+}
+
+// emptyWireDescriptor is the canonical descriptor of the reply half of a
+// one-way contract. protobufjs carries no google.protobuf.Empty, and the
+// descriptor holds neither the message name nor its package, so a fieldless
+// type produces the exact bytes the Go SDK derives from Empty.
+//
+// @internal — см. ./README.md
+export function emptyWireDescriptor(): string {
+	return canonicalMessageDescriptor(new protobuf.Type("Empty"));
 }
 
 // wireDescriptor returns the canonical descriptor string a serializer was built

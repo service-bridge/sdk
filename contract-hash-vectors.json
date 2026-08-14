@@ -4,6 +4,7 @@
 	"formula": "contractHash = \"v2:\" + lowerHex(sha256(canonicalInput + \":\" + canonicalOutput))",
 	"spec": {
 		"summary": "Language-neutral protobuf wire identity. Only what decides wire compatibility is hashed: field numbers, cardinality and types. Field names, message/enum member names, comments, formatting and declaration order are excluded.",
+		"kinds": "\"rpc\" hashes the (request, reply) pair a method declares. \"event\" hashes a payload that has no reply: the output half is always the empty message, so canonicalOutput is {\"f\":[]} and the reply type a schema source demands (inputMessage/outputMessage on such a vector) never reaches the identity.",
 		"messageDescriptor": {
 			"f": "Array of field descriptors, sorted ascending by field number. Always present, `[]` for an empty message.",
 			"o": "Array of oneof groups: {\"f\":[field numbers ascending]}, groups sorted ascending by their first number. Omitted when the message has no oneof group. A proto3 `optional` field is NOT a oneof group.",
@@ -26,6 +27,7 @@
 	"vectors": [
 		{
 			"name": "scalars",
+			"kind": "rpc",
 			"covers": "every protobuf scalar type, one field each",
 			"source": "proto",
 			"fixture": "sdk/node/src/serde/testdata/vectors-scalars.proto",
@@ -38,6 +40,7 @@
 		},
 		{
 			"name": "scalars_renamed",
+			"kind": "rpc",
 			"covers": "same wire shape as `scalars`, every field name changed",
 			"source": "proto",
 			"fixture": "sdk/node/src/serde/testdata/vectors-scalars-renamed.proto",
@@ -50,6 +53,7 @@
 		},
 		{
 			"name": "scalars_renumbered",
+			"kind": "rpc",
 			"covers": "same as `scalars` with field 15 moved to 16",
 			"source": "proto",
 			"fixture": "sdk/node/src/serde/testdata/vectors-scalars-renumbered.proto",
@@ -62,6 +66,7 @@
 		},
 		{
 			"name": "scalars_retyped",
+			"kind": "rpc",
 			"covers": "same as `scalars` with field 3 changed from int32 to int64",
 			"source": "proto",
 			"fixture": "sdk/node/src/serde/testdata/vectors-scalars-retyped.proto",
@@ -74,6 +79,7 @@
 		},
 		{
 			"name": "scalars_recardinalized",
+			"kind": "rpc",
 			"covers": "same as `scalars` with field 14 changed from singular to repeated",
 			"source": "proto",
 			"fixture": "sdk/node/src/serde/testdata/vectors-scalars-recardinalized.proto",
@@ -86,6 +92,7 @@
 		},
 		{
 			"name": "sparse_numbers",
+			"kind": "rpc",
 			"covers": "non-sequential field numbers up to the protobuf maximum",
 			"source": "proto",
 			"fixture": "sdk/node/src/serde/testdata/vectors-sparse.proto",
@@ -98,6 +105,7 @@
 		},
 		{
 			"name": "sparse_numbers_reordered",
+			"kind": "rpc",
 			"covers": "same fields as `sparse_numbers`, declared in a different order",
 			"source": "proto",
 			"fixture": "sdk/node/src/serde/testdata/vectors-sparse-reordered.proto",
@@ -110,6 +118,7 @@
 		},
 		{
 			"name": "complex",
+			"kind": "rpc",
 			"covers": "nested messages, transitive references, enum, repeated, scalar map, message map, oneof, proto3 optional",
 			"source": "proto",
 			"fixture": "sdk/node/src/serde/testdata/vectors-complex.proto",
@@ -122,6 +131,7 @@
 		},
 		{
 			"name": "enum_alias",
+			"kind": "rpc",
 			"covers": "enum with allow_alias — duplicate numbers collapse",
 			"source": "proto",
 			"fixture": "sdk/node/src/serde/testdata/vectors-enum-alias.proto",
@@ -134,6 +144,7 @@
 		},
 		{
 			"name": "cyclic",
+			"kind": "rpc",
 			"covers": "self-reference and mutual recursion between messages",
 			"source": "proto",
 			"fixture": "sdk/node/src/serde/testdata/vectors-cyclic.proto",
@@ -146,6 +157,7 @@
 		},
 		{
 			"name": "empty_message",
+			"kind": "rpc",
 			"covers": "message with no fields",
 			"source": "proto",
 			"fixture": "sdk/node/src/serde/testdata/vectors-empty.proto",
@@ -158,6 +170,7 @@
 		},
 		{
 			"name": "proto3_optional_and_oneof",
+			"kind": "rpc",
 			"covers": "proto3 optional stays `opt` and is not a oneof group; a real oneof is",
 			"source": "proto",
 			"fixture": "sdk/node/src/serde/testdata/vectors-optional.proto",
@@ -170,6 +183,7 @@
 		},
 		{
 			"name": "proto2_required",
+			"kind": "rpc",
 			"covers": "proto2 required / optional / repeated cardinality",
 			"source": "proto",
 			"fixture": "sdk/node/src/serde/testdata/vectors-proto2.proto",
@@ -181,7 +195,21 @@
 			"contractHash": "v2:6c81674e3cc9e83ae96edea1e1ba25d644557eab67e38016bfe0dbf2baded74a"
 		},
 		{
+			"name": "event_payload",
+			"kind": "event",
+			"covers": "event identity: the reply half is the empty message, and the reply type the schema source demands is left out",
+			"source": "proto",
+			"fixture": "sdk/node/src/serde/testdata/vectors-event.proto",
+			"proto": "syntax = \"proto3\";\n\npackage sb.vectors.event;\n\nmessage OrderPlaced {\n  string order_id = 1;\n  double amount = 2;\n  string currency = 3;\n}\n\n// A schema source that insists on an input/output pair has to be given some\n// reply type for an event. This one exists to prove the event identity ignores\n// it: it carries a field, so an implementation that hashed the declared reply\n// instead of the empty message would miss the vector's hash.\nmessage OrderPlacedAck {\n  bool ok = 1;\n}\n",
+			"inputMessage": "sb.vectors.event.OrderPlaced",
+			"outputMessage": "sb.vectors.event.OrderPlacedAck",
+			"canonicalInput": "{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"string\"},{\"c\":\"opt\",\"n\":2,\"t\":\"double\"},{\"c\":\"opt\",\"n\":3,\"t\":\"string\"}]}",
+			"canonicalOutput": "{\"f\":[]}",
+			"contractHash": "v2:ccece68de0e672ffbf5bb582b43cc1d9599ad8acd3bcacc7aa31ac6f49bd91e3"
+		},
+		{
 			"name": "json_schema",
+			"kind": "rpc",
 			"covers": ".schema.json source — object, array-of-object, array-of-scalar",
 			"source": "schema.json",
 			"fixture": "sdk/node/src/serde/testdata/vectors.schema.json",
@@ -247,6 +275,7 @@
 		},
 		{
 			"name": "json_schema_renamed",
+			"kind": "rpc",
 			"covers": "same as `json_schema` with every leaf field renamed; message-bearing field names kept because .schema.json derives nested message identity from them",
 			"source": "schema.json",
 			"fixture": "sdk/node/src/serde/testdata/vectors-renamed.schema.json",

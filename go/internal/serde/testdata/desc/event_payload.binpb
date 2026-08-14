@@ -1,0 +1,9 @@
+
+¯
+event_payload.protosb.vectors.event"\
+OrderPlaced
+order_id (	RorderId
+amount (Ramount
+currency (	Rcurrency" 
+OrderPlacedAck
+ok (Rokbproto3

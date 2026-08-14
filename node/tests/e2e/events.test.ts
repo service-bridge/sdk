@@ -21,7 +21,7 @@ import type {
 	DlqEntry,
 	ListDlqRequest,
 } from "../../src/pb/servicebridge/v1/events";
-import { computeContractHash } from "../../src/serde/contract-hash";
+import { computeEventContractHash } from "../../src/serde/contract-hash";
 import { buildSchemaPair } from "../../src/serde/serializer";
 import {
 	connect,
@@ -712,7 +712,9 @@ describe("events", () => {
 		// Client-side: the two schemas must hash differently (keep-history key).
 		const pairV1 = await buildSchemaPair(V1_SCHEMA);
 		const pairV2 = await buildSchemaPair(V2_SCHEMA);
-		expect(computeContractHash(pairV1)).not.toBe(computeContractHash(pairV2));
+		expect(computeEventContractHash(pairV1.input)).not.toBe(
+			computeEventContractHash(pairV2.input),
+		);
 
 		const received: Order[] = [];
 		const subscriber = track(dedicated("second"));

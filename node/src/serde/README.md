@@ -20,7 +20,7 @@
 |-----|-----|--------------|------------|
 | `protoFile` | `string` | нет (обязательно) | Путь к `.proto`, загружается через `protobuf.load`. |
 | `input` | `string?` | резолв из `service`-блока | Имя input-message. Нужен, только если в `.proto` нет подходящего `service { rpc <method>(In) returns (Out); }`. |
-| `output` | `string?` | резолв из `service`-блока | Имя output-message. Условие то же, что у `input`. |
+| `output` | `string?` | резолв из `service`-блока | Имя output-message. Условие то же, что у `input`. Для события формат требует его, но идентичность события его не использует. |
 | `method` | `string?` | имя метода/события | Метод для резолва против `service`-блока. Подставляется автоматически в `registry`/`connection`; задавать вручную обычно не нужно. |
 
 Форма `JsonSchemaFileSpec`:
@@ -31,7 +31,7 @@
 
 ## Приватный контракт
 
-Не реэкспортируется через публичный `index.ts` пакета. Часть символов потребляется другими доменами SDK прямым импортом из файлов модуля (`Serializer`/`SchemaPair`/`SchemaSpec`-форма, `buildSchemaPair`, `computeContractHash`); `SchemaPairCache`, `canonicalMessageDescriptor`, `attachWireDescriptor`, `wireDescriptor`, `canonicalize` — серде-внутренние. Ключевые символы помечены `@public`/`@internal`-маркером в коде на месте символа (`computeContractHash` — `@public`, остальное — `@internal`).
+Не реэкспортируется через публичный `index.ts` пакета. Часть символов потребляется другими доменами SDK прямым импортом из файлов модуля (`Serializer`/`SchemaPair`/`SchemaSpec`-форма, `buildSchemaPair`, `computeContractHash`, `computeEventContractHash`); `SchemaPairCache`, `canonicalMessageDescriptor`, `attachWireDescriptor`, `wireDescriptor`, `emptyWireDescriptor`, `canonicalize` — серде-внутренние. Ключевые символы помечены `@public`/`@internal`-маркером в коде на месте символа (`computeContractHash` и `computeEventContractHash` — `@public`, остальное — `@internal`).
 
 | Имя | Тип | По умолчанию | Что делает |
 |-----|-----|--------------|------------|
@@ -42,6 +42,8 @@
 | `buildSchemaPair(spec)` | `(spec: SchemaSpec) => Promise<SchemaPair>` | нет | Диспетчер: `.proto` грузит через `protobuf.load` (async) и резолвит input/output; `.schema.json` — через `buildSchemaPairFromJsonFile`. Бросает на ошибке загрузки/резолва. |
 | `buildSchemaPairFromJsonFile(spec)` | `(spec: JsonSchemaFileSpec) => SchemaPair` | нет | Синхронно читает `.schema.json`, валидирует `fieldNumber`, строит `protobuf.Type` динамически. |
 | `computeContractHash(pair)` | `(pair: SchemaPair) => string` | нет | `"v2:" + hex(sha256(canon(input) + ":" + canon(output)))`. Бросает, если пара собрана не через `buildSchemaPair`. |
+| `computeEventContractHash(payload)` | `(payload: Serializer) => string` | нет | Идентичность события: `"v2:" + hex(sha256(canon(payload) + ":" + {"f":[]}))` — вторая половина всегда пустой message. Объявленный в spec output в хеш не входит. Бросает, если сериализатор собран не через `buildSchemaPair`. |
+| `emptyWireDescriptor()` | `() => string` | нет | Канонический дескриптор пустого message (`{"f":[]}`) — вторая половина односторонней идентичности. |
 | `canonicalMessageDescriptor(type)` | `(type: protobuf.Type) => string` | нет | Канонический wire-дескриптор одного message: номера, кардинальность, типы. Формат — ниже. |
 | `attachWireDescriptor(serializer, type)` | `(serializer: Serializer, type: protobuf.Type) => void` | нет | Привязывает дескриптор к сериализатору по identity. Вызывается фабриками сериализаторов модуля. |
 | `wireDescriptor(serializer)` | `(serializer: Serializer) => string` | нет | Возвращает дескриптор, с которым собран сериализатор. Бросает, если его нет. |
@@ -70,7 +72,7 @@
 
 Синтетические map-entry message в `r` не попадают — map выражается прямо в поле через `c`/`k`/`t`. Канонический JSON: ключи объектов отсортированы лексикографически на всех уровнях, порядок массивов сохранён, пробелов нет.
 
-Golden-векторы — `sdk/contract-hash-vectors.json`, общий артефакт для всех языковых SDK. Фикстуры к ним — `./testdata/vectors-*`.
+Golden-векторы — `sdk/contract-hash-vectors.json`, общий артефакт для всех языковых SDK. Фикстуры к ним — `./testdata/vectors-*`. У вектора есть `kind`: `rpc` — хеш пары «запрос — ответ», `event` — односторонняя идентичность, у которой `canonicalOutput` всегда `{"f":[]}`, а названный в векторе output существует только чтобы доказать, что он в хеш не попадает.
 
 ## Архитектурные решения и почему
 
@@ -80,6 +82,7 @@ Golden-векторы — `sdk/contract-hash-vectors.json`, общий арте�
 - **Резолв input/output только явно или из `service`-блока.** Convention-based и unique-pair fallback'и удалены: они прятали ошибки контракта за похожестью имён вместо громкого фейла.
 - **contract hash — язык-нейтральный wire-дескриптор, не внутренний формат библиотеки.** Хешируется собственная структура из номеров, кардинальности и типов, а не `protobufjs Type.toJSON()`. `toJSON()` — деталь реализации конкретной JS-библиотеки (camelCase-имена, свой порядок ключей); хешируя её, любой не-JS SDK был бы обязан побайтово эмулировать protobufjs и ломался бы при её обновлении. Wire-дескриптор описан спецификацией, зафиксирован golden-векторами и воспроизводим на любом языке из дескрипторов protobuf.
 - **Имена полей в хеш не входят.** Contract hash — идентичность маршрутизации: рантайм фильтрует инстансы цели по совпадению хеша. Переименование поля wire-совместимо в protobuf, поэтому включение имён уводило бы трафик в никуда после безвредного рефакторинга. Меняют идентичность только номер, тип и кардинальность — ровно то, что ломает бинарную совместимость.
+- **У события вторую половину пары всегда занимает пустой message.** Ответа у события нет, а `SchemaSpec` требует пару, поэтому объявленный output — фиктивный: им ничего не кодируется и не декодируется (`publisher`/`subscriber` работают только с `pair.input`, в `RegisterRequest` едет только `input_schema_json`). Если бы он входил в хеш, идентичность события зависела бы от произвольного выбора автора схемы и расходилась бы с Go SDK, который хеширует payload против `google.protobuf.Empty`. `protobufjs` своего `Empty` не несёт, но дескриптор не содержит ни имени типа, ни пакета, поэтому message без полей даёт те же байты `{"f":[]}`, что и `Empty` в Go — это зафиксировано вектором `event_payload`.
 - **Имена типов в хеш входят.** Полное имя message/enum — единственный способ различить два структурно одинаковых, но семантически разных типа, и единственный якорь для разрыва циклических ссылок в справочнике `r`.
 - **Префикс `v2:`.** Генерация алгоритма едет внутри самого значения, поэтому хеши разных поколений не совпадут случайно. Пустая строка остаётся валидным значением: хендлер без схемы объявляет `""`, и равенство с `""` выполняется тривиально.
 - **Дескриптор хранится в side table по identity сериализатора.** `Serializer` — контракт encode/decode, на который опираются `events`/`registry`; дескриптор описывает protobuf-тип за сериализатором, а не этот контракт, поэтому живёт в `WeakMap` внутри `contract-hash.ts`, а не в интерфейсе.
@@ -91,4 +94,4 @@ Golden-векторы — `sdk/contract-hash-vectors.json`, общий арте�
 - `node:crypto` — SHA-256 для contract-hash.
 - `node:fs` — чтение `.schema.json`.
 
-Используется: `sdk/node/src/rpc/` (caller-сторона, `computeContractHash`), `sdk/node/src/registry/registry.ts` (`buildSchemaPair`, `computeContractHash`, передача JSON-schema в RegisterRequest), `sdk/node/src/events/` (publisher/subscriber/domain — `SchemaPair`/`SchemaSpec`), `sdk/node/src/connection/service-bridge.ts` (`buildSchemaPair`, реэкспорт `SchemaSpec`).
+Используется: `sdk/node/src/rpc/` (caller-сторона, `computeContractHash`), `sdk/node/src/registry/registry.ts` (`buildSchemaPair`, `computeContractHash` для методов, `computeEventContractHash` для published events, передача JSON-schema в RegisterRequest), `sdk/node/src/events/` (publisher/subscriber/domain — `SchemaPair`/`SchemaSpec`), `sdk/node/src/connection/service-bridge.ts` (`buildSchemaPair`, реэкспорт `SchemaSpec`).

@@ -10,6 +10,7 @@ import (
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/descriptorpb"
+	"google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/service-bridge/sdk/go/internal/serde"
 )
@@ -20,16 +21,19 @@ import (
 // would go stale exactly when the shared file changes.
 const vectorFile = "../../../contract-hash-vectors.json"
 
+type vector struct {
+	Name           string `json:"name"`
+	Kind           string `json:"kind"`
+	Source         string `json:"source"`
+	InputMessage   string `json:"inputMessage"`
+	OutputMessage  string `json:"outputMessage"`
+	CanonicalInput string `json:"canonicalInput"`
+	CanonicalOut   string `json:"canonicalOutput"`
+	ContractHash   string `json:"contractHash"`
+}
+
 type vectors struct {
-	Vectors []struct {
-		Name           string `json:"name"`
-		Source         string `json:"source"`
-		InputMessage   string `json:"inputMessage"`
-		OutputMessage  string `json:"outputMessage"`
-		CanonicalInput string `json:"canonicalInput"`
-		CanonicalOut   string `json:"canonicalOutput"`
-		ContractHash   string `json:"contractHash"`
-	} `json:"vectors"`
+	Vectors    []vector `json:"vectors"`
 	Properties []struct {
 		Name    string   `json:"name"`
 		Assert  string   `json:"assert"`
@@ -95,11 +99,46 @@ func (p *protoregistryFiles) message(name string) protoreflect.MessageDescriptor
 	return md
 }
 
+// identity is what the SDK derives for one vector: the canonical form of each
+// half of the pair and the hash over them.
+type identity struct {
+	in, out, hash string
+}
+
+// derive computes a vector's identity the way the SDK computes it for that kind
+// of contract. An event vector names a reply type only because a schema source
+// may demand one; the identity replaces it with the empty message.
+func derive(t *testing.T, vec vector) identity {
+	t.Helper()
+	reg := descriptors(t, vec.Name)
+	in := reg.message(vec.InputMessage)
+	switch vec.Kind {
+	case "rpc":
+		out := reg.message(vec.OutputMessage)
+		return identity{
+			in:   string(serde.Canonical(in)),
+			out:  string(serde.Canonical(out)),
+			hash: serde.ContractHash(in, out),
+		}
+	case "event":
+		empty := (&emptypb.Empty{}).ProtoReflect().Descriptor()
+		return identity{
+			in:   string(serde.Canonical(in)),
+			out:  string(serde.Canonical(empty)),
+			hash: serde.EventContractHash(in),
+		}
+	default:
+		t.Fatalf("%s: unknown vector kind %q", vec.Name, vec.Kind)
+		return identity{}
+	}
+}
+
 // TestGoldenVectors is the whole point of the file: canonical form and hash
 // must match the cross-SDK golden set byte for byte.
 func TestGoldenVectors(t *testing.T) {
 	v := loadVectors(t)
 	proved := 0
+	events := 0
 	for _, vec := range v.Vectors {
 		if vec.Source != "proto" {
 			// .schema.json is a Node-only schema source: the Go SDK derives
@@ -107,24 +146,27 @@ func TestGoldenVectors(t *testing.T) {
 			continue
 		}
 		proved++
+		if vec.Kind == "event" {
+			events++
+		}
 		t.Run(vec.Name, func(t *testing.T) {
-			reg := descriptors(t, vec.Name)
-			in := reg.message(vec.InputMessage)
-			out := reg.message(vec.OutputMessage)
-
-			if got := string(serde.Canonical(in)); got != vec.CanonicalInput {
-				t.Errorf("canonical input:\n got %s\nwant %s", got, vec.CanonicalInput)
+			got := derive(t, vec)
+			if got.in != vec.CanonicalInput {
+				t.Errorf("canonical input:\n got %s\nwant %s", got.in, vec.CanonicalInput)
 			}
-			if got := string(serde.Canonical(out)); got != vec.CanonicalOut {
-				t.Errorf("canonical output:\n got %s\nwant %s", got, vec.CanonicalOut)
+			if got.out != vec.CanonicalOut {
+				t.Errorf("canonical output:\n got %s\nwant %s", got.out, vec.CanonicalOut)
 			}
-			if got := serde.ContractHash(in, out); got != vec.ContractHash {
-				t.Errorf("contract hash: got %s want %s", got, vec.ContractHash)
+			if got.hash != vec.ContractHash {
+				t.Errorf("contract hash: got %s want %s", got.hash, vec.ContractHash)
 			}
 		})
 	}
 	if proved == 0 {
 		t.Fatal("no proto-source vector ran")
+	}
+	if events == 0 {
+		t.Fatal("no event vector ran: the one-way identity is what drifts between SDKs")
 	}
 }
 
@@ -137,8 +179,7 @@ func TestVectorProperties(t *testing.T) {
 		if vec.Source != "proto" {
 			continue
 		}
-		reg := descriptors(t, vec.Name)
-		hashes[vec.Name] = serde.ContractHash(reg.message(vec.InputMessage), reg.message(vec.OutputMessage))
+		hashes[vec.Name] = derive(t, vec).hash
 	}
 
 	ran := 0
