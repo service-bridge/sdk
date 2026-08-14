@@ -1,7 +1,10 @@
 name: CI
 
 on:
+  # Branches only: a release tag points at a commit this workflow already ran
+  # on, and an unfiltered push trigger runs the whole suite again per tag.
   push:
+    branches: [main]
   pull_request:
   # Lets the e2e job be re-run on its own without pushing a commit.
   workflow_dispatch:
@@ -78,6 +81,21 @@ jobs:
     env:
       PG_URL: postgres://servicebridge:servicebridge@localhost:5433/service-bridge?sslmode=disable
     steps:
+      # The runtime is a private repository, so this job needs a token that can
+      # read it. Checked before the checkout, which would otherwise report the
+      # missing grant as "Repository not found" and send the reader hunting for
+      # a repo that is right there.
+      - name: Require the runtime repository token
+        env:
+          RUNTIME_REPO_TOKEN: ${{ secrets.RUNTIME_REPO_TOKEN }}
+        run: |
+          if [ -z "$RUNTIME_REPO_TOKEN" ]; then
+            echo "RUNTIME_REPO_TOKEN is not set. This job checks out the private" >&2
+            echo "service-bridge/runtime repository, which the default GITHUB_TOKEN" >&2
+            echo "cannot read. Add a repo-scoped token as that secret." >&2
+            exit 1
+          fi
+
       # Two checkouts side by side: the e2e helpers and bootstrap script resolve
       # the runtime as ../runtime relative to this repo's root.
       - uses: actions/checkout@v4
@@ -88,7 +106,7 @@ jobs:
           repository: service-bridge/runtime
           ref: main
           path: runtime
-          token: ${{ secrets.RUNTIME_REPO_TOKEN || github.token }}
+          token: ${{ secrets.RUNTIME_REPO_TOKEN }}
 
       # The runtime pins the newer toolchain of the two, so its go.mod drives
       # the version: it must build here, and the SDK is compatible with it.
