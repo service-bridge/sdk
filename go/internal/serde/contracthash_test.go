@@ -14,9 +14,11 @@ import (
 	"github.com/service-bridge/sdk/go/internal/serde"
 )
 
-// vectorFile is the cross-SDK golden set. Every SDK hashes the same shapes to
-// the same string or the mesh routes a caller to a callee it cannot talk to.
-const vectorFile = "testdata/contract-hash-vectors.json"
+// vectorFile is the cross-SDK golden set, read from the repository root rather
+// than copied into testdata: every SDK hashes the same shapes to the same
+// string or the mesh routes a caller to a callee it cannot talk to, and a copy
+// would go stale exactly when the shared file changes.
+const vectorFile = "../../../contract-hash-vectors.json"
 
 type vectors struct {
 	Vectors []struct {
