@@ -85,19 +85,24 @@ Each SDK directory holds its own README with install instructions, a quick start
 
 ## AI coding skill
 
-Building with an AI agent like Claude Code? Each language SDK ships its own skill so the agent writes correct code on the first try — the real RPC, events, workflows, jobs and HTTP-integration API, grounded in the shipped SDK rather than guessed. The Node skill installs with the npm package; copy it into your agent's skills directory:
+Building with an AI agent like Claude Code? Each language SDK ships its own skill so the agent writes correct code on the first try — the real RPC, events, workflows, jobs and HTTP-integration API, grounded in the shipped SDK rather than guessed. Copy the one for your language into the agent's skills directory:
 
 ```sh
+# Node — the skill ships inside the npm package
 cp -r node_modules/service-bridge/skill .claude/skills/servicebridge-node
+
+# Go — the skill ships inside the module
+cp -r "$(go env GOMODCACHE)"/github.com/service-bridge/sdk/go@*/skill .claude/skills/servicebridge-go
 ```
 
-Or pull it from the repo without installing: `npx degit service-bridge/sdk/node/skill .claude/skills/servicebridge-node`. Restart the agent to pick it up. Source: [`node/skill/`](./node/skill).
+Or pull either from the repo without installing: `npx degit service-bridge/sdk/node/skill .claude/skills/servicebridge-node`, `npx degit service-bridge/sdk/go/skill .claude/skills/servicebridge-go`. Restart the agent to pick it up. Sources: [`node/skill/`](./node/skill), [`go/skill/`](./go/skill).
 
 ## Links
 
 - **Full feature tour, docs & quickstart:** [servicebridge.dev](https://servicebridge.dev) · [servicebridge.dev/docs](https://servicebridge.dev/docs)
 - **Node SDK — install, examples, API reference:** [`./node`](./node)
-- **AI coding skill (Node):** [`./node/skill`](./node/skill)
+- **Go SDK — install, examples, API reference:** [`./go`](./go)
+- **AI coding skills:** [`./node/skill`](./node/skill) · [`./go/skill`](./go/skill)
 
 ## License
 
