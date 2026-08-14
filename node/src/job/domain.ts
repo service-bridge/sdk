@@ -8,7 +8,6 @@ import type {
 	JobHandler,
 	JobOpts,
 	OverlapPolicy,
-	RetryPolicy,
 	Trigger,
 } from "./types";
 
