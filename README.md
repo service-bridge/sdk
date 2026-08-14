@@ -76,8 +76,10 @@ Every SDK speaks the same runtime over the same gRPC control plane, so the API s
 | Language | Status | Package | Directory |
 |---|---|---|---|
 | **Node.js / Bun** (TypeScript) | **Live** | [![npm](https://img.shields.io/npm/v/service-bridge?label=npm)](https://www.npmjs.com/package/service-bridge) `service-bridge` | [`./node`](./node) |
-| **Go** | Coming soon | — | `./go` |
+| **Go** | Unreleased | `go get github.com/service-bridge/sdk/go` | [`./go`](./go) |
 | **Python** | Coming soon | — | `./python` |
+
+The Go SDK covers the same surface as the Node one — RPC and server streams, durable events, workflows, jobs, telemetry, HTTP integrations. It carries no tagged version yet and its end-to-end suite against the runtime is still being written, so `go get` resolves a pseudo-version off the default branch.
 
 Each SDK directory holds its own README with install instructions, a quick start and the full API reference.
 
