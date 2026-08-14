@@ -465,7 +465,7 @@ func WithRunIdempotencyKey(key string) StartOption {
 	return func(o *startOpts) { o.idempotencyKey = key }
 }
 
-// WithRunTimeout bounds the whole run. Seconds, because that is the unit the
+// WithRunTimeoutSec bounds the whole run. Seconds, because that is the unit the
 // workflow contract carries.
 func WithRunTimeoutSec(sec int) StartOption {
 	return func(o *startOpts) { o.timeoutSec = sec }
