@@ -34,6 +34,9 @@ function makeSb(): { sb: ServiceBridge; started: StartedOp[] } {
 				started.push(op);
 				return {
 					...op,
+					// Mirrors OpHandle.scope: the plugins read it to nest downstream
+					// work under this op, so a stub without it silently un-nests.
+					scope: { traceId: op.traceId, parentOpId: op.opId },
 					capturing: false,
 					captureIn() {},
 					captureOut() {},

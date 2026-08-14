@@ -71,6 +71,9 @@ export function makeSbStub(captureMode: CaptureMode = "none"): SbStub {
 			return {
 				traceId: op.traceId,
 				opId: op.opId,
+				// Mirrors OpHandle.scope: the plugins nest downstream work under it,
+				// so a stub without it would silently un-nest and still pass.
+				scope: { traceId: op.traceId, parentOpId: op.opId },
 				capturing: captureMode !== "none",
 				captureIn(bytes: Uint8Array) {
 					state.captures.push({ direction: "in", bytes });

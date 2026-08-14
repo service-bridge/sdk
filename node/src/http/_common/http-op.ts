@@ -10,7 +10,7 @@ import {
 	type OpHandle,
 	Status,
 } from "../../telemetry/ops";
-import { childContext, type TraceContext } from "../../telemetry/trace-context";
+import type { TraceContext } from "../../telemetry/trace-context";
 import { contextFromXSbTrace } from "./trace-wrap";
 
 /** Node отдаёт повторяющиеся заголовки массивом, Fetch API — строкой или null. */
@@ -68,7 +68,7 @@ export function startHttpOp(sb: ServiceBridge, req: HttpOpRequest): HttpOp {
 	return {
 		handle,
 		incoming: ctx,
-		scope: childContext(ctx, handle.opId),
+		scope: handle.scope,
 		capturing: handle.capturing,
 	};
 }
