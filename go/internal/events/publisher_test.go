@@ -531,6 +531,10 @@ func TestEventPatternsAcceptWildcardsAndMatchDeliveredNames(t *testing.T) {
 		{"*.created", "order.created"},
 		{"order.#", "order.created"},
 		{"order.#", "order.eu.created"},
+		// `#` covers zero segments too — the runtime matcher does, and a delivery
+		// it routes here must find its handler.
+		{"order.#", "order"},
+		{"#", "order"},
 		{"#", "order.eu.created"},
 		{"*", "order"},
 	}
@@ -545,8 +549,6 @@ func TestEventPatternsAcceptWildcardsAndMatchDeliveredNames(t *testing.T) {
 		// `*` is exactly one segment, so it cannot span two.
 		{"order.*", "order.eu.created"},
 		{"*", "order.created"},
-		// `#` is one or more, never zero.
-		{"order.#", "order"},
 		{"payment.*", "order.created"},
 	}
 	for _, c := range miss {

@@ -309,9 +309,10 @@ func PublishEvent[T proto.Message](ctx context.Context, c *Client, name string, 
 	return id, nil
 }
 
-// SubscribeEvent registers a typed handler for one event name. The name is
-// exact: routing is the runtime's job (ADR-0002), and the delivery carries the
-// concrete name the publisher used.
+// SubscribeEvent registers a typed handler for one event name or pattern.
+// Routing is the runtime's (ADR-0002) and the delivery carries the concrete
+// name the publisher used, so a pattern is matched locally as well — otherwise
+// a wildcard subscription would receive deliveries no exact lookup can place.
 func SubscribeEvent[T proto.Message](c *Client, name string, fn func(ctx context.Context, event T) error) error {
 	const op = "servicebridge.SubscribeEvent"
 	if c.isStarted() {

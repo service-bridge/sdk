@@ -75,8 +75,11 @@ func matchSegments(pat, seg []string) bool {
 	}
 	switch pat[0] {
 	case "#":
-		// `#` covers one or more segments, so try every split it could take.
-		for i := 1; i <= len(seg); i++ {
+		// `#` covers zero or more segments, which is the AMQP semantics the
+		// runtime matches on. Requiring at least one would leave a delivery the
+		// runtime routed here with no local handler to run — it would be acked
+		// having done nothing.
+		for i := 0; i <= len(seg); i++ {
 			if matchSegments(pat[1:], seg[i:]) {
 				return true
 			}

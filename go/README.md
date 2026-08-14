@@ -345,7 +345,9 @@ id, err := placed.Publish(ctx,
 
 `sb.PublishEvent[T](ctx, c, name, payload, opts...)` is the same thing without the declared handle. `sb.SubscribeEventRaw(c, name, fn)` hands the payload over undecoded, for a name whose payload type varies by publisher.
 
-Subscription is by **exact** name — wildcard routing belongs to the runtime, and the delivery carries the concrete name the publisher used. Names must match `^[a-z0-9_-]+(\.[a-z0-9_-]+)*$`; anything else is refused at declaration with `CodeInvalidEventName`. A full outbox returns `CodeOutboxFull`.
+A subscription may name one event or a pattern: `*` covers exactly one segment, `#` covers zero or more, matching the runtime's AMQP routing. `order.*` sees `order.created`; `order.#` sees that and `order.eu.created` and plain `order`. The runtime routes the delivery and the SDK matches the pattern locally, so the handler is found under the concrete name the publisher used.
+
+A publish takes a name, never a pattern. Names must match `^[a-z0-9_-]+(\.[a-z0-9_-]+)*$`; anything else is refused at declaration with `CodeInvalidEventName`. A full outbox returns `CodeOutboxFull`.
 
 Returning an error from a subscriber nacks the delivery, and the runtime redelivers it later — make handlers idempotent. Retries, fan-out and the dead-letter queue are the runtime's; the SDK has no DLQ API, the dashboard operates it.
 
