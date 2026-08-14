@@ -128,7 +128,6 @@ export class RpcClient {
 			serviceName,
 			methodName,
 			schema.contractHash,
-			transport,
 		);
 		const useDirect = this.shouldUseDirect(candidate, transport);
 
@@ -244,7 +243,6 @@ export class RpcClient {
 					serviceName,
 					methodName,
 					schema.contractHash,
-					transport,
 				);
 			} catch (err) {
 				lastErr = err;
@@ -352,7 +350,6 @@ export class RpcClient {
 		serviceName: string,
 		methodName: string,
 		callerHash: string,
-		transport: "direct" | "proxy" | "auto",
 	): Candidate {
 		const all = this.instances.candidatesFor(
 			serviceName,
@@ -371,16 +368,20 @@ export class RpcClient {
 			// The LB reports "everything is filtered out" without knowing which
 			// call it was serving; keep the type and add the coordinates.
 			if (err instanceof NoLiveInstanceError) {
+				// The LB drops endpoint-less instances during eligibility, so
+				// "nothing eligible" has two very different causes and opposite
+				// fixes: nobody advertised an inbound address (the callee runs
+				// caller-only, or advertise is misconfigured) versus the fleet is
+				// there but shedding. Reporting the wrong one sends the operator
+				// after the wrong thing.
+				const advertised = all.some((c) => c.instance.callEndpoint !== "");
 				throw noLiveInstance(
-					`rpc: no live instance of ${serviceName}/${methodName} matching contract ${callerHash} — all candidates unhealthy or circuit-open`,
+					advertised
+						? `rpc: no live instance of ${serviceName}/${methodName} matching contract ${callerHash} — all candidates unhealthy or circuit-open`
+						: `rpc: no endpoint for ${serviceName}/${methodName} matching contract ${callerHash} — the callee advertises no inbound address`,
 				);
 			}
 			throw err;
-		}
-		if (transport === "direct" && !candidate.instance.callEndpoint) {
-			throw new Error(
-				`rpc: transport="direct" requested but no endpoint for ${serviceName}/${methodName} matching contract ${callerHash}`,
-			);
 		}
 		return candidate;
 	}

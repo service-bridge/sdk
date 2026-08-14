@@ -1,6 +1,6 @@
 import "reflect-metadata";
 import * as grpc from "@grpc/grpc-js";
-import { ConfigurationError, ServiceBridgeError } from "../errors";
+import { ConfigurationError, type ServiceBridgeError } from "../errors";
 import { EventDomain } from "../events/domain";
 import { Drainer } from "../events/drainer";
 import type { SchemaIndex } from "../events/publisher";

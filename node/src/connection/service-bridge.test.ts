@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { ConfigurationError } from "../errors";
 import { EventEmitter } from "node:events";
 import { status as GrpcStatus } from "@grpc/grpc-js";
+import { ConfigurationError } from "../errors";
 import { BootstrapKeyPayload } from "../pb/servicebridge/v1/bootstrap";
 import type {
 	ControlClient,

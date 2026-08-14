@@ -48,7 +48,9 @@ export class Semaphore {
 		private readonly maxQueued: number = limit,
 	) {
 		if (!Number.isInteger(limit) || limit < 1) {
-			throw new ConfigurationError(`semaphore: limit must be an integer >= 1, got ${limit}`);
+			throw new ConfigurationError(
+				`semaphore: limit must be an integer >= 1, got ${limit}`,
+			);
 		}
 		if (!Number.isInteger(maxQueued) || maxQueued < 0) {
 			throw new ConfigurationError(
