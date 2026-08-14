@@ -713,6 +713,20 @@ Both SDKs speak to the same runtime and expose the same platform. Where the shap
 
 ---
 
+## AI coding skill
+
+The package ships a skill so an AI coding agent writes correct ServiceBridge code on the first try — the real RPC, events, jobs, workflow and HTTP API, grounded in this SDK rather than guessed. Copy it into your agent's skills directory:
+
+```sh
+cp -r $(go env GOMODCACHE)/github.com/service-bridge/sdk/go@*/skill .claude/skills/servicebridge-go
+```
+
+Or pull it straight from the repo: `npx degit service-bridge/sdk/go/skill .claude/skills/servicebridge-go`. Restart the agent to load it. Source: [`skill/`](./skill).
+
+Every example in it is compiled against this module, so what the agent copies builds.
+
+---
+
 ## Platform features
 
 | Area | What you get |
