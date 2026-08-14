@@ -457,16 +457,14 @@ Telemetry flows automatically: every RPC, event, job, workflow step and HTTP req
 ```ts
 import { Channel, UserSubOp } from "service-bridge";
 
-const op = sb.telemetry.startOp({
-  channel: Channel.USER, kind: UserSubOp, subject: "reprice-cart", businessKey: cartId,
-});
-try {
-  await reprice(cartId);
-  op.end(/* Status.SUCCESS */);
-} catch (err) {
-  op.end(/* Status.ERROR */, String(err));
-  throw err;
-}
+await sb.telemetry
+  .startOp({
+    channel: Channel.USER, kind: UserSubOp, subject: "reprice-cart", businessKey: cartId,
+  })
+  .run(async () => {
+    await reprice(cartId);                      // every call in here nests under the span
+    await sb.rpc.call("pricing", "Quote", { cartId });
+  });
 
 sb.telemetry.log.info("cart repriced", { cartId, items: 7 }); // also sb.logger
 sb.telemetry.counter("carts_repriced_total").inc();
@@ -474,7 +472,11 @@ sb.telemetry.gauge("queue_depth").set(42);
 sb.telemetry.histogram("reprice_ms", "ms").observe(12.5);
 ```
 
-`startOp()` returns a handle whose `.end(status, message?)` closes the span. Anything emitted before `start()` buffers in an in-memory ring and drains once connected.
+`.run(fn)` is what makes the span a parent: it opens the trace scope for the duration of `fn`, closes the span with `SUCCESS` when `fn` settles and with `ERROR` (carrying the message) when it throws, then re-throws. It returns whatever `fn` returns, and hands `fn` the handle if you need `.end(status, message)` with a more precise status — `.end()` is idempotent, so yours wins.
+
+`startOp()` on its own only emits the span. It does **not** open a trace scope, so calls made after it keep the parent that was already active and end up beside your span instead of inside it. Use it alone only when the span outlives a single block (start here, `.end()` on a later callback); otherwise use `.run()`.
+
+Anything emitted before `start()` buffers in an in-memory ring and drains once connected.
 
 ### HTTP
 

@@ -48,13 +48,11 @@ import {
 	Channel,
 	OpHandle,
 	type StartOpParams,
-	Status,
 	UserSubOp,
 } from "../telemetry/ops";
 import type { CaptureMode } from "../telemetry/payload-capture";
 import { ProcessSampler } from "../telemetry/process-sampler";
 import { TelemetryRing } from "../telemetry/ring";
-import { childContext } from "../telemetry/trace-context";
 import {
 	adaptTelemetryClient,
 	TelemetryTransport,
@@ -1494,28 +1492,15 @@ export class ServiceBridge {
 						info.role === "compensation"
 							? `compensate:${info.compensatesForStepId ?? info.stepId}`
 							: `${info.role}:${info.stepId}`;
-					const handle = telemetryApi.startOp({
-						channel: Channel.USER,
-						kind: UserSubOp,
-						subject,
-						businessKey: info.runId,
-						metaJson: Buffer.from(JSON.stringify(meta)),
-					});
-					const parent = currentTraceContext();
-					const scoped = parent
-						? () => runWithTrace(childContext(parent, handle.opId), fn)
-						: fn;
-					try {
-						const out = await scoped();
-						handle.end(Status.SUCCESS);
-						return out;
-					} catch (err) {
-						handle.end(
-							Status.ERROR,
-							err instanceof Error ? err.message : String(err),
-						);
-						throw err;
-					}
+					return telemetryApi
+						.startOp({
+							channel: Channel.USER,
+							kind: UserSubOp,
+							subject,
+							businessKey: info.runId,
+							metaJson: Buffer.from(JSON.stringify(meta)),
+						})
+						.run(fn);
 				},
 			},
 			logger: { warn: console.warn, error: console.error },

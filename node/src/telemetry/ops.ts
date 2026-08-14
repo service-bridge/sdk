@@ -10,7 +10,7 @@ import {
 	type PayloadAttachment,
 	Status,
 } from "../pb/servicebridge/v1/telemetry";
-import { currentTraceContext } from "./context";
+import { currentTraceContext, runWithTrace } from "./context";
 import {
 	type CapturedAttachment,
 	type CaptureMode,
@@ -19,7 +19,7 @@ import {
 	resolveCaptureMode,
 } from "./payload-capture";
 import type { TelemetryRing } from "./ring";
-import { ZERO_OP_ID } from "./trace-context";
+import { type TraceContext, ZERO_OP_ID } from "./trace-context";
 
 export { Channel, Status };
 
@@ -117,6 +117,11 @@ export class OpHandle {
 	 * Start an operation, enqueue the START frame, return a handle for END.
 	 * traceId / parentOpId default to the active TraceContext from ALS
 	 * (set via runWithTrace). opId is auto-minted as a fresh UUIDv7.
+	 *
+	 * Reads the ambient trace scope but does NOT open one: work started after
+	 * this call keeps the parent that was active before it, so nested calls
+	 * land beside the new op instead of inside it. Wrap the work in
+	 * `handle.run(fn)` to make them children.
 	 */
 	static start(ring: TelemetryRing, params: StartOpParams): OpHandle {
 		const ctx = currentTraceContext();
@@ -226,6 +231,35 @@ export class OpHandle {
 			contractHash: att.contractHash,
 		};
 		this.ring.push("payloads", msg);
+	}
+
+	/** Context children of this op run in: same trace, this op as the parent. */
+	get scope(): TraceContext {
+		return { traceId: this.params.traceId, parentOpId: this.params.opId };
+	}
+
+	/**
+	 * Run fn inside this op's trace scope, then close the op: SUCCESS when fn
+	 * settles, ERROR carrying the thrown message when it throws — the throw is
+	 * re-raised to the caller. Everything fn reaches — `rpc.call`,
+	 * `event.publish`, another `startOp` — becomes a child of this op.
+	 *
+	 * fn may close the op itself with a more precise status (TIMEOUT,
+	 * ABANDONED); `end` is idempotent, so the automatic close then does nothing.
+	 *
+	 * `als.run` and not `als.enterWith`: enterWith leaves the scope installed on
+	 * the current async branch after the op is over, so the next sibling op and
+	 * any concurrently running op would inherit a parent that already ended.
+	 */
+	async run<T>(fn: (op: OpHandle) => T | Promise<T>): Promise<T> {
+		try {
+			const out = await runWithTrace(this.scope, () => fn(this));
+			this.end(Status.SUCCESS);
+			return out;
+		} catch (err) {
+			this.end(Status.ERROR, err instanceof Error ? err.message : String(err));
+			throw err;
+		}
 	}
 
 	/**

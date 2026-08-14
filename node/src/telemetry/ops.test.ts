@@ -3,8 +3,15 @@ import type {
 	OpReport,
 	PayloadAttachment,
 } from "../pb/servicebridge/v1/telemetry";
-import { runWithTrace } from "./context";
-import { Channel, HttpHandle, OpHandle, RpcCall, Status } from "./ops";
+import { currentTraceContext, runWithTrace } from "./context";
+import {
+	Channel,
+	HttpHandle,
+	OpHandle,
+	RpcCall,
+	Status,
+	UserSubOp,
+} from "./ops";
 import { TelemetryRing } from "./ring";
 import { ZERO_OP_ID } from "./trace-context";
 
@@ -216,5 +223,165 @@ describe("OpHandle payload capture", () => {
 		const a = drainPayloads()[0]!;
 		expect(a.bytes.byteLength).toBe(2);
 		expect(a.originalSize).toBe(5);
+	});
+});
+
+describe("OpHandle.run", () => {
+	let ring: TelemetryRing;
+
+	beforeEach(() => {
+		ring = new TelemetryRing();
+	});
+
+	const frames = (): OpReport[] =>
+		ring
+			.peek(200)
+			.filter((i) => i.kind === "ops")
+			.map((i) => i.message as OpReport);
+
+	const startFrames = (): OpReport[] =>
+		frames().filter((f) => f.finishedAtMs === undefined);
+
+	const endFrame = (opId: string): OpReport | undefined =>
+		frames().find((f) => f.opId === opId && f.finishedAtMs !== undefined);
+
+	const startFrameOf = (opId: string): OpReport | undefined =>
+		startFrames().find((f) => f.opId === opId);
+
+	const userOp = (subject: string) =>
+		OpHandle.start(ring, {
+			channel: Channel.USER,
+			kind: UserSubOp,
+			subject,
+		});
+
+	test("work inside the op becomes its child", async () => {
+		const outer = userOp("reconcile");
+		let child: OpHandle | undefined;
+
+		await outer.run(async () => {
+			await Promise.resolve();
+			child = OpHandle.start(ring, {
+				channel: Channel.RPC,
+				kind: RpcCall,
+				subject: "rpc.call:billing/Charge",
+			});
+		});
+
+		const childFrame = startFrameOf(child?.opId ?? "");
+		expect(childFrame?.parentOpId).toBe(outer.opId);
+		expect(childFrame?.traceId).toBe(outer.traceId);
+		expect(endFrame(outer.opId)?.status).toBe(Status.SUCCESS);
+	});
+
+	test("passes the handle to fn and returns its value", async () => {
+		const op = userOp("reconcile");
+		const got = await op.run((handle) => {
+			expect(handle).toBe(op);
+			return 42;
+		});
+		expect(got).toBe(42);
+	});
+
+	test("a throw closes the op with ERROR and re-throws", async () => {
+		const op = userOp("reconcile");
+		await expect(
+			op.run(async () => {
+				throw new Error("boom");
+			}),
+		).rejects.toThrow("boom");
+
+		const ended = endFrame(op.opId);
+		expect(ended?.status).toBe(Status.ERROR);
+		expect(ended?.statusMessage).toBe("boom");
+	});
+
+	test("a non-Error throw is stringified into the status message", async () => {
+		const op = userOp("reconcile");
+		await expect(op.run(() => Promise.reject("nope"))).rejects.toBe("nope");
+		expect(endFrame(op.opId)?.statusMessage).toBe("nope");
+	});
+
+	test("nested runs build a chain, not a flat list", async () => {
+		const outer = userOp("outer");
+		let inner: OpHandle | undefined;
+		let leaf: OpHandle | undefined;
+
+		await outer.run(async () => {
+			inner = userOp("inner");
+			await inner.run(async () => {
+				await Promise.resolve();
+				leaf = userOp("leaf");
+			});
+		});
+
+		expect(startFrameOf(inner?.opId ?? "")?.parentOpId).toBe(outer.opId);
+		expect(startFrameOf(leaf?.opId ?? "")?.parentOpId).toBe(inner?.opId);
+		expect(endFrame(inner?.opId ?? "")?.status).toBe(Status.SUCCESS);
+		expect(endFrame(outer.opId)?.status).toBe(Status.SUCCESS);
+	});
+
+	test("parallel runs do not steal each other's children", async () => {
+		const root = {
+			traceId: "01900000-0000-7000-8000-0000000000cc",
+			parentOpId: "01900000-0000-7000-8000-0000000000dd",
+		};
+
+		const spawn = async (subject: string, delayMs: number) => {
+			const op = userOp(subject);
+			let child: OpHandle | undefined;
+			await op.run(async () => {
+				await new Promise((r) => setTimeout(r, delayMs));
+				child = userOp(`${subject}-child`);
+			});
+			return { op, child };
+		};
+
+		const [a, b] = await runWithTrace(root, () =>
+			Promise.all([spawn("a", 5), spawn("b", 1)]),
+		);
+
+		expect(startFrameOf(a.child?.opId ?? "")?.parentOpId).toBe(a.op.opId);
+		expect(startFrameOf(b.child?.opId ?? "")?.parentOpId).toBe(b.op.opId);
+		expect(a.op.opId).not.toBe(b.op.opId);
+		// Both spans stay siblings under the ambient root, not under each other.
+		expect(startFrameOf(a.op.opId)?.parentOpId).toBe(root.parentOpId);
+		expect(startFrameOf(b.op.opId)?.parentOpId).toBe(root.parentOpId);
+	});
+
+	test("the ambient scope is restored after run", async () => {
+		const root = {
+			traceId: "01900000-0000-7000-8000-0000000000ee",
+			parentOpId: "01900000-0000-7000-8000-0000000000ff",
+		};
+
+		await runWithTrace(root, async () => {
+			const first = userOp("first");
+			await first.run(async () => {
+				await Promise.resolve();
+			});
+			expect(currentTraceContext()).toEqual(root);
+			const second = userOp("second");
+			expect(startFrameOf(second.opId)?.parentOpId).toBe(root.parentOpId);
+		});
+	});
+
+	test("a status set inside fn wins over the automatic close", async () => {
+		const op = userOp("reconcile");
+		await op.run((handle) => {
+			handle.end(Status.TIMEOUT, "took too long");
+		});
+
+		const ends = frames().filter(
+			(f) => f.opId === op.opId && f.finishedAtMs !== undefined,
+		);
+		expect(ends).toHaveLength(1);
+		expect(ends[0]?.status).toBe(Status.TIMEOUT);
+		expect(ends[0]?.statusMessage).toBe("took too long");
+	});
+
+	test("scope exposes this op as the parent for children", () => {
+		const op = userOp("reconcile");
+		expect(op.scope).toEqual({ traceId: op.traceId, parentOpId: op.opId });
 	});
 });

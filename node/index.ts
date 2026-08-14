@@ -43,7 +43,8 @@ export { RpcAccessDeniedError } from "./src/rpc/errors";
 export { NoLiveInstanceError } from "./src/rpc/lb";
 export type { TypedClient } from "./src/rpc/typed-client";
 // Everything needed to call sb.telemetry.startOp(): the params type names
-// Channel, and the kind is a per-channel numeric constant.
+// Channel, and the kind is a per-channel numeric constant. Wrap the work in
+// the returned handle's run(fn) to make it the parent of everything inside.
 export {
 	Channel,
 	EventDeliver,
