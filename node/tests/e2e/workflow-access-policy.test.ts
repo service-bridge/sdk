@@ -197,7 +197,11 @@ describe("workflow-access-policy", () => {
 		// terminal state is a real failure and propagates out of awaitRunStatus.
 		// Unique wf name makes each re-run independent.
 		let status1 = "";
-		const deadline = Date.now() + 45_000;
+		// Generous because the whole suite runs seven domains at once: the
+		// runtime is saturated, and each retry costs a full run start plus an
+		// await. A wrong-status run still fails immediately below, so the budget
+		// buys patience with the snapshot, not tolerance for a broken policy.
+		const deadline = Date.now() + 90_000;
 		for (;;) {
 			const { runId } = await startWorkflowWhenAllowed(
 				parentOwner,
@@ -249,7 +253,7 @@ describe("workflow-access-policy", () => {
 			await sleep(500);
 		}
 		expect(DENIED_RUN_STATUSES).toContain(status2);
-	}, 120_000);
+	}, 180_000);
 
 	test("access-policy: mid-flight rule tightening surfaces in policyEvaluation() within 5s", async () => {
 		const wfName = uniqueName("ap-live");
