@@ -29,6 +29,18 @@ interface AgentConfig {
 	// subscribeEvents are consumed; publishEvents are declared for publishing.
 	subscribeEvents: string[];
 	publishEvents: string[];
+	// jobName declares a scheduled job with jobOpts (raw JobOpts JSON). Empty
+	// name registers none. Used by the jobs cross-language tests to prove a job
+	// spec written by one SDK is accepted and, when this instance is the one
+	// live at fire time, executed by it.
+	jobName: string;
+	jobOpts: unknown;
+	// workflowName declares a workflow whose only step is a `call` reaching
+	// workflowCallService/workflowCallMethod (always declared as a dependency
+	// too, so the outgoing schema is registered). Empty name declares none.
+	workflowName: string;
+	workflowCallService: string;
+	workflowCallMethod: string;
 }
 
 const parsed: AgentConfig = JSON.parse(process.env.SB_AGENT_CONFIG ?? "");
@@ -58,8 +70,9 @@ const RPC_SCHEMA = {
 	input: "Echo",
 	output: "EchoReply",
 };
-// An event's contract hash pairs the payload with an empty reply, mirroring
-// what the Go SDK derives from google.protobuf.Empty.
+// An event's declared output never affects its contract hash — both SDKs hash
+// only the input half — but the schema parser still requires a non-empty
+// output name, so an empty-message type is named here.
 const EVENT_SCHEMA = {
 	protoFile: config.protoFile,
 	input: "OrderEvent",
@@ -129,6 +142,36 @@ for (const name of config.publishEvents) {
 	sb.event.define(name, EVENT_SCHEMA);
 }
 
+if (config.jobName) {
+	sb.job.handle(
+		config.jobName,
+		config.jobOpts as Parameters<typeof sb.job.handle>[1],
+		async (ctx: { attempt: number; idempotencyKey: string; executionId: string }) => {
+			emit({
+				type: "job",
+				name: config.jobName,
+				attempt: ctx.attempt,
+				idempotencyKey: ctx.idempotencyKey,
+			});
+		},
+	);
+}
+
+if (config.workflowName) {
+	sb.workflow.handle(config.workflowName, {
+		steps: [
+			{
+				id: "call_target",
+				type: "call",
+				service: config.workflowCallService,
+				method: config.workflowCallMethod,
+				input: { text: "from-node-workflow", n: 77 },
+				opts: { transport: "proxy", timeout: "20s" },
+			},
+		],
+	});
+}
+
 await new Promise<void>((resolve, reject) => {
 	const timer = setTimeout(() => reject(new Error("agent: connect timed out")), 20_000);
 	sb.on("connected", () => {
@@ -182,12 +225,13 @@ async function awaitMethod(service: string, method: string): Promise<void> {
 
 interface Command {
 	id: number;
-	cmd: "call" | "publish" | "awaitMethod" | "stop";
+	cmd: "call" | "publish" | "awaitMethod" | "startWorkflow" | "awaitWorkflow" | "stop";
 	service?: string;
 	method?: string;
 	name?: string;
 	payload?: Record<string, unknown>;
 	partitionKey?: string;
+	runId?: string;
 }
 
 async function run(cmd: Command): Promise<unknown> {
@@ -229,6 +273,12 @@ async function run(cmd: Command): Promise<unknown> {
 				cmd.payload ?? {},
 				cmd.partitionKey ? { partitionKey: cmd.partitionKey } : undefined,
 			);
+		case "startWorkflow": {
+			const { runId } = await sb.workflow.start(cmd.name, cmd.payload ?? {});
+			return { runId };
+		}
+		case "awaitWorkflow":
+			return await sb.workflow.await(cmd.runId as string);
 		case "stop":
 			await sb.stop();
 			return {};

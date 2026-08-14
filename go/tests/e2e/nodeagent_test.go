@@ -35,6 +35,15 @@ type agentConfig struct {
 	Deps             []agentDep `json:"deps"`
 	SubscribeEvents  []string   `json:"subscribeEvents"`
 	PublishEvents    []string   `json:"publishEvents"`
+	// JobName declares a scheduled job with JobOpts (a raw JobOpts JSON value,
+	// camelCase, matching node/src/job/types.ts). Empty registers none.
+	JobName string `json:"jobName"`
+	JobOpts any    `json:"jobOpts"`
+	// WorkflowName declares a workflow whose only step is a `call` reaching
+	// WorkflowCallService/WorkflowCallMethod. Empty declares none.
+	WorkflowName        string `json:"workflowName"`
+	WorkflowCallService string `json:"workflowCallService"`
+	WorkflowCallMethod  string `json:"workflowCallMethod"`
 }
 
 type agentDep struct {
@@ -60,6 +69,13 @@ type agentRPC struct {
 	Req    map[string]any `json:"req"`
 }
 
+// agentJob is one execution the agent's job handler was invoked for.
+type agentJob struct {
+	Name           string
+	Attempt        int
+	IdempotencyKey string
+}
+
 type agentMessage struct {
 	Type    string          `json:"type"`
 	ID      int64           `json:"id"`
@@ -76,6 +92,9 @@ type agentMessage struct {
 	InstanceID        string `json:"instanceId"`
 	RPCContractHash   string `json:"rpcContractHash"`
 	EventContractHash string `json:"eventContractHash"`
+
+	Attempt        int    `json:"attempt"`
+	IdempotencyKey string `json:"idempotencyKey"`
 }
 
 type nodeAgent struct {
@@ -88,6 +107,7 @@ type nodeAgent struct {
 
 	events chan agentEvent
 	rpcs   chan agentRPC
+	jobs   chan agentJob
 
 	mu      sync.Mutex
 	results map[int64]chan agentMessage
@@ -147,6 +167,7 @@ func startNodeAgent(ctx context.Context, t *testing.T, cfg agentConfig) *nodeAge
 		stderr:  stderr,
 		events:  make(chan agentEvent, 64),
 		rpcs:    make(chan agentRPC, 64),
+		jobs:    make(chan agentJob, 64),
 		results: map[int64]chan agentMessage{},
 	}
 	if err := cmd.Start(); err != nil {
@@ -199,6 +220,8 @@ func (a *nodeAgent) read(stdout io.Reader, ready chan<- agentReady, fatal chan<-
 			a.events <- agentEvent{Name: msg.Name, Payload: msg.Payload}
 		case "rpc":
 			a.rpcs <- agentRPC{Method: msg.Method, Req: msg.Req}
+		case "job":
+			a.jobs <- agentJob{Name: msg.Name, Attempt: msg.Attempt, IdempotencyKey: msg.IdempotencyKey}
 		case "result":
 			a.mu.Lock()
 			ch, ok := a.results[msg.ID]
@@ -305,6 +328,91 @@ func (a *nodeAgent) waitRPC(t *testing.T, timeout time.Duration) agentRPC {
 		t.Fatalf("the Node agent's handler was not called within %s\nstderr:\n%s", timeout, a.stderr.String())
 		return agentRPC{}
 	}
+}
+
+// waitJob blocks for one execution the agent's job handler served.
+func (a *nodeAgent) waitJob(t *testing.T, timeout time.Duration) agentJob {
+	t.Helper()
+	select {
+	case j := <-a.jobs:
+		return j
+	case <-time.After(timeout):
+		t.Fatalf("the Node agent's job handler was not called within %s\nstderr:\n%s", timeout, a.stderr.String())
+		return agentJob{}
+	}
+}
+
+// startWorkflow makes the Node instance start a run of its declared workflow.
+func (a *nodeAgent) startWorkflow(ctx context.Context, name string, payload map[string]any) (string, error) {
+	msg, err := a.send(ctx, map[string]any{"cmd": "startWorkflow", "name": name, "payload": payload})
+	if err != nil {
+		return "", err
+	}
+	var out struct {
+		RunID string `json:"runId"`
+	}
+	if err := json.Unmarshal(msg.Value, &out); err != nil {
+		return "", fmt.Errorf("decode agent startWorkflow reply %s: %w", msg.Value, err)
+	}
+	return out.RunID, nil
+}
+
+// awaitWorkflow blocks until the Node instance's run reaches a terminal state
+// and returns the final state map.
+func (a *nodeAgent) awaitWorkflow(ctx context.Context, runID string) (map[string]any, error) {
+	msg, err := a.send(ctx, map[string]any{"cmd": "awaitWorkflow", "runId": runID})
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := json.Unmarshal(msg.Value, &out); err != nil {
+		return nil, fmt.Errorf("decode agent awaitWorkflow reply %s: %w", msg.Value, err)
+	}
+	return out, nil
+}
+
+// nodeWorkflowFingerprint runs nodeagent/workflow-fingerprint.ts once, out of
+// process, and returns the Node SDK's own canonical JSON + fingerprint for
+// graph. It needs no runtime connection: canonicalize/fingerprint are pure
+// functions of the graph, so this is the fastest, most direct way to prove the
+// two SDKs render byte-identical bytes for the same workflow — a runtime round
+// trip would only prove the graph parses, not that the bytes matched.
+func nodeWorkflowFingerprint(ctx context.Context, t *testing.T, graph any) (canonicalJSON, fingerprint string) {
+	t.Helper()
+
+	bun, err := exec.LookPath("bun")
+	if err != nil {
+		t.Fatalf("bun is not on PATH: %v", err)
+	}
+	root, err := repoDir()
+	if err != nil {
+		t.Fatalf("resolve package directory: %v", err)
+	}
+	script := filepath.Join(root, "nodeagent", "workflow-fingerprint.ts")
+	nodeSrc := filepath.Join(suite.sdkRepo, "node", "src")
+
+	graphJSON, err := json.Marshal(graph)
+	if err != nil {
+		t.Fatalf("encode graph: %v", err)
+	}
+
+	cmd := exec.CommandContext(ctx, bun, "run", script, nodeSrc, string(graphJSON))
+	cmd.Dir = filepath.Join(suite.sdkRepo, "node")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("workflow-fingerprint.ts failed: %v\nstderr:\n%s", err, stderr.String())
+	}
+
+	var out struct {
+		Canonical   string `json:"canonical"`
+		Fingerprint string `json:"fingerprint"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &out); err != nil {
+		t.Fatalf("decode workflow-fingerprint.ts output %s: %v", stdout.String(), err)
+	}
+	return out.Canonical, out.Fingerprint
 }
 
 // stop asks the agent to close its client, then makes sure the process is gone:
