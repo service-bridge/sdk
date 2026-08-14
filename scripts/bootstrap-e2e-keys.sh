@@ -72,7 +72,13 @@ PG_MODE=${PG_MODE:-docker}
 # against its own three identities (e2e-<domain>-1/2/3, pool.ts roles
 # primary/second/third), so domains run in parallel without sharing any
 # identity. Tests namespace their own work within a domain.
-DOMAINS="access-policy events jobs rpc workflow http misc"
+#
+# The `go-*` domains belong to the Go SDK e2e suite (sb-go-sdk/go/tests/e2e).
+# They are separate identities because the runtime accepts one Events.Subscribe
+# stream per instance: a Go and a Node instance sharing one identity would fight
+# over it and the loser gets AlreadyExists. `go-xlang` hosts the cross-language
+# pair — index 1 is the Go process, index 2 the Node agent it spawns.
+DOMAINS="access-policy events jobs rpc workflow http misc go-rpc go-events go-jobs go-workflow go-misc go-xlang"
 
 case "$PG_MODE" in
   docker)
