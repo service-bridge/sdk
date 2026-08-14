@@ -138,10 +138,10 @@ func repoDir() (string, error) {
 	return wd, nil
 }
 
-// locateEnvFile finds .env.e2e. It is not in this repository: the keys are
-// provisioned by the Node SDK repository's script and shared by both suites, so
-// the search covers the sibling `sdk/` checkout as well as the ancestors of the
-// working directory.
+// locateEnvFile finds .env.e2e. It is gitignored and lives at the repository
+// root, shared by the Node and Go suites, so the search walks up from the
+// working directory; the `sdk/` candidate covers a checkout that nests this
+// repository under a workspace directory.
 func locateEnvFile() (string, error) {
 	if explicit := os.Getenv("SB_E2E_ENV_FILE"); explicit != "" {
 		if _, err := os.Stat(explicit); err != nil {

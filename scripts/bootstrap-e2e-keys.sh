@@ -73,7 +73,7 @@ PG_MODE=${PG_MODE:-docker}
 # primary/second/third), so domains run in parallel without sharing any
 # identity. Tests namespace their own work within a domain.
 #
-# The `go-*` domains belong to the Go SDK e2e suite (sb-go-sdk/go/tests/e2e).
+# The `go-*` domains belong to the Go SDK e2e suite (go/tests/e2e).
 # They are separate identities because the runtime accepts one Events.Subscribe
 # stream per instance: a Go and a Node instance sharing one identity would fight
 # over it and the loser gets AlreadyExists. `go-xlang` hosts the cross-language
