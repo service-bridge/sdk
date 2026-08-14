@@ -1,0 +1,44 @@
+version: v2
+
+# Runtime stubs live under runtime/internal/pb, so an external module cannot
+# import them. The SDK generates its own copy from the same .proto sources with
+# its own go_package. servicebridge/ui is the dashboard-only surface — excluded.
+inputs:
+  - directory: ../../runtime/proto
+    paths:
+      - ../../runtime/proto/servicebridge/v1
+
+# Plugins run locally: buf.build remote plugin execution needs a registry login,
+# a local toolchain keeps generation reproducible and offline.
+# scripts/gen-proto.sh pins their versions.
+plugins:
+  - local: protoc-gen-go
+    out: internal/pb
+    opt:
+      - paths=source_relative
+      - Mservicebridge/v1/bootstrap.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
+      - Mservicebridge/v1/call.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
+      - Mservicebridge/v1/control.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
+      - Mservicebridge/v1/events.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
+      - Mservicebridge/v1/invoke.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
+      - Mservicebridge/v1/jobs.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
+      - Mservicebridge/v1/registry.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
+      - Mservicebridge/v1/telemetry.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
+      - Mservicebridge/v1/ui.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
+      - Mservicebridge/v1/workflows.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
+
+  - local: protoc-gen-go-grpc
+    out: internal/pb
+    opt:
+      - paths=source_relative
+      - require_unimplemented_servers=false
+      - Mservicebridge/v1/bootstrap.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
+      - Mservicebridge/v1/call.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
+      - Mservicebridge/v1/control.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
+      - Mservicebridge/v1/events.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
+      - Mservicebridge/v1/invoke.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
+      - Mservicebridge/v1/jobs.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
+      - Mservicebridge/v1/registry.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
+      - Mservicebridge/v1/telemetry.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
+      - Mservicebridge/v1/ui.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
+      - Mservicebridge/v1/workflows.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb

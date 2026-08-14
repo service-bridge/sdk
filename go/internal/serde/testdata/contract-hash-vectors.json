@@ -1,0 +1,364 @@
+{
+	"algorithm": "servicebridge.contract-hash",
+	"version": "v2",
+	"formula": "contractHash = \"v2:\" + lowerHex(sha256(canonicalInput + \":\" + canonicalOutput))",
+	"spec": {
+		"summary": "Language-neutral protobuf wire identity. Only what decides wire compatibility is hashed: field numbers, cardinality and types. Field names, message/enum member names, comments, formatting and declaration order are excluded.",
+		"messageDescriptor": {
+			"f": "Array of field descriptors, sorted ascending by field number. Always present, `[]` for an empty message.",
+			"o": "Array of oneof groups: {\"f\":[field numbers ascending]}, groups sorted ascending by their first number. Omitted when the message has no oneof group. A proto3 `optional` field is NOT a oneof group.",
+			"r": "Flat table of every message/enum reachable transitively from this message's fields, keyed by fully-qualified name with a leading dot, keys sorted lexicographically. A message entry is {\"f\":...,\"o\":...} with no nested \"r\". An enum entry is {\"e\":[value numbers, ascending, duplicates collapsed]}. A message reachable from itself appears here too. Omitted when empty."
+		},
+		"fieldDescriptor": {
+			"n": "field number",
+			"c": "\"opt\" (singular, including proto3 optional) | \"rep\" (repeated) | \"map\" | \"req\" (proto2 required)",
+			"t": "scalar name exactly as written in .proto (\"string\", \"int32\", \"int64\", \"uint32\", \"uint64\", \"sint32\", \"sint64\", \"fixed32\", \"fixed64\", \"sfixed32\", \"sfixed64\", \"bool\", \"float\", \"double\", \"bytes\"), or \"m:<.full.Name>\" for a message, or \"e:<.full.Name>\" for an enum. For a map field this is the VALUE type.",
+			"k": "map key type (always a scalar name). Present only when c==\"map\"."
+		},
+		"mapEntries": "Synthetic protobuf map-entry messages never appear in `r`; a map is expressed inline through c/k/t.",
+		"canonicalJson": "Object keys sorted lexicographically at every level, array order preserved, no whitespace, no trailing commas. Numbers are plain integers.",
+		"emptyHash": "A handler registered without a schema declares the empty string as its contract hash. The empty string is a valid value and matches only the empty string."
+	},
+	"notes": [
+		"Runtime stores the hash opaque and never recomputes it; it only compares equality when routing Invoke to instances.",
+		"The two schema sources (.proto and .schema.json) are NOT expected to agree with each other — .schema.json derives nested message names from field names, so a caller and a callee must use the same source kind (ADR 0001)."
+	],
+	"vectors": [
+		{
+			"name": "scalars",
+			"covers": "every protobuf scalar type, one field each",
+			"source": "proto",
+			"fixture": "sdk/node/src/serde/testdata/vectors-scalars.proto",
+			"proto": "syntax = \"proto3\";\n\npackage sb.vectors.scalars;\n\nmessage ScalarsRequest {\n  double   f_double   = 1;\n  float    f_float    = 2;\n  int32    f_int32    = 3;\n  int64    f_int64    = 4;\n  uint32   f_uint32   = 5;\n  uint64   f_uint64   = 6;\n  sint32   f_sint32   = 7;\n  sint64   f_sint64   = 8;\n  fixed32  f_fixed32  = 9;\n  fixed64  f_fixed64  = 10;\n  sfixed32 f_sfixed32 = 11;\n  sfixed64 f_sfixed64 = 12;\n  bool     f_bool     = 13;\n  string   f_string   = 14;\n  bytes    f_bytes    = 15;\n}\n\nmessage ScalarsResponse {\n  bool ok = 1;\n}\n",
+			"inputMessage": "sb.vectors.scalars.ScalarsRequest",
+			"outputMessage": "sb.vectors.scalars.ScalarsResponse",
+			"canonicalInput": "{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"double\"},{\"c\":\"opt\",\"n\":2,\"t\":\"float\"},{\"c\":\"opt\",\"n\":3,\"t\":\"int32\"},{\"c\":\"opt\",\"n\":4,\"t\":\"int64\"},{\"c\":\"opt\",\"n\":5,\"t\":\"uint32\"},{\"c\":\"opt\",\"n\":6,\"t\":\"uint64\"},{\"c\":\"opt\",\"n\":7,\"t\":\"sint32\"},{\"c\":\"opt\",\"n\":8,\"t\":\"sint64\"},{\"c\":\"opt\",\"n\":9,\"t\":\"fixed32\"},{\"c\":\"opt\",\"n\":10,\"t\":\"fixed64\"},{\"c\":\"opt\",\"n\":11,\"t\":\"sfixed32\"},{\"c\":\"opt\",\"n\":12,\"t\":\"sfixed64\"},{\"c\":\"opt\",\"n\":13,\"t\":\"bool\"},{\"c\":\"opt\",\"n\":14,\"t\":\"string\"},{\"c\":\"opt\",\"n\":15,\"t\":\"bytes\"}]}",
+			"canonicalOutput": "{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"bool\"}]}",
+			"contractHash": "v2:acdf1e8435f4a6ab1f76cd5ed7df02af22ec2d85220db2b73293d507a61e364a"
+		},
+		{
+			"name": "scalars_renamed",
+			"covers": "same wire shape as `scalars`, every field name changed",
+			"source": "proto",
+			"fixture": "sdk/node/src/serde/testdata/vectors-scalars-renamed.proto",
+			"proto": "syntax = \"proto3\";\n\npackage sb.vectors.scalars;\n\nmessage ScalarsRequest {\n  double   alpha   = 1;\n  float    bravo   = 2;\n  int32    charlie = 3;\n  int64    delta   = 4;\n  uint32   echo    = 5;\n  uint64   foxtrot = 6;\n  sint32   golf    = 7;\n  sint64   hotel   = 8;\n  fixed32  india   = 9;\n  fixed64  juliett = 10;\n  sfixed32 kilo    = 11;\n  sfixed64 lima    = 12;\n  bool     mike    = 13;\n  string   november = 14;\n  bytes    oscar   = 15;\n}\n\nmessage ScalarsResponse {\n  bool accepted = 1;\n}\n",
+			"inputMessage": "sb.vectors.scalars.ScalarsRequest",
+			"outputMessage": "sb.vectors.scalars.ScalarsResponse",
+			"canonicalInput": "{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"double\"},{\"c\":\"opt\",\"n\":2,\"t\":\"float\"},{\"c\":\"opt\",\"n\":3,\"t\":\"int32\"},{\"c\":\"opt\",\"n\":4,\"t\":\"int64\"},{\"c\":\"opt\",\"n\":5,\"t\":\"uint32\"},{\"c\":\"opt\",\"n\":6,\"t\":\"uint64\"},{\"c\":\"opt\",\"n\":7,\"t\":\"sint32\"},{\"c\":\"opt\",\"n\":8,\"t\":\"sint64\"},{\"c\":\"opt\",\"n\":9,\"t\":\"fixed32\"},{\"c\":\"opt\",\"n\":10,\"t\":\"fixed64\"},{\"c\":\"opt\",\"n\":11,\"t\":\"sfixed32\"},{\"c\":\"opt\",\"n\":12,\"t\":\"sfixed64\"},{\"c\":\"opt\",\"n\":13,\"t\":\"bool\"},{\"c\":\"opt\",\"n\":14,\"t\":\"string\"},{\"c\":\"opt\",\"n\":15,\"t\":\"bytes\"}]}",
+			"canonicalOutput": "{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"bool\"}]}",
+			"contractHash": "v2:acdf1e8435f4a6ab1f76cd5ed7df02af22ec2d85220db2b73293d507a61e364a"
+		},
+		{
+			"name": "scalars_renumbered",
+			"covers": "same as `scalars` with field 15 moved to 16",
+			"source": "proto",
+			"fixture": "sdk/node/src/serde/testdata/vectors-scalars-renumbered.proto",
+			"proto": "syntax = \"proto3\";\n\npackage sb.vectors.scalars;\n\nmessage ScalarsRequest {\n  double   f_double   = 1;\n  float    f_float    = 2;\n  int32    f_int32    = 3;\n  int64    f_int64    = 4;\n  uint32   f_uint32   = 5;\n  uint64   f_uint64   = 6;\n  sint32   f_sint32   = 7;\n  sint64   f_sint64   = 8;\n  fixed32  f_fixed32  = 9;\n  fixed64  f_fixed64  = 10;\n  sfixed32 f_sfixed32 = 11;\n  sfixed64 f_sfixed64 = 12;\n  bool     f_bool     = 13;\n  string   f_string   = 14;\n  bytes    f_bytes    = 16;\n}\n\nmessage ScalarsResponse {\n  bool ok = 1;\n}\n",
+			"inputMessage": "sb.vectors.scalars.ScalarsRequest",
+			"outputMessage": "sb.vectors.scalars.ScalarsResponse",
+			"canonicalInput": "{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"double\"},{\"c\":\"opt\",\"n\":2,\"t\":\"float\"},{\"c\":\"opt\",\"n\":3,\"t\":\"int32\"},{\"c\":\"opt\",\"n\":4,\"t\":\"int64\"},{\"c\":\"opt\",\"n\":5,\"t\":\"uint32\"},{\"c\":\"opt\",\"n\":6,\"t\":\"uint64\"},{\"c\":\"opt\",\"n\":7,\"t\":\"sint32\"},{\"c\":\"opt\",\"n\":8,\"t\":\"sint64\"},{\"c\":\"opt\",\"n\":9,\"t\":\"fixed32\"},{\"c\":\"opt\",\"n\":10,\"t\":\"fixed64\"},{\"c\":\"opt\",\"n\":11,\"t\":\"sfixed32\"},{\"c\":\"opt\",\"n\":12,\"t\":\"sfixed64\"},{\"c\":\"opt\",\"n\":13,\"t\":\"bool\"},{\"c\":\"opt\",\"n\":14,\"t\":\"string\"},{\"c\":\"opt\",\"n\":16,\"t\":\"bytes\"}]}",
+			"canonicalOutput": "{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"bool\"}]}",
+			"contractHash": "v2:d05d3067dc06f2427b94fa1711e8280ff36cd270ed7dff8ff63d3708f521f2d9"
+		},
+		{
+			"name": "scalars_retyped",
+			"covers": "same as `scalars` with field 3 changed from int32 to int64",
+			"source": "proto",
+			"fixture": "sdk/node/src/serde/testdata/vectors-scalars-retyped.proto",
+			"proto": "syntax = \"proto3\";\n\npackage sb.vectors.scalars;\n\nmessage ScalarsRequest {\n  double   f_double   = 1;\n  float    f_float    = 2;\n  int64    f_int32    = 3;\n  int64    f_int64    = 4;\n  uint32   f_uint32   = 5;\n  uint64   f_uint64   = 6;\n  sint32   f_sint32   = 7;\n  sint64   f_sint64   = 8;\n  fixed32  f_fixed32  = 9;\n  fixed64  f_fixed64  = 10;\n  sfixed32 f_sfixed32 = 11;\n  sfixed64 f_sfixed64 = 12;\n  bool     f_bool     = 13;\n  string   f_string   = 14;\n  bytes    f_bytes    = 15;\n}\n\nmessage ScalarsResponse {\n  bool ok = 1;\n}\n",
+			"inputMessage": "sb.vectors.scalars.ScalarsRequest",
+			"outputMessage": "sb.vectors.scalars.ScalarsResponse",
+			"canonicalInput": "{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"double\"},{\"c\":\"opt\",\"n\":2,\"t\":\"float\"},{\"c\":\"opt\",\"n\":3,\"t\":\"int64\"},{\"c\":\"opt\",\"n\":4,\"t\":\"int64\"},{\"c\":\"opt\",\"n\":5,\"t\":\"uint32\"},{\"c\":\"opt\",\"n\":6,\"t\":\"uint64\"},{\"c\":\"opt\",\"n\":7,\"t\":\"sint32\"},{\"c\":\"opt\",\"n\":8,\"t\":\"sint64\"},{\"c\":\"opt\",\"n\":9,\"t\":\"fixed32\"},{\"c\":\"opt\",\"n\":10,\"t\":\"fixed64\"},{\"c\":\"opt\",\"n\":11,\"t\":\"sfixed32\"},{\"c\":\"opt\",\"n\":12,\"t\":\"sfixed64\"},{\"c\":\"opt\",\"n\":13,\"t\":\"bool\"},{\"c\":\"opt\",\"n\":14,\"t\":\"string\"},{\"c\":\"opt\",\"n\":15,\"t\":\"bytes\"}]}",
+			"canonicalOutput": "{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"bool\"}]}",
+			"contractHash": "v2:a0ce2ae10f35210888c8014a56889519b20cf8f7c56e28d854abb90aae0a4aad"
+		},
+		{
+			"name": "scalars_recardinalized",
+			"covers": "same as `scalars` with field 14 changed from singular to repeated",
+			"source": "proto",
+			"fixture": "sdk/node/src/serde/testdata/vectors-scalars-recardinalized.proto",
+			"proto": "syntax = \"proto3\";\n\npackage sb.vectors.scalars;\n\nmessage ScalarsRequest {\n  double   f_double   = 1;\n  float    f_float    = 2;\n  int32    f_int32    = 3;\n  int64    f_int64    = 4;\n  uint32   f_uint32   = 5;\n  uint64   f_uint64   = 6;\n  sint32   f_sint32   = 7;\n  sint64   f_sint64   = 8;\n  fixed32  f_fixed32  = 9;\n  fixed64  f_fixed64  = 10;\n  sfixed32 f_sfixed32 = 11;\n  sfixed64 f_sfixed64 = 12;\n  bool     f_bool     = 13;\n  repeated string f_string = 14;\n  bytes    f_bytes    = 15;\n}\n\nmessage ScalarsResponse {\n  bool ok = 1;\n}\n",
+			"inputMessage": "sb.vectors.scalars.ScalarsRequest",
+			"outputMessage": "sb.vectors.scalars.ScalarsResponse",
+			"canonicalInput": "{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"double\"},{\"c\":\"opt\",\"n\":2,\"t\":\"float\"},{\"c\":\"opt\",\"n\":3,\"t\":\"int32\"},{\"c\":\"opt\",\"n\":4,\"t\":\"int64\"},{\"c\":\"opt\",\"n\":5,\"t\":\"uint32\"},{\"c\":\"opt\",\"n\":6,\"t\":\"uint64\"},{\"c\":\"opt\",\"n\":7,\"t\":\"sint32\"},{\"c\":\"opt\",\"n\":8,\"t\":\"sint64\"},{\"c\":\"opt\",\"n\":9,\"t\":\"fixed32\"},{\"c\":\"opt\",\"n\":10,\"t\":\"fixed64\"},{\"c\":\"opt\",\"n\":11,\"t\":\"sfixed32\"},{\"c\":\"opt\",\"n\":12,\"t\":\"sfixed64\"},{\"c\":\"opt\",\"n\":13,\"t\":\"bool\"},{\"c\":\"rep\",\"n\":14,\"t\":\"string\"},{\"c\":\"opt\",\"n\":15,\"t\":\"bytes\"}]}",
+			"canonicalOutput": "{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"bool\"}]}",
+			"contractHash": "v2:32ffd77c8a83e54f490ba48a59842dcd35ca85284cdcecbd80c5d9f61dc31742"
+		},
+		{
+			"name": "sparse_numbers",
+			"covers": "non-sequential field numbers up to the protobuf maximum",
+			"source": "proto",
+			"fixture": "sdk/node/src/serde/testdata/vectors-sparse.proto",
+			"proto": "syntax = \"proto3\";\n\npackage sb.vectors.sparse;\n\nmessage SparseRequest {\n  string label   = 100;\n  int32  attempt = 3;\n  bool   flag    = 70000;\n}\n\nmessage SparseResponse {\n  string note = 536870911;\n}\n",
+			"inputMessage": "sb.vectors.sparse.SparseRequest",
+			"outputMessage": "sb.vectors.sparse.SparseResponse",
+			"canonicalInput": "{\"f\":[{\"c\":\"opt\",\"n\":3,\"t\":\"int32\"},{\"c\":\"opt\",\"n\":100,\"t\":\"string\"},{\"c\":\"opt\",\"n\":70000,\"t\":\"bool\"}]}",
+			"canonicalOutput": "{\"f\":[{\"c\":\"opt\",\"n\":536870911,\"t\":\"string\"}]}",
+			"contractHash": "v2:6f4d534415d788ec4af8c9146c2972408c1deff4f69400621452c22e911a3586"
+		},
+		{
+			"name": "sparse_numbers_reordered",
+			"covers": "same fields as `sparse_numbers`, declared in a different order",
+			"source": "proto",
+			"fixture": "sdk/node/src/serde/testdata/vectors-sparse-reordered.proto",
+			"proto": "syntax = \"proto3\";\n\npackage sb.vectors.sparse;\n\nmessage SparseRequest {\n  bool   flag    = 70000;\n  string label   = 100;\n  int32  attempt = 3;\n}\n\nmessage SparseResponse {\n  string note = 536870911;\n}\n",
+			"inputMessage": "sb.vectors.sparse.SparseRequest",
+			"outputMessage": "sb.vectors.sparse.SparseResponse",
+			"canonicalInput": "{\"f\":[{\"c\":\"opt\",\"n\":3,\"t\":\"int32\"},{\"c\":\"opt\",\"n\":100,\"t\":\"string\"},{\"c\":\"opt\",\"n\":70000,\"t\":\"bool\"}]}",
+			"canonicalOutput": "{\"f\":[{\"c\":\"opt\",\"n\":536870911,\"t\":\"string\"}]}",
+			"contractHash": "v2:6f4d534415d788ec4af8c9146c2972408c1deff4f69400621452c22e911a3586"
+		},
+		{
+			"name": "complex",
+			"covers": "nested messages, transitive references, enum, repeated, scalar map, message map, oneof, proto3 optional",
+			"source": "proto",
+			"fixture": "sdk/node/src/serde/testdata/vectors-complex.proto",
+			"proto": "syntax = \"proto3\";\n\npackage sb.vectors.complex;\n\nenum Kind {\n  KIND_UNSPECIFIED = 0;\n  KIND_CARD        = 1;\n  KIND_WIRE        = 2;\n}\n\nmessage Money {\n  string currency     = 1;\n  int64  amount_minor = 2;\n}\n\nmessage Item {\n  string          sku   = 1;\n  Money           price = 2;\n  repeated string tags  = 3;\n}\n\nmessage ComplexRequest {\n  string              id     = 1;\n  repeated Item       items  = 2;\n  map<string, string> labels = 3;\n  map<string, Money>  totals = 4;\n  Kind                kind   = 5;\n\n  oneof target {\n    string account = 7;\n    Money  card    = 9;\n  }\n\n  optional int32 retries = 12;\n}\n\nmessage ComplexResponse {\n  bool          ok    = 1;\n  repeated Kind kinds = 2;\n}\n",
+			"inputMessage": "sb.vectors.complex.ComplexRequest",
+			"outputMessage": "sb.vectors.complex.ComplexResponse",
+			"canonicalInput": "{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"string\"},{\"c\":\"rep\",\"n\":2,\"t\":\"m:.sb.vectors.complex.Item\"},{\"c\":\"map\",\"k\":\"string\",\"n\":3,\"t\":\"string\"},{\"c\":\"map\",\"k\":\"string\",\"n\":4,\"t\":\"m:.sb.vectors.complex.Money\"},{\"c\":\"opt\",\"n\":5,\"t\":\"e:.sb.vectors.complex.Kind\"},{\"c\":\"opt\",\"n\":7,\"t\":\"string\"},{\"c\":\"opt\",\"n\":9,\"t\":\"m:.sb.vectors.complex.Money\"},{\"c\":\"opt\",\"n\":12,\"t\":\"int32\"}],\"o\":[{\"f\":[7,9]}],\"r\":{\".sb.vectors.complex.Item\":{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"string\"},{\"c\":\"opt\",\"n\":2,\"t\":\"m:.sb.vectors.complex.Money\"},{\"c\":\"rep\",\"n\":3,\"t\":\"string\"}]},\".sb.vectors.complex.Kind\":{\"e\":[0,1,2]},\".sb.vectors.complex.Money\":{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"string\"},{\"c\":\"opt\",\"n\":2,\"t\":\"int64\"}]}}}",
+			"canonicalOutput": "{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"bool\"},{\"c\":\"rep\",\"n\":2,\"t\":\"e:.sb.vectors.complex.Kind\"}],\"r\":{\".sb.vectors.complex.Kind\":{\"e\":[0,1,2]}}}",
+			"contractHash": "v2:225fee2b532e0d0989a75ebef16785426ae5873c72694d062a5277c93e6187ff"
+		},
+		{
+			"name": "enum_alias",
+			"covers": "enum with allow_alias — duplicate numbers collapse",
+			"source": "proto",
+			"fixture": "sdk/node/src/serde/testdata/vectors-enum-alias.proto",
+			"proto": "syntax = \"proto3\";\n\npackage sb.vectors.alias;\n\nenum Status {\n  option allow_alias = true;\n  STATUS_UNSPECIFIED = 0;\n  STATUS_OK          = 1;\n  STATUS_SUCCESS     = 1;\n  STATUS_FAILED      = 4;\n}\n\nmessage AliasRequest {\n  Status status = 1;\n}\n\nmessage AliasResponse {\n  bool ok = 1;\n}\n",
+			"inputMessage": "sb.vectors.alias.AliasRequest",
+			"outputMessage": "sb.vectors.alias.AliasResponse",
+			"canonicalInput": "{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"e:.sb.vectors.alias.Status\"}],\"r\":{\".sb.vectors.alias.Status\":{\"e\":[0,1,4]}}}",
+			"canonicalOutput": "{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"bool\"}]}",
+			"contractHash": "v2:1515e6a13183b4dc402e2b6521b6605052b038b1d162689b4872430ddf3f3067"
+		},
+		{
+			"name": "cyclic",
+			"covers": "self-reference and mutual recursion between messages",
+			"source": "proto",
+			"fixture": "sdk/node/src/serde/testdata/vectors-cyclic.proto",
+			"proto": "syntax = \"proto3\";\n\npackage sb.vectors.cyclic;\n\nmessage Node {\n  string        id       = 1;\n  repeated Node children = 2;\n  Branch        branch   = 3;\n}\n\nmessage Branch {\n  Node head = 1;\n}\n\nmessage CyclicResponse {\n  int32 depth = 1;\n}\n",
+			"inputMessage": "sb.vectors.cyclic.Node",
+			"outputMessage": "sb.vectors.cyclic.CyclicResponse",
+			"canonicalInput": "{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"string\"},{\"c\":\"rep\",\"n\":2,\"t\":\"m:.sb.vectors.cyclic.Node\"},{\"c\":\"opt\",\"n\":3,\"t\":\"m:.sb.vectors.cyclic.Branch\"}],\"r\":{\".sb.vectors.cyclic.Branch\":{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"m:.sb.vectors.cyclic.Node\"}]},\".sb.vectors.cyclic.Node\":{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"string\"},{\"c\":\"rep\",\"n\":2,\"t\":\"m:.sb.vectors.cyclic.Node\"},{\"c\":\"opt\",\"n\":3,\"t\":\"m:.sb.vectors.cyclic.Branch\"}]}}}",
+			"canonicalOutput": "{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"int32\"}]}",
+			"contractHash": "v2:7ddd2780e628ae4cea93bc5e8bd31ad2e1a4187e1c2cac13ca0088d084140cb8"
+		},
+		{
+			"name": "empty_message",
+			"covers": "message with no fields",
+			"source": "proto",
+			"fixture": "sdk/node/src/serde/testdata/vectors-empty.proto",
+			"proto": "syntax = \"proto3\";\n\npackage sb.vectors.empty;\n\nmessage EmptyRequest {}\n\nmessage EmptyResponse {\n  string note = 1;\n}\n",
+			"inputMessage": "sb.vectors.empty.EmptyRequest",
+			"outputMessage": "sb.vectors.empty.EmptyResponse",
+			"canonicalInput": "{\"f\":[]}",
+			"canonicalOutput": "{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"string\"}]}",
+			"contractHash": "v2:cea986b84daaa1d2fb5ee145b32f475bec30f798db27e9de2c8a3d5892941167"
+		},
+		{
+			"name": "proto3_optional_and_oneof",
+			"covers": "proto3 optional stays `opt` and is not a oneof group; a real oneof is",
+			"source": "proto",
+			"fixture": "sdk/node/src/serde/testdata/vectors-optional.proto",
+			"proto": "syntax = \"proto3\";\n\npackage sb.vectors.optional;\n\nmessage OptionalRequest {\n  optional string note    = 1;\n  optional int32  count   = 2;\n  string          plain   = 3;\n\n  oneof choice {\n    bool   yes = 4;\n    string no  = 5;\n  }\n}\n\nmessage OptionalResponse {\n  bool ok = 1;\n}\n",
+			"inputMessage": "sb.vectors.optional.OptionalRequest",
+			"outputMessage": "sb.vectors.optional.OptionalResponse",
+			"canonicalInput": "{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"string\"},{\"c\":\"opt\",\"n\":2,\"t\":\"int32\"},{\"c\":\"opt\",\"n\":3,\"t\":\"string\"},{\"c\":\"opt\",\"n\":4,\"t\":\"bool\"},{\"c\":\"opt\",\"n\":5,\"t\":\"string\"}],\"o\":[{\"f\":[4,5]}]}",
+			"canonicalOutput": "{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"bool\"}]}",
+			"contractHash": "v2:02740363078a4e4f3e59ddcd8f71e4da296c1940184fb2c1d7396c8e3fb4fb5a"
+		},
+		{
+			"name": "proto2_required",
+			"covers": "proto2 required / optional / repeated cardinality",
+			"source": "proto",
+			"fixture": "sdk/node/src/serde/testdata/vectors-proto2.proto",
+			"proto": "syntax = \"proto2\";\n\npackage sb.vectors.proto2;\n\nmessage Proto2Request {\n  required string id   = 1;\n  optional int32  n    = 2;\n  repeated string tags = 3;\n}\n\nmessage Proto2Response {\n  optional bool ok = 1;\n}\n",
+			"inputMessage": "sb.vectors.proto2.Proto2Request",
+			"outputMessage": "sb.vectors.proto2.Proto2Response",
+			"canonicalInput": "{\"f\":[{\"c\":\"req\",\"n\":1,\"t\":\"string\"},{\"c\":\"opt\",\"n\":2,\"t\":\"int32\"},{\"c\":\"rep\",\"n\":3,\"t\":\"string\"}]}",
+			"canonicalOutput": "{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"bool\"}]}",
+			"contractHash": "v2:6c81674e3cc9e83ae96edea1e1ba25d644557eab67e38016bfe0dbf2baded74a"
+		},
+		{
+			"name": "json_schema",
+			"covers": ".schema.json source — object, array-of-object, array-of-scalar",
+			"source": "schema.json",
+			"fixture": "sdk/node/src/serde/testdata/vectors.schema.json",
+			"schemaJson": {
+				"input": {
+					"OrderRequest": {
+						"userId": {
+							"type": "string",
+							"fieldNumber": 1
+						},
+						"items": {
+							"type": "array",
+							"fieldNumber": 2,
+							"array": {
+								"type": "object",
+								"nested": {
+									"sku": {
+										"type": "string",
+										"fieldNumber": 1
+									},
+									"qty": {
+										"type": "int32",
+										"fieldNumber": 2
+									}
+								}
+							}
+						},
+						"metadata": {
+							"type": "object",
+							"fieldNumber": 3,
+							"nested": {
+								"source": {
+									"type": "string",
+									"fieldNumber": 1
+								}
+							}
+						},
+						"tags": {
+							"type": "array",
+							"fieldNumber": 4,
+							"array": {
+								"type": "string"
+							}
+						}
+					}
+				},
+				"output": {
+					"OrderResponse": {
+						"orderId": {
+							"type": "string",
+							"fieldNumber": 1
+						},
+						"total": {
+							"type": "double",
+							"fieldNumber": 2
+						}
+					}
+				}
+			},
+			"canonicalInput": "{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"string\"},{\"c\":\"rep\",\"n\":2,\"t\":\"m:.Input_items_elem\"},{\"c\":\"opt\",\"n\":3,\"t\":\"m:.Input_metadata\"},{\"c\":\"rep\",\"n\":4,\"t\":\"string\"}],\"r\":{\".Input_items_elem\":{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"string\"},{\"c\":\"opt\",\"n\":2,\"t\":\"int32\"}]},\".Input_metadata\":{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"string\"}]}}}",
+			"canonicalOutput": "{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"string\"},{\"c\":\"opt\",\"n\":2,\"t\":\"double\"}]}",
+			"contractHash": "v2:73d96bf228f0b38e536c4211e5e0c94465faba969b1b0446c0c8f0870cf8f4f0"
+		},
+		{
+			"name": "json_schema_renamed",
+			"covers": "same as `json_schema` with every leaf field renamed; message-bearing field names kept because .schema.json derives nested message identity from them",
+			"source": "schema.json",
+			"fixture": "sdk/node/src/serde/testdata/vectors-renamed.schema.json",
+			"schemaJson": {
+				"input": {
+					"OrderRequest": {
+						"customerRef": {
+							"type": "string",
+							"fieldNumber": 1
+						},
+						"items": {
+							"type": "array",
+							"fieldNumber": 2,
+							"array": {
+								"type": "object",
+								"nested": {
+									"code": {
+										"type": "string",
+										"fieldNumber": 1
+									},
+									"count": {
+										"type": "int32",
+										"fieldNumber": 2
+									}
+								}
+							}
+						},
+						"metadata": {
+							"type": "object",
+							"fieldNumber": 3,
+							"nested": {
+								"origin": {
+									"type": "string",
+									"fieldNumber": 1
+								}
+							}
+						},
+						"labels": {
+							"type": "array",
+							"fieldNumber": 4,
+							"array": {
+								"type": "string"
+							}
+						}
+					}
+				},
+				"output": {
+					"OrderResponse": {
+						"reference": {
+							"type": "string",
+							"fieldNumber": 1
+						},
+						"total": {
+							"type": "double",
+							"fieldNumber": 2
+						}
+					}
+				}
+			},
+			"canonicalInput": "{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"string\"},{\"c\":\"rep\",\"n\":2,\"t\":\"m:.Input_items_elem\"},{\"c\":\"opt\",\"n\":3,\"t\":\"m:.Input_metadata\"},{\"c\":\"rep\",\"n\":4,\"t\":\"string\"}],\"r\":{\".Input_items_elem\":{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"string\"},{\"c\":\"opt\",\"n\":2,\"t\":\"int32\"}]},\".Input_metadata\":{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"string\"}]}}}",
+			"canonicalOutput": "{\"f\":[{\"c\":\"opt\",\"n\":1,\"t\":\"string\"},{\"c\":\"opt\",\"n\":2,\"t\":\"double\"}]}",
+			"contractHash": "v2:73d96bf228f0b38e536c4211e5e0c94465faba969b1b0446c0c8f0870cf8f4f0"
+		}
+	],
+	"properties": [
+		{
+			"name": "field names are not part of the identity",
+			"assert": "equal",
+			"vectors": [
+				"scalars",
+				"scalars_renamed"
+			]
+		},
+		{
+			"name": "declaration order is not part of the identity",
+			"assert": "equal",
+			"vectors": [
+				"sparse_numbers",
+				"sparse_numbers_reordered"
+			]
+		},
+		{
+			"name": "leaf field names are not part of the identity (.schema.json)",
+			"assert": "equal",
+			"vectors": [
+				"json_schema",
+				"json_schema_renamed"
+			]
+		},
+		{
+			"name": "changing a field number changes the identity",
+			"assert": "different",
+			"vectors": [
+				"scalars",
+				"scalars_renumbered"
+			]
+		},
+		{
+			"name": "changing a field type changes the identity",
+			"assert": "different",
+			"vectors": [
+				"scalars",
+				"scalars_retyped"
+			]
+		},
+		{
+			"name": "changing a field cardinality changes the identity",
+			"assert": "different",
+			"vectors": [
+				"scalars",
+				"scalars_recardinalized"
+			]
+		}
+	]
+}

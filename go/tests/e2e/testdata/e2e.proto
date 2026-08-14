@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package sbe2e;
+
+option go_package = "github.com/service-bridge/sdk/go/tests/e2e/e2epb;e2epb";
+
+// Every message here is flat on purpose. The contract hash canonicalises field
+// numbers, cardinality and types only, and a message reference would drag the
+// referenced type's fully-qualified name into the descriptor — the one part of
+// the shape that differs between a Go generated type and the same .proto loaded
+// by protobufjs. Flat messages hash identically in both SDKs from this one file.
+
+message Echo {
+  string text = 1;
+  int64 n = 2;
+}
+
+message EchoReply {
+  string text = 1;
+  int64 n = 2;
+  string handled_by = 3;
+}
+
+// EchoV2 / EchoReplyV2 add a field, which changes the contract hash. Two callees
+// registering the same method name under these two pairs are distinct routing
+// targets: a caller reaches exactly the one whose hash it computed.
+message EchoV2 {
+  string text = 1;
+  int64 n = 2;
+  string region = 3;
+}
+
+message EchoReplyV2 {
+  string text = 1;
+  int64 n = 2;
+  string handled_by = 3;
+  string region = 4;
+}
+
+// Nothing stands in for the reply half of an event's contract hash. The Go SDK
+// hashes an event as (payload, google.protobuf.Empty); protobufjs has no
+// well-known Empty to point the Node side at, and a message with no fields
+// canonicalises identically to one.
+message Nothing {}
+
+message OrderEvent {
+  string order_id = 1;
+  double amount = 2;
+  string currency = 3;
+}

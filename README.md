@@ -12,7 +12,7 @@ Node SDK, TypeScript SDK, Go SDK, Python SDK, Istio alternative, Consul alternat
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Website](https://img.shields.io/badge/site-servicebridge.dev-0b0b0b.svg)](https://servicebridge.dev)
 
-**One self-hosted Go runtime plus PostgreSQL that replaces a whole microservices stack.** Service mesh, message broker, workflow engine, job scheduler, tracing backend, mTLS PKI — collapsed into a single binary. RPC, durable events, workflows, jobs and streaming over mTLS gRPC, with observability built in. Zero sidecars.
+**One self-hosted Go runtime plus PostgreSQL that replaces a whole microservices stack.** Service mesh, message broker, workflow engine, job scheduler, tracing backend, mTLS PKIcollapsed into a single binary. RPC, durable events, workflows, jobs and streaming over mTLS gRPC, with observability built in. Zero sidecars.
 
 Your services declare what they handle and what they call. The runtime takes over transport, delivery, orchestration, policy and observability — no proxy on the data path, no separate infrastructure to run, secure and correlate.
 
@@ -79,7 +79,7 @@ Every SDK speaks the same runtime over the same gRPC control plane, so the API s
 | **Go** | Unreleased | `go get github.com/service-bridge/sdk/go` | [`./go`](./go) |
 | **Python** | Coming soon | — | `./python` |
 
-The Go SDK covers the same surface as the Node one — RPC and server streams, durable events, workflows, jobs, telemetry, HTTP integrations. It carries no tagged version yet and its end-to-end suite against the runtime is still being written, so `go get` resolves a pseudo-version off the default branch.
+The Go SDK covers the same surface as the Node one — RPC and server streams, durable events, workflows, jobs, telemetry, HTTP integrations. It carries no tagged version yet, so `go get` resolves a pseudo-version off the default branch. Its end-to-end suite runs against the runtime and calls across to the Node SDK in both directions.
 
 Each SDK directory holds its own README with install instructions, a quick start and the full API reference.
 

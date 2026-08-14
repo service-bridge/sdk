@@ -1,0 +1,24 @@
+
+ö
+scalars.protosb.vectors.scalars"¥
+ScalarsRequest
+f_double (RfDouble
+f_float (RfFloat
+f_int32 (RfInt32
+f_int64 (RfInt64
+f_uint32 (RfUint32
+f_uint64 (RfUint64
+f_sint32 (RfSint32
+f_sint64 (RfSint64
+	f_fixed32	 (RfFixed32
+	f_fixed64
+ (RfFixed64
+
+f_sfixed32 (R	fSfixed32
+
+f_sfixed64 (R	fSfixed64
+f_bool (RfBool
+f_string (	RfString
+f_bytes (RfBytes"!
+ScalarsResponse
+ok (Rokbproto3
