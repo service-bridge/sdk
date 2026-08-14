@@ -11,6 +11,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -45,6 +47,11 @@ type Client struct {
 	decls    *registry.Declarations
 	dispatch *rpc.Dispatcher
 	jobDecls *jobi.Declarations
+	// callSchemas is the caller half of the same declarations: which pair of
+	// message types each named dependency is bound to. It never reaches the
+	// wire, and it is what lets a workflow call step — which holds a JSON tree
+	// and a method name — encode for a typed handler and route to it.
+	callSchemas *registry.CallSchemas
 
 	graphMu sync.RWMutex
 	graphs  map[string][]wf.Step
@@ -140,15 +147,16 @@ func New(url, key string, opts ...Option) (*Client, error) {
 	}
 
 	c := &Client{
-		cfg:      cfg,
-		log:      cfg.logger,
-		key:      bootstrap,
-		decls:    registry.NewDeclarations(),
-		dispatch: rpc.NewDispatcher(cfg.logger),
-		jobDecls: jobi.NewDeclarations(),
-		graphs:   map[string][]wf.Step{},
-		creds:    connection.NewCredentialRegistry(),
-		callers:  map[Transport]*rpc.Client{},
+		cfg:         cfg,
+		log:         cfg.logger,
+		key:         bootstrap,
+		decls:       registry.NewDeclarations(),
+		dispatch:    rpc.NewDispatcher(cfg.logger),
+		jobDecls:    jobi.NewDeclarations(),
+		callSchemas: registry.NewCallSchemas(),
+		graphs:      map[string][]wf.Step{},
+		creds:       connection.NewCredentialRegistry(),
+		callers:     map[Transport]*rpc.Client{},
 	}
 
 	c.buildTelemetry()
@@ -384,6 +392,8 @@ func (c *Client) buildDomains() error {
 
 // Start brings the instance up in the one order that works:
 //
+//  0. check that every workflow call step names a declared dependency, while
+//     the declarations are still the reader's to fix
 //  1. seal the declarations — after this the mesh has been told what exists
 //  2. open the local outbox, so a publish has somewhere durable to land
 //  3. register every credential consumer, so the first lease reaches all of them
@@ -403,6 +413,10 @@ func (c *Client) Start(ctx context.Context) error {
 	case c.started:
 		c.lifeMu.Unlock()
 		return newError(CodeState, op, "client is already started", nil)
+	}
+	if err := c.checkCallDependencies(); err != nil {
+		c.lifeMu.Unlock()
+		return err
 	}
 	c.started = true
 	// The client outlives the call that started it, so the supervision context
@@ -973,6 +987,36 @@ func (c *Client) workflowCount() int {
 	c.graphMu.RLock()
 	defer c.graphMu.RUnlock()
 	return len(c.graphs)
+}
+
+// checkCallDependencies refuses a start whose graphs call methods this service
+// never declared. A call step reaches a typed handler only through the schema
+// its dependency was bound to, so the graph could not run anyway; reporting it
+// here names the workflow and the step, while a step-level failure would name
+// them one run and one lease later.
+//
+// Only literally named targets are covered. A target written as a Path is a
+// value of the run, not of the graph, and it stays the responsibility of the
+// step that resolves it.
+func (c *Client) checkCallDependencies() error {
+	const op = "Client.Start"
+	c.graphMu.RLock()
+	graphs := make(map[string][]wf.Step, len(c.graphs))
+	maps.Copy(graphs, c.graphs)
+	c.graphMu.RUnlock()
+
+	// Sorted, so a service with two broken graphs is told about the same one on
+	// every start rather than a different one each time.
+	for _, name := range slices.Sorted(maps.Keys(graphs)) {
+		for _, target := range wfi.StaticCallTargets(graphs[name]) {
+			if _, bound := c.callSchemas.Lookup(target.Service, target.Method); bound {
+				continue
+			}
+			return newError(CodeConfig, op, fmt.Sprintf("workflow %q step %q: %s",
+				name, target.StepID, undeclaredDependency(target.Service, target.Method)), nil)
+		}
+	}
+	return nil
 }
 
 // channel owns the one mTLS channel a data-plane domain talks over and rebuilds

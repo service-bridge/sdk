@@ -6,6 +6,7 @@ import (
 
 	"github.com/service-bridge/sdk/go/internal/events"
 	"github.com/service-bridge/sdk/go/internal/outbox"
+	"github.com/service-bridge/sdk/go/internal/registry"
 	"github.com/service-bridge/sdk/go/internal/rpc"
 	"github.com/service-bridge/sdk/go/internal/serde"
 	wfi "github.com/service-bridge/sdk/go/internal/workflow"
@@ -166,6 +167,8 @@ func classify(err error) Code {
 		errors.Is(err, rpc.ErrEmptyMethod),
 		errors.Is(err, rpc.ErrNoFunc),
 		errors.Is(err, rpc.ErrDuplicate),
+		errors.Is(err, serde.ErrTreeShape),
+		errors.Is(err, registry.ErrSchemaConflict),
 		isValidation(err):
 		return CodeValidation
 

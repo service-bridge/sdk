@@ -435,6 +435,8 @@ err := c.Workflow.Handle("checkout", wf.Definition{
 
 Top-level steps start in parallel; `WaitFor` declares the dependencies that define the execution levels. Step kinds: `Call`, `Publish`, `Sleep`, `WaitEvent`, `WaitSignal`, `SubWorkflow`, `Parallel`, `Sequence`, `Local`. The set is closed — the marker method is unexported — so a graph can never carry a kind the runtime does not know.
 
+A `wf.Call` step reaches an ordinary `sb.Handle[Req, Resp]` handler, so the method it names must also be declared with `sb.NewMethod`: run state is JSON while the callee takes protobuf, and the declared pair of types is both the encoding and the contract hash the step routes at. The step's `Input` is written as the message's JSON mirror — 64-bit integers are strings, enums are value names — and the reply lands in run state in the same form. A target named literally and never declared is refused at `Start`, with the workflow, the step and the missing declaration in the message; a target computed from run state fails the same way inside the run, because its name does not exist any earlier.
+
 Two string types keep expressions and data apart: `wf.Path("$.reserve.id")` is read from run state when the step executes, `wf.Name("payment-svc")` is a literal written at declaration. A literal that happens to look like a path needs no escaping here; the type says which is which.
 
 `wf.Local` runs a Go closure in the declaring process. The closure is not part of the frozen graph or the fingerprint — the step is identified by its `ID`, and the locally declared graph supplies the function the assignment cannot carry.

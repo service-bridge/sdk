@@ -21,7 +21,8 @@ Import: `wf "github.com/service-bridge/sdk/go/workflow"`.
 
 ## The mental model
 
-- **Run state is JSON, not protobuf.** The run input lives under `input`; each step's output lives under that step's `ID`. Step inputs and outputs are plain Go values.
+- **Run state is JSON.** The run input lives under `input`; each step's output lives under that step's `ID`. Steps are written with plain Go values — maps, slices, strings, numbers.
+- **A `call` step reaches an ordinary typed handler.** Its JSON tree is read into the callee's protobuf request and its reply comes back as JSON, through the pair of types declared with `NewMethod`. See "Call steps need a declared dependency".
 - **Top-level steps start in parallel.** `WaitFor` declares the dependencies that create the execution levels.
 - **The step set is closed** — the `wf.Step` marker method is unexported, so a graph can never carry a kind the runtime does not know.
 - **The graph executes in the declaring process.** The runtime assigns a step; the body comes from the locally declared graph. That is what makes `wf.Local` possible.
@@ -43,6 +44,29 @@ Import: `wf "github.com/service-bridge/sdk/go/workflow"`.
 Every kind embeds `wf.Control{ID, WaitFor, When, Compensate, TimeoutSec, Retry}`.
 
 `Control.TimeoutSec` bounds the **step** (expiry starts compensation). `CallOpts.Timeout` bounds the underlying RPC. They are different things.
+
+## Call steps need a declared dependency
+
+The callee is an ordinary `Handle[Req, Resp]` handler. A `call` step reaches it only if the same service and method were declared with their types:
+
+```go
+inventory := sb.NewClient(c, "inventory-svc")
+_, err := sb.NewMethod[*pb.ReserveRequest, *pb.ReserveReply](inventory, "Reserve")
+```
+
+Version routing matches the contract hash of the `(Req, Resp)` pair exactly, and the step itself carries only a method name and a JSON tree. The pair supplies both the hash and the encoding.
+
+| What | Where it comes from |
+|---|---|
+| Request bytes | the step's `Input` tree read into `Req` |
+| Contract hash | the `(Req, Resp)` pair from `NewMethod` |
+| Step output in run state | `Resp` rendered as its JSON mirror |
+
+The JSON mirror is `protojson` output, not the Go struct: 64-bit integers are strings (`"9007199254740993"`), enums are value names (`"STATUS_ACTIVE"`), `bytes` is base64. `Input` is written in that form and outputs land in run state in that form, so a value leaving one step enters the next unchanged. A field the message has no room for fails the step rather than being dropped.
+
+An undeclared target with literal `wf.Name` service and method is refused at `Start` with `CodeConfig`, naming the workflow, the step and the fix. A target computed with `wf.Path` has no name until the step runs, so it fails the same way inside the run.
+
+`c.Service(name, sb.ServiceDeps{...})` declares only the mesh edge, without types, and is not enough for a `call` step.
 
 ## Paths versus literals
 

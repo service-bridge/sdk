@@ -85,26 +85,75 @@ func TestWorkflowCanonicalFingerprintMatchesAcrossLanguages(t *testing.T) {
 	}
 }
 
-// A Go-declared workflow whose step calls a Node handler is deliberately not
-// covered here: it cannot pass against the current SDK, and a red test left
-// in the suite is worse than no test. The Go workflow executor's Call
-// (go/generic.go, executor.Call) always encodes a step's input as a JSON tree
-// via serde.Encode's non-proto.Message fallback and always decodes the reply
-// with decodeJSONValue's plain json.Unmarshal — there is no path that carries
-// the target method's real protobuf schema, so the proxy call the runtime
-// receives has no (or an empty) contract hash. The runtime's resolver
-// (runtime/internal/rpc/server.go prepareCall → Resolver.Resolve) matches
-// live instances by that hash, so it finds nothing for a method actually
-// registered with a real schema and answers Unavailable "no compatible
-// instance". This reproduces the same way for a same-language wf.Call against
-// any Handle[Req,Resp]-declared method — it is not a cross-language gap, and
-// workflow_test.go's own coverage never exercises wf.Call against a live
-// handler either (every step there is wf.Local). Fixing it means deciding how
-// a dynamic call step learns the target's real schema, which is a
-// go/generic.go and/or runtime routing change outside this task's file
-// ownership; reported instead of patched. TestWorkflowNodeCallStepReachesGoService
-// below is unaffected: Node's workflow runner reuses the same schema-aware
-// sb.rpc.call() a direct call goes through, useSchema()-registered up front.
+// TestWorkflowGoCallStepReachesNodeService closes the mirror of the case below:
+// a Go-declared workflow whose step calls a method a Node instance handles. The
+// step encodes through the pair of types the dependency was declared with, so
+// the contract hash it routes at is computed on the Go side from generated Go
+// types while the callee's is computed by protobufjs from the .proto file — the
+// run only reaches the handler if those two agree.
+func TestWorkflowGoCallStepReachesNodeService(t *testing.T) {
+	ctx := testContext(t, 3*time.Minute)
+
+	method := uniqueName("wf.xlang.go2node")
+	workflowName := uniqueName("wf.xlang.go2node.wf")
+
+	cfg := newAgentConfig(t)
+	cfg.RPCMethod = method
+	agent := startNodeAgent(ctx, t, cfg)
+	callee := agent.Ready.ServiceName
+
+	owner := newClient(t, domainXLang, 3)
+	if _, err := servicebridge.NewMethod[*e2epb.Echo, *e2epb.EchoReply](
+		servicebridge.NewClient(owner, callee), method); err != nil {
+		t.Fatalf("declare dependency: %v", err)
+	}
+	err := owner.Workflow.Handle(workflowName, wf.Definition{
+		Steps: []wf.Step{
+			wf.Call{
+				Control: wf.Control{ID: "invoke"},
+				Service: wf.Name(callee),
+				Method:  wf.Name(method),
+				Input:   map[string]any{"text": "from-go-workflow", "n": "77"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("declare workflow: %v", err)
+	}
+	start(ctx, t, owner)
+	waitForMethod(ctx, t, owner, callee, method)
+
+	runID, err := owner.Workflow.Start(ctx, workflowName, map[string]any{})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+
+	awaitCtx, cancel := context.WithTimeout(ctx, deliveryTimeout)
+	defer cancel()
+	state, err := owner.Workflow.Await(awaitCtx, runID)
+	if err != nil {
+		t.Fatalf("await run %s: %v\nagent stderr:\n%s", runID, err, agent.stderr.String())
+	}
+
+	served := agent.waitRPC(t, 10*time.Second)
+	if served.Method != method {
+		t.Errorf("the Node handler served %q, want %q", served.Method, method)
+	}
+	if got := served.Req["text"]; got != "from-go-workflow" {
+		t.Errorf("the Node handler saw text %#v, want %q", got, "from-go-workflow")
+	}
+
+	output, ok := state["invoke"].(map[string]any)
+	if !ok {
+		t.Fatalf("run state holds %#v under the step, want the reply object", state["invoke"])
+	}
+	if got := output["handledBy"]; got != "node" {
+		t.Errorf("the reply in run state carries handledBy %#v, want %q", got, "node")
+	}
+	if got := output["n"]; got != "77" {
+		t.Errorf("the reply in run state carries n %#v, want the string %q", got, "77")
+	}
+}
 
 // TestWorkflowNodeCallStepReachesGoService proves a workflow declared by the
 // Node SDK, whose only step calls a method a Go instance handles, registers

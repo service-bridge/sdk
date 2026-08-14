@@ -30,10 +30,12 @@ type Payload struct {
 // Encode renders a payload into both wire forms.
 //
 // A protobuf message carries a schema, so it gets the canonical encoding, a
-// JSON mirror and a contract hash. Anything else is a schema-less payload — the
-// values a workflow graph carries are JSON trees by construction, and the
-// runtime stores them opaquely — so both forms are its JSON encoding and the
-// contract hash is the empty string, which matches only the empty string.
+// JSON mirror and a contract hash. Anything else is a schema-less payload — a
+// workflow publish step hands over the JSON tree it read out of run state, and
+// the runtime stores an event payload opaquely — so both forms are its JSON
+// encoding and the contract hash is the empty string, which matches only the
+// empty string. A payload that has to reach a typed handler goes through
+// EncodeTree instead.
 func Encode(payload any) (Payload, error) {
 	msg, ok := payload.(proto.Message)
 	if !ok {

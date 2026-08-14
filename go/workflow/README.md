@@ -29,7 +29,7 @@
 |-----|-----|--------------|------------|
 | `Step` | interface | — | Узел графа. `Kind() string`, `Common() Control` и неэкспортируемый маркер. Набор закрыт: снаружи пакета `Step` не реализовать. |
 | `Control` | struct | все поля нулевые | Общее для всех видов: `ID`, `WaitFor`, `When`, `Compensate`, `TimeoutSec`, `Retry`. Встраивается в каждый вид, поэтому `Common()` достаётся ему бесплатно. |
-| `Call` | struct | — | Вызов метода другого сервиса: `Service`, `Method` (`Target`), `Input`, `Opts *CallOpts`. |
+| `Call` | struct | — | Вызов метода другого сервиса: `Service`, `Method` (`Target`), `Input`, `Opts *CallOpts`. Названный метод должен быть объявлен зависимостью через `servicebridge.NewMethod`; `Input` пишется в форме JSON-зеркала сообщения запроса. |
 | `Publish` | struct | — | Публикация durable-события: `Event` (`Target`), `Input`, `Opts *PublishOpts`. |
 | `Sleep` | struct | — | Durable-таймер в рантайме: `DurationSec int64`. |
 | `WaitEvent` | struct | — | Ожидание события: `Event` (`Target`), `Filter map[string]any`. |

@@ -2,7 +2,6 @@ package servicebridge
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -234,12 +233,25 @@ type ServiceClient struct {
 // There is no separate "register the schema" call to forget: forgetting one in
 // the Node SDK is a throw on the first call in production, whereas here the
 // same mistake does not compile.
+//
+// The binding outlives this handle. A workflow call step names its target as
+// text and holds only a JSON tree, so the pair of types recorded here is the
+// only thing that lets such a step encode for, and route to, a typed handler.
 func NewMethod[Req, Resp proto.Message](sc *ServiceClient, method string) (*Method[Req, Resp], error) {
 	const op = "servicebridge.NewMethod"
 	if sc == nil || sc.c == nil {
 		return nil, newError(CodeConfig, op, "nil service client", nil)
 	}
 	if err := sc.c.decls.AddOutgoing(sc.service, method, pb.MethodType_METHOD_TYPE_RPC); err != nil {
+		return nil, wrap(op, err)
+	}
+	var reqZero Req
+	var respZero Resp
+	if err := sc.c.callSchemas.Bind(sc.service, method, registry.CallSchema{
+		Input:        reqZero,
+		Output:       respZero,
+		ContractHash: serde.ContractHash(serde.DescriptorOf(reqZero), serde.DescriptorOf(respZero)),
+	}); err != nil {
 		return nil, wrap(op, err)
 	}
 	return &Method[Req, Resp]{c: sc.c, service: sc.service, method: method}, nil
@@ -554,15 +566,26 @@ type StepSnapshot struct {
 // where they would compete with the API an application actually calls.
 type executor Client
 
-// Call dispatches a call step. Its payload is a JSON tree: the run state the
-// step reads from and writes back to is JSON by construction (ADR-0002), so
-// there is no protobuf type at this boundary and the contract hash is the empty
-// one a schema-less handler declares.
+// Call dispatches a call step. The step holds a JSON tree — run state is JSON
+// by construction (ADR-0002) — while the callee is an ordinary typed handler,
+// and the dependency declared with NewMethod is what joins the two: the tree is
+// read into the request message, and the reply comes back as the JSON mirror of
+// the response message, which is the same form the rest of the state is in.
+//
+// The declaration is also what makes the step routable. Version routing matches
+// the caller's contract hash exactly, and the pair of types is the only place
+// that hash can come from; an undeclared target is refused here rather than
+// called at the empty hash, which matches no typed handler at all.
 func (e *executor) Call(ctx context.Context, spec wfi.CallSpec) (any, error) {
+	const op = "workflow.call"
 	c := (*Client)(e)
-	payload, err := serde.Encode(spec.Input)
+	schema, bound := c.callSchemas.Lookup(spec.Service, spec.Method)
+	if !bound {
+		return nil, newError(CodeConfig, op, undeclaredDependency(spec.Service, spec.Method), nil)
+	}
+	payload, err := serde.EncodeTree(spec.Input, schema.Input)
 	if err != nil {
-		return nil, err
+		return nil, wrap(op, err)
 	}
 	transport := TransportDirect
 	if spec.Transport == "proxy" {
@@ -574,14 +597,28 @@ func (e *executor) Call(ctx context.Context, spec wfi.CallSpec) (any, error) {
 	raw, err := c.callers[transport].Unary(ctx, rpc.Request{
 		Service:        spec.Service,
 		Method:         spec.Method,
-		Payload:        payload.Proto,
+		Payload:        payload,
+		ContractHash:   schema.ContractHash,
 		IdempotencyKey: spec.IdempotencyKey,
 		BusinessKey:    spec.RequestID,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return decodeJSONValue(raw)
+	out, err := serde.DecodeTree(raw, schema.Output)
+	if err != nil {
+		return nil, wrap(op, err)
+	}
+	return out, nil
+}
+
+// undeclaredDependency spells the one fix out, because the failure is a missing
+// line of declaration and the reader is looking at a graph that names the target
+// perfectly well.
+func undeclaredDependency(service, method string) string {
+	return fmt.Sprintf("%s/%s is not a declared dependency: bind it with "+
+		"servicebridge.NewMethod[Req, Resp](servicebridge.NewClient(c, %q), %q) before Start",
+		service, method, service, method)
 }
 
 // Publish dispatches a publish step and answers with the event identifier, so
@@ -624,17 +661,6 @@ func (e *executor) StartRun(ctx context.Context, spec wfi.StartSpec) (string, er
 		TimeoutSec:     spec.TimeoutSec,
 		ParentRunID:    spec.ParentRunID,
 	})
-}
-
-func decodeJSONValue(raw []byte) (any, error) {
-	if len(raw) == 0 {
-		return nil, nil
-	}
-	var out any
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, fmt.Errorf("servicebridge: decode step output: %w", err)
-	}
-	return out, nil
 }
 
 // wrapStep opens one user sub-operation around every unit the runner executes,
