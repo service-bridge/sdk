@@ -76,10 +76,18 @@ Every SDK speaks the same runtime over the same gRPC control plane, so the API s
 | Language | Status | Package | Directory |
 |---|---|---|---|
 | **Node.js / Bun** (TypeScript) | **Live** | [![npm](https://img.shields.io/npm/v/service-bridge?label=npm)](https://www.npmjs.com/package/service-bridge) `service-bridge` | [`./node`](./node) |
-| **Go** | Unreleased | `go get github.com/service-bridge/sdk/go` | [`./go`](./go) |
+| **Go** | **Live** | [![Go module](https://img.shields.io/github/v/tag/service-bridge/sdk?filter=go%2Fv*&label=go%20module&color=00ADD8)](https://pkg.go.dev/github.com/service-bridge/sdk/go) `go get github.com/service-bridge/sdk/go` | [`./go`](./go) |
 | **Python** | Coming soon | — | `./python` |
 
-The Go SDK covers the same surface as the Node one — RPC and server streams, durable events, workflows, jobs, telemetry, HTTP integrations. It carries no tagged version yet, so `go get` resolves a pseudo-version off the default branch. Its end-to-end suite runs against the runtime and calls across to the Node SDK in both directions.
+The Go SDK covers the same surface as the Node one — RPC and server streams, durable events, workflows, jobs, telemetry, HTTP integrations. Its end-to-end suite runs against the runtime and calls across to the Node SDK in both directions. It ships on the `v0` line, so the API can still change between minor versions — pin the version you build against.
+
+The gin integration is a second module, which keeps gin out of the dependency graph of everyone who does not use it:
+
+```sh
+go get github.com/service-bridge/sdk/go/sbgin
+```
+
+Both modules live under `go/` rather than at the repository root, so their release tags carry that path prefix — `go/v0.1.0` and `go/sbgin/v0.1.0`.
 
 Each SDK directory holds its own README with install instructions, a quick start and the full API reference.
 
