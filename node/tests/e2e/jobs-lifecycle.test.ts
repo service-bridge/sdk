@@ -233,6 +233,7 @@ describe("jobs-lifecycle: catchup after a runtime-down gap", () => {
 	test("catchup=skip → no backfill burst after gap", async () => {
 		const jobName = uniqueName("catchup-skip");
 		const callTimestamps: number[] = [];
+		const scheduledFor: number[] = [];
 		const runtimeUrl = runtime!.url;
 
 		sb = new ServiceBridge(runtimeUrl, keys.serviceKey, FAST_OPTS);
@@ -244,8 +245,9 @@ describe("jobs-lifecycle: catchup after a runtime-down gap", () => {
 				overlap: "allow",
 				maxConcurrent: 10,
 			},
-			async () => {
+			async (ctx) => {
 				callTimestamps.push(Date.now());
+				scheduledFor.push(ctx.scheduledAt.getTime());
 			},
 		);
 		await sb.start();
@@ -271,8 +273,9 @@ describe("jobs-lifecycle: catchup after a runtime-down gap", () => {
 				overlap: "allow",
 				maxConcurrent: 10,
 			},
-			async () => {
+			async (ctx) => {
 				callTimestamps.push(Date.now());
+				scheduledFor.push(ctx.scheduledAt.getTime());
 			},
 		);
 		await sb.start();
@@ -289,15 +292,15 @@ describe("jobs-lifecycle: catchup after a runtime-down gap", () => {
 			"fresh ticks after restart",
 		);
 
-		// Counted inside a wall-clock window, not as a running total: the total
-		// keeps growing while the assertion waits, so on a loaded machine fresh
-		// ticks alone can outrun any budget stated as a count. A backfill lands
-		// as a burst the moment the subscriber attaches, so the window separates
-		// the two: 1.5s holds 3 fresh ticks at interval=500, never 8+ missed ones.
-		const burst = callTimestamps.filter(
-			(t) => t >= reconnectedAt && t < reconnectedAt + 1_500,
+		// Judged by the tick each call was scheduled for, not by how many calls
+		// arrived: a redelivery repeats one scheduled_at while a backfill replays
+		// the ones missed during the gap, and only the second is what catchup=skip
+		// forbids. Counting calls conflates them and turns machine load into a
+		// failure.
+		const replayed = scheduledFor.filter(
+			(t) => t > gapStart && t < reconnectedAt,
 		);
-		expect(burst.length).toBeLessThanOrEqual(5);
+		expect(replayed).toEqual([]);
 	}, 180_000);
 });
 
