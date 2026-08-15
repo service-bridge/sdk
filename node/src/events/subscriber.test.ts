@@ -1,4 +1,4 @@
-import { describe, expect, it, mock, spyOn } from "bun:test";
+import { describe, expect, it, mock } from "bun:test";
 import { EventEmitter } from "node:events";
 import type { EventHandlerFn } from "../registry/registry";
 import type { SubscriberDeps } from "./subscriber";
@@ -485,18 +485,18 @@ describe("Subscriber", () => {
 			reconnectOpts: { ladder: [4, 12, 24], jitterRatio: 0 },
 		};
 
-		const sub = new Subscriber(depsMod);
-		const setSpy = spyOn(globalThis, "setTimeout");
-		let delays: number[];
-		try {
-			sub.start();
-			for (let i = 0; i < 3; i++) {
-				fakes[fakes.length - 1]?.emitter.emit("end");
-				await wait(30);
-			}
-			delays = setSpy.mock.calls.map((c) => c[1] as number);
-		} finally {
-			setSpy.mockRestore();
+		// Read from the supervisor rather than a spy on the global timer: one
+		// test process also holds the subscribers of every other file, and their
+		// reconnect timers land in the spy too.
+		const delays: number[] = [];
+		const sub = new Subscriber({
+			...depsMod,
+			onSchedule: (ms) => delays.push(ms),
+		});
+		sub.start();
+		for (let i = 0; i < 3; i++) {
+			fakes[fakes.length - 1]?.emitter.emit("end");
+			await wait(30);
 		}
 		await sub.stop();
 
@@ -519,20 +519,17 @@ describe("Subscriber", () => {
 			reconnectOpts: { ladder: [4, 12, 24], jitterRatio: 0 },
 		};
 
-		const sub = new Subscriber(depsMod);
-		const setSpy = spyOn(globalThis, "setTimeout");
-		let delays: number[];
-		try {
-			sub.start();
-			fakes[fakes.length - 1]?.emitter.emit("end");
-			await wait(20);
-			fakes[fakes.length - 1]?.emitter.emit("data", makeDelivery("d-ladder"));
-			fakes[fakes.length - 1]?.emitter.emit("end");
-			await wait(20);
-			delays = setSpy.mock.calls.map((c) => c[1] as number);
-		} finally {
-			setSpy.mockRestore();
-		}
+		const delays: number[] = [];
+		const sub = new Subscriber({
+			...depsMod,
+			onSchedule: (ms) => delays.push(ms),
+		});
+		sub.start();
+		fakes[fakes.length - 1]?.emitter.emit("end");
+		await wait(20);
+		fakes[fakes.length - 1]?.emitter.emit("data", makeDelivery("d-ladder"));
+		fakes[fakes.length - 1]?.emitter.emit("end");
+		await wait(20);
 		await sub.stop();
 
 		expect(delays.slice(0, 2)).toEqual([4, 4]);

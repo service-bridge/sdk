@@ -52,6 +52,7 @@ interface HeartbeatCall {
 interface Harness {
 	sub: WorkflowSubscriber;
 	streams: FakeStream[];
+	delays: number[];
 	requests: Array<{ serviceId: string; instanceId: string }>;
 	heartbeats: HeartbeatCall[];
 	warns: string[];
@@ -67,6 +68,7 @@ function makeHarness(
 	} = {},
 ): Harness {
 	const streams: FakeStream[] = [];
+	const delays: number[] = [];
 	const requests: Array<{ serviceId: string; instanceId: string }> = [];
 	const heartbeats: HeartbeatCall[] = [];
 	const warns: string[] = [];
@@ -101,10 +103,12 @@ function makeHarness(
 		},
 		lookupLocalGraph: () => null,
 		reconnectOpts: opts.reconnectOpts ?? { ladder: [4], jitterRatio: 0 },
+		onSchedule: (ms) => delays.push(ms),
 	});
 
 	return {
 		sub,
+		delays,
 		streams,
 		requests,
 		heartbeats,
@@ -125,16 +129,6 @@ function makeHarness(
 async function waitForReconnect(h: Harness, closed: unknown): Promise<void> {
 	for (let i = 0; i < 400 && h.last() === closed; i++) {
 		await wait(5);
-	}
-}
-
-async function recordedDelays(body: () => Promise<void>): Promise<number[]> {
-	const setSpy = spyOn(globalThis, "setTimeout");
-	try {
-		await body();
-		return setSpy.mock.calls.map((c) => c[1] as number);
-	} finally {
-		setSpy.mockRestore();
 	}
 }
 
@@ -231,16 +225,16 @@ describe("WorkflowSubscriber stream", () => {
 		const h = makeHarness({
 			reconnectOpts: { ladder: [4, 12, 24], jitterRatio: 0 },
 		});
-		const delays = await recordedDelays(async () => {
-			h.sub.start();
-			for (let i = 0; i < 3; i++) {
-				const closed = h.last();
-				closed.emit("end");
-				await waitForReconnect(h, closed);
-			}
-		});
+		h.sub.start();
+		for (let i = 0; i < 3; i++) {
+			const closed = h.last();
+			closed.emit("end");
+			await waitForReconnect(h, closed);
+		}
 		h.sub.close();
-		expect(delays.slice(0, 3)).toEqual([4, 12, 24]);
+		// From the supervisor, not a spy on the global timer: one test process
+		// also holds every other file's subscribers and their timers.
+		expect(h.delays.slice(0, 3)).toEqual([4, 12, 24]);
 	});
 
 	it("LateEndFromReplacedStream_DoesNotOpenAThirdStream", async () => {

@@ -58,6 +58,7 @@ function makeHarness(
 	const streams: Array<ReturnType<typeof makeFakeStream>> = [];
 	const data: unknown[] = [];
 	const errors: Error[] = [];
+	const delays: number[] = [];
 	const sup = new StreamSupervisor<FakeStream, unknown>({
 		open: () => {
 			if (opts.openThrows?.()) throw new Error("open blew up");
@@ -73,25 +74,16 @@ function makeHarness(
 			errors.push(err);
 		},
 		reconnectOpts: { ladder: opts.ladder ?? [5], jitterRatio: 0 },
+		onSchedule: (ms) => delays.push(ms),
 	});
 	return {
 		sup,
 		streams,
 		data,
 		errors,
+		delays,
 		last: () => streams[streams.length - 1],
 	};
-}
-
-// recordedDelays returns every delay the supervisor scheduled while `body` ran.
-async function recordedDelays(body: () => Promise<void>): Promise<number[]> {
-	const setSpy = spyOn(globalThis, "setTimeout");
-	try {
-		await body();
-		return setSpy.mock.calls.map((c) => c[1] as number);
-	} finally {
-		setSpy.mockRestore();
-	}
 }
 
 describe("StreamSupervisor", () => {
@@ -111,36 +103,32 @@ describe("StreamSupervisor", () => {
 		// every graceful stream shutdown reconnect at the first rung, forever —
 		// a self-inflicted DDoS on a runtime that drains streams on purpose.
 		const h = makeHarness({ ladder: [4, 12, 24, 40] });
-		const delays = await recordedDelays(async () => {
-			h.sup.start();
-			for (let i = 0; i < 4; i++) {
-				h.last()!.emit("end");
-				await wait(30);
-			}
-		});
+		h.sup.start();
+		for (let i = 0; i < 4; i++) {
+			h.last()!.emit("end");
+			await wait(30);
+		}
 		h.sup.stop();
 
-		expect(delays.slice(0, 4)).toEqual([4, 12, 24, 40]);
+		expect(h.delays.slice(0, 4)).toEqual([4, 12, 24, 40]);
 		// Three rungs elapsed inside the loop; the fourth was still pending.
 		expect(h.streams).toHaveLength(4);
 	});
 
 	it("DataFrame_ResetsLadderToFirstRung", async () => {
 		const h = makeHarness({ ladder: [4, 12, 24, 40] });
-		const delays = await recordedDelays(async () => {
-			h.sup.start();
-			h.last()!.emit("end");
-			await wait(20);
-			h.last()!.emit("end");
-			await wait(30);
-			// Progress on the third stream — the next break starts over at rung 0.
-			h.last()!.emit("data", { ok: true });
-			h.last()!.emit("end");
-			await wait(20);
-		});
+		h.sup.start();
+		h.last()!.emit("end");
+		await wait(20);
+		h.last()!.emit("end");
+		await wait(30);
+		// Progress on the third stream — the next break starts over at rung 0.
+		h.last()!.emit("data", { ok: true });
+		h.last()!.emit("end");
+		await wait(20);
 		h.sup.stop();
 
-		expect(delays.slice(0, 3)).toEqual([4, 12, 4]);
+		expect(h.delays.slice(0, 3)).toEqual([4, 12, 4]);
 	});
 
 	it("ErrorPlusEnd_SchedulesSingleReconnect", async () => {
@@ -254,16 +242,14 @@ describe("StreamSupervisor", () => {
 		expect(h.streams).toHaveLength(3);
 
 		const before = h.streams[2]!;
-		const delays = await recordedDelays(async () => {
-			h.sup.restart();
-			expect(before.cancels()).toBe(1);
-			expect(h.streams).toHaveLength(4);
-			// Ladder is back at rung 0 after an explicit restart.
-			h.last()!.emit("end");
-			await wait(20);
-		});
+		h.sup.restart();
+		expect(before.cancels()).toBe(1);
+		expect(h.streams).toHaveLength(4);
+		// Ladder is back at rung 0 after an explicit restart.
+		h.last()!.emit("end");
+		await wait(20);
 		h.sup.stop();
-		expect(delays[0]).toBe(4);
+		expect(h.delays[0]).toBe(4);
 	});
 
 	it("RestartAfterStop_IsNoop", () => {
