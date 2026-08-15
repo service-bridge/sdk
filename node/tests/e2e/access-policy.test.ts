@@ -238,13 +238,16 @@ describe("access-policy (ADR-0004)", () => {
 			await sleep(900);
 		}
 
-		await waitFor(
-			() => methodVisible(caller!, PUBLISHER_SVC, allowed),
-			5_000,
-			"allowed method discovered",
-		);
 		await caller.useSchema(PUBLISHER_SVC, allowed, PAY);
 		await caller.useSchema(PUBLISHER_SVC, forbidden, PAY);
+		// After start(), declaring a dependency restarts the registry stream and
+		// the caller's caches are rebuilt from the next snapshot. Waiting before
+		// the declaration would gate on a view the declaration then discards.
+		await waitFor(
+			() => methodVisible(caller!, PUBLISHER_SVC, allowed),
+			10_000,
+			"allowed method discovered",
+		);
 
 		const ok = await caller.rpc.call<
 			{ userId: string; amount: number },
@@ -307,13 +310,16 @@ describe("access-policy (ADR-0004)", () => {
 			await sleep(900);
 		}
 
-		await waitFor(
-			() => methodVisible(caller!, PUBLISHER_SVC, allowed),
-			5_000,
-			"allowed method discovered",
-		);
 		await caller.useSchema(PUBLISHER_SVC, allowed, PAY);
 		await caller.useSchema(PUBLISHER_SVC, forbidden, PAY);
+		// After start(), declaring a dependency restarts the registry stream and
+		// the caller's caches are rebuilt from the next snapshot. Waiting before
+		// the declaration would gate on a view the declaration then discards.
+		await waitFor(
+			() => methodVisible(caller!, PUBLISHER_SVC, allowed),
+			10_000,
+			"allowed method discovered",
+		);
 
 		const ok = await caller.rpc.call<
 			{ userId: string; amount: number },
@@ -396,14 +402,16 @@ describe("access-policy (ADR-0004)", () => {
 		caller.service(PUBLISHER_SVC, { rpc: [allowed, forbidden] });
 		await connect(caller);
 		await waitFor(() => caller!.identity() !== null, 5_000, "caller connected");
-		await waitFor(
-			() => methodVisible(caller!, PUBLISHER_SVC, allowed),
-			5_000,
-			"allowed method discovered",
-		);
-
 		await caller.useSchema(PUBLISHER_SVC, allowed, PAY);
 		await caller.useSchema(PUBLISHER_SVC, forbidden, PAY);
+		// After start(), declaring a dependency restarts the registry stream and
+		// the caller's caches are rebuilt from the next snapshot. Waiting before
+		// the declaration would gate on a view the declaration then discards.
+		await waitFor(
+			() => methodVisible(caller!, PUBLISHER_SVC, allowed),
+			10_000,
+			"allowed method discovered",
+		);
 
 		const ok = await caller.rpc.call<
 			{ userId: string; amount: number },
