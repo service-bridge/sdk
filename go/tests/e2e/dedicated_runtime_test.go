@@ -172,7 +172,7 @@ func boolLiteral(v any) string {
 // keys — the CA lives in Postgres, not on disk.
 func seedRuntimeCaInto(ctx context.Context, t *testing.T, dbName string) {
 	t.Helper()
-	rows, err := queryRowsFromDB(ctx, defaultPGDatabase,
+	rows, err := queryRowsFromDB(ctx, ambientDatabase(),
 		`SELECT id, cert_der, key_der, created_at::text AS created_at FROM runtime_ca WHERE id = 1`)
 	if err != nil {
 		t.Fatalf("read runtime_ca: %v", err)
@@ -196,7 +196,7 @@ func seedRuntimeCaInto(ctx context.Context, t *testing.T, dbName string) {
 // as the ambient one.
 func seedServicesInto(ctx context.Context, t *testing.T, dbName string) {
 	t.Helper()
-	rows, err := queryRowsFromDB(ctx, defaultPGDatabase, `
+	rows, err := queryRowsFromDB(ctx, ambientDatabase(), `
 		SELECT id, name, key_id, secret_hash, status, persist_ops, persist_logs, persist_metrics,
 		       cap_rpc_handle, cap_event_handle, cap_workflow_handle, cap_job_handle,
 		       cap_rpc_call, cap_event_publish, cap_workflow_run, created_at::text AS created_at

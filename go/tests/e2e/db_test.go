@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -39,6 +40,21 @@ func pgContainer() string {
 		return v
 	}
 	return defaultPGContainer
+}
+
+// ambientDatabase names the database the runtime under test is using. In direct
+// mode it comes from the DSN, because the suite can be pointed at a database
+// created for one run; the constant is only the development default.
+func ambientDatabase() string {
+	dsn, direct := pgDirect()
+	if !direct {
+		return defaultPGDatabase
+	}
+	u, err := url.Parse(dsn)
+	if err != nil || strings.TrimPrefix(u.Path, "/") == "" {
+		return defaultPGDatabase
+	}
+	return strings.TrimPrefix(u.Path, "/")
 }
 
 // pgDirect reports whether psql runs on this host rather than inside the
@@ -85,7 +101,7 @@ func runPSQL(ctx context.Context, sql string) (string, error) {
 	} else {
 		cmd = exec.CommandContext(ctx, "docker",
 			append([]string{"exec", "-i", pgContainer(), args[0],
-				"-U", defaultPGUser, "-d", defaultPGDatabase}, args[1:]...)...)
+				"-U", defaultPGUser, "-d", ambientDatabase()}, args[1:]...)...)
 	}
 	cmd.Stdin = strings.NewReader(sql)
 	var stdout, stderr bytes.Buffer
