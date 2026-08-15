@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,15 +28,15 @@ import (
 // Mirrors node/tests/e2e/_helpers/dedicated-runtime.ts: a fresh DB built with
 // `-migrate`, the runtime CA and `services` rows copied from the main DB so
 // the .env.e2e bootstrap keys are recognized, ports pinned via
-// runtime_settings, and a plain TCP-connect poll for readiness. Uses `docker
-// exec psql` like db_test.go rather than adding a Postgres driver to go.mod
-// for a test-only need.
+// runtime_settings, and a plain TCP-connect poll for readiness. Reaches psql
+// the same two ways db_test.go does rather than adding a Postgres driver to
+// go.mod for a test-only need.
 
 // defaultPGPassword matches the local dev Postgres container's credentials
 // (see runtime/docs and scripts/bootstrap-e2e-keys.sh's POSTGRES_DSN default).
-// It has no bearing on `docker exec psql`, which authenticates inside the
-// container without a password — only the dedicated runtime binary, dialing
-// Postgres over TCP from outside the container, needs it.
+// It has no bearing on psql run inside the container, which authenticates
+// there without a password — only the dedicated runtime binary, dialing
+// Postgres over TCP, needs it.
 const defaultPGPassword = "servicebridge"
 
 func pgPort() string {
@@ -76,12 +77,19 @@ func buildDedicatedRuntimeBinary(t *testing.T, outputPath string) {
 	}
 }
 
-// runPSQLDB runs sql against dbName in the same container db_test.go reads
-// the ambient runtime's database through.
+// runPSQLDB runs sql against dbName on the same server db_test.go reads the
+// ambient runtime's database through, by whichever route that file uses.
 func runPSQLDB(ctx context.Context, dbName, sql string) (string, error) {
-	cmd := exec.CommandContext(ctx, "docker", "exec", "-i", pgContainer(),
-		"psql", "-U", defaultPGUser, "-d", dbName,
-		"-v", "ON_ERROR_STOP=1", "-q", "-t", "-A")
+	args := []string{"psql", "-v", "ON_ERROR_STOP=1", "-q", "-t", "-A"}
+	var cmd *exec.Cmd
+	if dsn, direct := pgDirect(); direct {
+		cmd = exec.CommandContext(ctx, args[0],
+			append([]string{dsnForDatabase(dsn, dbName)}, args[1:]...)...)
+	} else {
+		cmd = exec.CommandContext(ctx, "docker",
+			append([]string{"exec", "-i", pgContainer(), args[0],
+				"-U", defaultPGUser, "-d", dbName}, args[1:]...)...)
+	}
 	cmd.Stdin = strings.NewReader(sql)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -376,4 +384,16 @@ func (rt *dedicatedRuntime) Cleanup() {
 	if err := dropIsolatedDatabase(ctx, rt.dbName); err != nil {
 		rt.t.Logf("drop isolated database %s: %v", rt.dbName, err)
 	}
+}
+
+// dsnForDatabase repoints a DSN at another database on the same server. The
+// dedicated runtime gets its own database, and in direct mode the only handle
+// on the server is the DSN the suite was given.
+func dsnForDatabase(dsn, dbName string) string {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return dsn
+	}
+	u.Path = "/" + dbName
+	return u.String()
 }
