@@ -521,7 +521,7 @@ describe("workflow", () => {
 		expect(q.state.c).toEqual({ which: "c", call: 2 });
 	}, 40_000);
 
-	test("static parallel group overlaps — wall-clock ≤ critical-path budget and siblings overlap", async () => {
+	test("static parallel group overlaps — siblings run at the same instant", async () => {
 		const wfName = uniqueName("fanout");
 		const SLEEP_MS = 300;
 
@@ -529,8 +529,9 @@ describe("workflow", () => {
 			type: "local" as const,
 			id,
 			fn: async () => {
+				const startedAt = Date.now();
 				await new Promise((r) => setTimeout(r, SLEEP_MS));
-				return { id, doneAt: Date.now() };
+				return { id, startedAt, doneAt: Date.now() };
 			},
 		});
 
@@ -561,23 +562,31 @@ describe("workflow", () => {
 		const callerID = caller.identity()!.serviceId;
 		await addWorkflowRule(callerID, ownerID, wfName);
 
-		const t0 = Date.now();
 		const { runId } = await startWorkflowWhenAllowed(caller, wfName, {});
 		const finalStatus = await awaitRunStatus(caller, runId, TERMINAL, 20_000);
-		const elapsed = Date.now() - t0;
 		expect(finalStatus).toBe("success");
 
-		// Critical path = 5 sequential steps × SLEEP_MS. Budget absorbs gRPC
-		// overhead (each of 9 steps makes BeginStep + CompleteStep against PG).
-		const criticalPath = 5 * SLEEP_MS;
-		expect(elapsed).toBeLessThanOrEqual(criticalPath * 2 + 500);
-
-		// Cross-check group siblings overlap: doneAt timestamps within SLEEP_MS×0.7.
+		// Overlap is proven by the steps' own clocks, not by how long the run
+		// took: a wall-clock budget measures the machine, passes on a fast one
+		// whether or not the group overlapped, and fails on a loaded one that
+		// overlapped perfectly well.
 		const q = await caller.workflow.query(runId);
-		const g1 = q.state.g1 as Record<string, { doneAt: number }>;
-		const dones = ["b1", "b2", "b3"].map((id) => g1[id]!.doneAt);
-		const spread = Math.max(...dones) - Math.min(...dones);
-		expect(spread).toBeLessThan(SLEEP_MS * 0.7);
+		const g1 = q.state.g1 as Record<
+			string,
+			{ startedAt: number; doneAt: number }
+		>;
+		const siblings = ["b1", "b2", "b3"].map((id) => g1[id]!);
+
+		// Every pair ran at a common instant, so all three were in flight together.
+		for (let i = 0; i < siblings.length; i++) {
+			for (let j = i + 1; j < siblings.length; j++) {
+				const a = siblings[i]!;
+				const b = siblings[j]!;
+				const overlap =
+					Math.min(a.doneAt, b.doneAt) - Math.max(a.startedAt, b.startedAt);
+				expect(overlap).toBeGreaterThan(0);
+			}
+		}
 	}, 30_000);
 
 	test("forEach over non-empty array spawns N keyed parallel sub-steps", async () => {
