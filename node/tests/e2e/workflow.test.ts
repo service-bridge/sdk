@@ -24,6 +24,7 @@ import {
 import { addRule, allServiceIDs, withDb } from "./_helpers/policy-db";
 import {
 	addWorkflowRule,
+	awaitPolicyLive,
 	awaitRunStatus,
 	startWorkflowWhenAllowed,
 } from "./_helpers/wf.ts";
@@ -739,6 +740,10 @@ describe("workflow", () => {
 		}
 		await owner.useSchema(calleeName, method, { protoFile: COMP_PROTO });
 		await awaitRpcMethodLive(calleeName, method);
+		// The rule reaches Postgres synchronously and the runtime's snapshot
+		// asynchronously; starting the run before it lands denies the step.
+		await awaitPolicyLive(owner, "egress", "rpc.call", method);
+		await awaitPolicyLive(callee, "acceptance", "rpc.handle", method);
 
 		const { runId } = await startWorkflowWhenAllowed(callee, wfName, {});
 		expect(runId).toMatch(/^[0-9a-f-]{36}$/);
@@ -1092,6 +1097,10 @@ describe("workflow", () => {
 		}
 		await owner.useSchema(calleeName, method, { protoFile: COMP_PROTO });
 		await awaitRpcMethodLive(calleeName, method);
+		// The rule reaches Postgres synchronously and the runtime's snapshot
+		// asynchronously; starting the run before it lands denies the step.
+		await awaitPolicyLive(owner, "egress", "rpc.call", method);
+		await awaitPolicyLive(callee, "acceptance", "rpc.handle", method);
 
 		const { runId } = await startWorkflowWhenAllowed(callee, wfName, {
 			amount: 99.0,
@@ -1197,6 +1206,10 @@ describe("workflow", () => {
 			}
 			await owner.useSchema(calleeName, method, { protoFile: COMP_PROTO });
 			await awaitRpcMethodLive(calleeName, method);
+			// The rule reaches Postgres synchronously and the runtime's snapshot
+			// asynchronously; starting the run before it lands denies the step.
+			await awaitPolicyLive(owner, "egress", "rpc.call", method);
+			await awaitPolicyLive(callee, "acceptance", "rpc.handle", method);
 		}
 
 		const { runId } = await startWorkflowWhenAllowed(callee, wfName, {

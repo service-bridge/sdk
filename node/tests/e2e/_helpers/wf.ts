@@ -209,3 +209,36 @@ export async function addWorkflowRule(
 	await addRule(callerID, "E", "workflow.run", ownerID, wfName);
 	await addRule(ownerID, "A", "workflow.handle", callerID, wfName);
 }
+
+// awaitPolicyLive waits until the runtime's own view of a client's rules carries
+// the one just written. A rule reaches Postgres synchronously and the snapshot
+// asynchronously, so a test that starts work right after addRule races the
+// propagation and its steps get denied — a failure that reads like a policy bug
+// and is really a missing wait.
+export async function awaitPolicyLive(
+	sb: ServiceBridge,
+	side: "egress" | "acceptance",
+	action: string,
+	targetName: string,
+	timeoutMs = 10_000,
+): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		const rules = sb.policyEvaluation()?.[side] ?? [];
+		if (
+			rules.some(
+				(r) =>
+					r.action === action &&
+					(r.targetName === targetName || r.targetName === "*"),
+			)
+		) {
+			return;
+		}
+		if (Date.now() >= deadline) {
+			throw new Error(
+				`awaitPolicyLive: ${side} ${action} ${targetName} not in the snapshot after ${timeoutMs}ms`,
+			);
+		}
+		await new Promise((r) => setTimeout(r, 100));
+	}
+}
