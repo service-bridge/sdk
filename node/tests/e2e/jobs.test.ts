@@ -86,6 +86,18 @@ describe("jobs", () => {
 			await sb.stop().catch(() => {});
 		}
 		clients = [];
+		// Stopping the client does not retire its job definitions: an interval
+		// job keeps firing into a service with no live instance, and by the end
+		// of the file those leftovers outnumber the ticks the current test is
+		// waiting for. Every name here is unique, so this removes only its own.
+		await withDb(
+			(sql) => sql`
+				DELETE FROM job_definitions
+				WHERE name LIKE ${`%.t%`} AND service_id IN (
+					SELECT id FROM services WHERE name LIKE ${"e2e-jobs-%"}
+				)
+			`,
+		).catch(() => {});
 	});
 
 	test("delayed trigger fires exactly once with attempt===1", async () => {
