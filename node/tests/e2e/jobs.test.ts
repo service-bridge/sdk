@@ -219,12 +219,15 @@ describe("jobs", () => {
 		);
 		await connect(sb);
 
+		// Gate on the first tick instead of assuming one lands inside a fixed
+		// sleep: connecting provisions a certificate, and on a loaded machine
+		// that alone can outlast the window.
+		await waitFor(() => totalCalls >= 1, 20_000, "first tick");
 		// 200ms interval, 800ms handler, skip → ~1 completion every 800ms.
 		await sleep(3_000);
 
 		expect(maxConcurrent).toBe(1);
-		expect(totalCalls).toBeGreaterThanOrEqual(1);
-		expect(totalCalls).toBeLessThanOrEqual(5);
+		expect(totalCalls).toBeLessThanOrEqual(6);
 	}, 30_000);
 
 	test("overlap=buffer_one allows at most 1 buffered (in-flight ≤2)", async () => {
@@ -269,6 +272,7 @@ describe("jobs", () => {
 		);
 		await connect(sb);
 
+		await waitFor(() => maxConcurrent >= 1, 20_000, "first tick");
 		await sleep(3_000);
 
 		// SDK semaphore caps concurrency even though the policy is allow.
@@ -496,7 +500,10 @@ describe("jobs", () => {
 		const sb1 = track(dedicated("primary"));
 		sb1.job.handle(
 			jobName,
-			{ trigger: { delayed: { at: Date.now() + 800 } }, maxAttempts: 1 },
+			// Retries because the workflow rule is written after this client
+			// connects: a tick that lands first is denied, and the retry is how a
+			// job is meant to survive a dependency that is not ready yet.
+			{ trigger: { delayed: { at: Date.now() + 800 } }, maxAttempts: 3 },
 			async () => {
 				const result = await sb1.workflow.start(wfName, {});
 				runId = result.runId;
