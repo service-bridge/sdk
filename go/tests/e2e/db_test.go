@@ -17,8 +17,12 @@ import (
 // The runtime's own tables are the only place the effects of a call can be
 // observed from outside both SDKs: an operation row, a job execution, a workflow
 // step. The suite reads them with psql rather than a Postgres driver — adding a
-// driver would put a test-only dependency in the SDK's go.mod, and the
-// development database only exists inside a container anyway.
+// driver would put a test-only dependency in the SDK's go.mod.
+//
+// Two ways to reach psql, same contract as scripts/bootstrap-e2e-keys.sh:
+// "docker" runs it inside the development container, "direct" runs the host's
+// own psql against SB_E2E_PG_DSN. CI has Postgres as a service container with a
+// generated name and nothing to exec into, so it sets the direct mode.
 
 const (
 	defaultPGContainer = "servicebridge2-pg"
@@ -37,27 +41,52 @@ func pgContainer() string {
 	return defaultPGContainer
 }
 
+// pgDirect reports whether psql runs on this host rather than inside the
+// development container, and answers with the DSN it should use.
+func pgDirect() (string, bool) {
+	if os.Getenv("SB_E2E_PG_MODE") != "direct" {
+		return "", false
+	}
+	if dsn := os.Getenv("SB_E2E_PG_DSN"); dsn != "" {
+		return dsn, true
+	}
+	return os.Getenv("TEST_DATABASE_URL"), true
+}
+
 // checkDatabase proves the suite can read the runtime's tables before any test
 // runs, so a missing container is one clear message instead of one failure per
 // assertion.
 func checkDatabase() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	if dsn, direct := pgDirect(); direct && dsn == "" {
+		return fmt.Errorf("SB_E2E_PG_MODE=direct needs a DSN in SB_E2E_PG_DSN or TEST_DATABASE_URL")
+	}
 	out, err := runPSQL(ctx, "SELECT count(*)::text FROM operations")
 	if err != nil {
+		if _, direct := pgDirect(); direct {
+			return fmt.Errorf("cannot read the runtime database with the host psql: %w\n"+
+				"       check SB_E2E_PG_DSN and that postgresql-client is installed", err)
+		}
 		return fmt.Errorf("cannot read the runtime database through container %q: %w\n"+
 			"       start it, or point SB_E2E_PG_CONTAINER at the right container name", pgContainer(), err)
 	}
 	if strings.TrimSpace(out) == "" {
-		return fmt.Errorf("container %q answered nothing for a count query", pgContainer())
+		return fmt.Errorf("the database answered nothing for a count query")
 	}
 	return nil
 }
 
 func runPSQL(ctx context.Context, sql string) (string, error) {
-	cmd := exec.CommandContext(ctx, "docker", "exec", "-i", pgContainer(),
-		"psql", "-U", defaultPGUser, "-d", defaultPGDatabase,
-		"-v", "ON_ERROR_STOP=1", "-q", "-t", "-A")
+	args := []string{"psql", "-v", "ON_ERROR_STOP=1", "-q", "-t", "-A"}
+	var cmd *exec.Cmd
+	if dsn, direct := pgDirect(); direct {
+		cmd = exec.CommandContext(ctx, args[0], append([]string{dsn}, args[1:]...)...)
+	} else {
+		cmd = exec.CommandContext(ctx, "docker",
+			append([]string{"exec", "-i", pgContainer(), args[0],
+				"-U", defaultPGUser, "-d", defaultPGDatabase}, args[1:]...)...)
+	}
 	cmd.Stdin = strings.NewReader(sql)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
