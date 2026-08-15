@@ -449,10 +449,18 @@ describe("misc: structured-log ingest", () => {
 		sb.logger.warn(warnMsg);
 		sb.logger.error(errMsg, { boom: true });
 
+		// All three, not just the first: the ring is flushed in batches, so the
+		// entries can be committed by separate ones and the arrival of the first
+		// says nothing about the rest.
 		await waitFor(
-			async () => Boolean(await fetchSdkLog(infoMsg)),
-			8_000,
-			"sdk info log persisted",
+			async () =>
+				Boolean(
+					(await fetchSdkLog(infoMsg)) &&
+						(await fetchSdkLog(warnMsg)) &&
+						(await fetchSdkLog(errMsg)),
+				),
+			15_000,
+			"sdk logs persisted",
 		);
 
 		const info = await fetchSdkLog(infoMsg);
