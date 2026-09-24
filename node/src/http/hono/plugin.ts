@@ -4,6 +4,10 @@ import { runWithTrace } from "../../telemetry/context";
 import { Status } from "../../telemetry/ops";
 import { bodyToBytes, RAW_JSON_CONTRACT } from "../_common/body-capture";
 import { startHttpOp, statusForHttpCode } from "../_common/http-op";
+import {
+	HttpRequestGuard,
+	type HttpSecurityOptions,
+} from "../_common/security";
 import { resolveHttpAdvertiseHost } from "../endpoint";
 
 /**
@@ -16,6 +20,7 @@ import { resolveHttpAdvertiseHost } from "../endpoint";
 export interface HonoEndpoint {
 	host?: string;
 	port: number;
+	security?: HttpSecurityOptions;
 }
 
 /**
@@ -60,12 +65,16 @@ export function attachHono(
 	collectHonoRoutes(app, sb);
 	const host = resolveHttpAdvertiseHost(endpoint.host);
 	sb.routes.publishHttp({ host, port: endpoint.port });
-	installHonoTracing(app, sb);
+	installHonoTracing(app, sb, endpoint.security);
 }
 
 const TRACE_FLAG = Symbol.for("servicebridge.hono.trace");
 
-function installHonoTracing(app: Hono, sb: ServiceBridge): void {
+function installHonoTracing(
+	app: Hono,
+	sb: ServiceBridge,
+	security?: HttpSecurityOptions,
+): void {
 	// biome-ignore lint/suspicious/noExplicitAny: app не хранит произвольные поля в типах
 	const tagged = app as any;
 	if (tagged[TRACE_FLAG]) return;
@@ -76,9 +85,27 @@ function installHonoTracing(app: Hono, sb: ServiceBridge): void {
 	// chain в runWithTrace, чтобы handler и downstream user-code видели ALS,
 	// и эмитим HTTP.HANDLE op (start/end по response.status).
 	const origFetch = app.fetch.bind(app);
+	const guard = new HttpRequestGuard(security);
 	// biome-ignore lint/suspicious/noExplicitAny: env/executionCtx — рантайм-зависимы
 	(app as any).fetch = async (req: Request, env?: any, executionCtx?: any) => {
 		const url = new URL(req.url);
+		const decision = guard.check({
+			method: req.method,
+			pathname: `${url.pathname}${url.search}`,
+			forwardedFor: req.headers.get("x-forwarded-for"),
+		});
+		if (!decision.allowed) {
+			const headers = new Headers({ "content-type": "application/json" });
+			if (decision.retryAfterSeconds) {
+				headers.set("Retry-After", String(decision.retryAfterSeconds));
+			}
+			return new Response(
+				JSON.stringify({
+					error: decision.status === 429 ? "Too Many Requests" : "Not Found",
+				}),
+				{ status: decision.status, headers },
+			);
+		}
 		const op = startHttpOp(sb, {
 			method: req.method,
 			subjectPath: url.pathname,

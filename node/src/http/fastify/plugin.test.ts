@@ -161,6 +161,42 @@ describe("sbFastify plugin", () => {
 			{ status: Status.ERROR, message: "HTTP 503" },
 		]);
 	});
+
+	it("rejects scanner probes before creating HTTP telemetry", async () => {
+		const stub = makeSbStub();
+		app = Fastify({ logger: false });
+		await app.register(sbFastify, { sb: stub.sb });
+		app.get("/*", async () => ({ leaked: true }));
+		await app.ready();
+
+		const response = await app.inject({ method: "GET", url: "/api/dev/.env" });
+		expect(response.statusCode).toBe(404);
+		expect(response.json()).toEqual({ error: "Not Found" });
+		expect(stub.started).toHaveLength(0);
+		expect(stub.endCalls).toHaveLength(0);
+	});
+
+	it("rate-limits by a trusted proxy address and emits no rejected op", async () => {
+		const stub = makeSbStub();
+		app = Fastify({ logger: false });
+		await app.register(sbFastify, {
+			sb: stub.sb,
+			security: {
+				rateLimit: { limit: 1, windowMs: 60_000, trustProxyHops: 1 },
+			},
+		});
+		app.get("/ok", async () => ({ ok: true }));
+		await app.ready();
+
+		const headers = { "x-forwarded-for": "198.51.100.20" };
+		expect(
+			(await app.inject({ method: "GET", url: "/ok", headers })).statusCode,
+		).toBe(200);
+		const rejected = await app.inject({ method: "GET", url: "/ok", headers });
+		expect(rejected.statusCode).toBe(429);
+		expect(rejected.headers["retry-after"]).toBeDefined();
+		expect(stub.started).toHaveLength(1);
+	});
 });
 
 describe("sbFastify payload capture gating", () => {

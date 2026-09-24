@@ -172,4 +172,19 @@ describe("attachExpress payload capture gating", () => {
 		expect(serializations()).toBe(2);
 		expect(stub.captures.map((c) => c.direction)).toEqual(["in", "out"]);
 	});
+
+	it("rejects scanner probes before creating HTTP telemetry", async () => {
+		const stub = makeSbStub();
+		const app = express();
+		const port = await new Promise<number>((resolve) => {
+			server = app.listen(0, "127.0.0.1", () => {
+				resolve((server?.address() as { port: number }).port);
+			});
+		});
+		attachExpress(app, stub.sb, { port });
+		const response = await fetch(`http://127.0.0.1:${port}/.git/config`);
+		expect(response.status).toBe(404);
+		expect(await response.json()).toEqual({ error: "Not Found" });
+		expect(stub.started).toHaveLength(0);
+	});
 });

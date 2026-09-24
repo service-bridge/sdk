@@ -17,6 +17,7 @@
 | `HonoEndpoint` | `interface { host?: string; port: number }` | — | Адрес, на котором фактически слушает Hono-сервер. `port` обязателен (Hono агностичен к серверу, не открывает сокет сам — должен совпадать с тем, что передан в `Bun.serve`/`serve`). `host` опционален. |
 | `HonoEndpoint.host` | `string \| undefined` | `127.0.0.1` (с одноразовым warn) | Advertise-host для HTTP-плоскости (ADR 0001). Если опущен — `resolveHttpAdvertiseHost()` → `127.0.0.1`. |
 | `HonoEndpoint.port` | `number` | — (обязателен) | Порт HTTP-сервера. |
+| `HonoEndpoint.security` | `HttpSecurityOptions` | scanner block + 300 req/min/client | Ранний отсев до `app.fetch`, route handler и HTTP telemetry. |
 
 ### Трейсинг и захват тел (поведение обёртки `app.fetch`)
 

@@ -4,6 +4,10 @@ import { runWithTrace } from "../../telemetry/context";
 import { Status } from "../../telemetry/ops";
 import { bodyToBytes, RAW_JSON_CONTRACT } from "../_common/body-capture";
 import { startHttpOp, statusForHttpCode } from "../_common/http-op";
+import {
+	HttpRequestGuard,
+	type HttpSecurityOptions,
+} from "../_common/security";
 import { resolveHttpAdvertiseHost } from "../endpoint";
 
 /**
@@ -83,6 +87,7 @@ function collect(
 export interface ExpressEndpoint {
 	host?: string;
 	port: number;
+	security?: HttpSecurityOptions;
 }
 
 /**
@@ -116,7 +121,7 @@ export function attachExpress(
 	const host = resolveHttpAdvertiseHost(endpoint.host);
 	sb.routes.publishHttp({ host, port: endpoint.port });
 
-	installTraceMiddleware(app, sb);
+	installTraceMiddleware(app, sb, endpoint.security);
 }
 
 const TRACE_FLAG = "__servicebridge_trace__";
@@ -127,13 +132,33 @@ const TRACE_FLAG = "__servicebridge_trace__";
  * middleware и route handlers видят TraceContext через ALS. Эмитит HTTP.HANDLE
  * op (start на запрос, end на `res.finish` / `res.close`).
  */
-function installTraceMiddleware(app: Express, sb: ServiceBridge): void {
+function installTraceMiddleware(
+	app: Express,
+	sb: ServiceBridge,
+	security?: HttpSecurityOptions,
+): void {
 	// biome-ignore lint/suspicious/noExplicitAny: app не хранит произвольные поля в типах
 	const tagged = app as any;
 	if (tagged[TRACE_FLAG]) return;
 	tagged[TRACE_FLAG] = true;
+	const guard = new HttpRequestGuard(security);
 
 	app.use((req: Request, res: Response, next: NextFunction) => {
+		const decision = guard.check({
+			method: req.method,
+			pathname: req.originalUrl || req.url,
+			remoteAddress: req.socket.remoteAddress,
+			forwardedFor: req.headers["x-forwarded-for"]?.toString(),
+		});
+		if (!decision.allowed) {
+			if (decision.retryAfterSeconds) {
+				res.setHeader("Retry-After", String(decision.retryAfterSeconds));
+			}
+			res.status(decision.status).json({
+				error: decision.status === 429 ? "Too Many Requests" : "Not Found",
+			});
+			return;
+		}
 		const op = startHttpOp(sb, {
 			method: req.method,
 			subjectPath: req.path,

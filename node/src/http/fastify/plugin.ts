@@ -12,6 +12,10 @@ import { type OpHandle, Status } from "../../telemetry/ops";
 import type { TraceContext } from "../../telemetry/trace-context";
 import { bodyToBytes, RAW_JSON_CONTRACT } from "../_common/body-capture";
 import { startHttpOp, statusForHttpCode } from "../_common/http-op";
+import {
+	HttpRequestGuard,
+	type HttpSecurityOptions,
+} from "../_common/security";
 import { resolveHttpAdvertiseHost } from "../endpoint";
 
 /**
@@ -21,6 +25,7 @@ import { resolveHttpAdvertiseHost } from "../endpoint";
  */
 export interface SbFastifyOptions {
 	sb: ServiceBridge;
+	security?: HttpSecurityOptions;
 	/**
 	 * Опционально: явный host для http_endpoint. По умолчанию идёт
 	 * `resolveHttpAdvertiseHost()` — bound socket address, иначе `127.0.0.1`.
@@ -60,6 +65,31 @@ const plugin: FastifyPluginAsync<SbFastifyOptions> = async (
 	opts: SbFastifyOptions,
 ) => {
 	const { sb } = opts;
+	const guard = new HttpRequestGuard(opts.security);
+
+	// Reject at the first Fastify hook, before parsing bodies, route execution and
+	// ServiceBridge telemetry. This keeps scanner floods out of operations.
+	fastify.addHook(
+		"onRequest",
+		(req: FastifyRequest, reply: FastifyReply, done) => {
+			const decision = guard.check({
+				method: req.method,
+				pathname: req.url,
+				remoteAddress: req.socket.remoteAddress,
+				forwardedFor: req.headers["x-forwarded-for"]?.toString(),
+			});
+			if (decision.allowed) {
+				done();
+				return;
+			}
+			if (decision.retryAfterSeconds) {
+				reply.header("Retry-After", String(decision.retryAfterSeconds));
+			}
+			reply.code(decision.status).send({
+				error: decision.status === 429 ? "Too Many Requests" : "Not Found",
+			});
+		},
+	);
 
 	// preHandler — последний async-hook перед route-handler'ом. Используем
 	// als.enterWith (а не runWithTrace callback-style) потому что Fastify hooks

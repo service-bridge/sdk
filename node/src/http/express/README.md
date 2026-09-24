@@ -30,6 +30,7 @@
 |------|-----|--------------|------------|
 | `port` | `number` | — (обязателен) | Порт, на котором фактически слушает Express. Передаётся явно: при bind на `0` реальный порт в момент сбора роутов неизвестен. |
 | `host` | `string` | `127.0.0.1` (с одноразовым warn) | Advertise-host. Если опущен — fallback `127.0.0.1` с одноразовым `console.warn`. Для cross-host передавай явный `host`. |
+| `security` | `HttpSecurityOptions` | scanner block + 300 req/min/client | Ранний отсев secret/CMS probes и per-client rate limit до route handler и telemetry. |
 
 ### Trace + telemetry middleware
 

@@ -159,4 +159,17 @@ describe("attachHono payload capture gating", () => {
 			{ status: Status.ERROR, message: "HTTP 503" },
 		]);
 	});
+
+	it("rejects scanner probes before creating HTTP telemetry", async () => {
+		const stub = makeSbStub();
+		const app = new Hono();
+		app.get("*", (c) => c.json({ leaked: true }));
+		attachHono(app, stub.sb, { port: 1 });
+		const response = await app.fetch(
+			new Request("http://localhost/wp/wp-json/batch/v1"),
+		);
+		expect(response.status).toBe(404);
+		expect(await response.json()).toEqual({ error: "Not Found" });
+		expect(stub.started).toHaveLength(0);
+	});
 });
