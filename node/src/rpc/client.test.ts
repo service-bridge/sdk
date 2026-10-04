@@ -19,6 +19,7 @@ import { Channel, OpHandle, RpcCall } from "../telemetry/ops";
 import { TelemetryRing } from "../telemetry/ring";
 import { CircuitBreakerRegistry } from "./circuit-breaker";
 import { RpcClient } from "./client";
+import type { DirectTransport } from "./direct-transport";
 import { InstanceCache } from "./instance-cache";
 import type { Candidate, LoadBalancer } from "./lb";
 import type { ProxyTransport } from "./proxy-transport";
@@ -426,6 +427,114 @@ describe("RpcClient caller-side CALL emission", () => {
 		expect(ends[0]!.opId).toBe(starts[0]!.opId);
 		expect(ends[0]!.attempt).toBe(2);
 		expect(ends[0]!.status).toBe(Status.ERROR);
+	});
+
+	it("falls back to runtime proxy once when a stale direct endpoint refuses connection", async () => {
+		const candidate = makeCandidate("target-svc", "Charge");
+		candidate.instance.callEndpoint = "10.0.1.221:50051";
+		const cache = makeInstanceCache("target-svc", "Charge");
+		const lb = makeLB(candidate);
+		const directCalls: string[] = [];
+		let directRequestId = "";
+		const direct = {
+			callUnary: async (
+				target: { endpoint: string },
+				_method: string,
+				_payload: Uint8Array,
+				_callerService: string,
+				requestId: string,
+			) => {
+				directCalls.push(target.endpoint);
+				directRequestId = requestId;
+				throw Object.assign(new Error("connect ECONNREFUSED 10.0.1.221"), {
+					code: 14,
+				});
+			},
+		} as unknown as DirectTransport;
+		const proxyCalls: Array<{
+			serviceId: string;
+			requestId: string;
+			timeoutMs: number;
+		}> = [];
+		const proxy = {
+			callUnary: async (
+				serviceId: string,
+				_method: string,
+				_payload: Uint8Array,
+				requestId: string,
+				_idempotencyKey: string,
+				timeoutMs: number,
+			) => {
+				proxyCalls.push({ serviceId, requestId, timeoutMs });
+				return Buffer.from('{"instance":"10.0.1.226"}');
+			},
+		} as unknown as ProxyTransport;
+		const client = new RpcClient(
+			proxy,
+			direct,
+			cache,
+			() => makeSchemaPair(),
+			() => "caller-svc",
+			cb,
+			lb,
+			sb,
+		);
+
+		const result = await client.call<object, { instance: string }>(
+			"target-svc",
+			"Charge",
+			{},
+			{
+				requestId: "same-logical-call",
+				timeout: "1s",
+				retry: { maxAttempts: 3 },
+			},
+		);
+		expect(result.instance).toBe("10.0.1.226");
+		expect(directCalls).toEqual(["10.0.1.221:50051"]);
+		expect(proxyCalls).toHaveLength(1);
+		expect(proxyCalls[0]!.serviceId).toBe(candidate.instance.serviceId);
+		expect(directRequestId).toBe("same-logical-call");
+		expect(proxyCalls[0]!.requestId).toBe(directRequestId);
+		expect(proxyCalls[0]!.timeoutMs).toBeGreaterThan(0);
+		expect(proxyCalls[0]!.timeoutMs).toBeLessThanOrEqual(1000);
+		const ends = drainOpReports(ring).filter(
+			(r) => r.kind === RpcCall && r.finishedAtMs !== undefined,
+		);
+		expect(ends).toHaveLength(1);
+		expect(ends[0]!.status).toBe(Status.SUCCESS);
+		expect(ends[0]!.attempt).toBe(1);
+	});
+
+	it("does not replay an ambiguous direct UNAVAILABLE without idempotency", async () => {
+		const candidate = makeCandidate("target-svc", "Charge");
+		let directCalls = 0;
+		let proxyCalls = 0;
+		const direct = {
+			callUnary: async () => {
+				directCalls++;
+				throw Object.assign(new Error("callee disconnected after dispatch"), {
+					code: 14,
+				});
+			},
+		} as unknown as DirectTransport;
+		const proxy = makeProxyTransport(() => proxyCalls++);
+		const client = new RpcClient(
+			proxy,
+			direct,
+			makeInstanceCache("target-svc", "Charge"),
+			() => makeSchemaPair(),
+			() => "caller-svc",
+			cb,
+			makeLB(candidate),
+			sb,
+		);
+
+		await expect(
+			client.call("target-svc", "Charge", {}, { retry: { maxAttempts: 3 } }),
+		).rejects.toThrow("callee disconnected after dispatch");
+		expect(directCalls).toBe(1);
+		expect(proxyCalls).toBe(0);
 	});
 
 	// ─── T7: stream produces single CALL op ─────────────────────────────────────

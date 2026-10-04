@@ -226,6 +226,7 @@ export class RpcClient {
 		// "no key" — runtime then skips Claim/Save entirely.
 		const idempotencyKey = opts?.idempotencyKey ?? "";
 		const timeoutMs = parseTimeout(opts?.timeout) ?? 30_000;
+		const deadlineAt = Date.now() + timeoutMs;
 		const transport = opts?.transport ?? "auto";
 		const retry = mergeRetryOpts(opts?.retry);
 		const hasIdempotency = idempotencyKey.length > 0;
@@ -324,8 +325,52 @@ export class RpcClient {
 			} catch (err) {
 				lastErr = err;
 				this.cb.recordFailure(cbKey(candidate.instance));
+				// A dead pod can remain in the local registry snapshot until its
+				// Control.Open teardown reaches this caller. Redialling that same
+				// endpoint only repeats ECONNREFUSED; the runtime proxy resolves the
+				// currently connected instance from its authoritative registry.
+				if (
+					transport === "auto" &&
+					useDirect &&
+					isPreDispatchConnectionFailure(err) &&
+					attempt + 1 < retry.maxAttempts
+				) {
+					const remainingMs = deadlineAt - Date.now();
+					if (remainingMs > 0) {
+						callOp.setAttempt(attempt + 1);
+						try {
+							const respBytes = await runWithTrace(
+								{ traceId: callOp.traceId, parentOpId: callOp.opId },
+								() =>
+									this.proxy.callUnary(
+										candidate.instance.serviceId,
+										methodName,
+										reqBytes,
+										requestId,
+										idempotencyKey,
+										remainingMs,
+										schema.contractHashBytes,
+									),
+							);
+							callOp.captureOut(respBytes, schema.contractHash);
+							const result = schema.pair.output.decode(respBytes) as Res;
+							callOp.end(Status.SUCCESS);
+							return result;
+						} catch (proxyErr) {
+							callOp.end(
+								Status.ERROR,
+								proxyErr instanceof Error ? proxyErr.message : String(proxyErr),
+							);
+							throw proxyErr;
+						}
+					}
+				}
 				if (
 					attempt === retry.maxAttempts - 1 ||
+					(useDirect &&
+						!hasIdempotency &&
+						(err as { code?: unknown })?.code === GRPC_CODE_UNAVAILABLE &&
+						!isPreDispatchConnectionFailure(err)) ||
 					!isRetryable(err, hasIdempotency)
 				) {
 					callOp.end(
@@ -412,6 +457,24 @@ function noLiveInstance(message: string): NoLiveInstanceError {
 	return Object.assign(new NoLiveInstanceError(message), {
 		code: GRPC_CODE_UNAVAILABLE,
 	});
+}
+
+function isPreDispatchConnectionFailure(err: unknown): boolean {
+	const failure = err as {
+		code?: unknown;
+		message?: unknown;
+		cause?: { code?: unknown };
+	};
+	if (
+		failure?.code === "ECONNREFUSED" ||
+		failure?.cause?.code === "ECONNREFUSED"
+	) {
+		return true;
+	}
+	if (failure?.code !== GRPC_CODE_UNAVAILABLE) return false;
+	return /\b(?:ECONNREFUSED|No connection established|Failed to connect to all addresses)\b/i.test(
+		String(failure.message ?? ""),
+	);
 }
 
 // rpcCallMeta builds the RPC.CALL meta JSON. Written out instead of
