@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { status as GrpcStatus } from "@grpc/grpc-js";
+import { testTls } from "../../tests/helpers/tls";
 import { ConfigurationError } from "../errors";
 import { BootstrapKeyPayload } from "../pb/servicebridge/v1/bootstrap";
 import type {
@@ -158,14 +159,14 @@ function rotatingBridge(
 
 function fakeProvisionResult(): ProvisionResult {
 	return {
-		certDer: Buffer.alloc(1),
-		caChainDer: Buffer.alloc(1),
+		certDer: testTls.certDer,
+		caChainDer: testTls.certDer,
 		serviceId: "svc",
 		serviceName: "svc-name",
 		instanceId: "inst",
 		notAfterUnix: BigInt(Math.floor(Date.now() / 1000) + 3600),
 		privateKey: {} as CryptoKey,
-		privateKeyDer: Buffer.alloc(1),
+		privateKeyDer: testTls.privateKeyDer,
 	};
 }
 

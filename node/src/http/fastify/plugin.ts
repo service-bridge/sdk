@@ -38,6 +38,7 @@ declare module "fastify" {
 		sbTraceCtx?: TraceContext;
 		sbHttpHandle?: OpHandle;
 		sbHttpCapturing?: boolean;
+		sbHttpFinish?: (status: Status, message?: string) => void;
 	}
 }
 
@@ -99,24 +100,43 @@ const plugin: FastifyPluginAsync<SbFastifyOptions> = async (
 	// HTTP.HANDLE op стартует здесь, end — в onResponse hook. ALS-фрейм несёт
 	// childContext(ctx, handle.opId): downstream-операции вложены под HTTP.HANDLE
 	// (симметрично rpc-клиенту, который ставит CALL.op_id родителем для callee).
-	fastify.addHook("preHandler", async (req: FastifyRequest) => {
-		const op = startHttpOp(sb, {
-			method: req.method,
-			subjectPath: req.routeOptions?.url ?? req.url,
-			keyPath: req.url,
-			traceHeader: req.headers["x-sb-trace"],
-			idempotencyKey: req.headers["idempotency-key"],
-		});
-		req.sbTraceCtx = op.incoming;
-		req.sbHttpHandle = op.handle;
-		req.sbHttpCapturing = op.capturing;
-		als.enterWith(op.scope);
-		// Request body (IN) — Fastify has already parsed it by preHandler.
-		if (op.capturing) {
-			const inBytes = bodyToBytes(req.body);
-			if (inBytes) op.handle.captureIn(inBytes, RAW_JSON_CONTRACT);
-		}
-	});
+	fastify.addHook(
+		"preHandler",
+		async (req: FastifyRequest, reply: FastifyReply) => {
+			const op = startHttpOp(sb, {
+				method: req.method,
+				subjectPath: req.routeOptions?.url ?? req.url,
+				keyPath: req.url,
+				traceHeader: req.headers["x-sb-trace"],
+				idempotencyKey: req.headers["idempotency-key"],
+			});
+			req.sbTraceCtx = op.incoming;
+			req.sbHttpHandle = op.handle;
+			req.sbHttpCapturing = op.capturing;
+			// IncomingMessage abort only covers interrupted request bodies. A client
+			// can disconnect after its POST was fully read, before/during the reply;
+			// Fastify then never calls onResponse. Observe the response socket too.
+			let finished = false;
+			const abort = () => {
+				if (!reply.raw.writableFinished) {
+					req.sbHttpFinish?.(Status.TIMEOUT, "client abort");
+				}
+			};
+			req.sbHttpFinish = (status, message) => {
+				if (finished) return;
+				finished = true;
+				reply.raw.off("close", abort);
+				op.handle.end(status, message);
+			};
+			reply.raw.once("close", abort);
+			als.enterWith(op.scope);
+			// Request body (IN) — Fastify has already parsed it by preHandler.
+			if (op.capturing) {
+				const inBytes = bodyToBytes(req.body);
+				if (inBytes) op.handle.captureIn(inBytes, RAW_JSON_CONTRACT);
+			}
+		},
+	);
 
 	// onSend exposes the serialized response payload — capture it (OUT) before
 	// onResponse ends the op (so "errors"-mode buffering still works).
@@ -136,16 +156,11 @@ const plugin: FastifyPluginAsync<SbFastifyOptions> = async (
 			const handle = req.sbHttpHandle;
 			if (!handle) return;
 			const { status, message } = statusForHttpCode(reply.statusCode);
-			handle.end(status, message);
+			req.sbHttpFinish?.(status, message);
 		},
 	);
-
-	// onRequestAbort fires when the client disconnects before the response is
-	// sent — onResponse never runs in that case, so the HTTP.HANDLE op would
-	// otherwise hang RUNNING forever. End it as TIMEOUT, matching express/hono.
-	// OpHandle.end is idempotent, so a later onResponse end is a safe no-op.
 	fastify.addHook("onRequestAbort", async (req: FastifyRequest) => {
-		req.sbHttpHandle?.end(Status.TIMEOUT, "client abort");
+		req.sbHttpFinish?.(Status.TIMEOUT, "client abort");
 	});
 
 	fastify.addHook("onRoute", (route: RouteOptions) => {

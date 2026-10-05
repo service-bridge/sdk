@@ -5,6 +5,7 @@ import "reflect-metadata";
 
 import { describe, expect, it } from "bun:test";
 import type { PeerCertificate } from "node:tls";
+import { testTls } from "../../tests/helpers/tls";
 import { SPIFFE_TRUST_DOMAIN } from "../connection/spiffe";
 import {
 	channelTtlMs,
@@ -25,15 +26,11 @@ function mkTarget(overrides: Partial<DirectTarget> = {}): DirectTarget {
 	};
 }
 
-// DER content is never parsed by DirectTransport — derToPem base64-wraps it and
-// grpc.credentials.createSsl stores the buffers without validating them. A
-// fixed byte string is enough to exercise cache + TTL behaviour offline.
 function mkCreds(notAfterUnix: bigint): DirectCredentials {
-	const der = Buffer.from("der");
 	return {
-		caChainDer: der,
-		leafCertDer: der,
-		privateKeyDer: der,
+		caChainDer: testTls.certDer,
+		leafCertDer: testTls.certDer,
+		privateKeyDer: testTls.privateKeyDer,
 		notAfterUnix,
 	};
 }
