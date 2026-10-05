@@ -341,7 +341,7 @@ describe("workflow-access-policy", () => {
 			...FAST_WF_OPTS,
 			failOnPolicyViolation: true,
 			advertise: { host: "127.0.0.1", port: 0 },
-			dataDir: `./.servicebridge-e2e/${domain}-ap-fov`,
+			dataDir: `./.servicebridge-e2e/${domain}-ap-fov-${Date.now()}`,
 		});
 		caller.service(ownerSvcName, { workflows: [wfName] });
 		clients.push(caller);

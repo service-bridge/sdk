@@ -22,11 +22,16 @@
 // The warm pool is closed once at process exit via the global afterAll in
 // setup.ts (a top-level afterAll in a Bun preload fires once per run).
 
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { ServiceBridge } from "../../../src/connection/service-bridge";
 
 export type Role = "primary" | "second" | "third";
 
 const CONNECT_TIMEOUT_MS = 10_000;
+// A fresh runtime database must never receive a previous run's SQLite outbox.
+const dataRoot = mkdtempSync(join(tmpdir(), "sb-e2e-pool-"));
 
 const POOL_OPTS = {
 	reconnectIntervalMs: 500,
@@ -70,7 +75,7 @@ function buildClient(role: Role, tag: string): ServiceBridge {
 	return new ServiceBridge(url, key, {
 		...POOL_OPTS,
 		advertise: { host: "127.0.0.1", port: 0 },
-		dataDir: `./.servicebridge-e2e/${domain()}-${tag}`,
+		dataDir: join(dataRoot, `${domain()}-${tag}`),
 	});
 }
 
@@ -148,4 +153,5 @@ export async function closeAll(): Promise<void> {
 	const entries = [...pool.values()];
 	pool.clear();
 	await Promise.all(entries.map((e) => e.sb.stop().catch(() => {})));
+	rmSync(dataRoot, { recursive: true, force: true });
 }
