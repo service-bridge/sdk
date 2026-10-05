@@ -39,7 +39,7 @@ SDK-сторона интеграции с рантайм-подсистемой
 | `SubscriberDeps` | interface @internal | — | Контракт зависимостей `JobSubscriber`: `rpcClient: JobsClient`, `identity: () => IdentityProvider \| null`, `domain: JobDomain`, `logger: Logger`, `runWithTrace: (xSbTrace, fn) => Promise<void>`, `reconnectOpts?: ReconnectDelayOptions`, `onSchedule?: (delayMs: number) => void`. Экспортируется из `subscriber.ts` для `connection/service-bridge`, но не реэкспортируется через `index.ts`. |
 | `SubscriberDeps.reconnectOpts` | `ReconnectDelayOptions?` | общая лестница + ±20% jitter | Тестовый hook: пиннит лестницу/jitter, чтобы reconnect наблюдался за миллисекунды. |
 | `SubscriberDeps.onSchedule` | `((delayMs: number) => void)?` | нет | Тестовый hook: наблюдает каждую задержку reconnect. См. `registry/README.md`. |
-| `Semaphore` | реэкспорт из `utils/semaphore` | — | Per-job in-flight cap по `opts.maxConcurrent` (`0` / отсутствие → `32`, явный cap до `1024`). Очередь ограничена `1024` назначениями на fingerprint. Своей копии класса модуль больше не держит. |
+| `Semaphore` | реэкспорт из `utils/semaphore` | — | Для `overlap=skip` (также по умолчанию) cap всегда `1`; для остальных политик cap по `opts.maxConcurrent` (`0` / отсутствие → `32`, явный cap до `1024`). Семафор принадлежит JobDomain и сохраняется при замене subscriber во время ротации identity. Очередь ограничена `1024` назначениями на fingerprint. Своей копии класса модуль больше не держит. |
 | `canonicalJobSpec(opts)` | функция @internal | — | Сериализует `JobOpts` в `CanonicalJobSpec` JSON (must match `runtime/internal/jobs.CanonicalJobSpec`): `trigger` + опциональные `catchup`, `overlap`, `deps`, `maxAttempts`, `leaseTtlMs`, `maxConcurrent`, `retry`. Поля времени — unix-ms (`runAtUnixMs`) и ms (`everyMs`, `leaseTtlMs`). |
 | `Logger` / `IdentityProvider` | interface @internal | — | Контракты для `SubscriberDeps`: `Logger {warn,error}`, `IdentityProvider {serviceId, instanceId}`. |
 
@@ -69,4 +69,4 @@ Each job requires an explicit `version` string identifying its immutable executa
 
 An assignment for an executable fingerprint absent from the retained local registry reports terminal `unsupported_version` (`failed` for workflows, non-retryable failure for jobs), so it cannot wait through repeated lease expiry.
 
-Duplicate live execution epochs are ignored; a higher epoch aborts the previous handler and suppresses its result. Explicit maxConcurrent is an integer 0..1024; zero selects the safe default of 32.
+Duplicate live execution epochs are ignored; a higher epoch aborts the previous handler and suppresses its result. Explicit maxConcurrent is an integer 0..1024; zero selects 32 for allow/buffer_one. The default skip policy always uses one slot, retained across subscriber replacement until the prior application handler actually finishes.

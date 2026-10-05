@@ -61,6 +61,7 @@ interface Harness {
 function makeHarness(
 	opts: {
 		identity?: () => IdentityProvider | null;
+		domain?: JobDomain;
 		reconnectOpts?: ReconnectDelayOptions;
 	} = {},
 ): Harness {
@@ -70,7 +71,7 @@ function makeHarness(
 	const heartbeats: Array<{ serviceId: string; instanceId: string }> = [];
 	const warns: string[] = [];
 	const results: unknown[] = [];
-	const domain = new JobDomain(new Registry());
+	const domain = opts.domain ?? new JobDomain(new Registry());
 	let heartbeatError: string | null = null;
 
 	const deps: SubscriberDeps = {
@@ -326,6 +327,73 @@ describe("JobSubscriber concurrency", () => {
 			xSbTrace: "",
 		};
 	}
+
+	it.each([undefined, "skip"] as const)(
+		"Skip_SerializesRedeliveryAcrossIdentityAndSubscriberReplacement (%s)",
+		async (overlap) => {
+			const h = makeHarness();
+			let running = 0;
+			let peak = 0;
+			let calls = 0;
+			const releases: Array<() => void> = [];
+			h.domain.handle(
+				"nightly",
+				{
+					version: "test-v1",
+					trigger: { interval: 1000 },
+					overlap,
+					maxConcurrent: 8,
+				},
+				async () => {
+					running++;
+					calls++;
+					peak = Math.max(peak, running);
+					// Deliberately ignore AbortSignal: cancellation cannot force an
+					// application promise to finish during certificate rotation.
+					await new Promise<void>((resolve) => releases.push(resolve));
+					running--;
+				},
+			);
+			const fingerprint = createHash("sha256")
+				.update(
+					JSON.stringify({
+						version: "test-v1",
+						trigger: { interval: { everyMs: 1000 } },
+						overlap,
+						maxConcurrent: 8,
+					}),
+				)
+				.digest("hex");
+			h.sub.start();
+			h.last().emit("data", { ...makeExec("reassigned"), fingerprint });
+			await wait(5);
+			expect(calls).toBe(1);
+			await h.sub.stop();
+			const replacement = makeHarness({
+				domain: h.domain,
+				identity: () => ({ serviceId: "svc-1", instanceId: "inst-rotated" }),
+			});
+			replacement.sub.start();
+			replacement.last().emit("data", {
+				...makeExec("reassigned"),
+				fingerprint,
+				leaseEpoch: 2,
+			});
+			await wait(5);
+			expect(calls).toBe(1);
+			expect(h.results).toHaveLength(0);
+			releases.shift()?.();
+			for (let i = 0; i < 100 && calls < 2; i++) await wait(5);
+			expect(calls).toBe(2);
+			expect(peak).toBe(1);
+			releases.shift()?.();
+			for (let i = 0; i < 100 && replacement.results.length === 0; i++)
+				await wait(5);
+			expect(replacement.results).toHaveLength(1);
+			expect(h.results).toHaveLength(0);
+			await replacement.sub.stop();
+		},
+	);
 
 	it("MaxConcurrent_QueuesInsteadOfSheddingLoad", async () => {
 		// Executions arrive holding a runtime-issued lease, so the wait queue is

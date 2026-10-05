@@ -11,6 +11,11 @@ import type { JobHandler, JobHandlerCtx, JobOpts } from "./types";
 const HEARTBEAT_INTERVAL_MS = 5_000;
 const HEARTBEAT_FAIL_THRESHOLD = 3;
 
+// Certificate/identity rotation replaces the subscriber while an application
+// handler may still be finishing. Keep its slots with the owning JobDomain so
+// the replacement cannot overlap a handler that has not honored cancellation.
+const domainSemaphores = new WeakMap<JobDomain, Map<string, Semaphore>>();
+
 export interface Logger {
 	warn(msg: string): void;
 	error(msg: string): void;
@@ -51,7 +56,7 @@ export class JobSubscriber {
 	>();
 	private _heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 	private _heartbeatFailures = 0;
-	private readonly _semaphores = new Map<string, Semaphore>();
+	private readonly _semaphores: Map<string, Semaphore>;
 	private readonly supervisor: StreamSupervisor<
 		ClientReadableStream<JobExecution>,
 		JobExecution
@@ -62,6 +67,12 @@ export class JobSubscriber {
 	) => Promise<void>;
 
 	constructor(private readonly d: SubscriberDeps) {
+		let semaphores = domainSemaphores.get(d.domain);
+		if (!semaphores) {
+			semaphores = new Map();
+			domainSemaphores.set(d.domain, semaphores);
+		}
+		this._semaphores = semaphores;
 		this.runWithTrace = d.runWithTrace;
 		this.supervisor = new StreamSupervisor({
 			open: () => this.openStream(),
@@ -132,7 +143,10 @@ export class JobSubscriber {
 		this._active.set(exec.executionId, { epoch: exec.leaseEpoch, controller });
 		const signal = AbortSignal.any([this._stopping.signal, controller.signal]);
 		try {
-			const maxConcurrent = reg.opts.maxConcurrent ?? 32;
+			const maxConcurrent =
+				(reg.opts.overlap ?? "skip") === "skip"
+					? 1
+					: (reg.opts.maxConcurrent ?? 32);
 			const sem = this.getSemaphore(
 				`${exec.jobName}:${exec.fingerprint}`,
 				maxConcurrent,
