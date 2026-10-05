@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"google.golang.org/grpc"
 
@@ -117,11 +118,13 @@ type Client struct {
 	onDisconn   []func(cause error)
 	onViolation []func(PolicyViolation)
 
-	lifeMu  sync.Mutex
-	runCtx  context.Context
-	cancel  context.CancelFunc
-	started bool
-	stopped bool
+	lifeMu    sync.Mutex
+	startDone chan struct{}
+	runCtx    context.Context
+	cancel    context.CancelFunc
+	ready     bool
+	started   bool
+	stopped   bool
 }
 
 // New builds a client for the runtime at url, authenticating with the service
@@ -403,7 +406,7 @@ func (c *Client) buildDomains() error {
 //     first RegisterRequest or the mesh dials an endpoint nobody listens on
 //  5. wait for the first snapshot, which is the confirmation of registration
 //  6. start the subscriptions that need a registered identity
-func (c *Client) Start(ctx context.Context) error {
+func (c *Client) Start(ctx context.Context) (result error) {
 	const op = "Client.Start"
 	c.lifeMu.Lock()
 	switch {
@@ -419,10 +422,26 @@ func (c *Client) Start(ctx context.Context) error {
 		return err
 	}
 	c.started = true
+	c.startDone = make(chan struct{})
+	startDone := c.startDone
 	// The client outlives the call that started it, so the supervision context
 	// keeps the caller's values and drops its cancellation.
 	c.runCtx, c.cancel = context.WithCancel(context.WithoutCancel(ctx))
 	c.lifeMu.Unlock()
+
+	defer func() {
+		close(startDone)
+		if result != nil {
+			rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			result = errors.Join(result, c.Stop(rollbackCtx))
+		}
+	}()
+	startCtx, cancelStart := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelStart()
+	stopCancellation := context.AfterFunc(c.runCtx, cancelStart)
+	defer stopCancellation()
+	ctx = startCtx
 
 	c.dispatch.Seal()
 	if err := c.openOutbox(ctx); err != nil {
@@ -437,6 +456,9 @@ func (c *Client) Start(ctx context.Context) error {
 	if err := c.watch.Ready(ctx); err != nil {
 		return wrap(op, err)
 	}
+	c.lifeMu.Lock()
+	c.ready = !c.stopped
+	c.lifeMu.Unlock()
 	return wrap(op, c.startSubscriptions())
 }
 
@@ -544,27 +566,67 @@ func (c *Client) Stop(ctx context.Context) error {
 		return nil
 	}
 	c.stopped = true
+	startDone := c.startDone
 	c.lifeMu.Unlock()
 
-	c.wfSub.Stop()
-	c.jobSub.Stop()
-	c.eventSub.Stop()
-	c.sampler.Stop()
-	c.drainer.Stop()
-	c.tport.Stop()
-	c.watch.Stop()
-
-	var errs []error
-	errs = append(errs, c.life.Stop(ctx))
-	errs = append(errs, c.direct.Close())
-	for _, ch := range []*channel{c.invokeCh, c.eventsCh, c.jobsCh, c.workflowCh, c.telemCh} {
-		errs = append(errs, ch.Close())
+	if c.cancel != nil {
+		c.cancel()
 	}
-	if c.buffer != nil {
-		errs = append(errs, c.buffer.Close())
+	if _, bounded := ctx.Deadline(); !bounded {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
 	}
-	c.cancel()
-	return wrap(op, errors.Join(errs...))
+	done := make(chan error, 1)
+	go func() {
+		if startDone != nil {
+			<-startDone
+		}
+		var errs []error
+		errs = append(errs, c.direct.Close())
+		for _, ch := range []*channel{c.invokeCh, c.eventsCh, c.jobsCh, c.workflowCh, c.telemCh} {
+			if ch != nil {
+				errs = append(errs, ch.Close())
+			}
+		}
+		if c.server != nil {
+			errs = append(errs, c.server.Close(ctx))
+		}
+		if c.sampler != nil {
+			c.sampler.Stop()
+		}
+		if c.drainer != nil {
+			c.drainer.Stop()
+		}
+		if c.tport != nil {
+			c.tport.Stop()
+		}
+		if c.watch != nil {
+			c.watch.Stop()
+		}
+		if c.buffer != nil {
+			errs = append(errs, c.buffer.Close())
+		}
+		// User handlers can ignore cancellation. All owned network/storage
+		// resources are closed before waiting for those goroutines to return.
+		if c.wfSub != nil {
+			c.wfSub.Stop()
+		}
+		if c.jobSub != nil {
+			c.jobSub.Stop()
+		}
+		if c.eventSub != nil {
+			c.eventSub.Stop()
+		}
+		errs = append(errs, c.life.Stop(ctx))
+		done <- errors.Join(errs...)
+	}()
+	select {
+	case err := <-done:
+		return wrap(op, err)
+	case <-ctx.Done():
+		return wrap(op, ctx.Err())
+	}
 }
 
 // Recorder, Declarations and RestartRegistry are what the HTTP integrations
@@ -771,6 +833,7 @@ type observer Client
 
 func (o *observer) Connected(id connection.SessionIdentity) {
 	c := (*Client)(o)
+	c.metrics.RetireExcept(id.InstanceID)
 	c.log.Info("connected", "service", id.ServiceName, "instance", id.InstanceID)
 	identity := Identity{
 		SessionID:   id.SessionID,
@@ -807,6 +870,18 @@ func (o *observer) Draining(reason string) {
 
 func (o *observer) Disconnected(cause error) {
 	c := (*Client)(o)
+	if cause != nil {
+		if c.cancel != nil {
+			c.cancel()
+		}
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := c.Stop(ctx); err != nil {
+				c.log.Warn("terminal connection cleanup", "error", err)
+			}
+		}()
+	}
 	c.log.Error("disconnected", "error", cause)
 	c.obsMu.RLock()
 	defer c.obsMu.RUnlock()
@@ -976,10 +1051,10 @@ func (c *Client) publishEnvelope(ctx context.Context, req *pb.PublishRequest) (*
 // Steps satisfies workflow.GraphSource: a run is executed from the graph
 // declared in this process, because a Local step carries a Go closure no frozen
 // plan can hold.
-func (c *Client) Steps(name string) ([]wf.Step, bool) {
+func (c *Client) Steps(name string, fingerprint string) ([]wf.Step, bool) {
 	c.graphMu.RLock()
 	defer c.graphMu.RUnlock()
-	steps, ok := c.graphs[name]
+	steps, ok := c.graphs[name+":"+fingerprint]
 	return steps, ok
 }
 
@@ -1108,4 +1183,10 @@ func (codec) Encode(_ string, payload any) (events.Encoded, error) {
 
 func (codec) Decode(_ string, payload []byte, out any) error {
 	return serde.Decode(payload, out)
+}
+
+func (c *Client) canPublish() bool {
+	c.lifeMu.Lock()
+	defer c.lifeMu.Unlock()
+	return c.ready && !c.stopped
 }

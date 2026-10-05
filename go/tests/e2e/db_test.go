@@ -42,12 +42,22 @@ func pgContainer() string {
 	return defaultPGContainer
 }
 
+func pgUser() string {
+	if v := os.Getenv("SB_E2E_PG_USER"); v != "" {
+		return v
+	}
+	return defaultPGUser
+}
+
 // ambientDatabase names the database the runtime under test is using. In direct
 // mode it comes from the DSN, because the suite can be pointed at a database
 // created for one run; the constant is only the development default.
 func ambientDatabase() string {
 	dsn, direct := pgDirect()
 	if !direct {
+		if v := os.Getenv("SB_E2E_PG_DATABASE"); v != "" {
+			return v
+		}
 		return defaultPGDatabase
 	}
 	u, err := url.Parse(dsn)
@@ -101,7 +111,7 @@ func runPSQL(ctx context.Context, sql string) (string, error) {
 	} else {
 		cmd = exec.CommandContext(ctx, "docker",
 			append([]string{"exec", "-i", pgContainer(), args[0],
-				"-U", defaultPGUser, "-d", ambientDatabase()}, args[1:]...)...)
+				"-U", pgUser(), "-d", ambientDatabase()}, args[1:]...)...)
 	}
 	cmd.Stdin = strings.NewReader(sql)
 	var stdout, stderr bytes.Buffer

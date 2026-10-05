@@ -311,7 +311,7 @@ func (e *Event[T]) Publish(ctx context.Context, payload T, opts ...PublishOption
 // a publication down or to fail it.
 func PublishEvent[T proto.Message](ctx context.Context, c *Client, name string, payload T, opts ...PublishOption) (string, error) {
 	const op = "servicebridge.PublishEvent"
-	if c.publisher == nil {
+	if !c.canPublish() {
 		return "", newError(CodeState, op, "publish before Start", nil)
 	}
 	id, err := c.publisher.Publish(ctx, name, payload, publishOptions(opts)...)
@@ -453,7 +453,7 @@ func (d *WorkflowDomain) Handle(name string, def wf.Definition) error {
 		return wrap(op, err)
 	}
 	d.c.graphMu.Lock()
-	d.c.graphs[name] = frozen.Steps
+	d.c.graphs[name+":"+frozen.Fingerprint] = frozen.Steps
 	d.c.graphMu.Unlock()
 
 	return wrap(op, d.c.decls.AddIncoming(registry.IncomingSpec{
@@ -625,7 +625,7 @@ func undeclaredDependency(service, method string) string {
 // the run state records what was emitted.
 func (e *executor) Publish(ctx context.Context, spec wfi.PublishSpec) (any, error) {
 	c := (*Client)(e)
-	if c.publisher == nil {
+	if !c.canPublish() {
 		return nil, newError(CodeState, "workflow.publish", "publish before Start", nil)
 	}
 	opts := []events.PublishOption{}
@@ -766,7 +766,7 @@ func (d *TelemetryDomain) Gauge(name, unit string, labels map[string]string) *Ga
 
 func (d *TelemetryDomain) Histogram(name, unit string, labels map[string]string, bounds []float64) *Histogram {
 	s := d.series(name, unit, labels, seriesHistogram)
-	s.bounds = bounds
+	s.bounds = append([]float64(nil), bounds...)
 	return &Histogram{series: s}
 }
 
@@ -797,7 +797,11 @@ type series struct {
 }
 
 func (d *TelemetryDomain) series(name, unit string, labels map[string]string, kind seriesKind) *series {
-	return &series{d: d, kind: kind, name: name, unit: unit, labels: telemetry.Labels(labels)}
+	copied := make(telemetry.Labels, len(labels))
+	for key, value := range labels {
+		copied[key] = value
+	}
+	return &series{d: d, kind: kind, name: name, unit: unit, labels: copied}
 }
 
 func (s *series) resolve() error {

@@ -26,7 +26,7 @@ func TestDelayedJobFiresAndReports(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build delayed trigger: %v", err)
 	}
-	err = c.Job.Handle(name, job.NewSpec(trigger, job.WithMaxAttempts(1)),
+	err = c.Job.Handle(name, job.NewSpec(trigger, job.WithVersion("test-v1"), job.WithMaxAttempts(1)),
 		func(_ context.Context, exec job.Execution) error {
 			select {
 			case fired <- exec:

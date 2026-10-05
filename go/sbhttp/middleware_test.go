@@ -3,6 +3,7 @@ package sbhttp_test
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -542,5 +543,54 @@ func TestLoggerIsReachableByAdapters(t *testing.T) {
 	integ, _ := newIntegration(t, telemetry.ModeNone)
 	if integ.Logger() == nil {
 		t.Error("adapters in their own module report a failed span through this logger")
+	}
+}
+
+func TestCaptureObservesOnlyHandlerReadsWithoutReadAhead(t *testing.T) {
+	integ, rt := newIntegration(t, telemetry.ModeAll)
+	body := newCountingBody(strings.Repeat("x", 2<<20))
+	request := httptest.NewRequest(http.MethodPost, "/partial", body)
+	var readCountBefore int
+	serve(integ, request, func(w http.ResponseWriter, r *http.Request) {
+		readCountBefore = body.count()
+		buf := make([]byte, 3)
+		n, err := r.Body.Read(buf)
+		if n != 3 || err != nil {
+			t.Fatalf("handler read changed: %d %v", n, err)
+		}
+		w.WriteHeader(http.StatusBadRequest)
+	})
+	if readCountBefore != 0 || body.count() != 1 {
+		t.Fatalf("capture read ahead: before=%d total=%d", readCountBefore, body.count())
+	}
+	for _, att := range payloads(rt) {
+		if att.GetDirection() == telemetry.DirectionIn && string(att.GetBytes()) != "xxx" {
+			t.Fatalf("captured bytes beyond actual consumption: %d", len(att.GetBytes()))
+		}
+	}
+}
+
+type errorBody struct {
+	calls int
+	err   error
+}
+
+func (b *errorBody) Read(p []byte) (int, error) { b.calls++; return 0, b.err }
+func (*errorBody) Close() error                 { return nil }
+func TestCapturePreservesTheHandlerFirstReadError(t *testing.T) {
+	integ, _ := newIntegration(t, telemetry.ModeAll)
+	boom := errors.New("one-shot body failure")
+	body := &errorBody{err: boom}
+	request := httptest.NewRequest(http.MethodPost, "/error", body)
+	serve(integ, request, func(_ http.ResponseWriter, r *http.Request) {
+		if body.calls != 0 {
+			t.Fatal("body consumed before handler")
+		}
+		if _, err := r.Body.Read(make([]byte, 1)); !errors.Is(err, boom) {
+			t.Fatalf("read error replaced: %v", err)
+		}
+	})
+	if body.calls != 1 {
+		t.Fatal("capture performed extra reads")
 	}
 }

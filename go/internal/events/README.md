@@ -161,3 +161,5 @@ Durable-события Go SDK: публикация (запись в локал�
 - `github.com/google/uuid` — UUIDv7 для идентификаторов событий.
 
 На него опираются: корневой пакет `servicebridge` (сборка графа зависимостей клиента: транспорт `Events`, кодек из слоя сериализации, идентичность из `internal/connection`, объявления подписок через `internal/registry`).
+
+Subscriber ограничен глобальными слотами (32 по умолчанию, максимум1024), не создаёт очередь при превышении runtime credits и отвечает NACK с исходным lease token. Handler metadata доступна через `DeliveryFromContext(ctx)` (attempt/event/delivery/name/token). При разрыве потока контекст handler отменяется, stale ACK/NACK не отправляется. Отсутствующий handler отвергается. FireAndForget подтверждает только точный per-item accepted/duplicate результат; пустой или чужой ответ — ошибка. Drainer повторяет локальный Complete без повторной публикации уже принятого пакета.

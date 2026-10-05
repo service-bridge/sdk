@@ -3,6 +3,7 @@ package telemetry
 import (
 	"encoding/json"
 	"errors"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -342,5 +343,25 @@ func TestMutatingTheCallersLabelsDoesNotMoveASeries(t *testing.T) {
 	points := m.Drain(1)
 	if len(points) != 1 || points[0].GetLabels()["route"] != "/a" {
 		t.Fatalf("labels = %v, want the value captured at creation", points)
+	}
+}
+
+func TestMetricRegistryRetiresOldIdentitiesAcrossLifetimeBudget(t *testing.T) {
+	sink := &collectingSink{}
+	m := NewMetrics(sink)
+	for i := 0; i < DefaultMaxMetricSeries+10; i++ {
+		id := strconv.Itoa(i)
+		m.RetireExcept(id)
+		counter, err := m.Counter(id, "same", nil)
+		if err != nil {
+			t.Fatalf("rotation exhausted budget: %v", err)
+		}
+		counter.Inc()
+		if m.SeriesCount() != 1 {
+			t.Fatal("retired identity still tracked")
+		}
+	}
+	if m.RejectedSeries() != 0 {
+		t.Fatal("rotation caused budget rejection")
 	}
 }

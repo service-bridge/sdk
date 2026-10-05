@@ -7,6 +7,8 @@ import "time"
 // out of the frozen graph, so the runtime keeps its own defaults instead of
 // receiving a copy of them that drifts.
 type Definition struct {
+	// Version identifies executable code. Required for graphs containing local closures.
+	Version string
 	// Input is the JSON Schema of the run input. It travels inside the frozen
 	// graph and is what the runtime validates a start against.
 	Input map[string]any

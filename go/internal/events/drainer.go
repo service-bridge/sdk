@@ -196,10 +196,17 @@ func (d *Drainer) drainOnce(ctx context.Context) (int, error) {
 	resp, sendErr := d.send(ctx, recs)
 	result, violations := d.classify(recs, resp, sendErr)
 
-	if err := d.cfg.Storage.Complete(ctx, result); err != nil {
-		// The batch stays inflight until the next Open resets it. Nothing is
-		// lost, but nothing moves either, so this is loud.
-		return 0, fmt.Errorf("events: drain: complete: %w", err)
+	for attempt := 0; ; attempt++ {
+		err := d.cfg.Storage.Complete(ctx, result)
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			return 0, fmt.Errorf("events: drain: complete: %w", err)
+		}
+		// Retry the retained completion result, never re-publish accepted events.
+		d.reportError(fmt.Errorf("events: drain: complete: %w", err))
+		d.cfg.Sleep(ctx, d.cfg.Backoff.Delay(attempt))
 	}
 
 	for _, v := range violations {

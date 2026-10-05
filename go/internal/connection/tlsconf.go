@@ -8,19 +8,25 @@ import (
 
 // PinnedTLSConfig trusts exactly one root — the CA carried by the bootstrap key.
 //
-// The runtime's server leaf has no DNS or IP SAN (its CN is
-// "servicebridge-runtime"), so the standard hostname check can never pass.
-// Verification is therefore done by hand in VerifyConnection: the peer chain must
-// terminate in the pinned CA. InsecureSkipVerify only switches off the built-in
-// hostname/chain step that VerifyConnection replaces — it does not weaken trust.
+// Verification requires the pinned CA, ServerAuth and exactly the runtime URI
+// SAN. InsecureSkipVerify disables DNS matching, which URI identities replace.
 func PinnedTLSConfig(ca *x509.Certificate) *tls.Config {
 	roots := x509.NewCertPool()
 	roots.AddCert(ca)
 
 	return &tls.Config{
 		MinVersion:         tls.VersionTLS13,
+		RootCAs:            roots,
 		InsecureSkipVerify: true, //nolint:gosec // chain verified in VerifyConnection
-		VerifyConnection:   verifyAgainst(roots),
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			if err := VerifyServerChain(roots)(cs); err != nil {
+				return err
+			}
+			if len(cs.PeerCertificates[0].URIs) != 1 || cs.PeerCertificates[0].URIs[0].String() != RuntimeSPIFFEURI {
+				return fmt.Errorf("connection: runtime peer role mismatch")
+			}
+			return nil
+		},
 	}
 }
 
@@ -31,7 +37,7 @@ func MutualTLSConfig(ca *x509.Certificate, clientCert tls.Certificate) *tls.Conf
 	return cfg
 }
 
-func verifyAgainst(roots *x509.CertPool) func(tls.ConnectionState) error {
+func VerifyServerChain(roots *x509.CertPool) func(tls.ConnectionState) error {
 	return func(cs tls.ConnectionState) error {
 		if len(cs.PeerCertificates) == 0 {
 			return fmt.Errorf("connection: verify peer: no peer certificates")

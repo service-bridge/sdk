@@ -159,6 +159,7 @@ if (config.jobName) {
 
 if (config.workflowName) {
 	sb.workflow.handle(config.workflowName, {
+        version:"test-v1",
 		steps: [
 			{
 				id: "call_target",

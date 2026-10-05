@@ -552,3 +552,56 @@ func TestOpenReportsACorruptFile(t *testing.T) {
 		t.Fatal("Open accepted a file that is not a database")
 	}
 }
+
+func TestFailedRecoveryPreservesIdentityProtectsPendingAndCountsActualDeletes(t *testing.T) {
+	st := openTemp(t)
+	ctx := context.Background()
+	for _, id := range []string{"a", "b", "c"} {
+		if err := st.Enqueue(ctx, record(id, 1), 3); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.Complete(ctx, Result{Failed: []Failure{{ID: "a", Attempts: 3, LastError: "forbidden"}, {ID: "b", Attempts: 4, LastError: "invalid"}}}); err != nil {
+		t.Fatal(err)
+	}
+	page, err := st.ListFailed(ctx, 1, "")
+	if err != nil || len(page) != 1 || page[0].ID != "a" {
+		t.Fatalf("first page: %v %v", page, err)
+	}
+	next, err := st.ListFailed(ctx, 1, page[0].ID)
+	if err != nil || len(next) != 1 || next[0].ID != "b" {
+		t.Fatalf("next page: %v %v", next, err)
+	}
+	if _, err = st.ListFailed(ctx, 1001, ""); err == nil {
+		t.Fatal("unbounded failed page accepted")
+	}
+	if changed, err := st.DiscardFailed(ctx, "c"); err != nil || changed {
+		t.Fatal("pending event discarded")
+	}
+	if changed, err := st.RetryFailed(ctx, "a"); err != nil || !changed {
+		t.Fatal("failed event not rearmed")
+	}
+	rec, status, err := st.Load(ctx, "a")
+	if err != nil || status != StatusPending || rec.Attempts != 3 || rec.ID != "a" {
+		t.Fatalf("retry lost original state: %v %s %v", rec, status, err)
+	}
+	if changed, err := st.DiscardFailed(ctx, "b"); err != nil || !changed {
+		t.Fatal("failed event not discarded")
+	}
+	if err := st.Enqueue(ctx, record("d", 2), 3); err != nil {
+		t.Fatal("discard did not release row cap")
+	}
+	result := Result{Done: []string{"a", "a", "not-present"}}
+	if err := st.Complete(ctx, result); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Complete(ctx, result); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Enqueue(ctx, record("e", 2), 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Enqueue(ctx, record("f", 2), 3); !errors.Is(err, ErrFull) {
+		t.Fatalf("repeated completion corrupted cap: %v", err)
+	}
+}

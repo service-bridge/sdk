@@ -177,8 +177,7 @@ type PublisherConfig struct {
 	Identity func() Identity
 	// Kick wakes the drain after an enqueue. Optional.
 	Kick func()
-	// MaxOutboxRows caps the local buffer; zero takes DefaultMaxOutboxRows. An
-	// uncapped buffer is not on offer: it turns a long outage into a full disk.
+	// MaxOutboxRows caps the local buffer; zero explicitly disables the row limit.
 	MaxOutboxRows int
 	// Now returns unix-ms; defaults to the wall clock.
 	Now func() int64
@@ -209,9 +208,6 @@ func NewPublisher(cfg PublisherConfig) (*Publisher, error) {
 	}
 	if cfg.MaxOutboxRows < 0 {
 		return nil, fmt.Errorf("events: new publisher: negative MaxOutboxRows: %w", ErrInvalidConfig)
-	}
-	if cfg.MaxOutboxRows == 0 {
-		cfg.MaxOutboxRows = DefaultMaxOutboxRows
 	}
 	if cfg.Kick == nil {
 		cfg.Kick = func() {}
@@ -307,15 +303,17 @@ func (p *Publisher) sendNow(ctx context.Context, id, name string, enc Encoded, o
 		return fmt.Errorf("events: publish %q: send: %w", name, err)
 	}
 	for _, r := range resp.GetResults() {
-		if r.GetEventId() != id && r.GetEventId() != "" {
+		if r.GetEventId() != id {
 			continue
 		}
-		if terminalStatus(r.GetStatus()) {
-			return fmt.Errorf("events: publish %q: rejected %s: %s: %w",
-				name, r.GetStatus(), r.GetMessage(), ErrRejected)
+		switch r.GetStatus() {
+		case pb.PublishStatus_PUBLISH_STATUS_ACCEPTED, pb.PublishStatus_PUBLISH_STATUS_REJECTED_DUPLICATE:
+			return nil
+		default:
+			return fmt.Errorf("events: publish %q: rejected %s: %s: %w", name, r.GetStatus(), r.GetMessage(), ErrRejected)
 		}
 	}
-	return nil
+	return fmt.Errorf("events: publish %q: missing acceptance result for %s: %w", name, id, ErrRejected)
 }
 
 // ErrRejected marks an envelope the runtime refused for a reason no retry

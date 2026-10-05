@@ -30,7 +30,7 @@ type staticGraphs struct {
 	graphs map[string][]wf.Step
 }
 
-func (g *staticGraphs) Steps(name string) ([]wf.Step, bool) {
+func (g *staticGraphs) Steps(name string, fingerprint string) ([]wf.Step, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	steps, ok := g.graphs[name]
@@ -192,7 +192,7 @@ func TestLocalGraphReplacesTheWireGraph(t *testing.T) {
 	}
 }
 
-func TestAssignmentForAnUndeclaredWorkflowIsDropped(t *testing.T) {
+func TestUnavailableWorkflowVersionFailsWithoutBlockingKnownRun(t *testing.T) {
 	t.Parallel()
 
 	ran := make(chan struct{}, 1)
@@ -218,12 +218,13 @@ func TestAssignmentForAnUndeclaredWorkflowIsDropped(t *testing.T) {
 		t.Fatal("an unknown workflow tore down the subscription")
 	}
 
-	waitFor(t, "the known run to complete", func() bool { return len(h.srv.snapshotCompleteRuns()) == 1 })
-	if got := h.srv.snapshotCompleteRuns()[0].GetRunId(); got != "r-2" {
-		t.Fatalf("completed the wrong run: %s", got)
+	waitFor(t, "both assignments complete", func() bool { return len(h.srv.snapshotCompleteRuns()) == 2 })
+	got := map[string]*pb.CompleteRunRequest{}
+	for _, done := range h.srv.snapshotCompleteRuns() {
+		got[done.GetRunId()] = done
 	}
-	if !h.logs.contains("no graph declared") {
-		t.Fatal("the dropped assignment was not explained in the log")
+	if got["r-1"].GetTerminalStatus() != "failed" || got["r-2"].GetTerminalStatus() != "success" {
+		t.Fatalf("unexpected version/known outcomes: %v", got)
 	}
 }
 
@@ -233,6 +234,7 @@ func TestAssignmentForAnUndeclaredWorkflowIsDropped(t *testing.T) {
 func TestHeartbeatIsKeyedByRunAndEpoch(t *testing.T) {
 	t.Parallel()
 
+	cancelled := make(chan float64, 2)
 	gates := map[float64]chan struct{}{1: make(chan struct{}), 2: make(chan struct{})}
 	graph := []wf.Step{localStep("hold", nil, func(ctx context.Context, state map[string]any) (any, error) {
 		input, _ := state["input"].(map[string]any)
@@ -241,6 +243,7 @@ func TestHeartbeatIsKeyedByRunAndEpoch(t *testing.T) {
 		case <-gate:
 			return nil, nil
 		case <-ctx.Done():
+			cancelled <- input["gate"].(float64)
 			return nil, ctx.Err()
 		}
 	})}
@@ -267,7 +270,17 @@ func TestHeartbeatIsKeyedByRunAndEpoch(t *testing.T) {
 	// The superseded execution now finishes. Its exit must not retire the lease
 	// the live execution is holding.
 	close(gates[1])
-	waitFor(t, "the superseded execution to finish", func() bool { return len(h.srv.snapshotCompleteRuns()) > 0 })
+	select {
+	case gate := <-cancelled:
+		if gate != 1 {
+			t.Fatalf("wrong lease cancelled: %v", gate)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("superseded lease did not cancel")
+	}
+	if len(h.srv.snapshotCompleteRuns()) != 0 {
+		t.Fatal("superseded lease reported stale success")
+	}
 
 	settled := h.heartbeatsFor("r-1", 2)
 	waitFor(t, "the live lease to keep beating", func() bool { return h.heartbeatsFor("r-1", 2) > settled+1 })
@@ -282,11 +295,13 @@ func TestUnrenewableLeaseRetiresItsHeartbeat(t *testing.T) {
 	t.Parallel()
 
 	release := make(chan struct{})
+	cancelled := make(chan struct{})
 	graph := []wf.Step{localStep("hold", nil, func(ctx context.Context, _ map[string]any) (any, error) {
 		select {
 		case <-release:
 			return nil, nil
 		case <-ctx.Done():
+			close(cancelled)
 			return nil, ctx.Err()
 		}
 	})}
@@ -314,9 +329,15 @@ func TestUnrenewableLeaseRetiresItsHeartbeat(t *testing.T) {
 		t.Fatalf("a refused heartbeat kept repeating: %d then %d", settled, got)
 	}
 
-	// And the run itself is still running: the subscription was not torn down.
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("lost lease handler kept executing")
+	}
 	close(release)
-	waitFor(t, "the run to finish", func() bool { return len(h.srv.snapshotCompleteRuns()) == 1 })
+	if len(h.srv.snapshotCompleteRuns()) != 0 {
+		t.Fatal("lost lease reported stale success")
+	}
 }
 
 func TestCompensatingAssignmentReportsItsTerminalStatus(t *testing.T) {

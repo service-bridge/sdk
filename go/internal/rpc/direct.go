@@ -391,6 +391,9 @@ func peerTLSConfig(base *tls.Config, want connection.Identity) (*tls.Config, err
 		return nil, fmt.Errorf("rpc: peer TLS config: %w", ErrNoLease)
 	}
 	chain := base.VerifyConnection
+	if base.RootCAs != nil {
+		chain = connection.VerifyServerChain(base.RootCAs)
+	}
 	if base.InsecureSkipVerify && chain == nil {
 		// The session config switches off the built-in check because peer leaves
 		// carry no hostname; something must replace it. Dialling without either
@@ -417,10 +420,8 @@ func verifyPeerIdentity(cs tls.ConnectionState, expect string) error {
 	if len(cs.PeerCertificates) == 0 {
 		return fmt.Errorf("rpc: verify peer identity: no peer certificate: %w", ErrPeerIdentity)
 	}
-	for _, u := range cs.PeerCertificates[0].URIs {
-		if u.String() == expect {
-			return nil
-		}
+	if uris := cs.PeerCertificates[0].URIs; len(uris) == 1 && uris[0].String() == expect {
+		return nil
 	}
 	return fmt.Errorf("rpc: verify peer identity: want %s, got %s: %w",
 		expect, joinURIs(cs.PeerCertificates[0].URIs), ErrPeerIdentity)

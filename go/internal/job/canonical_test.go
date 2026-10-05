@@ -20,6 +20,7 @@ import (
 // output into it proves the two declarations still describe the same document;
 // the golden strings below pin the bytes themselves.
 type runtimeCanonicalJobSpec struct {
+	Version       string                  `json:"version"`
 	Trigger       runtimeCanonicalTrigger `json:"trigger"`
 	Catchup       string                  `json:"catchup,omitempty"`
 	Overlap       string                  `json:"overlap,omitempty"`
@@ -102,7 +103,7 @@ func TestCanonicalSpecMatchesTheRuntimeByteForByte(t *testing.T) {
 	}{
 		{
 			name: "cron with every option set",
-			spec: job.Spec{
+			spec: job.Spec{Version: "test-v1",
 				Trigger: mustCron(t, "*/5 * * * *", "Europe/Moscow"),
 				Catchup: job.CatchupFireOnce,
 				Overlap: job.OverlapAllow,
@@ -116,7 +117,7 @@ func TestCanonicalSpecMatchesTheRuntimeByteForByte(t *testing.T) {
 				MaxConcurrent: 2,
 				Retry:         &job.RetryPolicy{InitialMs: 1000, MaxMs: 600000, Multiplier: 2, Jitter: 0.25},
 			},
-			want: `{"trigger":{"cron":{"expr":"*/5 * * * *","tz":"Europe/Moscow"}},` +
+			want: `{"version":"test-v1","trigger":{"cron":{"expr":"*/5 * * * *","tz":"Europe/Moscow"}},` +
 				`"catchup":"fire_once","overlap":"allow",` +
 				`"deps":[{"kind":"rpc","target":"billing.Charge"},` +
 				`{"kind":"event","target":"orders.created"},` +
@@ -126,18 +127,18 @@ func TestCanonicalSpecMatchesTheRuntimeByteForByte(t *testing.T) {
 		},
 		{
 			name: "cron without a timezone omits tz",
-			spec: job.Spec{Trigger: mustCron(t, "0 3 * * *", "")},
-			want: `{"trigger":{"cron":{"expr":"0 3 * * *"}}}`,
+			spec: job.Spec{Version: "test-v1", Trigger: mustCron(t, "0 3 * * *", "")},
+			want: `{"version":"test-v1","trigger":{"cron":{"expr":"0 3 * * *"}}}`,
 		},
 		{
 			name: "delayed carries unix milliseconds",
-			spec: job.Spec{Trigger: delayed},
-			want: `{"trigger":{"delayed":{"runAtUnixMs":1767225600000}}}`,
+			spec: job.Spec{Version: "test-v1", Trigger: delayed},
+			want: `{"version":"test-v1","trigger":{"delayed":{"runAtUnixMs":1767225600000}}}`,
 		},
 		{
 			name: "interval carries milliseconds",
-			spec: job.Spec{Trigger: interval},
-			want: `{"trigger":{"interval":{"everyMs":90000}}}`,
+			spec: job.Spec{Version: "test-v1", Trigger: interval},
+			want: `{"version":"test-v1","trigger":{"interval":{"everyMs":90000}}}`,
 		},
 	}
 
@@ -157,7 +158,7 @@ func TestCanonicalSpecMatchesTheRuntimeByteForByte(t *testing.T) {
 func TestCanonicalSpecDecodesIntoTheRuntimeStruct(t *testing.T) {
 	t.Parallel()
 
-	spec := job.Spec{
+	spec := job.Spec{Version: "test-v1",
 		Trigger:       mustCron(t, "*/5 * * * *", "Europe/Moscow"),
 		Catchup:       job.CatchupFireAll,
 		Overlap:       job.OverlapBufferOne,
@@ -205,8 +206,8 @@ func TestCanonicalSpecDecodesIntoTheRuntimeStruct(t *testing.T) {
 func TestUnsetOptionsStayOutOfTheSpec(t *testing.T) {
 	t.Parallel()
 
-	got := mustJSON(t, job.Spec{Trigger: mustCron(t, "* * * * *", "")})
-	if got != `{"trigger":{"cron":{"expr":"* * * * *"}}}` {
+	got := mustJSON(t, job.Spec{Version: "test-v1", Trigger: mustCron(t, "* * * * *", "")})
+	if got != `{"version":"test-v1","trigger":{"cron":{"expr":"* * * * *"}}}` {
 		t.Fatalf("a bare spec carries more than its trigger: %s", got)
 	}
 }
@@ -218,7 +219,7 @@ func TestUnsetOptionsStayOutOfTheSpec(t *testing.T) {
 func TestContractHashIsStableAndSpecific(t *testing.T) {
 	t.Parallel()
 
-	spec := job.Spec{Trigger: mustCron(t, "*/5 * * * *", "UTC"), MaxAttempts: 3}
+	spec := job.Spec{Version: "test-v1", Trigger: mustCron(t, "*/5 * * * *", "UTC"), MaxAttempts: 3}
 	first, err := spec.CanonicalJSON()
 	if err != nil {
 		t.Fatalf("canonical json: %v", err)
@@ -331,7 +332,7 @@ func TestExactlyOneTriggerByConstruction(t *testing.T) {
 		"delayed":  delayed,
 	}
 	for want, trg := range cases {
-		raw, err := job.Spec{Trigger: trg}.CanonicalJSON()
+		raw, err := job.Spec{Version: "test-v1", Trigger: trg}.CanonicalJSON()
 		if err != nil {
 			t.Fatalf("%s: canonical json: %v", want, err)
 		}
@@ -350,7 +351,7 @@ func TestExactlyOneTriggerByConstruction(t *testing.T) {
 	}
 
 	// The zero value is the only shape with no trigger, and it never encodes.
-	if _, err := (job.Spec{}).CanonicalJSON(); !errors.Is(err, job.ErrNoTrigger) {
+	if _, err := (job.Spec{Version: "test-v1"}).CanonicalJSON(); !errors.Is(err, job.ErrNoTrigger) {
 		t.Fatalf("zero spec: got %v, want %v", err, job.ErrNoTrigger)
 	}
 }
@@ -362,7 +363,7 @@ func TestExactlyOneTriggerByConstruction(t *testing.T) {
 func TestSpecRejectsWhatTheRuntimeWouldRefuseOrRewrite(t *testing.T) {
 	t.Parallel()
 
-	base := func() job.Spec { return job.Spec{Trigger: mustCron(t, "* * * * *", "UTC")} }
+	base := func() job.Spec { return job.Spec{Version: "test-v1", Trigger: mustCron(t, "* * * * *", "UTC")} }
 
 	cases := []struct {
 		name  string
@@ -423,7 +424,7 @@ func TestDeclarationsFreezeTheCanonicalFormAndItsHash(t *testing.T) {
 	t.Parallel()
 
 	decls := job.NewDeclarations()
-	spec := job.Spec{Trigger: mustCron(t, "0 * * * *", "UTC")}
+	spec := job.Spec{Version: "test-v1", Trigger: mustCron(t, "0 * * * *", "UTC")}
 	noop := func(context.Context, job.Execution) error { return nil }
 
 	decl, err := decls.Add("hourly", spec, noop)
@@ -455,7 +456,7 @@ func TestDeclarationsRejectBrokenDeclarations(t *testing.T) {
 	t.Parallel()
 
 	decls := job.NewDeclarations()
-	spec := job.Spec{Trigger: mustCron(t, "0 * * * *", "UTC")}
+	spec := job.Spec{Version: "test-v1", Trigger: mustCron(t, "0 * * * *", "UTC")}
 	noop := func(context.Context, job.Execution) error { return nil }
 
 	if _, err := decls.Add("", spec, noop); !errors.Is(err, job.ErrEmptyName) {
@@ -464,7 +465,7 @@ func TestDeclarationsRejectBrokenDeclarations(t *testing.T) {
 	if _, err := decls.Add("nohandler", spec, nil); !errors.Is(err, job.ErrNoHandler) {
 		t.Fatalf("missing handler: got %v, want %v", err, job.ErrNoHandler)
 	}
-	if _, err := decls.Add("notrigger", job.Spec{}, noop); !errors.Is(err, job.ErrNoTrigger) {
+	if _, err := decls.Add("notrigger", job.Spec{Version: "test-v1"}, noop); !errors.Is(err, job.ErrNoTrigger) {
 		t.Fatalf("missing trigger: got %v, want %v", err, job.ErrNoTrigger)
 	}
 	if _, err := decls.Add("hourly", spec, noop); err != nil {
@@ -479,7 +480,7 @@ func TestEachWalksInDeclarationOrder(t *testing.T) {
 	t.Parallel()
 
 	decls := job.NewDeclarations()
-	spec := job.Spec{Trigger: mustCron(t, "0 * * * *", "UTC")}
+	spec := job.Spec{Version: "test-v1", Trigger: mustCron(t, "0 * * * *", "UTC")}
 	noop := func(context.Context, job.Execution) error { return nil }
 	for _, name := range []string{"c", "a", "b"} {
 		if _, err := decls.Add(name, spec, noop); err != nil {
@@ -503,5 +504,47 @@ func TestEachWalksInDeclarationOrder(t *testing.T) {
 	})
 	if len(seen) != 1 {
 		t.Fatalf("returning false did not stop the walk: %v", seen)
+	}
+}
+
+func TestExecutableVersionGoldenAndRetainedHandlers(t *testing.T) {
+	trigger, err := job.NewIntervalTrigger(time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = (job.Spec{Trigger: trigger}).CanonicalJSON(); !errors.Is(err, job.ErrVersion) {
+		t.Fatalf("missing version accepted: %v", err)
+	}
+	spec := job.Spec{Version: "v1", Trigger: trigger}
+	raw, err := spec.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != `{"version":"v1","trigger":{"interval":{"everyMs":1000}}}` || job.ContractHash(raw) != "1be70dfb3805071572dd48e43245ec178865dc98d254ac6840ff39a8f496b8c2" {
+		t.Fatalf("Go/Node golden drift: %s %s", raw, job.ContractHash(raw))
+	}
+	decls := job.NewDeclarations()
+	called := ""
+	first, err := decls.Add("same", spec, func(context.Context, job.Execution) error { called = "v1"; return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec.Version = "v2"
+	second, err := decls.Add("same", spec, func(context.Context, job.Execution) error { called = "v2"; return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []struct{ hash, version string }{{first.ContractHash, "v1"}, {second.ContractHash, "v2"}} {
+		decl, ok := decls.Lookup("same", want.hash)
+		if !ok {
+			t.Fatal("retained version missing")
+		}
+		_ = decl.Handler(context.Background(), job.Execution{})
+		if called != want.version {
+			t.Fatal("handler rebound to latest version")
+		}
+	}
+	if _, ok := decls.Lookup("same", "absent"); ok {
+		t.Fatal("unknown fingerprint fell back to current")
 	}
 }

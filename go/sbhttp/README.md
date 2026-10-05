@@ -143,3 +143,5 @@
 - stdlib: `net/http`, `io`, `sort`, `sync`, `log/slog`.
 
 На него опираются: `sbgin` (отдельный модуль — берёт `Integration`, `Operation`, `Outcome`, `Endpoint`, `Route`), корневой пакет `servicebridge` (обязан реализовать `Runtime`), прикладной код.
+
+Payload capture observes only reads performed by the handler and stores a bounded prefix. Begin performs no read-ahead; body errors and Close remain the application's original operations. The request may be partially consumed or streamed without capture forcing full buffering.

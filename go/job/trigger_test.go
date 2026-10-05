@@ -95,7 +95,7 @@ func TestOneTriggerByConstruction(t *testing.T) {
 		"interval": interval,
 		"delayed":  at,
 	} {
-		raw, err := job.NewSpec(trg).CanonicalJSON()
+		raw, err := job.NewSpec(trg, job.WithVersion("test-v1")).CanonicalJSON()
 		if err != nil {
 			t.Fatalf("%s: canonical json: %v", want, err)
 		}
@@ -113,7 +113,7 @@ func TestOneTriggerByConstruction(t *testing.T) {
 		}
 	}
 
-	if _, err := job.NewSpec(job.Trigger{}).CanonicalJSON(); !errors.Is(err, job.ErrNoTrigger) {
+	if _, err := job.NewSpec(job.Trigger{}, job.WithVersion("test-v1")).CanonicalJSON(); !errors.Is(err, job.ErrNoTrigger) {
 		t.Fatalf("spec with no trigger = %v, want %v", err, job.ErrNoTrigger)
 	}
 }
@@ -121,7 +121,7 @@ func TestOneTriggerByConstruction(t *testing.T) {
 func TestOptionsBuildTheSpecTheRuntimeReads(t *testing.T) {
 	t.Parallel()
 
-	spec := job.NewSpec(mustCron(t, "*/5 * * * *", "Europe/Moscow"),
+	spec := job.NewSpec(mustCron(t, "*/5 * * * *", "Europe/Moscow"), job.WithVersion("test-v1"),
 		job.WithCatchup(job.CatchupFireOnce),
 		job.WithOverlap(job.OverlapAllow),
 		job.WithDeps(job.RPC("billing.Charge")),
@@ -136,7 +136,7 @@ func TestOptionsBuildTheSpecTheRuntimeReads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("canonical json: %v", err)
 	}
-	want := `{"trigger":{"cron":{"expr":"*/5 * * * *","tz":"Europe/Moscow"}},` +
+	want := `{"version":"test-v1","trigger":{"cron":{"expr":"*/5 * * * *","tz":"Europe/Moscow"}},` +
 		`"catchup":"fire_once","overlap":"allow",` +
 		`"deps":[{"kind":"rpc","target":"billing.Charge"},` +
 		`{"kind":"event","target":"orders.created"},` +
@@ -154,11 +154,11 @@ func TestOptionsBuildTheSpecTheRuntimeReads(t *testing.T) {
 func TestUnsetOptionsLeaveTheDefaultsToTheRuntime(t *testing.T) {
 	t.Parallel()
 
-	raw, err := job.NewSpec(mustCron(t, "0 * * * *", "")).CanonicalJSON()
+	raw, err := job.NewSpec(mustCron(t, "0 * * * *", ""), job.WithVersion("test-v1")).CanonicalJSON()
 	if err != nil {
 		t.Fatalf("canonical json: %v", err)
 	}
-	if got, want := string(raw), `{"trigger":{"cron":{"expr":"0 * * * *"}}}`; got != want {
+	if got, want := string(raw), `{"version":"test-v1","trigger":{"cron":{"expr":"0 * * * *"}}}`; got != want {
 		t.Fatalf("bare spec carries more than its trigger\n got: %s\nwant: %s", got, want)
 	}
 }
@@ -181,7 +181,7 @@ func TestBadOptionsAreRefused(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if _, err := job.NewSpec(trg, tc.opt).CanonicalJSON(); !errors.Is(err, tc.want) {
+			if _, err := job.NewSpec(trg, job.WithVersion("test-v1"), tc.opt).CanonicalJSON(); !errors.Is(err, tc.want) {
 				t.Fatalf("got %v, want %v", err, tc.want)
 			}
 		})

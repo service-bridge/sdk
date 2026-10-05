@@ -44,7 +44,7 @@ const (
 // closed set that cannot be rebuilt from JSON. The declaration in this process
 // is the only executable form of the workflow.
 type GraphSource interface {
-	Steps(workflowName string) ([]wf.Step, bool)
+	Steps(workflowName string, fingerprint string) ([]wf.Step, bool)
 }
 
 // SubscriberConfig wires the owner side. See ./README.md.
@@ -85,7 +85,9 @@ type Subscriber struct {
 	// leases maps a run to the epoch of the assignment being executed for it. A
 	// re-assignment bumps the epoch, and only the execution holding the current
 	// one may retire the lease.
-	leases map[string]uint64
+	leases  map[string]uint64
+	pending chan struct{}
+	active  map[string]activeExecution
 	// openedInstanceID is the identity the live stream was opened with. A
 	// rotation mints a new one, and a stream still carrying the retired id keeps
 	// the runtime assigning runs to an instance it has already torn down.
@@ -121,7 +123,7 @@ func NewSubscriber(cfg SubscriberConfig) (*Subscriber, error) {
 		cfg.Logger = slog.Default()
 	}
 
-	s := &Subscriber{cfg: cfg, logger: cfg.Logger, leases: make(map[string]uint64)}
+	s := &Subscriber{cfg: cfg, logger: cfg.Logger, leases: make(map[string]uint64), pending: make(chan struct{}, 1024), active: make(map[string]activeExecution)}
 	sup, err := stream.NewSupervisor(stream.Config[*pb.RunAssignment, pb.Workflows_SubscribeClient]{
 		Name:    "workflows.subscribe",
 		Open:    s.open,
@@ -206,33 +208,53 @@ func (s *Subscriber) open(ctx context.Context) (pb.Workflows_SubscribeClient, er
 
 // onData runs on the supervisor goroutine, so it must never block: every
 // assignment gets a goroutine of its own.
-func (s *Subscriber) onData(_ context.Context, msg *pb.RunAssignment, _ pb.Workflows_SubscribeClient) {
-	steps, ok := s.cfg.Graphs.Steps(msg.GetWorkflowName())
+func (s *Subscriber) onData(streamCtx context.Context, msg *pb.RunAssignment, _ pb.Workflows_SubscribeClient) {
+	select {
+	case s.pending <- struct{}{}:
+	default:
+		s.reportError(fmt.Errorf("workflow: local assignment queue full; lease will be reclaimed"))
+		return
+	}
+	steps, ok := s.cfg.Graphs.Steps(msg.GetWorkflowName(), msg.GetFingerprint())
 	if !ok {
-		s.logger.Warn("workflow: no graph declared, dropping assignment",
-			"workflow", msg.GetWorkflowName(), "run_id", msg.GetRunId())
+		go func() {
+			defer func() { <-s.pending }()
+			ctx, cancel := context.WithTimeout(streamCtx, s.cfg.CompleteTimeout)
+			defer cancel()
+			message := fmt.Sprintf("unsupported_version: %s/%s", msg.GetWorkflowName(), msg.GetFingerprint())
+			if err := s.cfg.Ops.CompleteRun(ctx, CompleteRunArgs{RunID: msg.GetRunId(), LeaseEpoch: msg.GetLeaseEpoch(), TerminalStatus: "failed", FinalState: map[string]any{"error": map[string]any{"code": "unsupported_version", "message": message}}}); err != nil {
+				s.reportError(err)
+			}
+		}()
 		return
 	}
 
 	s.mu.Lock()
-	runCtx, stopped := s.runCtx, s.stopped
-	if !stopped && runCtx != nil {
-		s.wg.Add(1)
-	}
-	s.mu.Unlock()
-	if stopped || runCtx == nil {
+	if s.stopped || s.runCtx == nil {
+		s.mu.Unlock()
+		<-s.pending
 		return
 	}
-
-	// The run context is the subscriber's, not the stream's: a broken stream
-	// makes the runtime reclaim the lease, but abandoning a half-executed run
-	// does not undo the effects already committed. The stale epoch is what
-	// fences the checkpoints of a superseded holder.
-	go s.execute(runCtx, msg, steps)
+	key, epoch := msg.GetRunId(), msg.GetLeaseEpoch()
+	if previous, ok := s.active[key]; ok {
+		if previous.epoch >= epoch {
+			s.mu.Unlock()
+			<-s.pending
+			return
+		}
+		previous.cancel()
+	}
+	executionCtx, cancel := context.WithCancel(streamCtx)
+	s.active[key] = activeExecution{epoch: epoch, cancel: cancel}
+	s.wg.Add(1)
+	s.mu.Unlock()
+	go s.execute(executionCtx, msg, steps)
 }
 
 func (s *Subscriber) execute(ctx context.Context, msg *pb.RunAssignment, steps []wf.Step) {
 	defer s.wg.Done()
+	defer func() { <-s.pending }()
+	defer s.releaseLease(msg.GetRunId(), msg.GetLeaseEpoch())
 
 	runID, epoch := msg.GetRunId(), msg.GetLeaseEpoch()
 	state, err := runStateOf(msg)
@@ -244,7 +266,6 @@ func (s *Subscriber) execute(ctx context.Context, msg *pb.RunAssignment, steps [
 	}
 
 	s.holdLease(runID, epoch)
-	defer s.releaseLease(runID, epoch)
 
 	// The runtime owns the WORKFLOW.RUN operation (ADR 0003). The SDK only
 	// carries its trace context forward, so the step sub-operations and the
@@ -275,7 +296,10 @@ func (s *Subscriber) execute(ctx context.Context, msg *pb.RunAssignment, steps [
 	// The run is over and the runtime is waiting to hear it, so the last
 	// checkpoint outlives a stopping subscriber and is bounded by its own
 	// timeout instead.
-	completeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cfg.CompleteTimeout)
+	if ctx.Err() != nil {
+		return
+	}
+	completeCtx, cancel := context.WithTimeout(ctx, s.cfg.CompleteTimeout)
 	defer cancel()
 	if err := s.cfg.Ops.CompleteRun(completeCtx, CompleteRunArgs{
 		RunID:          runID,
@@ -333,7 +357,9 @@ func (s *Subscriber) holdLease(runID string, epoch uint64) {
 	if s.stopped {
 		return
 	}
-	s.leases[runID] = epoch
+	if current, ok := s.leases[runID]; !ok || current <= epoch {
+		s.leases[runID] = epoch
+	}
 }
 
 // releaseLease retires a lease only if this execution still holds it. A run
@@ -344,6 +370,10 @@ func (s *Subscriber) holdLease(runID string, epoch uint64) {
 func (s *Subscriber) releaseLease(runID string, epoch uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if active, ok := s.active[runID]; ok && active.epoch == epoch {
+		active.cancel()
+		delete(s.active, runID)
+	}
 	if s.leases[runID] == epoch {
 		delete(s.leases, runID)
 	}
@@ -416,4 +446,9 @@ func (s *Subscriber) reportError(err error) {
 	if s.cfg.OnError != nil {
 		s.cfg.OnError(err)
 	}
+}
+
+type activeExecution struct {
+	epoch  uint64
+	cancel context.CancelFunc
 }

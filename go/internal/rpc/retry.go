@@ -26,65 +26,36 @@ const (
 type RetryClass uint8
 
 const (
-	// RetryNever covers every business outcome: the callee ran, decided, and
-	// answered. Repeating it changes nothing.
+	// RetryNever covers dispatched or ambiguous outcomes. Execution may have
+	// committed an effect, so transport status cannot authorize replay.
 	RetryNever RetryClass = iota
-	// RetryAlways covers codes that prove the request never executed.
+	// RetryAlways covers proven local pre-dispatch selection failures.
 	RetryAlways
-	// RetryIfIdempotent covers codes that leave the callee's state unknown.
-	RetryIfIdempotent
 )
 
 func (c RetryClass) String() string {
 	switch c {
 	case RetryAlways:
 		return "always"
-	case RetryIfIdempotent:
-		return "if-idempotent"
 	default:
 		return "never"
 	}
 }
 
-// Classify maps an error onto its retry class.
-//
-// DeadlineExceeded sits behind the idempotency gate on purpose (ADR-0001 §2).
-// The deadline expires on the CALLER side and says nothing about the callee,
-// which may have completed the work and answered a moment late. The Node SDK
-// retried it unconditionally and turned one Charge into three.
-// An error carrying no wire code at all — a handler's business failure, a
-// local configuration fault — is never retried: nothing about it says the call
-// can be repeated.
+// Classify allows automatic retry only for a locally proven pre-dispatch
+// rejection. A gRPC status, or the presence of a business key, cannot prove that
+// the remote handler did not execute.
 func Classify(err error) RetryClass {
-	code, ok := callCode(err)
-	if !ok {
-		return RetryNever
-	}
-	switch code {
-	case codes.Unavailable, codes.ResourceExhausted:
-		// Unavailable: the connection was never established. ResourceExhausted:
-		// rejected by a limiter before the handler ran. Both prove no side
-		// effect happened.
+	var selection *SelectionError
+	if errors.As(err, &selection) {
 		return RetryAlways
-	case codes.DeadlineExceeded, codes.Internal, codes.Aborted, codes.Unknown:
-		return RetryIfIdempotent
-	default:
-		return RetryNever
 	}
+	return RetryNever
 }
 
-// Retryable answers whether err may be retried given whether the caller
-// supplied an idempotency key.
-func Retryable(err error, hasIdempotencyKey bool) bool {
-	switch Classify(err) {
-	case RetryAlways:
-		return true
-	case RetryIfIdempotent:
-		return hasIdempotencyKey
-	default:
-		return false
-	}
-}
+// Retryable ignores the correlation key: it does not guarantee atomic dedup of
+// remote business effects. Selection failures are safe to retry.
+func Retryable(err error, _ bool) bool { return Classify(err) == RetryAlways }
 
 // callCode extracts the gRPC code an error carries. The second result is false
 // when the error carries none, which is what separates the wire code UNKNOWN —

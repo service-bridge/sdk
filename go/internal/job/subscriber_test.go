@@ -210,7 +210,7 @@ func declare(t *testing.T, decls *job.Declarations, name string, spec job.Spec, 
 
 func cronSpec(t *testing.T) job.Spec {
 	t.Helper()
-	return job.Spec{Trigger: mustCron(t, "* * * * *", "UTC")}
+	return job.Spec{Version: "test-v1", Trigger: mustCron(t, "* * * * *", "UTC")}
 }
 
 func execution(name, id string) *pb.JobExecution {
@@ -422,7 +422,7 @@ func TestConcurrencyIsCappedPerJob(t *testing.T) {
 	})
 
 	sub, err := job.NewSubscriber(job.SubscriberConfig{
-		Clients:           &staticClients{client: client},
+		Clients:           &staticClients{client: versionedJobsClient{JobsClient: client, decls: decls}},
 		Identity:          (&rotatingIdentity{fixed: true}).get,
 		Jobs:              decls,
 		HeartbeatInterval: time.Hour,
@@ -474,7 +474,7 @@ func TestUnlimitedJobsRunConcurrently(t *testing.T) {
 	})
 
 	sub, err := job.NewSubscriber(job.SubscriberConfig{
-		Clients:           &staticClients{client: client},
+		Clients:           &staticClients{client: versionedJobsClient{JobsClient: client, decls: decls}},
 		Identity:          (&rotatingIdentity{fixed: true}).get,
 		Jobs:              decls,
 		HeartbeatInterval: time.Hour,
@@ -529,21 +529,17 @@ func TestExecutionContextReachesTheHandler(t *testing.T) {
 	}
 }
 
-func TestUnknownJobIsDroppedWithAWarning(t *testing.T) {
+func TestUnknownJobReportsPermanentUnsupportedVersion(t *testing.T) {
 	t.Parallel()
-
 	srv, client := startJobs(t)
-	sink := &logSink{}
-	sub := startSubscriber(t, client, job.NewDeclarations(), sink)
+	sub := startSubscriber(t, client, job.NewDeclarations(), nil)
 	defer sub.Stop()
-
-	srv.push <- execution("never-declared", "exec-1")
-	waitFor(t, "the drop to be logged", func() bool { return sink.contains("no handler declared") })
-
-	select {
-	case r := <-srv.results:
-		t.Fatalf("an undeclared job reported a result: %+v", r)
-	case <-time.After(50 * time.Millisecond):
+	msg := execution("never-declared", "exec-1")
+	msg.Fingerprint = "old-version"
+	srv.push <- msg
+	r := recvResult(t, srv)
+	if r.GetFailure() == nil || r.GetFailure().GetRetryable() || !strings.Contains(r.GetFailure().GetErrorMessage(), "unsupported_version") {
+		t.Fatalf("missing version must fail terminally: %v", r)
 	}
 }
 
@@ -560,7 +556,7 @@ func TestResultCarriesTheLeaseEpochAndTheCurrentInstance(t *testing.T) {
 
 	ident := &rotatingIdentity{}
 	sub, err := job.NewSubscriber(job.SubscriberConfig{
-		Clients:           &staticClients{client: client},
+		Clients:           &staticClients{client: versionedJobsClient{JobsClient: client, decls: decls}},
 		Identity:          ident.get,
 		Jobs:              decls,
 		HeartbeatInterval: time.Hour,
@@ -724,11 +720,11 @@ func TestStopCancelsARunningHandler(t *testing.T) {
 		t.Fatal("Stop did not return")
 	}
 
-	// The handler ran, so its outcome still reaches the runtime: the result send
-	// is detached from the cancelled context on purpose.
-	res := recvResult(t, srv)
-	if res.GetExecutionId() != "exec-1" {
-		t.Fatalf("result for the wrong execution: %+v", res)
+	// A cancelled stream no longer owns this lease; no stale result may be sent.
+	select {
+	case res := <-srv.results:
+		t.Fatalf("stale cancelled result: %v", res)
+	case <-time.After(25 * time.Millisecond):
 	}
 }
 
@@ -748,7 +744,7 @@ func TestStopIsQuietAndLeavesNoGoroutines(t *testing.T) {
 	before := runtime.NumGoroutine()
 
 	sub, err := job.NewSubscriber(job.SubscriberConfig{
-		Clients:           &staticClients{client: client},
+		Clients:           &staticClients{client: versionedJobsClient{JobsClient: client, decls: decls}},
 		Identity:          (&rotatingIdentity{fixed: true}).get,
 		Jobs:              decls,
 		HeartbeatInterval: 5 * time.Millisecond,
@@ -883,6 +879,7 @@ func TestAChannelThatDisappearsIsReportedOnEveryPath(t *testing.T) {
 		return nil
 	})
 
+	clients.client = versionedJobsClient{JobsClient: client, decls: decls}
 	errs := &errorSink{}
 	sub, err := job.NewSubscriber(job.SubscriberConfig{
 		Clients:           clients,
@@ -926,7 +923,7 @@ func TestARefusedResultIsReported(t *testing.T) {
 
 	errs := &errorSink{}
 	sub, err := job.NewSubscriber(job.SubscriberConfig{
-		Clients:           &staticClients{client: client},
+		Clients:           &staticClients{client: versionedJobsClient{JobsClient: client, decls: decls}},
 		Identity:          (&rotatingIdentity{fixed: true}).get,
 		Jobs:              decls,
 		HeartbeatInterval: time.Hour,
@@ -998,7 +995,7 @@ func startSubscriber(t *testing.T, client pb.JobsClient, decls *job.Declarations
 		sink = &logSink{}
 	}
 	sub, err := job.NewSubscriber(job.SubscriberConfig{
-		Clients:           &staticClients{client: client},
+		Clients:           &staticClients{client: versionedJobsClient{JobsClient: client, decls: decls}},
 		Identity:          (&rotatingIdentity{fixed: true}).get,
 		Jobs:              decls,
 		HeartbeatInterval: time.Hour,
@@ -1013,4 +1010,33 @@ func startSubscriber(t *testing.T, client pb.JobsClient, decls *job.Declarations
 		t.Fatalf("start: %v", err)
 	}
 	return sub
+}
+
+// Test runtime fixture resolves assignments to the declaration's frozen version.
+type versionedJobsClient struct {
+	pb.JobsClient
+	decls *job.Declarations
+}
+
+func (c versionedJobsClient) Subscribe(ctx context.Context, req *pb.JobsSubscribeRequest, opts ...grpc.CallOption) (pb.Jobs_SubscribeClient, error) {
+	st, err := c.JobsClient.Subscribe(ctx, req, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return versionedJobsStream{Jobs_SubscribeClient: st, decls: c.decls}, nil
+}
+
+type versionedJobsStream struct {
+	pb.Jobs_SubscribeClient
+	decls *job.Declarations
+}
+
+func (s versionedJobsStream) Recv() (*pb.JobExecution, error) {
+	msg, err := s.Jobs_SubscribeClient.Recv()
+	if err == nil && msg.Fingerprint == "" {
+		if decl, ok := s.decls.Lookup(msg.JobName); ok {
+			msg.Fingerprint = decl.ContractHash
+		}
+	}
+	return msg, err
 }

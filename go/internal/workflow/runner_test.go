@@ -1289,3 +1289,173 @@ func TestRunnerRefusesAnIncompleteConfig(t *testing.T) {
 		t.Fatalf("want ErrInvalidConfig for an empty run id, got %v", err)
 	}
 }
+
+func TestGlobalSlotsBoundNestedGroupsAndDefault(t *testing.T) {
+	for _, limit := range []int{0, 1, 2} {
+		t.Run(fmt.Sprint(limit), func(t *testing.T) {
+			bound := limit
+			if bound == 0 {
+				bound = 64
+			}
+			var mu sync.Mutex
+			active, peak, total := 0, 0, 0
+			entered := make(chan struct{}, bound)
+			release := make(chan struct{})
+			fn := func(ctx context.Context, _ map[string]any) (any, error) {
+				mu.Lock()
+				active++
+				total++
+				if active > peak {
+					peak = active
+				}
+				mu.Unlock()
+				select {
+				case entered <- struct{}{}:
+				default:
+				}
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+				mu.Lock()
+				active--
+				mu.Unlock()
+				return nil, nil
+			}
+			var groups []wf.Step
+			for i := 0; i < 4; i++ {
+				var children []wf.Step
+				for j := 0; j < 20; j++ {
+					children = append(children, localStep(fmt.Sprintf("s%d_%d", i, j), nil, fn))
+				}
+				groups = append(groups, wf.Parallel{Control: wf.Control{ID: fmt.Sprintf("g%d", i)}, Steps: children})
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				_, err := newRunner(t, &scriptedOps{}, &scriptedExec{}).Run(ctx, groups, iwf.RunContext{RunID: "slots", MaxParallelism: limit})
+				done <- err
+			}()
+			for i := 0; i < bound; i++ {
+				select {
+				case <-entered:
+				case <-ctx.Done():
+					t.Fatal("group held an operation slot or default did not admit 64 leaves")
+				}
+			}
+			close(release)
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			if peak > bound || total != 80 {
+				t.Fatalf("global limit %d: peak %d, executed %d", bound, peak, total)
+			}
+		})
+	}
+}
+
+func TestForeachScopedDependenciesResumeAliasesAndConcreteState(t *testing.T) {
+	group := wf.Parallel{Control: wf.Control{ID: "fan"}, ForEach: &wf.ForEach{From: wf.Path("$.input.items"), As: "item"}, Steps: []wf.Step{
+		localStep("prepare", nil, func(_ context.Context, s map[string]any) (any, error) { return s["item"], nil }),
+		localStep("consume", []string{"prepare"}, func(_ context.Context, s map[string]any) (any, error) { return s["prepare"], nil }),
+	}}
+	state := map[string]any{"input": map[string]any{"items": []any{"a", "b"}}, "prepare:0": "cached-a"}
+	ops := &scriptedOps{}
+	out, err := newRunner(t, ops, &scriptedExec{}).Run(t.Context(), []wf.Step{group}, iwf.RunContext{RunID: "resume", State: state})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.State["consume:0"] != "cached-a" || out.State["consume:1"] != "b" {
+		t.Fatalf("scoped aliases/state: %#v", out.State)
+	}
+	for _, id := range ops.beganSteps() {
+		if id == "prepare:0" {
+			t.Fatal("resumed concrete checkpoint executed again")
+		}
+	}
+	if group.Steps[1].Common().WaitFor[0] != "prepare" {
+		t.Fatal("rewriter mutated the frozen template")
+	}
+}
+
+func TestForeachBudgetRejectsBeforeDispatch(t *testing.T) {
+	items := make([]any, 10001)
+	ops := &scriptedOps{}
+	group := wf.Parallel{Control: wf.Control{ID: "fan"}, ForEach: &wf.ForEach{From: wf.Path("$.input.items"), As: "item"}, Steps: []wf.Step{callStep("effect", "svc", "work")}}
+	exec := &scriptedExec{}
+	_, err := newRunner(t, ops, exec).Run(t.Context(), []wf.Step{group}, iwf.RunContext{RunID: "budget", State: map[string]any{"input": map[string]any{"items": items}}})
+	if err == nil || !strings.Contains(err.Error(), "budget") {
+		t.Fatalf("fanout budget not refused: %v", err)
+	}
+	if len(exec.calls) != 0 {
+		t.Fatal("oversized fanout dispatched an effect")
+	}
+}
+
+func TestDynamicFanoutCompensationRestoresAliasesAndNullPresence(t *testing.T) {
+	group := wf.Sequence{Control: wf.Control{ID: "fan"}, ForEach: &wf.ForEach{From: wf.Path("$.input.items"), As: "item"}, Steps: []wf.Step{
+		wf.Publish{Control: wf.Control{ID: "send", Compensate: &wf.Compensation{Event: wf.Name("undo"), Input: map[string]any{"item": wf.Path("$.item"), "output": wf.Path("$.send")}}}, Event: wf.Name("sent")},
+	}}
+	exec := &scriptedExec{}
+	_, err := newRunner(t, &scriptedOps{}, exec).Run(t.Context(), []wf.Step{group}, iwf.RunContext{RunID: "undo", Compensating: true, State: map[string]any{"input": map[string]any{"items": []any{"a", "b"}}, "send:0": nil, "send:1": nil}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(exec.publishs) != 2 {
+		t.Fatalf("null-output fanout checkpoints not compensated: %#v", exec.publishs)
+	}
+	if exec.publishs[0].Payload.(map[string]any)["item"] != "b" || exec.publishs[1].Payload.(map[string]any)["item"] != "a" {
+		t.Fatalf("reverse scoped compensation order: %#v", exec.publishs)
+	}
+}
+
+func TestRunnerRejectsUnresolvedDependenciesAndInvalidParallelism(t *testing.T) {
+	for _, limit := range []int{-1, 1025} {
+		if _, err := newRunner(t, &scriptedOps{}, &scriptedExec{}).Run(t.Context(), nil, iwf.RunContext{RunID: "bad", MaxParallelism: limit}); err == nil {
+			t.Errorf("parallelism %d accepted", limit)
+		}
+	}
+	_, err := newRunner(t, &scriptedOps{}, &scriptedExec{}).Run(t.Context(), []wf.Step{localStep("blocked", []string{"missing"}, func(context.Context, map[string]any) (any, error) { return nil, nil })}, iwf.RunContext{RunID: "blocked"})
+	if err == nil {
+		t.Fatal("unresolved graph reported success")
+	}
+}
+
+func TestNestedFanoutCompensationKeepsEveryBinding(t *testing.T) {
+	leaf := wf.Publish{Control: wf.Control{ID: "send", Compensate: &wf.Compensation{Event: wf.Name("undo"), Input: map[string]any{"group": wf.Path("$.group.name"), "item": wf.Path("$.item"), "output": wf.Path("$.send")}}}, Event: wf.Name("sent")}
+	nested := wf.Parallel{Control: wf.Control{ID: "inner"}, ForEach: &wf.ForEach{From: wf.Path("$.group.items"), As: "item"}, Steps: []wf.Step{leaf}}
+	outer := wf.Parallel{Control: wf.Control{ID: "outer"}, ForEach: &wf.ForEach{From: wf.Path("$.input.groups"), As: "group"}, Steps: []wf.Step{nested}}
+	state := map[string]any{"input": map[string]any{"groups": []any{map[string]any{"name": "A", "items": []any{"a", "b"}}, map[string]any{"name": "B", "items": []any{"c"}}}}, "send:0:0": nil, "send:0:1": nil, "send:1:0": nil}
+	exec := &scriptedExec{}
+	_, err := newRunner(t, &scriptedOps{}, exec).Run(t.Context(), []wf.Step{outer}, iwf.RunContext{RunID: "nested-undo", Compensating: true, State: state})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(exec.publishs) != 3 {
+		t.Fatalf("nested concrete compensations: %#v", exec.publishs)
+	}
+	for index, want := range []string{"c", "b", "a"} {
+		payload := exec.publishs[index].Payload.(map[string]any)
+		if payload["item"] != want {
+			t.Fatalf("binding/order %d: %#v", index, payload)
+		}
+	}
+	if exec.publishs[0].Payload.(map[string]any)["group"] != "B" || exec.publishs[1].Payload.(map[string]any)["group"] != "A" {
+		t.Fatalf("outer bindings lost: %#v", exec.publishs)
+	}
+}
+
+func TestCompensationReversesDependencyOrder(t *testing.T) {
+	first := wf.Publish{Control: wf.Control{ID: "dependent", WaitFor: []string{"prerequisite"}, Compensate: &wf.Compensation{Event: wf.Name("undo_dependent")}}, Event: wf.Name("dependent")}
+	later := wf.Publish{Control: wf.Control{ID: "prerequisite", Compensate: &wf.Compensation{Event: wf.Name("undo_prerequisite")}}, Event: wf.Name("prerequisite")}
+	exec := &scriptedExec{}
+	_, err := newRunner(t, &scriptedOps{}, exec).Run(t.Context(), []wf.Step{first, later}, iwf.RunContext{RunID: "causal-undo", Compensating: true, State: map[string]any{"dependent": nil, "prerequisite": nil}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(exec.publishs) != 2 || exec.publishs[0].Event != "undo_dependent" || exec.publishs[1].Event != "undo_prerequisite" {
+		t.Fatalf("compensation violated dependencies: %#v", exec.publishs)
+	}
+}

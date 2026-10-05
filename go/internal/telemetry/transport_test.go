@@ -20,10 +20,12 @@ type fakeStream struct {
 	acks chan *pb.TelemetryAck
 	fail chan error
 
-	mu        sync.Mutex
-	batches   []*pb.TelemetryBatch
-	closeSend int
-	sendErr   error
+	mu          sync.Mutex
+	batches     []*pb.TelemetryBatch
+	closeSend   int
+	sendErr     error
+	sendEntered chan struct{}
+	blockSend   bool
 }
 
 func newFakeStream(ctx context.Context) *fakeStream {
@@ -36,6 +38,16 @@ func newFakeStream(ctx context.Context) *fakeStream {
 
 func (f *fakeStream) Send(b *pb.TelemetryBatch) error {
 	f.mu.Lock()
+	blocked, entered := f.blockSend, f.sendEntered
+	if blocked {
+		f.mu.Unlock()
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-f.ctx.Done()
+		return f.ctx.Err()
+	}
 	defer f.mu.Unlock()
 	if f.sendErr != nil {
 		return f.sendErr
@@ -201,37 +213,43 @@ func TestTransportThroughputIsNotBoundByAckInterval(t *testing.T) {
 	}
 }
 
-// An acknowledgement names no batch, so it may only release what the runtime
-// provably had. Items written after the ack was emitted must survive it.
 func TestTransportAckDoesNotReleaseUnseenItems(t *testing.T) {
 	ring := NewRing(Budgets{})
 	ring.PushOp(&pb.OpReport{Subject: "first"})
-
 	tr, sf := startTransport(t, TransportConfig{Ring: ring})
 	tr.Flush()
 	st := sf.at(0)
-
-	// "second" is written by the flush the acknowledgement itself triggers, so
-	// it races that acknowledgement in exactly the way the epoch lag exists for.
 	ring.PushOp(&pb.OpReport{Subject: "second"})
-	st.acks <- &pb.TelemetryAck{}
-	waitFor(t, "second op on the wire", func() bool { return len(st.opSubjects()) == 2 })
-
-	if got := ring.Len(RingOps); got != 2 {
-		t.Fatalf("buffered ops after the first ack = %d, want 2 — neither item is proven received", got)
+	st.acks <- &pb.TelemetryAck{AcknowledgedSequence: 1}
+	waitFor(t, "second sent", func() bool { return len(st.opSubjects()) == 2 })
+	if ring.Len(RingOps) != 1 {
+		t.Fatal("ACK for batch 1 must retain batch 2")
 	}
-
-	st.acks <- &pb.TelemetryAck{}
-	waitFor(t, "first op released", func() bool { return ring.Len(RingOps) == 1 })
-
-	// The second item was written during the epoch the second ack closed, so it
-	// is still unproven and must stay buffered.
-	if got := ring.Len(RingOps); got != 1 {
-		t.Fatalf("buffered ops after the second ack = %d, want 1", got)
+	st.acks <- &pb.TelemetryAck{AcknowledgedSequence: 1}
+	st.acks <- &pb.TelemetryAck{AcknowledgedSequence: 100}
+	st.acks <- &pb.TelemetryAck{AcknowledgedSequence: 2}
+	waitFor(t, "second accepted", func() bool { return ring.Len(RingOps) == 0 })
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.batches[0].Sequence != 1 || st.batches[1].Sequence != 2 {
+		t.Fatal("wire sequences must increase")
 	}
+}
 
-	st.acks <- &pb.TelemetryAck{}
-	waitFor(t, "second op released", func() bool { return ring.Len(RingOps) == 0 })
+func TestTransportBoundsUnacknowledgedItemsAndResumes(t *testing.T) {
+	ring := NewRing(Budgets{Ops: 1 << 20})
+	pushOps(ring, 1200)
+	tr, sf := startTransport(t, TransportConfig{Ring: ring, MaxInflightItems: 64, MaxBatchItems: 32})
+	tr.Flush()
+	st := sf.at(0)
+	if len(st.opSubjects()) != 64 {
+		t.Fatalf("sent %d before ACK", len(st.opSubjects()))
+	}
+	st.acks <- &pb.TelemetryAck{AcknowledgedSequence: 2}
+	waitFor(t, "capacity refilled", func() bool { return len(st.opSubjects()) == 128 })
+	if ring.Len(RingOps) != 1136 {
+		t.Fatal("unconfirmed items must stay in bounded ring")
+	}
 }
 
 // Backpressure is advisory. Pausing the flusher while producers keep writing
@@ -253,7 +271,7 @@ func TestTransportKeepsFlushingUnderBackpressure(t *testing.T) {
 	}
 }
 
-func TestTransportDrainFlushesAndClosesSend(t *testing.T) {
+func TestTransportDrainStopsNewSendsAndClosesSend(t *testing.T) {
 	ring := NewRing(Budgets{})
 	drained := make(chan string, 1)
 
@@ -275,8 +293,8 @@ func TestTransportDrainFlushesAndClosesSend(t *testing.T) {
 		t.Fatal("timed out waiting for the drain callback")
 	}
 
-	if got := len(st.opSubjects()); got != 3 {
-		t.Fatalf("ops written on drain = %d, want 3 — the final flush must precede the close", got)
+	if got := len(st.opSubjects()); got != 0 {
+		t.Fatalf("drain must not send new batches, got %d", got)
 	}
 	if got := st.closeSendCount(); got != 1 {
 		t.Fatalf("CloseSend calls = %d, want 1", got)
@@ -501,5 +519,36 @@ func TestTransportStartsOnlyOnce(t *testing.T) {
 	tr, _ := startTransport(t, TransportConfig{})
 	if err := tr.Start(context.Background()); !errors.Is(err, ErrTransportStarted) {
 		t.Fatalf("err = %v, want ErrTransportStarted", err)
+	}
+}
+
+func TestTransportStopCancelsBlockedSendWithoutWaitingForItsMutex(t *testing.T) {
+	ring := NewRing(Budgets{})
+	tr, sf := startTransport(t, TransportConfig{Ring: ring})
+	st := sf.at(0)
+	entered := make(chan struct{}, 1)
+	st.mu.Lock()
+	st.blockSend = true
+	st.sendEntered = entered
+	st.mu.Unlock()
+	pushOps(ring, 1)
+	flushed := make(chan struct{})
+	go func() { tr.Flush(); close(flushed) }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("Send did not block")
+	}
+	stopped := make(chan struct{})
+	go func() { tr.Stop(); close(stopped) }()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("Stop deadlocked behind Send mutex")
+	}
+	select {
+	case <-flushed:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled Send did not unwind")
 	}
 }

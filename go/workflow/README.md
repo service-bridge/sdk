@@ -88,3 +88,5 @@
 Опирается на: стандартную библиотеку (`context`, `time`). Больше ни на что — пакет описательный.
 
 На него опираются: `internal/workflow` (валидация, каноническая форма, вычисление выражений, раннер) и прикладной код, объявляющий workflow.
+
+Set `Definition.Version` explicitly for any graph containing Local functions. Version identifies executable code omitted from JSON. Keep prior versions registered side by side while their frozen runs exist; removal produces terminal unsupported_version for a raced assignment. MaxParallelism zero now defaults to64; positive values must be <=1024.

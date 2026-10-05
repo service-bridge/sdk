@@ -7,7 +7,6 @@
 package sbhttp
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -146,8 +145,9 @@ func (i *Integration) Begin(r *http.Request) (*http.Request, *Operation, error) 
 // Operation is one in-flight HTTP.HANDLE span. Its whole surface is stdlib
 // typed so an adapter in another module can drive it.
 type Operation struct {
-	op    *telemetry.Op
-	limit int
+	requestBody *capturedRequestBody
+	op          *telemetry.Op
+	limit       int
 }
 
 // Capturing reports whether building a body payload would keep anything. Ask
@@ -183,6 +183,14 @@ type Outcome struct {
 
 // Finish closes the operation. Calling it twice does nothing.
 func (o *Operation) Finish(out Outcome) {
+	if o.requestBody != nil {
+		o.requestBody.mu.Lock()
+		body := append([]byte(nil), o.requestBody.captured...)
+		o.requestBody.mu.Unlock()
+		if len(body) > 0 {
+			o.op.CaptureIn(body, rawJSONContract)
+		}
+	}
 	status, message := statusOf(out)
 	o.op.End(status, message)
 }
@@ -206,34 +214,34 @@ func statusOf(out Outcome) (pb.Status, string) {
 	}
 }
 
-// captureRequestBody records up to PayloadLimit bytes and hands the handler a
-// body that still reads whole.
-//
-// The bytes are taken up front rather than teed off the handler's own reads:
-// capture mode "errors" exists for requests that failed, and a handler that
-// rejects a request before reading its body is exactly that case. The limit
-// bounds what is held in memory — the rest streams straight through.
+// captureRequestBody observes only the reads made by the application. It never
+// pulls bytes or consumes a one-shot error ahead of the handler.
 func (o *Operation) captureRequestBody(r *http.Request) *http.Request {
 	if r.Body == nil || r.Body == http.NoBody || o.limit <= 0 {
 		return r
 	}
-	body := r.Body
-	// A read failure here is the handler's to see: the same body is spliced
-	// back below and returns the error again on the next read.
-	head, _ := io.ReadAll(io.LimitReader(body, int64(o.limit)))
-	if len(head) > 0 {
-		o.op.CaptureIn(head, rawJSONContract)
-	}
-	r.Body = restoredBody{
-		Reader: io.MultiReader(bytes.NewReader(head), body),
-		Closer: body,
-	}
+	body := &capturedRequestBody{ReadCloser: r.Body, limit: o.limit}
+	o.requestBody = body
+	r.Body = body
 	return r
 }
 
-// restoredBody keeps the original Closer so a handler that closes the body
-// closes the real one rather than a no-op stand-in.
-type restoredBody struct {
-	io.Reader
-	io.Closer
+type capturedRequestBody struct {
+	io.ReadCloser
+	mu       sync.Mutex
+	limit    int
+	captured []byte
+}
+
+func (b *capturedRequestBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if n > 0 {
+		b.mu.Lock()
+		keep := min(n, b.limit-len(b.captured))
+		if keep > 0 {
+			b.captured = append(b.captured, p[:keep]...)
+		}
+		b.mu.Unlock()
+	}
+	return n, err
 }

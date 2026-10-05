@@ -91,6 +91,8 @@ func (f *fakeStream) push(t *testing.T, d *pb.EventDelivery) {
 func delivery(id, name, partitionKey string, payload []byte) *pb.EventDelivery {
 	return &pb.EventDelivery{
 		DeliveryId: id,
+		LeaseToken: "lease-" + id,
+		Attempt:    3,
 		Envelope: &pb.EventEnvelope{
 			Id:           "evt-" + id,
 			Name:         name,
@@ -271,12 +273,12 @@ func TestDeliveryReachesTheHandlerAndIsAcked(t *testing.T) {
 	if ack == nil {
 		t.Fatal("the delivery was not acked")
 	}
-	if ack.GetDeliveryId() != "d-1" || string(ack.GetEventId()) != "evt-d-1" {
+	if ack.GetDeliveryId() != "d-1" || string(ack.GetEventId()) != "evt-d-1" || ack.GetLeaseToken() != "lease-d-1" {
 		t.Fatalf("ack = %+v", ack)
 	}
 }
 
-func TestDeliveryWithoutAHandlerIsAcked(t *testing.T) {
+func TestDeliveryWithoutAHandlerIsRejected(t *testing.T) {
 	h := &subHarness{}
 	s := newTestSubscriber(t, h)
 
@@ -289,13 +291,12 @@ func TestDeliveryWithoutAHandlerIsAcked(t *testing.T) {
 
 	st := h.stream(t, 0)
 	st.nextFrame(t)
-	// Routing is server-side, so an unmatched name is not a local mistake to
-	// retry — it is confirmed and dropped.
+	// An unsupported local route must remain retryable; it cannot be silently lost.
 	st.push(t, delivery("d-1", "unknown.event", "", []byte("proto:{}")))
 
 	frame := st.nextFrame(t)
-	if frame.GetAck() == nil {
-		t.Fatalf("frame = %+v, want an ack", frame)
+	if frame.GetNack() == nil {
+		t.Fatalf("frame = %+v, want a rejection", frame)
 	}
 }
 
@@ -492,7 +493,7 @@ func TestEmptyPartitionKeyRunsInParallel(t *testing.T) {
 	}
 }
 
-func TestMaxInFlightStopsReadingTheStream(t *testing.T) {
+func TestMaxInFlightRejectsExcessWithoutBlockingStream(t *testing.T) {
 	const maxInFlight = 2
 	const queued = 100
 
@@ -529,32 +530,27 @@ func TestMaxInFlightStopsReadingTheStream(t *testing.T) {
 			encodePayload(t, order{ID: fmt.Sprint(i)})))
 	}
 
-	// The limit is only real if it stops the stream being drained. Reading ahead
-	// and queueing internally would show up here as recvN climbing to queued.
-	time.Sleep(200 * time.Millisecond)
-	first := st.recvN.Load()
-	time.Sleep(200 * time.Millisecond)
-	second := st.recvN.Load()
-
-	if first != second {
-		t.Fatalf("the subscriber kept reading while at its limit: %d then %d", first, second)
+	// Runtime credits prevent this in production. An over-delivering peer gets
+	// explicit rejections without blocking stream cancellation or allocating a queue.
+	rejected := 0
+	for rejected < queued-maxInFlight {
+		if frame := st.nextFrame(t); frame.GetNack() != nil {
+			rejected++
+		} else {
+			t.Fatalf("unexpected frame before handlers released: %v", frame)
+		}
 	}
-	// Two deliveries sit in handlers, one waits for a slot, one sits in the
-	// supervisor's hand-off and one is held by the reader.
-	if second > maxInFlight+3 {
-		t.Fatalf("read %d deliveries with a limit of %d, want at most %d", second, maxInFlight, maxInFlight+3)
+	if handled.Load() != 0 {
+		t.Fatal("blocked handlers unexpectedly completed")
 	}
-	if second >= queued {
-		t.Fatalf("the whole backlog of %d was drained despite the limit", queued)
-	}
-
 	unblock()
-	deadline := time.Now().Add(10 * time.Second)
-	for handled.Load() < queued && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+	for range maxInFlight {
+		if st.nextFrame(t).GetAck() == nil {
+			t.Fatal("accepted delivery was not acknowledged")
+		}
 	}
-	if handled.Load() != queued {
-		t.Fatalf("handled %d of %d after the limit cleared", handled.Load(), queued)
+	if handled.Load() != maxInFlight {
+		t.Fatalf("handled %d, admitted limit %d", handled.Load(), maxInFlight)
 	}
 }
 
@@ -864,5 +860,42 @@ func TestAckWriteFailureDoesNotStopTheSubscriber(t *testing.T) {
 	case <-handled:
 	case <-time.After(3 * time.Second):
 		t.Fatal("the handler never ran")
+	}
+}
+
+func TestDeliveryMetadataAndRejectionEchoLeaseGeneration(t *testing.T) {
+	h := &subHarness{}
+	s := newTestSubscriber(t, h)
+	seen := make(chan DeliveryInfo, 1)
+	if err := Subscribe(s, "order.*", func(ctx context.Context, _ order) error {
+		info, ok := DeliveryFromContext(ctx)
+		if !ok {
+			return errors.New("missing attempt metadata")
+		}
+		seen <- info
+		return errors.New("retry business handler")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop()
+	st := h.stream(t, 0)
+	st.nextFrame(t)
+	st.push(t, delivery("d", "order.created", "", encodePayload(t, order{ID: "o"})))
+	frame := st.nextFrame(t)
+	if frame.GetNack() == nil || frame.GetNack().GetLeaseToken() != "lease-d" {
+		t.Fatalf("NACK lost exact lease generation: %v", frame)
+	}
+	select {
+	case info := <-seen:
+		if info.Attempt != 3 || info.DeliveryID != "d" || info.EventName != "order.created" || info.LeaseToken != "lease-d" {
+			t.Fatalf("metadata lost: %v", info)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("metadata not observed")
 	}
 }

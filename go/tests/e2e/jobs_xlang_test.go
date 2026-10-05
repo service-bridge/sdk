@@ -39,7 +39,7 @@ func TestJobCanonicalSpecMatchesAcrossLanguages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build interval trigger: %v", err)
 	}
-	spec := job.NewSpec(trigger,
+	spec := job.NewSpec(trigger, job.WithVersion("test-v1"),
 		job.WithCatchup(job.CatchupFireOnce),
 		job.WithOverlap(job.OverlapAllow),
 		job.WithDeps(job.RPC("some-service.SomeMethod")),
@@ -57,7 +57,7 @@ func TestJobCanonicalSpecMatchesAcrossLanguages(t *testing.T) {
 
 	nodeAgentCfg := newAgentConfig(t)
 	nodeAgentCfg.JobName = nodeName
-	nodeAgentCfg.JobOpts = map[string]any{
+	nodeAgentCfg.JobOpts = map[string]any{"version": "test-v1",
 		"trigger":       map[string]any{"interval": intervalMs},
 		"catchup":       "fire_once",
 		"overlap":       "allow",
@@ -112,7 +112,7 @@ func TestJobRegisteredInNodeExecutesOnGoInstance(t *testing.T) {
 	cfg := newAgentConfig(t)
 	cfg.Key = bootstrapKey(t, domainXLang, 3)
 	cfg.JobName = jobName
-	cfg.JobOpts = map[string]any{
+	cfg.JobOpts = map[string]any{"version": "test-v1",
 		"trigger":     map[string]any{"delayed": map[string]any{"at": fireAtMs}},
 		"maxAttempts": 3,
 	}
@@ -129,7 +129,7 @@ func TestJobRegisteredInNodeExecutesOnGoInstance(t *testing.T) {
 	}
 	fired := make(chan job.Execution, 4)
 	goClient := newClient(t, domainXLang, 3)
-	err = goClient.Job.Handle(jobName, job.NewSpec(trigger, job.WithMaxAttempts(3)),
+	err = goClient.Job.Handle(jobName, job.NewSpec(trigger, job.WithVersion("test-v1"), job.WithMaxAttempts(3)),
 		func(_ context.Context, exec job.Execution) error {
 			select {
 			case fired <- exec:
@@ -175,7 +175,7 @@ func TestJobRegisteredInGoExecutesOnNodeInstance(t *testing.T) {
 		t.Fatalf("build delayed trigger: %v", err)
 	}
 	goClient := newClient(t, domainXLang, 3)
-	err = goClient.Job.Handle(jobName, job.NewSpec(trigger, job.WithMaxAttempts(3)),
+	err = goClient.Job.Handle(jobName, job.NewSpec(trigger, job.WithVersion("test-v1"), job.WithMaxAttempts(3)),
 		func(context.Context, job.Execution) error {
 			t.Error("the Go instance's handler fired: it should have disconnected before fire time")
 			return nil
@@ -197,7 +197,7 @@ func TestJobRegisteredInGoExecutesOnNodeInstance(t *testing.T) {
 	cfg := newAgentConfig(t)
 	cfg.Key = bootstrapKey(t, domainXLang, 3)
 	cfg.JobName = jobName
-	cfg.JobOpts = map[string]any{
+	cfg.JobOpts = map[string]any{"version": "test-v1",
 		"trigger":     map[string]any{"delayed": map[string]any{"at": fireAtMs}},
 		"maxAttempts": 3,
 	}

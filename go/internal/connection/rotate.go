@@ -82,7 +82,7 @@ func (ControlRefresher) Refresh(ctx context.Context, conn grpc.ClientConnInterfa
 func leafIdentity(leaf *x509.Certificate) (Identity, error) {
 	const op = "read leaf identity"
 
-	if leaf == nil || len(leaf.URIs) == 0 {
+	if leaf == nil || len(leaf.URIs) != 1 {
 		return Identity{}, newError(KindIdentity, op, "renewed leaf carries no SPIFFE URI SAN", nil)
 	}
 	return ParseSPIFFE(leaf.URIs[0].String())

@@ -83,6 +83,8 @@ type Subscriber struct {
 	runCtx  context.Context
 	cancel  context.CancelFunc
 	slots   map[string]chan struct{}
+	pending chan struct{}
+	active  map[string]activeExecution
 
 	wg sync.WaitGroup
 
@@ -115,9 +117,10 @@ func NewSubscriber(cfg SubscriberConfig) (*Subscriber, error) {
 	}
 
 	s := &Subscriber{
-		cfg:    cfg,
-		logger: cfg.Logger,
-		slots:  make(map[string]chan struct{}),
+		cfg:     cfg,
+		logger:  cfg.Logger,
+		slots:   make(map[string]chan struct{}),
+		pending: make(chan struct{}, 1024), active: make(map[string]activeExecution),
 	}
 	sup, err := stream.NewSupervisor(stream.Config[*pb.JobExecution, pb.Jobs_SubscribeClient]{
 		Name:    "jobs.subscribe",
@@ -196,33 +199,48 @@ func (s *Subscriber) open(ctx context.Context) (pb.Jobs_SubscribeClient, error) 
 // onData runs on the supervisor goroutine, so it must never block: every
 // execution gets its own goroutine, and the wait for a concurrency slot happens
 // there.
-func (s *Subscriber) onData(_ context.Context, msg *pb.JobExecution, _ pb.Jobs_SubscribeClient) {
-	decl, ok := s.cfg.Jobs.Lookup(msg.GetJobName())
+func (s *Subscriber) onData(streamCtx context.Context, msg *pb.JobExecution, _ pb.Jobs_SubscribeClient) {
+	select {
+	case s.pending <- struct{}{}:
+	default:
+		s.reportError(fmt.Errorf("job: local assignment queue full; lease will be reclaimed"))
+		return
+	}
+	decl, ok := s.cfg.Jobs.Lookup(msg.GetJobName(), msg.GetFingerprint())
 	if !ok {
-		s.logger.Warn("job: no handler declared, dropping execution",
-			"job", msg.GetJobName(), "execution_id", msg.GetExecutionId())
+		go func() {
+			defer func() { <-s.pending }()
+			s.sendResult(streamCtx, msg, fmt.Errorf("%w: unsupported_version: %s/%s", ErrPermanent, msg.GetJobName(), msg.GetFingerprint()))
+		}()
 		return
 	}
 
 	s.mu.Lock()
-	runCtx, stopped := s.runCtx, s.stopped
-	if !stopped && runCtx != nil {
-		s.wg.Add(1)
-	}
-	s.mu.Unlock()
-	if stopped || runCtx == nil {
+	if s.stopped || s.runCtx == nil {
+		s.mu.Unlock()
+		<-s.pending
 		return
 	}
-
-	// The handler context is the subscriber's, not the stream's. A broken stream
-	// makes the runtime reclaim the lease, but abandoning a half-done handler
-	// does not undo the work already committed; the stale-epoch result is
-	// dropped silently, which is exactly the fencing this relies on.
-	go s.dispatch(runCtx, decl, msg)
+	key, epoch := msg.GetExecutionId(), msg.GetLeaseEpoch()
+	if previous, ok := s.active[key]; ok {
+		if previous.epoch >= epoch {
+			s.mu.Unlock()
+			<-s.pending
+			return
+		}
+		previous.cancel()
+	}
+	executionCtx, cancel := context.WithCancel(streamCtx)
+	s.active[key] = activeExecution{epoch: epoch, cancel: cancel}
+	s.wg.Add(1)
+	s.mu.Unlock()
+	go s.dispatch(executionCtx, decl, msg)
 }
 
 func (s *Subscriber) dispatch(ctx context.Context, decl Declaration, msg *pb.JobExecution) {
 	defer s.wg.Done()
+	defer func() { <-s.pending }()
+	defer s.retireExecution(msg.GetExecutionId(), msg.GetLeaseEpoch())
 
 	release, ok := s.acquire(ctx, decl)
 	if !ok {
@@ -243,14 +261,14 @@ func (s *Subscriber) dispatch(ctx context.Context, decl Declaration, msg *pb.Job
 func (s *Subscriber) acquire(ctx context.Context, decl Declaration) (func(), bool) {
 	limit := decl.Spec.MaxConcurrent
 	if limit <= 0 {
-		return func() {}, true
+		limit = 32
 	}
 
 	s.mu.Lock()
-	slot := s.slots[decl.Name]
+	slot := s.slots[decl.Name+":"+decl.ContractHash]
 	if slot == nil {
 		slot = make(chan struct{}, limit)
-		s.slots[decl.Name] = slot
+		s.slots[decl.Name+":"+decl.ContractHash] = slot
 	}
 	s.mu.Unlock()
 
@@ -293,7 +311,10 @@ func (s *Subscriber) withTrace(ctx context.Context, msg *pb.JobExecution) contex
 func (s *Subscriber) sendResult(ctx context.Context, msg *pb.JobExecution, runErr error) {
 	// The handler already ran and the runtime is waiting for the outcome, so the
 	// send outlives a cancelled subscriber and is bounded by its own timeout.
-	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cfg.ResultTimeout)
+	if ctx.Err() != nil {
+		return
+	}
+	sendCtx, cancel := context.WithTimeout(ctx, s.cfg.ResultTimeout)
 	defer cancel()
 
 	// Identity read now, not when the execution arrived: after a rotation the
@@ -386,4 +407,18 @@ func (s *Subscriber) reportError(err error) {
 	if s.cfg.OnError != nil {
 		s.cfg.OnError(err)
 	}
+}
+
+func (s *Subscriber) retireExecution(id string, epoch uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if active, ok := s.active[id]; ok && active.epoch == epoch {
+		active.cancel()
+		delete(s.active, id)
+	}
+}
+
+type activeExecution struct {
+	epoch  uint64
+	cancel context.CancelFunc
 }

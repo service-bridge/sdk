@@ -39,6 +39,13 @@ import (
 // Postgres over TCP, needs it.
 const defaultPGPassword = "servicebridge"
 
+func pgPassword() string {
+	if v := os.Getenv("SB_E2E_PG_PASSWORD"); v != "" {
+		return v
+	}
+	return defaultPGPassword
+}
+
 func pgPort() string {
 	if v := os.Getenv("SB_E2E_PG_PORT"); v != "" {
 		return v
@@ -88,7 +95,7 @@ func runPSQLDB(ctx context.Context, dbName, sql string) (string, error) {
 	} else {
 		cmd = exec.CommandContext(ctx, "docker",
 			append([]string{"exec", "-i", pgContainer(), args[0],
-				"-U", defaultPGUser, "-d", dbName}, args[1:]...)...)
+				"-U", pgUser(), "-d", dbName}, args[1:]...)...)
 	}
 	cmd.Stdin = strings.NewReader(sql)
 	var stdout, stderr bytes.Buffer
@@ -295,7 +302,7 @@ func spawnDedicatedRuntime(ctx context.Context, t *testing.T, opts spawnDedicate
 	if err != nil {
 		t.Fatalf("locate runtime checkout: %v", err)
 	}
-	dsn := fmt.Sprintf("postgres://%s:%s@localhost:%s/%s?sslmode=disable", defaultPGUser, defaultPGPassword, pgPort(), dbName)
+	dsn := fmt.Sprintf("postgres://%s:%s@localhost:%s/%s?sslmode=disable", pgUser(), pgPassword(), pgPort(), dbName)
 
 	if err := runMigrateOnly(ctx, opts.BinaryPath, dsn); err != nil {
 		_ = dropIsolatedDatabase(ctx, dbName)

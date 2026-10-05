@@ -27,7 +27,7 @@ func TestLinearWorkflowRunsToSuccess(t *testing.T) {
 	executed := make(chan string, 8)
 
 	c := newClient(t, domainWorkflow, 1)
-	err := c.Workflow.Handle(name, wf.Definition{
+	err := c.Workflow.Handle(name, wf.Definition{Version: "test-v1",
 		Steps: []wf.Step{
 			wf.Local{
 				Control: wf.Control{ID: "first"},
@@ -156,7 +156,7 @@ func TestWorkflowCallStepReachesTypedHandler(t *testing.T) {
 		servicebridge.NewClient(owner, calleeName), method); err != nil {
 		t.Fatalf("declare dependency: %v", err)
 	}
-	err = owner.Workflow.Handle(name, wf.Definition{
+	err = owner.Workflow.Handle(name, wf.Definition{Version: "test-v1",
 		Steps: []wf.Step{
 			wf.Call{
 				Control: wf.Control{ID: "invoke"},
@@ -228,7 +228,7 @@ func TestWorkflowCallStepRefusesAnUndeclaredDependency(t *testing.T) {
 	callee := serviceName(domainWorkflow, 2)
 
 	owner := newClient(t, domainWorkflow, 1)
-	err := owner.Workflow.Handle(name, wf.Definition{
+	err := owner.Workflow.Handle(name, wf.Definition{Version: "test-v1",
 		Steps: []wf.Step{
 			wf.Call{
 				Control: wf.Control{ID: "invoke"},
@@ -268,7 +268,7 @@ func TestWorkflowCallStepFailsOnAnUndeclaredComputedTarget(t *testing.T) {
 	callee := serviceName(domainWorkflow, 2)
 
 	owner := newClient(t, domainWorkflow, 1)
-	err := owner.Workflow.Handle(name, wf.Definition{
+	err := owner.Workflow.Handle(name, wf.Definition{Version: "test-v1",
 		Steps: []wf.Step{
 			wf.Call{
 				Control: wf.Control{ID: "invoke"},
@@ -316,7 +316,7 @@ func TestWorkflowCallStepSurfacesTheCalleeError(t *testing.T) {
 		servicebridge.NewClient(owner, calleeName), method); err != nil {
 		t.Fatalf("declare dependency: %v", err)
 	}
-	err = owner.Workflow.Handle(name, wf.Definition{
+	err = owner.Workflow.Handle(name, wf.Definition{Version: "test-v1",
 		Steps: []wf.Step{
 			wf.Call{
 				Control: wf.Control{ID: "invoke"},

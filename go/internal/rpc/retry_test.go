@@ -11,57 +11,22 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// TestDeadlineExceededRetriesOnlyWithAnIdempotencyKey pins the decision the
-// Node SDK got wrong: the deadline expires on the CALLER and says nothing about
-// the callee, which may have completed the work and answered late. Retrying it
-// blind turned one Charge into three (ADR-0001 §2).
-func TestDeadlineExceededRetriesOnlyWithAnIdempotencyKey(t *testing.T) {
-	err := status.Error(codes.DeadlineExceeded, "too slow")
-
-	if got := Classify(err); got != RetryIfIdempotent {
-		t.Fatalf("Classify(DeadlineExceeded) = %v, want %v", got, RetryIfIdempotent)
-	}
-	if Retryable(err, false) {
-		t.Fatal("DeadlineExceeded must NOT be retried without an idempotency key")
-	}
-	if !Retryable(err, true) {
-		t.Fatal("DeadlineExceeded must be retried once the caller supplies an idempotency key")
+// An ambiguous status can follow a committed effect and a lost response.
+func TestDispatchedErrorsNeverRetryEvenWithKey(t *testing.T) {
+	for _, code := range []codes.Code{codes.DeadlineExceeded, codes.Unavailable, codes.ResourceExhausted, codes.Internal, codes.Aborted, codes.Unknown} {
+		for _, keyed := range []bool{false, true} {
+			err := status.Error(code, "effect may already have committed")
+			if Classify(err) != RetryNever || Retryable(err, keyed) {
+				t.Fatalf("unsafe replay for %v keyed=%v", code, keyed)
+			}
+		}
 	}
 }
 
-// TestConnectionFailuresRetryWithoutAKey covers the codes that prove the
-// request never executed.
-func TestConnectionFailuresRetryWithoutAKey(t *testing.T) {
-	for _, code := range []codes.Code{codes.Unavailable, codes.ResourceExhausted} {
-		t.Run(code.String(), func(t *testing.T) {
-			err := status.Error(code, "no")
-			if got := Classify(err); got != RetryAlways {
-				t.Fatalf("Classify(%v) = %v, want %v", code, got, RetryAlways)
-			}
-			if !Retryable(err, false) {
-				t.Fatalf("%v must be retried without an idempotency key", code)
-			}
-			if !Retryable(err, true) {
-				t.Fatalf("%v must be retried with an idempotency key too", code)
-			}
-		})
-	}
-}
-
-func TestAmbiguousCodesSitBehindTheIdempotencyGate(t *testing.T) {
-	for _, code := range []codes.Code{codes.Internal, codes.Aborted, codes.Unknown} {
-		t.Run(code.String(), func(t *testing.T) {
-			err := status.Error(code, "maybe")
-			if got := Classify(err); got != RetryIfIdempotent {
-				t.Fatalf("Classify(%v) = %v, want %v", code, got, RetryIfIdempotent)
-			}
-			if Retryable(err, false) {
-				t.Fatalf("%v must not be retried without a key", code)
-			}
-			if !Retryable(err, true) {
-				t.Fatalf("%v must be retried with a key", code)
-			}
-		})
+func TestOnlyLocalSelectionProofRetries(t *testing.T) {
+	err := fmt.Errorf("selection: %w", &SelectionError{Reason: status.Error(codes.Unavailable, "no candidates")})
+	if Classify(err) != RetryAlways || !Retryable(err, false) {
+		t.Fatalf("proven pre-dispatch failure should retry: %v", err)
 	}
 }
 
@@ -111,14 +76,14 @@ func TestLocalErrorsWithoutAWireCodeAreNeverRetried(t *testing.T) {
 
 func TestWrappedStatusKeepsItsClass(t *testing.T) {
 	err := fmt.Errorf("rpc: direct unary Ping to 10.0.0.1:14446: %w", status.Error(codes.Unavailable, "conn refused"))
-	if got := Classify(err); got != RetryAlways {
-		t.Fatalf("wrapping must not hide the status: got %v, want %v", got, RetryAlways)
+	if got := Classify(err); got != RetryNever {
+		t.Fatalf("wrapping cannot create pre-dispatch proof: got %v", got)
 	}
 }
 
 func TestContextDeadlineIsTreatedAsTheWireDeadline(t *testing.T) {
-	if got := Classify(context.DeadlineExceeded); got != RetryIfIdempotent {
-		t.Fatalf("Classify(context.DeadlineExceeded) = %v, want %v", got, RetryIfIdempotent)
+	if got := Classify(context.DeadlineExceeded); got != RetryNever {
+		t.Fatalf("Classify(context.DeadlineExceeded) = %v, want %v", got, RetryNever)
 	}
 	if got := Classify(context.Canceled); got != RetryNever {
 		t.Fatalf("Classify(context.Canceled) = %v, want %v", got, RetryNever)
@@ -201,9 +166,8 @@ func TestSleepMsChecksTheContextEvenAtZeroDelay(t *testing.T) {
 
 func TestRetryClassNamesItself(t *testing.T) {
 	cases := map[RetryClass]string{
-		RetryNever:        "never",
-		RetryAlways:       "always",
-		RetryIfIdempotent: "if-idempotent",
+		RetryNever:  "never",
+		RetryAlways: "always",
 	}
 	for class, want := range cases {
 		if got := class.String(); got != want {

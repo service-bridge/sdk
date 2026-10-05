@@ -150,3 +150,5 @@
 Опирается на: `internal/stream` (`Backoff` — лестница), `internal/pb` (стабы `Bootstrap`, `Control`, `Registry`), `google.golang.org/grpc`, `crypto/x509`, `crypto/tls`, `log/slog`.
 
 На него опираются: корневой пакет `servicebridge` (сборка графа зависимостей клиента), `internal/registry` (берёт канал живой сессии через `Conn`), и все будущие держатели mTLS-кредов — входящий Call-сервер, исходящие транспорты, клиенты событий, workflow, job и телеметрии — через `CredentialRegistry` и `IdentitySource`.
+
+Runtime TLS требует закреплённую цепочку CA, ServerAuth и ровно один URI `spiffe://service-bridge/runtime`; проверка CN не используется. Прямое соединение отдельно проверяет точный service/instance URI. URI с query, fragment, userinfo или escaped path отвергается. Терминальный отказ авторизации отменяет активный SDK lifetime; после incident rotation старого bootstrap key требуется развёртывание нового ключа.

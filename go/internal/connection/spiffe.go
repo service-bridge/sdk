@@ -10,6 +10,7 @@ import (
 // stay byte-identical to connection.SPIFFETrustDomain in the runtime and to
 // SPIFFE_TRUST_DOMAIN in the Node SDK — a mismatch rejects every peer cert.
 const SPIFFETrustDomain = "service-bridge"
+const RuntimeSPIFFEURI = "spiffe://service-bridge/runtime"
 
 // Identity is the SPIFFE identity carried in a leaf cert URI SAN.
 type Identity struct {
@@ -30,6 +31,9 @@ func ParseSPIFFE(raw string) (Identity, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return Identity{}, newError(KindIdentity, op, "malformed URI", err)
+	}
+	if u.User != nil || u.RawQuery != "" || u.ForceQuery || u.RawPath != "" || u.Fragment != "" || u.Opaque != "" {
+		return Identity{}, newError(KindIdentity, op, "unexpected URI components", nil)
 	}
 	if u.Scheme != "spiffe" {
 		return Identity{}, newError(KindIdentity, op, "unexpected scheme "+strconv.Quote(u.Scheme), nil)

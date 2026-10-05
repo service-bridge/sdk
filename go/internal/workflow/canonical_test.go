@@ -56,7 +56,7 @@ type runtimePolicyStep struct {
 // fullGraph declares one step of every kind so a single freeze exercises the
 // whole encoder.
 func fullGraph() wf.Definition {
-	return wf.Definition{
+	return wf.Definition{Version: "test-v1",
 		Input: map[string]any{
 			"type":       "object",
 			"properties": map[string]any{"orderId": map[string]any{"type": "string"}},
@@ -299,7 +299,7 @@ func TestFreezeMaterializesRetryOnTheStepsTheRunnerExecutes(t *testing.T) {
 	policy := &wf.RetryPolicy{MaxAttempts: 5}
 	own := &wf.RetryPolicy{MaxAttempts: 2}
 
-	def := wf.Definition{
+	def := wf.Definition{Version: "test-v1",
 		Retry: policy,
 		Steps: []wf.Step{
 			wf.Call{Control: wf.Control{ID: "a"}, Service: wf.Name("s"), Method: wf.Name("M")},
@@ -337,8 +337,8 @@ func TestFreezeMaterializesRetryOnTheStepsTheRunnerExecutes(t *testing.T) {
 	if got := byID["a"].Common().Retry; got != policy {
 		t.Errorf("step a retry = %v, want the workflow policy", got)
 	}
-	if got := byID["b"].Common().Retry; got != own {
-		t.Errorf("step b retry = %v, want its own policy left alone", got)
+	if got := byID["b"].Common().Retry; got == own || *got != *own {
+		t.Errorf("step b retry = %v, want an independent copy of its own policy", got)
 	}
 	if got := byID["c"].Common().Retry; got != nil {
 		t.Errorf("step c retry = %v, want none on a parked step", got)
@@ -379,7 +379,7 @@ func TestFingerprintIsStableAcrossRuns(t *testing.T) {
 
 func TestFingerprintIgnoresOrderThatCarriesNoMeaning(t *testing.T) {
 	build := func(deps []string, input map[string]any) wf.Definition {
-		return wf.Definition{Steps: []wf.Step{
+		return wf.Definition{Version: "test-v1", Steps: []wf.Step{
 			wf.Call{Control: wf.Control{ID: "a"}, Service: wf.Name("s"), Method: wf.Name("M")},
 			wf.Call{Control: wf.Control{ID: "b"}, Service: wf.Name("s"), Method: wf.Name("M")},
 			wf.Call{
@@ -405,7 +405,7 @@ func TestFingerprintIgnoresOrderThatCarriesNoMeaning(t *testing.T) {
 }
 
 func TestFingerprintFollowsMeaning(t *testing.T) {
-	base := wf.Definition{Steps: []wf.Step{
+	base := wf.Definition{Version: "test-v1", Steps: []wf.Step{
 		wf.Call{Control: wf.Control{ID: "a"}, Service: wf.Name("billing"), Method: wf.Name("Charge")},
 	}}
 	baseline, err := Freeze("wf", base)
@@ -448,7 +448,7 @@ func TestFingerprintFollowsMeaning(t *testing.T) {
 
 func TestFreezeLeavesTheLocalFunctionOut(t *testing.T) {
 	called := false
-	def := wf.Definition{Steps: []wf.Step{
+	def := wf.Definition{Version: "test-v1", Steps: []wf.Step{
 		wf.Local{
 			Control: wf.Control{ID: "compute"},
 			Fn: func(_ context.Context, _ map[string]any) (any, error) {
@@ -486,7 +486,7 @@ func TestFreezeLeavesTheLocalFunctionOut(t *testing.T) {
 	}
 
 	// Two graphs differing only in the closure describe the same work.
-	other := wf.Definition{Steps: []wf.Step{
+	other := wf.Definition{Version: "test-v1", Steps: []wf.Step{
 		wf.Local{
 			Control: wf.Control{ID: "compute"},
 			Fn:      func(_ context.Context, _ map[string]any) (any, error) { return 42, nil },
@@ -517,20 +517,20 @@ func TestCanonicalKeysAreSortedAndCompact(t *testing.T) {
 }
 
 func TestCanonicalOmitsZeroValuedFields(t *testing.T) {
-	frozen, err := Freeze("wf", wf.Definition{Steps: []wf.Step{
+	frozen, err := Freeze("wf", wf.Definition{Version: "test-v1", Steps: []wf.Step{
 		wf.Call{Control: wf.Control{ID: "a"}, Service: wf.Name("s"), Method: wf.Name("M")},
 	}})
 	if err != nil {
 		t.Fatalf("freeze: %v", err)
 	}
-	want := `{"graph":[{"id":"a","method":"M","service":"s","type":"call"}]}`
+	want := `{"graph":[{"id":"a","method":"M","service":"s","type":"call"}],"version":"test-v1"}`
 	if string(frozen.JSON) != want {
 		t.Errorf("canonical = %s, want %s", frozen.JSON, want)
 	}
 }
 
 func TestCanonicalKeepsPathsAndEscapesLiteralsThatLookLikeThem(t *testing.T) {
-	frozen, err := Freeze("wf", wf.Definition{Steps: []wf.Step{
+	frozen, err := Freeze("wf", wf.Definition{Version: "test-v1", Steps: []wf.Step{
 		wf.Call{
 			Control: wf.Control{ID: "a"},
 			Service: wf.Name("s"),
@@ -558,11 +558,40 @@ func TestCanonicalKeepsPathsAndEscapesLiteralsThatLookLikeThem(t *testing.T) {
 }
 
 func TestFreezeRefusesAnInvalidGraph(t *testing.T) {
-	_, err := Freeze("wf", wf.Definition{Steps: []wf.Step{
+	_, err := Freeze("wf", wf.Definition{Version: "test-v1", Steps: []wf.Step{
 		wf.Call{Control: wf.Control{ID: "Bad ID"}, Service: wf.Name("s"), Method: wf.Name("M")},
 	}})
 	var invalid *ValidationError
 	if err == nil || !errors.As(err, &invalid) {
 		t.Fatalf("freeze error = %v, want a ValidationError", err)
+	}
+}
+
+func TestLocalExecutableVersionGoldenAndImmutableSnapshot(t *testing.T) {
+	local := wf.Local{Control: wf.Control{ID: "a"}, Fn: func(context.Context, map[string]any) (any, error) { return "v1", nil }}
+	if _, err := Freeze("wf", wf.Definition{Steps: []wf.Step{local}}); err == nil {
+		t.Fatal("local code needs explicit version")
+	}
+	def := wf.Definition{Version: "v1", Steps: []wf.Step{local}}
+	frozen, err := Freeze("wf", def)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(frozen.JSON) != `{"graph":[{"id":"a","type":"local"}],"version":"v1"}` || frozen.Fingerprint != "791a2a611a183307ab8abb8bf7fa99201ff70ee22623ae93785543f9dd5e99be" {
+		t.Fatalf("Go/Node golden drift: %s %s", frozen.JSON, frozen.Fingerprint)
+	}
+	local.Fn = func(context.Context, map[string]any) (any, error) { return "v2", nil }
+	def.Steps[0] = local
+	got, err := frozen.Steps[0].(wf.Local).Fn(context.Background(), nil)
+	if err != nil || got != "v1" {
+		t.Fatalf("frozen handler mutated: %v %v", got, err)
+	}
+	def.Version = "v2"
+	changed, err := Freeze("wf", def)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.Fingerprint == frozen.Fingerprint {
+		t.Fatal("executable version absent from fingerprint")
 	}
 }

@@ -34,7 +34,7 @@ import (
 func TestWorkflowCanonicalFingerprintMatchesAcrossLanguages(t *testing.T) {
 	ctx := testContext(t, time.Minute)
 
-	def := wf.Definition{
+	def := wf.Definition{Version: "test-v1",
 		Steps: []wf.Step{
 			wf.Call{
 				Control: wf.Control{ID: "invoke"},
@@ -59,7 +59,7 @@ func TestWorkflowCanonicalFingerprintMatchesAcrossLanguages(t *testing.T) {
 	// declares none of them, so only "graph" is present — mirroring what Go's
 	// Freeze leaves in root when Definition carries no Retry/MaxParallelism/
 	// TimeoutSec/Input.
-	nodeGraph := map[string]any{
+	nodeGraph := map[string]any{"version": "test-v1",
 		"graph": []map[string]any{
 			{
 				"id":      "invoke",
@@ -107,7 +107,7 @@ func TestWorkflowGoCallStepReachesNodeService(t *testing.T) {
 		servicebridge.NewClient(owner, callee), method); err != nil {
 		t.Fatalf("declare dependency: %v", err)
 	}
-	err := owner.Workflow.Handle(workflowName, wf.Definition{
+	err := owner.Workflow.Handle(workflowName, wf.Definition{Version: "test-v1",
 		Steps: []wf.Step{
 			wf.Call{
 				Control: wf.Control{ID: "invoke"},

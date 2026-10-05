@@ -557,3 +557,29 @@ func TestEventPatternsAcceptWildcardsAndMatchDeliveredNames(t *testing.T) {
 		}
 	}
 }
+
+func TestFireAndForgetRequiresExactPerItemAcceptance(t *testing.T) {
+	st := openStorage(t, t.TempDir())
+	for _, kind := range []string{"missing", "wrong-id", "unspecified", "transient"} {
+		t.Run(kind, func(t *testing.T) {
+			publish := func(_ context.Context, req *pb.PublishRequest) (*pb.PublishResponse, error) {
+				entry := &pb.PublishStatusEntry{EventId: req.Events[0].Id, Status: pb.PublishStatus_PUBLISH_STATUS_ACCEPTED}
+				switch kind {
+				case "missing":
+					return &pb.PublishResponse{}, nil
+				case "wrong-id":
+					entry.EventId = "unrelated"
+				case "unspecified":
+					entry.Status = pb.PublishStatus_PUBLISH_STATUS_UNSPECIFIED
+				case "transient":
+					entry.Status = pb.PublishStatus(99)
+				}
+				return &pb.PublishResponse{Results: []*pb.PublishStatusEntry{entry}}, nil
+			}
+			p := newTestPublisher(t, st, publish)
+			if _, err := p.Publish(context.Background(), "order.created", order{}, WithFireAndForget()); !errors.Is(err, ErrRejected) {
+				t.Fatalf("unaccepted item reported success: %v", err)
+			}
+		})
+	}
+}

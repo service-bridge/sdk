@@ -211,12 +211,10 @@ func TestSelectionFailureEmitsNoOperation(t *testing.T) {
 // operation, they do not mint a row each.
 func TestOneOperationPerLogicalCall(t *testing.T) {
 	stub := &stubInvoke{
-		err:      status.Error(codes.Unavailable, "conn refused"),
-		errUntil: 2,
-		resp:     &pb.InvokeResponse{Payload: []byte("ok")},
+		resp: &pb.InvokeResponse{Payload: []byte("ok")},
 	}
 	var ring *telemetry.Ring
-	c := proxyClient(t, registryWith(instanceInfo("inst-1", "10.0.0.1:14446")), stub, &ring)
+	c := proxyClient(t, &lateCandidates{stubRegistry: registryWith(instanceInfo("inst-1", "10.0.0.1:14446")), empty: 2}, stub, &ring)
 
 	got, err := c.Unary(context.Background(), testRequest())
 	if err != nil {
@@ -225,8 +223,8 @@ func TestOneOperationPerLogicalCall(t *testing.T) {
 	if string(got) != "ok" {
 		t.Fatalf("payload = %q, want ok", got)
 	}
-	if stub.calls != 3 {
-		t.Fatalf("dispatched %d times, want 3 (two Unavailable retries then success)", stub.calls)
+	if stub.calls != 1 {
+		t.Fatalf("dispatched %d times, want one dispatch after local selection retries", stub.calls)
 	}
 
 	frames := opReports(ring)
@@ -288,8 +286,8 @@ func TestDeadlineExceededIsNotRetriedWithoutAKey(t *testing.T) {
 		if _, err := c.Unary(context.Background(), req); err == nil {
 			t.Fatal("expected the call to fail")
 		}
-		if stub.calls != 3 {
-			t.Fatalf("dispatched %d times, want the full ladder once the caller opted in", stub.calls)
+		if stub.calls != 1 {
+			t.Fatalf("a key cannot prove atomic business dedup; dispatched %d times", stub.calls)
 		}
 		if stub.requests[0].GetIdempotencyKey() != "charge-42" {
 			t.Fatal("the idempotency key must travel on the wire")
@@ -297,15 +295,15 @@ func TestDeadlineExceededIsNotRetriedWithoutAKey(t *testing.T) {
 	})
 }
 
-func TestUnavailableRetriesWithoutAKey(t *testing.T) {
+func TestUnavailableDoesNotReplayAfterDispatch(t *testing.T) {
 	stub := &stubInvoke{err: status.Error(codes.Unavailable, "conn refused")}
 	c := proxyClient(t, registryWith(instanceInfo("inst-1", "10.0.0.1:14446")), stub, nil)
 
 	if _, err := c.Unary(context.Background(), testRequest()); err == nil {
 		t.Fatal("expected the call to fail")
 	}
-	if stub.calls != 3 {
-		t.Fatalf("dispatched %d times, want 3: Unavailable proves the request never ran", stub.calls)
+	if stub.calls != 1 {
+		t.Fatalf("ambiguous dispatched result repeated %d times", stub.calls)
 	}
 }
 
@@ -479,7 +477,7 @@ func TestTraceHeaderTravelsInBothMetadataAndBody(t *testing.T) {
 	}
 }
 
-func TestRequestIdIsStableAcrossRetries(t *testing.T) {
+func TestRequestIdIsSetAndKeyDoesNotAuthorizeReplay(t *testing.T) {
 	stub := &stubInvoke{
 		err:      status.Error(codes.Unavailable, "conn refused"),
 		errUntil: 2,
@@ -489,11 +487,11 @@ func TestRequestIdIsStableAcrossRetries(t *testing.T) {
 
 	req := testRequest()
 	req.IdempotencyKey = "charge-42"
-	if _, err := c.Unary(context.Background(), req); err != nil {
-		t.Fatalf("call: %v", err)
+	if _, err := c.Unary(context.Background(), req); err == nil {
+		t.Fatal("expected ambiguous response failure")
 	}
-	if len(stub.requests) != 3 {
-		t.Fatalf("want 3 attempts, got %d", len(stub.requests))
+	if len(stub.requests) != 1 {
+		t.Fatalf("want one attempt, got %d", len(stub.requests))
 	}
 	first := stub.requests[0].GetRequestId()
 	if first == "" {
@@ -728,4 +726,18 @@ func TestBackoffStopsWhenTheCallerContextExpires(t *testing.T) {
 	if stub.calls != 1 {
 		t.Fatalf("dispatched %d times; the backoff must abort once the caller's context is done", stub.calls)
 	}
+}
+
+// lateCandidates models a locally observed discovery gap, before any RPC exists.
+type lateCandidates struct {
+	*stubRegistry
+	empty int
+}
+
+func (r *lateCandidates) Candidates(service, method, hash string) []*pb.MethodDescriptor {
+	if r.empty > 0 {
+		r.empty--
+		return nil
+	}
+	return r.stubRegistry.Candidates(service, method, hash)
 }

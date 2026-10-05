@@ -10,7 +10,7 @@ circuit breaker, idempotency, retries, load balancing, protobuf, iter.Seq2, slog
 # service-bridge (Go)
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/service-bridge/sdk/go.svg)](https://pkg.go.dev/github.com/service-bridge/sdk/go)
-[![Go 1.24+](https://img.shields.io/badge/go-%E2%89%A51.24-00ADD8.svg)](https://go.dev/dl/)
+[![Go 1.26.6+](https://img.shields.io/badge/go-%E2%89%A51.26.6-00ADD8.svg)](https://go.dev/dl/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](../LICENSE)
 
 **The Go SDK for [ServiceBridge](https://servicebridge.dev) — RPC, durable events, workflows, jobs, streaming and full observability over one self-hosted runtime. No broker. No sidecar. No tracing stack. Just one Go binary plus PostgreSQL.**
@@ -72,7 +72,7 @@ You declare what your service handles and what it calls. ServiceBridge does the 
 go get github.com/service-bridge/sdk/go
 ```
 
-- **Go:** 1.24 or newer.
+- **Go:** 1.26.6 or newer (patched standard library).
 - **Backend:** a running ServiceBridge runtime (gRPC control plane on `:14445`) backed by PostgreSQL 18+. See [Runtime setup](#runtime-setup).
 - **Cgo:** not required. The local event outbox is SQLite through a pure-Go driver.
 
@@ -369,6 +369,7 @@ import "github.com/service-bridge/sdk/go/job"
 nightly, err := job.Cron("0 3 * * *", "UTC") // five fields, no seconds
 err = c.Job.Handle("nightly-rollup",
 	job.NewSpec(nightly,
+		job.WithVersion("v1"),
 		job.WithOverlap(job.OverlapSkip),
 		job.WithCatchup(job.CatchupFireOnce),
 		job.WithMaxAttempts(5),
@@ -379,7 +380,7 @@ err = c.Job.Handle("nightly-rollup",
 	})
 
 beat, err := job.Interval(30 * time.Second)
-err = c.Job.Handle("heartbeat", job.NewSpec(beat), ping)
+err = c.Job.Handle("heartbeat", job.NewSpec(beat, job.WithVersion("v1")), ping)
 ```
 
 A trigger comes only from `job.Cron`, `job.Interval` or `job.At`, so a job carries exactly one by construction. The cron expression is parsed at declaration by the same parser the runtime registers with — a typo fails where you wrote it instead of never firing.
@@ -396,6 +397,7 @@ Durable DAGs. Declare the graph once; the runtime executes it, persists state be
 import wf "github.com/service-bridge/sdk/go/workflow"
 
 err := c.Workflow.Handle("checkout", wf.Definition{
+    Version: "v1",
 	Input: map[string]any{
 		"type":       "object",
 		"properties": map[string]any{"orderId": map[string]any{"type": "string"}},
@@ -785,3 +787,13 @@ Issues and feedback are welcome.
 ## License
 
 Licensed under the **MIT License** — see [LICENSE](../LICENSE). Free for any use, including commercial; you only need to keep the copyright and license notice (attribution to esurkov1 <esurkovv@yandex.ru>).
+
+Production delivery and lifecycle contracts: RPC automatic retries are limited to locally proven pre-dispatch selection failures. A key or an ambiguous gRPC status cannot prove an effect did not happen. Jobs require WithVersion; local workflows require Definition.Version. Retained versions are advertised old→new; deploy old executable versions while frozen work remains, or drain before removing them. Unknown assigned fingerprints report terminal unsupported_version.
+
+Event handlers can inspect `DeliveryFromContext(ctx)` for Attempt, DeliveryID, EventID, EventName and the opaque LeaseToken. Token ownership prevents stale ACKs from acknowledging another delivery attempt. Public outbox recovery uses `FailedOutboxEvents(ctx,limit,cursor)`, `RetryFailedEvent(ctx,id)` and `DiscardFailedEvent(ctx,id)`; retries preserve event identity. Zero row cap explicitly disables the row limit.
+
+Telemetry ACK confirms runtime ingress acceptance or disposal, not database persistence; drops are observable. Causal ACK sequences and a 1024-item in-flight bound protect replay. Metrics have bounded series/metadata/layout sizes and old instance series retire on rotation. Workflow default parallelism is64 (maximum1024), job default concurrency32, assignment queues1024, and expanded workflow budget10000 units.
+
+Start has a 30-second initial deadline and rolls back resources after any failure. Stop first cancels execution, closes owned channels/storage, and waits up to its caller deadline (five seconds when absent). Go cannot terminate arbitrary application code that ignores context cancellation; Stop reports deadline expiry, and that handler must eventually unwind. Stream loss or superseded lease cancels active work and suppresses stale results. Revoked bootstrap credentials require deployment of the new key; terminal auth failures stop reconnecting.
+
+Each client instance needs exclusive ownership of its outbox directory; do not share it between live instances. The local SQLite insert is durable publication intent, but it is not atomic with a transaction in an external business database. Applications needing that atomic boundary must persist business changes and publication intent together in their own transaction, then relay the intent.

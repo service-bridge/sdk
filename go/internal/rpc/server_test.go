@@ -39,6 +39,7 @@ type inboundFixture struct {
 	ca       *inboundCA
 	srv      *Server
 	endpoint string
+	instance string
 }
 
 func newInboundFixture(t *testing.T, d *Dispatcher, limits ServerLimits, policies AcceptancePolicySource) *inboundFixture {
@@ -73,14 +74,22 @@ func newInboundFixture(t *testing.T, d *Dispatcher, limits ServerLimits, policie
 		}
 	})
 
-	return &inboundFixture{ca: ca, srv: srv, endpoint: endpoint}
+	return &inboundFixture{ca: ca, srv: srv, endpoint: endpoint, instance: "inst-callee"}
 }
 
 func (f *inboundFixture) client(t *testing.T, leaf tls.Certificate) pb.CallClient {
 	t.Helper()
 
+	cfg := connection.MutualTLSConfig(f.ca.cert, leaf)
+	chain := connection.VerifyServerChain(cfg.RootCAs)
+	cfg.VerifyConnection = func(cs tls.ConnectionState) error {
+		if err := chain(cs); err != nil {
+			return err
+		}
+		return verifyPeerIdentity(cs, connection.FormatSPIFFE(connection.Identity{ServiceID: inboundCalleeID, InstanceID: f.instance}))
+	}
 	conn, err := grpc.NewClient(f.endpoint,
-		grpc.WithTransportCredentials(gcreds.NewTLS(connection.MutualTLSConfig(f.ca.cert, leaf))))
+		grpc.WithTransportCredentials(gcreds.NewTLS(cfg)))
 	if err != nil {
 		t.Fatalf("dial %s: %v", f.endpoint, err)
 	}
@@ -727,6 +736,7 @@ func TestCredentialsRotateUnderALiveListener(t *testing.T) {
 	f := newInboundFixture(t, d, DefaultServerLimits(), nil)
 	before := f.endpoint
 
+	f.instance = "inst-rotated"
 	next := f.ca.serviceLeaf(t, inboundCalleeID, "inst-rotated")
 	if err := f.srv.UseCredentials(context.Background(), f.ca.credentials(t, next, inboundCalleeID, "inst-rotated")); err != nil {
 		t.Fatalf("UseCredentials: %v", err)
@@ -782,8 +792,15 @@ func TestServerLeavesNoGoroutinesBehind(t *testing.T) {
 			t.Fatalf("Start: %v", err)
 		}
 
-		conn, err := grpc.NewClient(endpoint, grpc.WithTransportCredentials(
-			gcreds.NewTLS(connection.MutualTLSConfig(ca.cert, ca.serviceLeaf(t, inboundCallerID, "inst-1")))))
+		cfg := connection.MutualTLSConfig(ca.cert, ca.serviceLeaf(t, inboundCallerID, "inst-1"))
+		chain := connection.VerifyServerChain(cfg.RootCAs)
+		cfg.VerifyConnection = func(cs tls.ConnectionState) error {
+			if err := chain(cs); err != nil {
+				return err
+			}
+			return verifyPeerIdentity(cs, connection.FormatSPIFFE(connection.Identity{ServiceID: inboundCalleeID, InstanceID: "inst-callee"}))
+		}
+		conn, err := grpc.NewClient(endpoint, grpc.WithTransportCredentials(gcreds.NewTLS(cfg)))
 		if err != nil {
 			t.Fatalf("dial: %v", err)
 		}

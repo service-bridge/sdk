@@ -55,7 +55,7 @@ type DropInfo struct {
 // TransportConfig wires the Telemetry.Report client. See ./README.md.
 type TransportConfig struct {
 	// Open builds one Report stream bound to ctx. Cancelling ctx must unblock
-	// Recv. Evaluated on every reconnect, so a rotated identity is picked up.
+	// Send and Recv. Evaluated on every reconnect, so a rotated identity is picked up.
 	Open func(ctx context.Context) (ReportStream, error)
 	// Ring is the buffer drained onto the stream.
 	Ring *Ring
@@ -65,10 +65,12 @@ type TransportConfig struct {
 	FlushInterval time.Duration
 	// MaxBatchItems defaults to DefaultMaxBatchItems.
 	MaxBatchItems int
+	// MaxInflightItems bounds all unacknowledged kinds together; default 1024.
+	MaxInflightItems int
 	// OnDrop fires when a drop counter rises on either side.
 	OnDrop func(DropInfo)
 	// OnDrain fires once per stream when the runtime asks the SDK to close. The
-	// final flush has already been written when it runs.
+	// transport stops sending new batches before it runs.
 	OnDrain func(reason string)
 	// OnError reports stream failures. The transport reconnects regardless.
 	OnError func(err error)
@@ -88,6 +90,7 @@ type Transport struct {
 
 	wg sync.WaitGroup
 
+	lifeMu  sync.Mutex
 	mu      sync.Mutex
 	started bool
 	cancel  context.CancelFunc
@@ -95,11 +98,9 @@ type Transport struct {
 	// that picked up a stream just before it was replaced would otherwise mark
 	// items in flight against the new session's ledger and see them released
 	// two acknowledgements later, having never left the process.
-	cur      *session
-	inflight inflightSet
-	// ackEpoch counts the acknowledgements seen on the current stream. See
-	// inflightSet.release for what it buys.
-	ackEpoch      uint64
+	cur           *session
+	inflight      inflightSet
+	sequence      uint64
 	draining      bool
 	backpressure  uint32
 	serverDropped uint64
@@ -122,6 +123,9 @@ func NewTransport(cfg TransportConfig) (*Transport, error) {
 	}
 	if cfg.MaxBatchItems <= 0 {
 		cfg.MaxBatchItems = DefaultMaxBatchItems
+	}
+	if cfg.MaxInflightItems <= 0 {
+		cfg.MaxInflightItems = 1024
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -148,15 +152,15 @@ func NewTransport(cfg TransportConfig) (*Transport, error) {
 // Start opens the stream and runs the flush loop until ctx is cancelled or Stop
 // runs.
 func (t *Transport) Start(ctx context.Context) error {
-	t.mu.Lock()
+	t.lifeMu.Lock()
 	if t.started {
-		t.mu.Unlock()
+		t.lifeMu.Unlock()
 		return fmt.Errorf("telemetry: transport: start: %w", ErrTransportStarted)
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	t.started = true
 	t.cancel = cancel
-	t.mu.Unlock()
+	t.lifeMu.Unlock()
 
 	if err := t.sup.Start(runCtx); err != nil {
 		cancel()
@@ -168,15 +172,13 @@ func (t *Transport) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop writes one last cycle, then tears the stream and the flush loop down.
+// Stop cancels Send and Recv before waiting for either worker.
 // Terminal: a stopped transport cannot be started again.
 func (t *Transport) Stop() {
-	t.Flush()
-
-	t.mu.Lock()
+	t.lifeMu.Lock()
 	cancel := t.cancel
 	t.cancel = nil
-	t.mu.Unlock()
+	t.lifeMu.Unlock()
 
 	if cancel != nil {
 		cancel()
@@ -214,6 +216,7 @@ func (t *Transport) Flush() {
 
 	if err != nil {
 		t.reportError(err)
+		t.sup.Restart()
 	}
 }
 
@@ -252,7 +255,7 @@ func (t *Transport) open(ctx context.Context) (*session, error) {
 	t.mu.Lock()
 	t.cur = sess
 	t.inflight.reset()
-	t.ackEpoch = 0
+	t.sequence = 0
 	t.draining = false
 	t.mu.Unlock()
 
@@ -261,8 +264,14 @@ func (t *Transport) open(ctx context.Context) (*session, error) {
 
 func (t *Transport) onData(_ context.Context, ack *pb.TelemetryAck, sess *session) {
 	t.mu.Lock()
-	t.ackEpoch++
-	confirmed := t.inflight.release(t.ackEpoch)
+	if t.cur != sess {
+		t.mu.Unlock()
+		return
+	}
+	confirmed := Batch{}
+	if seq := ack.GetAcknowledgedSequence(); seq > 0 && seq <= t.sequence {
+		confirmed = t.inflight.release(seq)
+	}
 	if !confirmed.Empty() {
 		t.cfg.Ring.Commit(confirmed)
 	}
@@ -279,13 +288,9 @@ func (t *Transport) onData(_ context.Context, ack *pb.TelemetryAck, sess *sessio
 		t.cfg.OnDrop(drop)
 	}
 
-	// An acknowledgement is the cheapest proof the runtime is keeping up, so
-	// refill the wire now instead of idling until the next tick. The runtime's
-	// backpressure level is deliberately not consulted: it is advisory, and
-	// pausing the flusher while producers keep writing makes the buffer evict
-	// its oldest items — which are the START frames the runtime needs to open a
-	// row. Losing the tail of a batch beats losing its head.
-	t.Flush()
+	if drainReason == "" {
+		t.Flush()
+	}
 
 	if drainReason == "" {
 		return
@@ -320,14 +325,17 @@ func (t *Transport) writeOnceLocked(st ReportStream) (bool, error) {
 	if batch.Empty() {
 		return false, nil
 	}
-	if err := sendBatch(st, batch); err != nil {
-		// The items keep their place in the buffer: this stream is finished, and
-		// the next one re-reads them from the head. Anything the peer did take
-		// before the failure arrives twice, which the at-least-once contract
-		// allows.
-		return false, err
+	parts := []Batch{{Ops: batch.Ops}, {Logs: batch.Logs}, {Metrics: batch.Metrics}, {Payloads: batch.Payloads}}
+	for _, part := range parts {
+		if part.Empty() {
+			continue
+		}
+		t.sequence++
+		if err := sendBatch(st, part, t.sequence); err != nil {
+			return false, err
+		}
+		t.inflight.add(part, t.sequence)
 	}
-	t.inflight.add(batch, t.ackEpoch)
 	return true, nil
 }
 
@@ -339,14 +347,21 @@ func (t *Transport) writeOnceLocked(st ReportStream) (bool, error) {
 // runtime acknowledging on a fixed two-second ticker, that is where throughput
 // silently collapses.
 func (t *Transport) selectLocked() Batch {
-	max := t.cfg.MaxBatchItems
-	peeked := t.cfg.Ring.Peek(max + t.inflight.deepestKind())
-	return Batch{
-		Ops:      selectUnsent(peeked.Ops, t.inflight.ids, max),
-		Logs:     selectUnsent(peeked.Logs, t.inflight.ids, max),
-		Metrics:  selectUnsent(peeked.Metrics, t.inflight.ids, max),
-		Payloads: selectUnsent(peeked.Payloads, t.inflight.ids, max),
+	remaining := t.cfg.MaxInflightItems - len(t.inflight.ids)
+	if t.draining || remaining <= 0 {
+		return Batch{}
 	}
+	n := min(t.cfg.MaxBatchItems, remaining)
+	peeked := t.cfg.Ring.Peek(n + t.inflight.deepestKind())
+	b := Batch{}
+	b.Ops = selectUnsent(peeked.Ops, t.inflight.ids, n)
+	remaining -= len(b.Ops)
+	b.Logs = selectUnsent(peeked.Logs, t.inflight.ids, min(n, remaining))
+	remaining -= len(b.Logs)
+	b.Metrics = selectUnsent(peeked.Metrics, t.inflight.ids, min(n, remaining))
+	remaining -= len(b.Metrics)
+	b.Payloads = selectUnsent(peeked.Payloads, t.inflight.ids, min(n, remaining))
+	return b
 }
 
 func (t *Transport) reportError(err error) {
@@ -356,13 +371,13 @@ func (t *Transport) reportError(err error) {
 	}
 }
 
-func sendBatch(st ReportStream, b Batch) error {
+func sendBatch(st ReportStream, b Batch, sequence uint64) error {
 	if len(b.Ops) > 0 {
 		items := make([]*pb.OpReport, len(b.Ops))
 		for i, it := range b.Ops {
 			items[i] = it.Msg
 		}
-		msg := &pb.TelemetryBatch{Kind: &pb.TelemetryBatch_Ops{Ops: &pb.OpBatch{Items: items}}}
+		msg := &pb.TelemetryBatch{Sequence: sequence, Kind: &pb.TelemetryBatch_Ops{Ops: &pb.OpBatch{Items: items}}}
 		if err := st.Send(msg); err != nil {
 			return fmt.Errorf("telemetry: transport: send ops: %w", err)
 		}
@@ -372,7 +387,7 @@ func sendBatch(st ReportStream, b Batch) error {
 		for i, it := range b.Logs {
 			items[i] = it.Msg
 		}
-		msg := &pb.TelemetryBatch{Kind: &pb.TelemetryBatch_Logs{Logs: &pb.LogBatch{Items: items}}}
+		msg := &pb.TelemetryBatch{Sequence: sequence, Kind: &pb.TelemetryBatch_Logs{Logs: &pb.LogBatch{Items: items}}}
 		if err := st.Send(msg); err != nil {
 			return fmt.Errorf("telemetry: transport: send logs: %w", err)
 		}
@@ -382,7 +397,7 @@ func sendBatch(st ReportStream, b Batch) error {
 		for i, it := range b.Metrics {
 			items[i] = it.Msg
 		}
-		msg := &pb.TelemetryBatch{Kind: &pb.TelemetryBatch_Metrics{Metrics: &pb.MetricBatch{Items: items}}}
+		msg := &pb.TelemetryBatch{Sequence: sequence, Kind: &pb.TelemetryBatch_Metrics{Metrics: &pb.MetricBatch{Items: items}}}
 		if err := st.Send(msg); err != nil {
 			return fmt.Errorf("telemetry: transport: send metrics: %w", err)
 		}
@@ -392,7 +407,7 @@ func sendBatch(st ReportStream, b Batch) error {
 		for i, it := range b.Payloads {
 			items[i] = it.Msg
 		}
-		msg := &pb.TelemetryBatch{Kind: &pb.TelemetryBatch_Payloads{Payloads: &pb.PayloadBatch{Items: items}}}
+		msg := &pb.TelemetryBatch{Sequence: sequence, Kind: &pb.TelemetryBatch_Payloads{Payloads: &pb.PayloadBatch{Items: items}}}
 		if err := st.Send(msg); err != nil {
 			return fmt.Errorf("telemetry: transport: send payloads: %w", err)
 		}
@@ -446,23 +461,8 @@ func (s *inflightSet) add(b Batch, epoch uint64) {
 	s.payloads = addInflight(s.payloads, b.Payloads, epoch, s.ids)
 }
 
-// release returns everything the acknowledgement that raised the epoch to
-// ackEpoch actually proves the runtime received.
-//
-// TelemetryAck carries no batch identifier and the runtime emits it on a fixed
-// ticker (runtime/internal/telemetry/server.go), so no acknowledgement can name
-// what it confirms; exact confirmation would need a protocol change. What an
-// acknowledgement does prove is that the runtime's receive loop had consumed
-// everything that reached it before the ack was emitted. An item written during
-// epoch E left this process before ack E arrived here, so the runtime held it
-// at most one network delay after ack E was emitted — comfortably before ack
-// E+1 goes out a full ack interval later. Epoch E is therefore released by the
-// acknowledgement that raises the epoch to E+2: one ack of lag, deliberately.
-// Releasing the current epoch as well — what committing the whole in-flight set
-// does — would drop items written by a cycle that raced the ack in transit:
-// they would vanish from the buffer having never arrived. That is the honesty
-// boundary: at-least-once holds, and the cost is one extra ack interval of
-// buffer occupancy plus a duplicate delivery window of the same size.
+// release commits only batches explicitly accepted or disposed by runtime ingress.
+// It does not prove durable database persistence.
 func (s *inflightSet) release(ackEpoch uint64) Batch {
 	var confirmed Batch
 	confirmed.Ops, s.ops = releaseInflight(s.ops, ackEpoch, s.ids)
@@ -488,7 +488,7 @@ func addInflight[T any](dst []inflightEntry[T], items []Item[T], epoch uint64, i
 
 func releaseInflight[T any](entries []inflightEntry[T], ackEpoch uint64, ids map[uint64]struct{}) (confirmed []Item[T], held []inflightEntry[T]) {
 	for _, e := range entries {
-		if e.epoch+1 < ackEpoch {
+		if e.epoch <= ackEpoch {
 			confirmed = append(confirmed, e.item)
 			delete(ids, e.item.ID)
 			continue

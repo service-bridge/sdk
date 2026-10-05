@@ -175,8 +175,8 @@ func TestProxyUnaryPreservesTheTransportStatus(t *testing.T) {
 	if err == nil {
 		t.Fatal("a transport failure must surface")
 	}
-	if got := Classify(err); got != RetryAlways {
-		t.Fatalf("wrapping must preserve the status: Classify = %v, want %v", got, RetryAlways)
+	if got := Classify(err); got != RetryNever {
+		t.Fatalf("wrapping must preserve the status: Classify = %v, want %v", got, RetryNever)
 	}
 	if !strings.Contains(err.Error(), "Ping") {
 		t.Fatalf("the error must name the method, got %q", err.Error())

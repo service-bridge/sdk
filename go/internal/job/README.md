@@ -112,3 +112,5 @@
 Опирается на: `internal/pb/servicebridge/v1` (контракт `Jobs`), `internal/stream` (супервизор и лестница переподключения), `internal/telemetry` (`ParseHeader`, `WithTraceContext`), `github.com/robfig/cron/v3`, stdlib (`crypto/sha256`, `encoding/json`, `sync`, `log/slog`, `context`).
 
 На него опираются: пакет `job/` в корне модуля (публичный фасад), корневой пакет `servicebridge` (объявляет задачи в `internal/registry` через `Declaration.SpecJSON` и `ContractHash`, поднимает и останавливает подписчик).
+
+`Spec.Version` обязателен: изменение closure требует новой явной версии. Канонические байты начинаются с version, поэтому executable version входит в fingerprint. Declarations хранит версии по name:fingerprint в порядке old→new; dispatch требует точного assignment fingerprint. Только последняя зарегистрированная версия запускает новый schedule; старые исполняют ранее созданные задания. Нет версии — non-retryable unsupported_version. По умолчанию одновременно32 handlers на версию; MaxConcurrent ограничен1024, вся очередь назначений1024. Потеря потока/новая эпоха/Stop отменяют контекст; stale результат подавляется.

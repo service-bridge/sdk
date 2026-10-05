@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -37,7 +38,10 @@ func Freeze(name string, def wf.Definition) (Frozen, error) {
 		return Frozen{}, err
 	}
 
-	steps := def.Steps
+	if hasLocal(def.Steps) && strings.TrimSpace(def.Version) == "" {
+		return Frozen{}, fmt.Errorf("workflow: executable version required for local closures")
+	}
+	steps := cloneExecutable(reflect.ValueOf(def.Steps)).Interface().([]wf.Step)
 	if def.Retry != nil {
 		steps = materializeRetry(steps, def.Retry)
 	}
@@ -52,6 +56,9 @@ func Freeze(name string, def wf.Definition) (Frozen, error) {
 	}
 
 	root := map[string]any{"graph": graph}
+	if def.Version != "" {
+		root["version"] = def.Version
+	}
 	if def.Retry != nil {
 		root["retry"] = canonicalRetry(def.Retry)
 	}
@@ -427,4 +434,73 @@ func escapeLiteral(s string) any {
 		return map[string]any{"literal": s}
 	}
 	return s
+}
+
+func hasLocal(steps []wf.Step) bool {
+	for _, step := range steps {
+		switch n := step.(type) {
+		case wf.Local:
+			return true
+		case wf.Parallel:
+			if hasLocal(n.Steps) {
+				return true
+			}
+		case wf.Sequence:
+			if hasLocal(n.Steps) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// cloneExecutable snapshots mutable exported containers while retaining closures
+// and immutable private expression values. It never serializes executable code.
+func cloneExecutable(v reflect.Value) reflect.Value {
+	switch v.Kind() {
+	case reflect.Interface:
+		if v.IsNil() {
+			return v
+		}
+		out := reflect.New(v.Type()).Elem()
+		out.Set(cloneExecutable(v.Elem()))
+		return out
+	case reflect.Pointer:
+		if v.IsNil() {
+			return v
+		}
+		out := reflect.New(v.Type().Elem())
+		out.Elem().Set(cloneExecutable(v.Elem()))
+		return out
+	case reflect.Slice:
+		if v.IsNil() {
+			return v
+		}
+		out := reflect.MakeSlice(v.Type(), v.Len(), v.Len())
+		for i := 0; i < v.Len(); i++ {
+			out.Index(i).Set(cloneExecutable(v.Index(i)))
+		}
+		return out
+	case reflect.Map:
+		if v.IsNil() {
+			return v
+		}
+		out := reflect.MakeMapWithSize(v.Type(), v.Len())
+		it := v.MapRange()
+		for it.Next() {
+			out.SetMapIndex(it.Key(), cloneExecutable(it.Value()))
+		}
+		return out
+	case reflect.Struct:
+		out := reflect.New(v.Type()).Elem()
+		out.Set(v)
+		for i := 0; i < v.NumField(); i++ {
+			if out.Field(i).CanSet() && v.Type().Field(i).IsExported() {
+				out.Field(i).Set(cloneExecutable(v.Field(i)))
+			}
+		}
+		return out
+	default:
+		return v
+	}
 }

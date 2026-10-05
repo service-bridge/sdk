@@ -77,3 +77,5 @@
 Опирается на: `internal/job`.
 
 На него опираются: прикладной код и корневой пакет `servicebridge`.
+
+Every job handler requires `job.WithVersion("v1")` (or Spec.Version). Retain old versions while their queued executions may still run, then drain them before removal. Changed executable code needs a changed version; the caller must make effects idempotent atomically with its business transaction.

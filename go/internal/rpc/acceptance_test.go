@@ -99,7 +99,7 @@ func (ca *inboundCA) serviceLeaf(t *testing.T, serviceID, instanceID string) tls
 // all, identified only by its CN.
 func (ca *inboundCA) runtimeLeaf(t *testing.T) tls.Certificate {
 	t.Helper()
-	return ca.issue(t, &x509.Certificate{Subject: pkix.Name{CommonName: RuntimeCommonName}})
+	return ca.issue(t, &x509.Certificate{URIs: []*url.URL{{Scheme: "spiffe", Host: "service-bridge", Path: "/runtime"}}})
 }
 
 func (ca *inboundCA) sanlessLeaf(t *testing.T, commonName string) tls.Certificate {
@@ -162,7 +162,7 @@ func TestIdentifyPeer(t *testing.T) {
 			wantID:   "svc-a",
 		},
 		{
-			name:     "SAN-less runtime CN is the proxy",
+			name:     "runtime URI is the proxy",
 			cert:     ca.runtimeLeaf(t).Leaf,
 			wantKind: PeerRuntime,
 		},
@@ -181,6 +181,7 @@ func TestIdentifyPeer(t *testing.T) {
 			cert:    ca.sanlessLeaf(t, "servicebridge-leaf").Leaf,
 			wantErr: true,
 		},
+		{name: "runtime CN without URI is refused", cert: ca.sanlessLeaf(t, "servicebridge-runtime").Leaf, wantErr: true},
 		{
 			name:    "no certificate is refused",
 			cert:    nil,
@@ -215,7 +216,7 @@ func TestIdentifyPeer(t *testing.T) {
 	}
 }
 
-func TestIdentifyPeerPrefersTheSPIFFEURIAmongSeveral(t *testing.T) {
+func TestIdentifyPeerRejectsMultipleIdentities(t *testing.T) {
 	t.Parallel()
 
 	ca := newInboundCA(t)
@@ -232,12 +233,8 @@ func TestIdentifyPeerPrefersTheSPIFFEURIAmongSeveral(t *testing.T) {
 		URIs:    []*url.URL{other, spiffe},
 	})
 
-	got, err := IdentifyPeer(leaf.Leaf)
-	if err != nil {
-		t.Fatalf("IdentifyPeer: %v", err)
-	}
-	if got.Kind != PeerService || got.ServiceID != "svc-a" || got.InstanceID != "inst-1" {
-		t.Fatalf("got %+v", got)
+	if _, err := IdentifyPeer(leaf.Leaf); !errors.Is(err, ErrPeerUnidentified) {
+		t.Fatalf("multiple identities must be refused: %v", err)
 	}
 }
 

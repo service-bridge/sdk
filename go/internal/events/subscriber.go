@@ -28,6 +28,21 @@ type Handler[T any] func(ctx context.Context, event T) error
 
 // rawHandler is what the dispatch path actually holds: decoding is closed over
 // by Subscribe so the delivery loop stays free of type parameters.
+type DeliveryInfo struct {
+	Attempt    int32
+	DeliveryID string
+	EventID    string
+	EventName  string
+	LeaseToken string
+}
+type deliveryContextKey struct{}
+
+// DeliveryFromContext returns metadata for the current leased event delivery.
+func DeliveryFromContext(ctx context.Context) (DeliveryInfo, bool) {
+	d, ok := ctx.Value(deliveryContextKey{}).(DeliveryInfo)
+	return d, ok
+}
+
 type rawHandler func(ctx context.Context, payload []byte) error
 
 // SubscriberConfig wires the delivery stream. See ./README.md.
@@ -90,6 +105,9 @@ func NewSubscriber(cfg SubscriberConfig) (*Subscriber, error) {
 	if cfg.MaxInFlight <= 0 {
 		cfg.MaxInFlight = DefaultMaxInFlight
 	}
+	if cfg.MaxInFlight > 1024 {
+		return nil, fmt.Errorf("events: max in flight exceeds 1024: %w", ErrInvalidConfig)
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -137,7 +155,11 @@ func Subscribe[T any](s *Subscriber, name string, fn Handler[T]) error {
 	codec := s.cfg.Codec
 	s.addHandler(name, func(ctx context.Context, payload []byte) error {
 		var event T
-		if err := codec.Decode(name, payload, &event); err != nil {
+		decodeName := name
+		if info, ok := DeliveryFromContext(ctx); ok {
+			decodeName = info.EventName
+		}
+		if err := codec.Decode(decodeName, payload, &event); err != nil {
 			return fmt.Errorf("decode %q: %w", name, err)
 		}
 		return fn(ctx, event)
@@ -225,6 +247,9 @@ func (s *Subscriber) onData(ctx context.Context, msg *pb.SubscribeServerMessage,
 		return
 	}
 	if !s.acquire(ctx) {
+		if ctx.Err() == nil {
+			s.nack(st, delivery.GetDeliveryId(), delivery.GetEnvelope().GetId(), "local delivery concurrency exhausted", delivery.GetLeaseToken())
+		}
 		return
 	}
 
@@ -280,6 +305,8 @@ func (s *Subscriber) acquire(ctx context.Context) bool {
 		return true
 	case <-ctx.Done():
 		return false
+	default:
+		return false
 	}
 }
 
@@ -288,25 +315,28 @@ func (s *Subscriber) release() { <-s.slots }
 func (s *Subscriber) process(ctx context.Context, d *pb.EventDelivery, st SubscribeStream) {
 	env := d.GetEnvelope()
 	if env == nil {
-		s.nack(st, d.GetDeliveryId(), "", "missing envelope")
+		s.nack(st, d.GetDeliveryId(), "", "missing envelope", d.GetLeaseToken())
 		return
 	}
 	handlers := s.handlersFor(env.GetName())
 	if len(handlers) == 0 {
-		// Routing is the runtime's job, so an unmatched name is not a local
-		// mistake to retry: acknowledge and move on.
-		s.ack(st, d.GetDeliveryId(), env.GetId())
+		s.nack(st, d.GetDeliveryId(), env.GetId(), "no registered handler", d.GetLeaseToken())
 		return
 	}
 
 	handlerCtx := s.traceContext(ctx, env.GetXSbTrace())
+	handlerCtx = context.WithValue(handlerCtx, deliveryContextKey{}, DeliveryInfo{Attempt: d.GetAttempt(), DeliveryID: d.GetDeliveryId(), EventID: env.GetId(), EventName: env.GetName(), LeaseToken: d.GetLeaseToken()})
 	for _, h := range handlers {
 		if err := invokeHandler(handlerCtx, h, env.GetPayload()); err != nil {
-			s.nack(st, d.GetDeliveryId(), env.GetId(), err.Error())
+			if ctx.Err() == nil {
+				s.nack(st, d.GetDeliveryId(), env.GetId(), err.Error(), d.GetLeaseToken())
+			}
 			return
 		}
 	}
-	s.ack(st, d.GetDeliveryId(), env.GetId())
+	if ctx.Err() == nil {
+		s.ack(st, d.GetDeliveryId(), env.GetId(), d.GetLeaseToken())
+	}
 }
 
 // traceContext puts the publisher's trace into the handler context so nested
@@ -333,10 +363,10 @@ func invokeHandler(ctx context.Context, h rawHandler, payload []byte) (err error
 	return h(ctx, payload)
 }
 
-func (s *Subscriber) ack(st SubscribeStream, deliveryID, eventID string) {
+func (s *Subscriber) ack(st SubscribeStream, deliveryID, eventID string, token ...string) {
 	msg := &pb.SubscribeClientMessage{
 		Kind: &pb.SubscribeClientMessage_Ack{
-			Ack: &pb.Ack{DeliveryId: deliveryID, EventId: []byte(eventID)},
+			Ack: &pb.Ack{LeaseToken: firstToken(token), DeliveryId: deliveryID, EventId: []byte(eventID)},
 		},
 	}
 	if err := s.send(st, msg); err != nil {
@@ -344,10 +374,10 @@ func (s *Subscriber) ack(st SubscribeStream, deliveryID, eventID string) {
 	}
 }
 
-func (s *Subscriber) nack(st SubscribeStream, deliveryID, eventID, reason string) {
+func (s *Subscriber) nack(st SubscribeStream, deliveryID, eventID, reason string, token ...string) {
 	msg := &pb.SubscribeClientMessage{
 		Kind: &pb.SubscribeClientMessage_Nack{
-			Nack: &pb.Nack{DeliveryId: deliveryID, EventId: []byte(eventID), ErrorMessage: reason},
+			Nack: &pb.Nack{LeaseToken: firstToken(token), DeliveryId: deliveryID, EventId: []byte(eventID), ErrorMessage: reason},
 		},
 	}
 	if err := s.send(st, msg); err != nil {
@@ -368,4 +398,11 @@ func (s *Subscriber) reportError(err error) {
 	if s.cfg.OnError != nil {
 		s.cfg.OnError(err)
 	}
+}
+
+func firstToken(token []string) string {
+	if len(token) > 0 {
+		return token[0]
+	}
+	return ""
 }

@@ -50,9 +50,8 @@ func newTestCA(t *testing.T) *testCA {
 	return &testCA{cert: cert, der: der, key: key}
 }
 
-// issueServerCert mirrors the runtime: CN only, no DNS or IP SAN, so hostname
-// verification cannot pass and the pinned VerifyConnection is what decides.
-func (ca *testCA) issueServerCert(t *testing.T) tls.Certificate {
+// issueServerCert mirrors the runtime URI role without DNS or IP SAN.
+func (ca *testCA) issueServerCert(t *testing.T, roles ...string) tls.Certificate {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -61,10 +60,24 @@ func (ca *testCA) issueServerCert(t *testing.T) tls.Certificate {
 	tmpl := &x509.Certificate{
 		SerialNumber: serial(t),
 		Subject:      pkix.Name{CommonName: "servicebridge-runtime"},
+		URIs:         []*url.URL{{Scheme: "spiffe", Host: "service-bridge", Path: "/runtime"}},
 		NotBefore:    time.Now().Add(-time.Minute),
 		NotAfter:     time.Now().Add(time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+	}
+	if len(roles) > 0 {
+		tmpl.URIs = nil
+		for _, raw := range roles {
+			if raw == "" {
+				continue
+			}
+			uri, err := url.Parse(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tmpl.URIs = append(tmpl.URIs, uri)
+		}
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca.cert, &key.PublicKey, ca.key)
 	if err != nil {
@@ -265,5 +278,17 @@ func TestNewTLSCertificateRejectsGarbage(t *testing.T) {
 	leaf := ca.issueLeaf(t, &priv.PublicKey, connection.Identity{ServiceID: "s", InstanceID: "i"})
 	if _, err := connection.NewTLSCertificate(leaf, []byte{0x30, 0x00}, priv); err == nil {
 		t.Error("accepted a malformed CA chain")
+	}
+}
+
+func TestPinnedTLSRejectsTrustedServiceOrAmbiguousRole(t *testing.T) {
+	ca := newTestCA(t)
+	service := connection.FormatSPIFFE(connection.Identity{ServiceID: "service", InstanceID: "instance"})
+	for _, roles := range [][]string{{""}, {service}, {connection.RuntimeSPIFFEURI, service}, {connection.RuntimeSPIFFEURI + "?role=runtime"}} {
+		server := ca.serverConfig(t)
+		server.Certificates = []tls.Certificate{ca.issueServerCert(t, roles...)}
+		if err := handshake(t, server, connection.PinnedTLSConfig(ca.cert)); err == nil {
+			t.Fatalf("trusted wrong/ambiguous role accepted: %v", roles)
+		}
 	}
 }

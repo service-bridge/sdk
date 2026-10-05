@@ -532,3 +532,28 @@ func TestValidateReadsEveryFieldOfEveryKind(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateRejectsDependencyScopeAndForwardSequence(t *testing.T) {
+	for _, steps := range [][]wf.Step{
+		{call("outside"), wf.Parallel{Control: wf.Control{ID: "group"}, Steps: []wf.Step{call("inside", "outside")}}},
+		{wf.Sequence{Control: wf.Control{ID: "group"}, Steps: []wf.Step{call("first", "later"), call("later")}}},
+	} {
+		if err := Validate("scoped", wf.Definition{Steps: steps}); err == nil {
+			t.Fatal("unexecutable dependency scope accepted")
+		}
+	}
+}
+
+func TestValidateParallelismAndReservedIdentifiers(t *testing.T) {
+	for _, limit := range []int{-1, 1025} {
+		if Validate("limits", wf.Definition{Steps: []wf.Step{call("step")}, MaxParallelism: limit}) == nil {
+			t.Errorf("parallelism %d accepted", limit)
+		}
+	}
+	if Validate("reserved", wf.Definition{Steps: []wf.Step{call("input")}}) == nil {
+		t.Fatal("reserved input step id accepted")
+	}
+	if Validate("alias", wf.Definition{Steps: []wf.Step{wf.Parallel{Control: wf.Control{ID: "group"}, ForEach: &wf.ForEach{From: wf.Path("$.input.items"), As: "step"}, Steps: []wf.Step{call("step")}}}}) == nil {
+		t.Fatal("alias shadows a step checkpoint")
+	}
+}

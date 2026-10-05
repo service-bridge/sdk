@@ -12,11 +12,6 @@ import (
 	"google.golang.org/grpc/peer"
 )
 
-// RuntimeCommonName is the Subject CN of the runtime's own leaf certificate. It
-// must stay byte-identical to the CN stamped in runtime/internal/tlsca; a
-// mismatch makes every proxied call look like an unidentified peer.
-const RuntimeCommonName = "servicebridge-runtime"
-
 // actionRPCHandle is the PolicyRule action that governs inbound RPC.
 const actionRPCHandle = "rpc.handle"
 
@@ -68,17 +63,8 @@ type Peer struct {
 
 // IdentifyPeer reads the caller's identity off its verified leaf certificate.
 //
-// Identification is positive on both branches, never residual. A leaf with URI
-// SANs must yield a ServiceBridge SPIFFE identity — if none of its URIs parse,
-// the peer is refused rather than waved through, because a parse failure that
-// opens the door is a parse failure an attacker can arrange. A leaf with no URI
-// SAN at all is only the runtime's proxy, and only when its CN says so; the
-// runtime never issues a SAN-less leaf to a service, so the two shapes cannot
-// be confused.
-//
-// The certificate reaching this function has already been verified against the
-// pinned CA by the TLS handshake, so CN is a trustworthy claim here and nowhere
-// else.
+// The handshake verifies the chain. Exactly one URI SAN then identifies either
+// the runtime role or one service instance; common names grant no authority.
 func IdentifyPeer(cert *x509.Certificate) (Peer, error) {
 	const op = "rpc: identify peer"
 
@@ -86,22 +72,17 @@ func IdentifyPeer(cert *x509.Certificate) (Peer, error) {
 		return Peer{}, fmt.Errorf("%s: no client certificate: %w", op, ErrPeerUnidentified)
 	}
 
-	if len(cert.URIs) > 0 {
-		for _, u := range cert.URIs {
-			id, err := connection.ParseSPIFFE(u.String())
-			if err != nil {
-				continue
-			}
-			return Peer{Kind: PeerService, ServiceID: id.ServiceID, InstanceID: id.InstanceID}, nil
-		}
-		return Peer{}, fmt.Errorf("%s: no URI SAN carries a ServiceBridge identity: %w", op, ErrPeerUnidentified)
+	if len(cert.URIs) != 1 {
+		return Peer{}, fmt.Errorf("%s: expected exactly one SPIFFE URI: %w", op, ErrPeerUnidentified)
 	}
-
-	if cert.Subject.CommonName == RuntimeCommonName {
+	if cert.URIs[0].String() == connection.RuntimeSPIFFEURI {
 		return Peer{Kind: PeerRuntime}, nil
 	}
-	return Peer{}, fmt.Errorf("%s: no URI SAN and CN %q is not the runtime: %w",
-		op, cert.Subject.CommonName, ErrPeerUnidentified)
+	id, err := connection.ParseSPIFFE(cert.URIs[0].String())
+	if err != nil {
+		return Peer{}, fmt.Errorf("%s: invalid SPIFFE URI: %w", op, ErrPeerUnidentified)
+	}
+	return Peer{Kind: PeerService, ServiceID: id.ServiceID, InstanceID: id.InstanceID}, nil
 }
 
 // PeerFromContext identifies the caller of the inbound gRPC call carried by ctx.

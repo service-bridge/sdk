@@ -205,7 +205,7 @@ type Request struct {
 	// callees advertise; an empty hash matches only an empty one.
 	ContractHash string
 	// IdempotencyKey is caller-supplied and never generated. Its presence is
-	// what unlocks retrying the ambiguous codes.
+	// a correlation/dedup key; it does not authorize ambiguous retries.
 	IdempotencyKey string
 	BusinessKey    string
 }
@@ -217,14 +217,12 @@ func (r Request) subject() string { return "rpc.call:" + r.Service + "/" + r.Met
 // Unary runs one logical call to completion, retrying on the same telemetry
 // operation until the ladder is exhausted.
 func (c *Client) Unary(ctx context.Context, req Request) ([]byte, error) {
-	cands := c.candidates(req)
-
 	var op *telemetry.Op
 	callCtx := ctx
 	var lastErr error
 
 	for attempt := 0; attempt < c.retry.MaxAttempts; attempt++ {
-		res, selErr := c.reserve(cands, req)
+		res, selErr := c.reserve(c.candidates(req), req)
 		if selErr != nil {
 			lastErr = selErr
 			// A retry re-runs selection: an instance leaving the open state or

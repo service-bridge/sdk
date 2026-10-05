@@ -167,3 +167,5 @@ Gauge **сохраняет значение между окнами, но пер
 - сбор метрик и мост `slog` — кладут точки и записи через `Ring.PushMetric` / `Ring.PushLog`;
 - домены RPC, HTTP и пользовательских под-операций — стартуют и закрывают операции через `Recorder`;
 - слой реестра — источник снапшота `CaptureModes`, который кладётся в `Policy.Set`.
+
+Каждый wire batch получает строго возрастающий sequence в пределах stream. Cumulative acknowledgedSequence освобождает только <=ACK записи текущего stream; старые, нулевые или будущие ACK не подтверждают новый пакет. ACK означает принятие/утилизацию ingress, а не database commit: persistence остаётся best effort, drop counters наблюдаемы. Все виды вместе ограничены MaxInflightItems (1024 по умолчанию); drain запрещает новые Send. Stop отменяет Send/Recv до ожидания mutex/workers. Metrics registry ограничен 4096 сериями, 32 labels, именами/ключами 256 bytes, значениями 1024 bytes и 256 histogram bounds; отказ виден в RejectedSeries. Старые instance series выгружаются и удаляются при identity rotation; публичные handles разрешают новую identity.

@@ -401,15 +401,22 @@ func (s *Storage) Complete(ctx context.Context, res Result) error {
 	if len(res.Done) == 0 && len(res.Retry) == 0 && len(res.Failed) == 0 {
 		return nil
 	}
+	removed := 0
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		if len(res.Done) > 0 {
 			ids, err := idListJSON(res.Done)
 			if err != nil {
 				return err
 			}
-			if _, err := tx.StmtContext(ctx, s.deleteStmt).ExecContext(ctx, ids); err != nil {
+			result, err := tx.StmtContext(ctx, s.deleteStmt).ExecContext(ctx, ids)
+			if err != nil {
 				return err
 			}
+			n, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			removed = int(n)
 		}
 		retry := tx.StmtContext(ctx, s.retryStmt)
 		for _, r := range res.Retry {
@@ -428,7 +435,7 @@ func (s *Storage) Complete(ctx context.Context, res Result) error {
 	if err != nil {
 		return fmt.Errorf("outbox: complete batch: %w", err)
 	}
-	s.addRows(-len(res.Done))
+	s.addRows(-removed)
 	return nil
 }
 
@@ -650,4 +657,67 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// ListFailed returns a bounded page ordered by immutable event ID. Pass the last
+// returned ID as cursor; records preserve the original retry identity.
+func (s *Storage) ListFailed(ctx context.Context, limit int, cursor string) ([]Record, error) {
+	if s.isClosed() {
+		return nil, ErrClosed
+	}
+	if limit < 1 || limit > 1000 {
+		return nil, fmt.Errorf("outbox: failed page limit must be 1..1000")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id,name,payload,payload_json,contract_hash,partition_key,idempotency_key,fire_and_forget,headers,occurred_at_ms,enqueued_at_ms,attempts,last_error,next_attempt_at_ms,x_sb_trace FROM event_outbox WHERE status='failed' AND id>? ORDER BY id LIMIT ?`, cursor, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]Record, 0, limit)
+	for rows.Next() {
+		var r Record
+		var headers string
+		var faf int
+		if err := rows.Scan(&r.ID, &r.Name, &r.Payload, &r.PayloadJSON, &r.ContractHash, &r.PartitionKey, &r.IdempotencyKey, &faf, &headers, &r.OccurredAtMs, &r.EnqueuedAtMs, &r.Attempts, &r.LastError, &r.NextAttemptAtMs, &r.Trace); err != nil {
+			return nil, err
+		}
+		r.FireAndForget = faf != 0
+		if err := json.Unmarshal([]byte(headers), &r.Headers); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// RetryFailed preserves ID and attempts while explicitly rearming a failed row.
+func (s *Storage) RetryFailed(ctx context.Context, id string) (bool, error) {
+	if s.isClosed() {
+		return false, ErrClosed
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE event_outbox SET status='pending',last_error='',next_attempt_at_ms=0 WHERE id=? AND status='failed'`, id)
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	return n == 1, err
+}
+
+// DiscardFailed removes only a terminally failed row and releases its cap slot.
+func (s *Storage) DiscardFailed(ctx context.Context, id string) (bool, error) {
+	s.enqueueMu.Lock()
+	defer s.enqueueMu.Unlock()
+	if s.isClosed() {
+		return false, ErrClosed
+	}
+	result, err := s.db.ExecContext(ctx, `DELETE FROM event_outbox WHERE id=? AND status='failed'`, id)
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	s.addRows(-int(n))
+	return n == 1, nil
 }

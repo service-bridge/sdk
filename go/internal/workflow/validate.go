@@ -40,6 +40,8 @@ var (
 	ErrEmptyTarget             = errors.New("target must not be empty")
 	ErrNegativeDuration        = errors.New("sleep duration must not be negative")
 	ErrForEachAlias            = errors.New("forEach alias must match ^[a-z0-9_]+$")
+	ErrDependencyScope         = errors.New("waitFor must name a sibling in the same scope")
+	ErrSequenceDependency      = errors.New("sequence waitFor must name an earlier sibling")
 	ErrMissingFunc             = errors.New("local step needs a function")
 )
 
@@ -74,6 +76,9 @@ func Validate(name string, def wf.Definition) error {
 	if name == "" {
 		return &ValidationError{Reason: ErrEmptyWorkflowName}
 	}
+	if def.MaxParallelism < 0 || def.MaxParallelism > 1024 {
+		return &ValidationError{Workflow: name, Field: "maxParallelism", Reason: ErrInvalidConfig}
+	}
 	if len(def.Steps) == 0 {
 		return &ValidationError{Workflow: name, Reason: ErrNoSteps}
 	}
@@ -82,8 +87,9 @@ func Validate(name string, def wf.Definition) error {
 		workflow: name,
 		ids:      make(map[string]struct{}),
 		deps:     make(map[string][]string),
+		scopes:   map[string]string{}, positions: map[string]int{}, sequential: map[string]bool{}, aliases: map[string]string{},
 	}
-	if err := v.walk(def.Steps, 0); err != nil {
+	if err := v.walk(def.Steps, 0, "", false); err != nil {
 		return err
 	}
 	return v.checkDependencies()
@@ -95,19 +101,29 @@ type validator struct {
 	deps     map[string][]string
 	// order keeps declaration order so the cycle walk reports the same step on
 	// every run; a map walk would name a different one each time.
-	order []string
-	total int
+	order      []string
+	total      int
+	scopes     map[string]string
+	positions  map[string]int
+	sequential map[string]bool
+	aliases    map[string]string
 }
 
 func (v *validator) fail(step, field string, reason error) error {
 	return &ValidationError{Workflow: v.workflow, Step: step, Field: field, Reason: reason}
 }
 
-func (v *validator) walk(steps []wf.Step, depth int) error {
+func (v *validator) walk(steps []wf.Step, depth int, parent string, sequential bool) error {
 	if depth > maxDepth {
 		return v.fail("", "", fmt.Errorf("%w: %d levels", ErrDepth, maxDepth))
 	}
-	for _, step := range steps {
+	for index, step := range steps {
+		if step != nil {
+			id := step.Common().ID
+			v.scopes[id] = parent
+			v.positions[id] = index
+			v.sequential[id] = sequential
+		}
 		v.total++
 		if v.total > maxSteps {
 			return v.fail("", "", fmt.Errorf("%w: %d steps", ErrStepCount, maxSteps))
@@ -125,7 +141,7 @@ func (v *validator) step(step wf.Step, depth int) error {
 	}
 
 	common := step.Common()
-	if !stepIDPattern.MatchString(common.ID) {
+	if !stepIDPattern.MatchString(common.ID) || common.ID == stateInputKey {
 		return v.fail(common.ID, "id", fmt.Errorf("%w: got %q", ErrStepID, common.ID))
 	}
 	if _, dup := v.ids[common.ID]; dup {
@@ -204,10 +220,10 @@ func (v *validator) step(step wf.Step, depth int) error {
 		return v.startOpts(s.ID, s.Opts)
 
 	case wf.Parallel:
-		return v.group(s.ID, s.Steps, s.ForEach, depth)
+		return v.group(s.ID, s.Steps, s.ForEach, depth, false)
 
 	case wf.Sequence:
-		return v.group(s.ID, s.Steps, s.ForEach, depth)
+		return v.group(s.ID, s.Steps, s.ForEach, depth, true)
 
 	case wf.Local:
 		if s.Fn == nil {
@@ -220,7 +236,7 @@ func (v *validator) step(step wf.Step, depth int) error {
 	}
 }
 
-func (v *validator) group(id string, steps []wf.Step, each *wf.ForEach, depth int) error {
+func (v *validator) group(id string, steps []wf.Step, each *wf.ForEach, depth int, sequential bool) error {
 	if len(steps) == 0 {
 		return v.fail(id, "steps", ErrEmptyGroup)
 	}
@@ -228,11 +244,12 @@ func (v *validator) group(id string, steps []wf.Step, each *wf.ForEach, depth in
 		if err := v.path(id, "forEach.from", each.From); err != nil {
 			return err
 		}
-		if !stepIDPattern.MatchString(each.As) {
+		v.aliases[each.As] = id
+		if !stepIDPattern.MatchString(each.As) || each.As == stateInputKey {
 			return v.fail(id, "forEach.as", fmt.Errorf("%w: got %q", ErrForEachAlias, each.As))
 		}
 	}
-	return v.walk(steps, depth+1)
+	return v.walk(steps, depth+1, id, sequential)
 }
 
 func (v *validator) compensation(step wf.Step, common wf.Control) error {
@@ -386,6 +403,11 @@ func (v *validator) predicateNode(id, field string, node any) error {
 // checkDependencies runs after every id is known, because a step may wait for
 // one declared later in the graph.
 func (v *validator) checkDependencies() error {
+	for alias, owner := range v.aliases {
+		if _, exists := v.ids[alias]; exists {
+			return v.fail(owner, "forEach.as", ErrForEachAlias)
+		}
+	}
 	const (
 		unvisited = iota
 		onStack
@@ -405,6 +427,12 @@ func (v *validator) checkDependencies() error {
 		for _, dep := range v.deps[id] {
 			if _, known := v.ids[dep]; !known {
 				return v.fail(id, "waitFor", fmt.Errorf("%w: %q", ErrUnknownDependency, dep))
+			}
+			if v.scopes[id] != v.scopes[dep] {
+				return v.fail(id, "waitFor", ErrDependencyScope)
+			}
+			if v.sequential[id] && v.positions[dep] >= v.positions[id] {
+				return v.fail(id, "waitFor", ErrSequenceDependency)
 			}
 			if err := visit(dep); err != nil {
 				return err

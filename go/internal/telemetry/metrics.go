@@ -20,6 +20,11 @@ var ErrMetricConflict = errors.New("metric already registered with a different s
 // ErrInvalidBounds reports histogram bounds that cannot describe buckets.
 var ErrInvalidBounds = errors.New("invalid histogram bounds")
 
+// ErrMetricBudget means the bounded registry cannot admit another series.
+var ErrMetricBudget = errors.New("metric series budget exhausted")
+
+const DefaultMaxMetricSeries = 4096
+
 // Labels are the dimensions one metric series is keyed by.
 type Labels map[string]string
 
@@ -59,8 +64,9 @@ func DefaultHistogramBounds() []float64 {
 type Metrics struct {
 	sink MetricSink
 
-	mu     sync.Mutex
-	series map[string]*series
+	mu       sync.Mutex
+	series   map[string]*series
+	rejected uint64
 	// order preserves creation order so a drain emits points deterministically;
 	// Go map iteration would reshuffle them on every flush.
 	order []*series
@@ -265,6 +271,19 @@ func (m *Metrics) resolve(
 	labels Labels,
 	bounds []float64,
 ) (*series, error) {
+	invalid := name == "" || len(name) > 256 || len(instanceID) > 256 || len(unit) > 256 || len(labels) > 32 || strings.ContainsRune(name, '\x00') || strings.ContainsRune(instanceID, '\x00') || strings.ContainsRune(unit, '\x00')
+	for key, value := range labels {
+		if len(key) > 256 || len(value) > 1024 || strings.ContainsRune(key, '\x00') || strings.ContainsRune(value, '\x00') {
+			invalid = true
+			break
+		}
+	}
+	if invalid {
+		m.mu.Lock()
+		m.rejected++
+		m.mu.Unlock()
+		return nil, fmt.Errorf("metric metadata budget: %w", ErrMetricBudget)
+	}
 	keys, copied := normalizeLabels(labels)
 	key := seriesKey(kind, name, instanceID, keys, copied)
 
@@ -281,13 +300,17 @@ func (m *Metrics) resolve(
 		return existing, nil
 	}
 
+	if len(m.series) >= DefaultMaxMetricSeries {
+		m.rejected++
+		return nil, ErrMetricBudget
+	}
 	s := &series{
 		kind:       kind,
 		name:       name,
 		instanceID: instanceID,
 		labels:     copied,
 		unit:       unit,
-		bounds:     bounds,
+		bounds:     append([]float64(nil), bounds...),
 	}
 	if kind == pb.MetricKind_METRIC_KIND_HISTOGRAM {
 		s.counts = make([]uint64, len(bounds)+1)
@@ -332,6 +355,9 @@ func seriesKey(kind pb.MetricKind, name, instanceID string, keys []string, label
 }
 
 func validateBounds(bounds []float64) error {
+	if len(bounds) > 256 {
+		return ErrInvalidBounds
+	}
 	if len(bounds) == 0 {
 		return fmt.Errorf("no bounds: %w", ErrInvalidBounds)
 	}
@@ -384,4 +410,27 @@ func encodeBuckets(bounds []float64, counts []uint64) []byte {
 	buf = strconv.AppendUint(buf, cumulative, 10)
 	buf = append(buf, '}', ']')
 	return buf
+}
+
+// RejectedSeries reports admissions rejected by the cardinality bound.
+func (m *Metrics) RejectedSeries() uint64 { m.mu.Lock(); defer m.mu.Unlock(); return m.rejected }
+
+// RetireExcept bounds registry lifetime across identity rotation. Flush pending
+// values before removing retired series; public handles resolve the new identity.
+func (m *Metrics) RetireExcept(instanceID string) {
+	m.Flush(nowUnixMs())
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	kept := make([]*series, 0, len(m.order))
+	for _, s := range m.order {
+		if s.instanceID == instanceID {
+			kept = append(kept, s)
+		}
+	}
+	for key, s := range m.series {
+		if s.instanceID != instanceID {
+			delete(m.series, key)
+		}
+	}
+	m.order = kept
 }

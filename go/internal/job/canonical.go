@@ -20,6 +20,7 @@ import (
 // round trip and an InvalidArgument at start, so they are checked here, where
 // the job is written.
 var (
+	ErrVersion        = errors.New("job executable version is required")
 	ErrNoTrigger      = errors.New("job needs exactly one trigger")
 	ErrCronFieldCount = errors.New("cron expression must have five fields, seconds are not one of them")
 	ErrCronExpr       = errors.New("cron expression is not parseable")
@@ -151,6 +152,7 @@ func NewAtTrigger(t time.Time) (Trigger, error) {
 // make the SDK a second source of truth that drifts on the first settings
 // change.
 type Spec struct {
+	Version       string
 	Trigger       Trigger
 	Catchup       CatchupPolicy
 	Overlap       OverlapPolicy
@@ -166,6 +168,7 @@ type Spec struct {
 // CanonicalJobSpec). Field order here is key order in the encoded JSON, so this
 // struct mirrors the runtime declaration line for line.
 type canonicalSpec struct {
+	Version       string           `json:"version"`
 	Trigger       canonicalTrigger `json:"trigger"`
 	Catchup       string           `json:"catchup,omitempty"`
 	Overlap       string           `json:"overlap,omitempty"`
@@ -231,6 +234,9 @@ func (s Spec) Validate() error {
 	if s.MaxAttempts < 0 || s.LeaseTTLMs < 0 || s.MaxConcurrent < 0 {
 		return fmt.Errorf("job: validate spec: %w", ErrNegativeLimit)
 	}
+	if s.MaxConcurrent > 1024 {
+		return fmt.Errorf("job: maxConcurrent exceeds 1024")
+	}
 	if s.Retry != nil && s.Retry.InitialMs <= 0 {
 		return fmt.Errorf("job: validate spec: %w", ErrRetryInitial)
 	}
@@ -245,7 +251,11 @@ func (s Spec) CanonicalJSON() ([]byte, error) {
 	if err := s.Validate(); err != nil {
 		return nil, err
 	}
+	if strings.TrimSpace(s.Version) == "" {
+		return nil, ErrVersion
+	}
 	c := canonicalSpec{
+		Version:       s.Version,
 		Trigger:       s.Trigger.canonical(),
 		Catchup:       string(s.Catchup),
 		Overlap:       string(s.Overlap),
@@ -342,6 +352,11 @@ func (d *Declarations) Add(name string, spec Spec, h Handler) (Declaration, erro
 		return Declaration{}, fmt.Errorf("job: declare %q: %w", name, err)
 	}
 
+	spec.Deps = append([]Dep(nil), spec.Deps...)
+	if spec.Retry != nil {
+		retry := *spec.Retry
+		spec.Retry = &retry
+	}
 	decl := Declaration{
 		Name:         name,
 		Spec:         spec,
@@ -352,20 +367,32 @@ func (d *Declarations) Add(name string, spec Spec, h Handler) (Declaration, erro
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if _, dup := d.byName[name]; dup {
+	key := name + ":" + decl.ContractHash
+	if _, dup := d.byName[key]; dup {
 		return Declaration{}, fmt.Errorf("job: declare %q: %w", name, ErrDuplicateName)
 	}
-	d.byName[name] = decl
-	d.order = append(d.order, name)
+	d.byName[key] = decl
+	d.order = append(d.order, key)
 	return decl, nil
 }
 
 // Lookup resolves an incoming execution to its declaration.
-func (d *Declarations) Lookup(name string) (Declaration, bool) {
+func (d *Declarations) Lookup(name string, fingerprint ...string) (Declaration, bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	decl, ok := d.byName[name]
-	return decl, ok
+	if len(fingerprint) == 1 {
+		decl, ok := d.byName[name+":"+fingerprint[0]]
+		return decl, ok
+	}
+	// Legacy declaration inspection returns the latest retained version. Dispatch
+	// always supplies an exact fingerprint.
+	for i := len(d.order) - 1; i >= 0; i-- {
+		decl := d.byName[d.order[i]]
+		if decl.Name == name {
+			return decl, true
+		}
+	}
+	return Declaration{}, false
 }
 
 // Each walks the declarations in the order they were added, so the register

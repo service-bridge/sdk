@@ -29,6 +29,7 @@ var ErrPermanent = internaljob.ErrPermanent
 // job reaches the runtime, so they surface at the declaration, not at the first
 // fire. Match them with errors.Is.
 var (
+	ErrVersion        = internaljob.ErrVersion
 	ErrNoTrigger      = internaljob.ErrNoTrigger
 	ErrCronFieldCount = internaljob.ErrCronFieldCount
 	ErrCronExpr       = internaljob.ErrCronExpr
@@ -138,3 +139,6 @@ func WithMaxConcurrent(n int) Option {
 func WithRetry(p RetryPolicy) Option {
 	return func(s *Spec) { s.Retry = &p }
 }
+
+// WithVersion declares the immutable executable version of this handler.
+func WithVersion(version string) Option { return func(s *Spec) { s.Version = version } }

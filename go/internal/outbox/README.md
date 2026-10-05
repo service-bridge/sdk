@@ -96,3 +96,5 @@
 Опирается на: `modernc.org/sqlite` (драйвер), `database/sql`, `encoding/json` (заголовки и списки идентификаторов), stdlib.
 
 На него опирается: `internal/events` — публикация пишет сюда, дренаж читает и применяет исход.
+
+Операторская recovery: `ListFailed(ctx,limit1..1000,cursorID)`, `RetryFailed(ctx,id)` сохраняет исходные ID/attempts, `DiscardFailed(ctx,id)` удаляет только failed. Pending/inflight защищены. Учёт row cap использует фактические RowsAffected: повторный Complete с уже удалёнными или дублированными ID не освобождает лишние слоты. Нулевая настройка row cap явно отключает лимит строк.

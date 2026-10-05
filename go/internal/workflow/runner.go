@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -111,8 +112,8 @@ type RunContext struct {
 	Compensating bool
 	// CancelReason mirrors the assignment: 'user_cancel' or 'step_failure'.
 	CancelReason string
-	// MaxParallelism caps how many steps of one level run at once. Zero is
-	// unlimited.
+	// MaxParallelism caps concurrent operation steps across the entire run.
+	// Zero selects 64; accepted maximum is 1024. Groups do not consume slots.
 	MaxParallelism int
 }
 
@@ -198,8 +199,14 @@ func (r *Runner) Run(ctx context.Context, steps []wf.Step, rc RunContext) (Outco
 		return Outcome{}, fmt.Errorf("workflow: run: %w: empty run id", ErrInvalidConfig)
 	}
 
-	ex := &execution{runner: r, rc: rc}
+	if rc.MaxParallelism < 0 || rc.MaxParallelism > 1024 {
+		return Outcome{}, fmt.Errorf("workflow: max parallelism must be 0..1024: %w", ErrInvalidConfig)
+	}
+	if rc.MaxParallelism == 0 {
+		rc.MaxParallelism = 64
+	}
 	state := newRunState(rc.State)
+	ex := &execution{runner: r, rc: rc, slots: make(chan struct{}, rc.MaxParallelism), checkpoints: state}
 
 	if rc.Compensating {
 		if err := ex.compensate(ctx, steps, state); err != nil {
@@ -224,6 +231,9 @@ type execution struct {
 	mu           sync.Mutex
 	parked       bool
 	parkedStepID string
+	slots        chan struct{}
+	checkpoints  *runState
+	expanded     int
 }
 
 func (e *execution) markParked(stepID string) {
@@ -262,6 +272,11 @@ func (e *execution) runLevels(ctx context.Context, steps []wf.Step, st *runState
 
 		ready := readySteps(steps, st)
 		if len(ready) == 0 {
+			for _, step := range steps {
+				if !st.isDone(step.Common().ID) {
+					return fmt.Errorf("workflow: step %q has unresolved dependencies", step.Common().ID)
+				}
+			}
 			return nil
 		}
 		if e.rc.MaxParallelism > 0 && len(ready) > e.rc.MaxParallelism {
@@ -302,6 +317,14 @@ func (e *execution) runSequential(ctx context.Context, steps []wf.Step, st *runS
 		if e.isParked() {
 			return nil
 		}
+		if st.isDone(step.Common().ID) {
+			continue
+		}
+		for _, dep := range step.Common().WaitFor {
+			if !st.isDone(dep) {
+				return fmt.Errorf("workflow: sequence step %q waits for incomplete %q", step.Common().ID, dep)
+			}
+		}
 		if err := e.executeStep(ctx, step, st, parent); err != nil {
 			return err
 		}
@@ -334,6 +357,19 @@ func readySteps(steps []wf.Step, st *runState) []wf.Step {
 // it for exactly as long as the runtime keeps answering "retry".
 func (e *execution) executeStep(ctx context.Context, step wf.Step, st *runState, parent string) error {
 	common := step.Common()
+	if st.isDone(common.ID) {
+		return nil
+	}
+	switch step.(type) {
+	case wf.Parallel, wf.Sequence:
+	default:
+		select {
+		case e.slots <- struct{}{}:
+			defer func() { <-e.slots }()
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("workflow: run %s: step %q: %w", e.rc.RunID, common.ID, err)
@@ -345,7 +381,7 @@ func (e *execution) executeStep(ctx context.Context, step wf.Step, st *runState,
 			return fmt.Errorf("workflow: run %s: step %q: when: %w", e.rc.RunID, common.ID, err)
 		}
 		if !holds {
-			st.set(common.ID, nil)
+			e.completed(st, common.ID, nil)
 			return nil
 		}
 	}
@@ -370,7 +406,7 @@ func (e *execution) executeStep(ctx context.Context, step wf.Step, st *runState,
 		// The runtime already has an output for this step: the run is being
 		// replayed and executing again would repeat the effect.
 		if begin.AlreadyDone {
-			st.set(common.ID, begin.Output)
+			e.completed(st, common.ID, begin.Output)
 			return nil
 		}
 
@@ -394,7 +430,7 @@ func (e *execution) executeStep(ctx context.Context, step wf.Step, st *runState,
 			}); err != nil {
 				return err
 			}
-			st.set(common.ID, output)
+			e.completed(st, common.ID, output)
 			return nil
 		}
 
@@ -666,16 +702,35 @@ func (e *execution) dispatchGroup(
 	parallel bool,
 	st *runState,
 ) (any, error) {
-	iterations, err := e.iterations(common, steps, each, st)
+	items, err := e.groupItems(common, steps, each, st)
 	if err != nil {
 		return nil, err
 	}
+	count := 1
+	if each != nil {
+		count = len(items)
+	}
+	iterationAt := func(index int) iteration {
+		if each == nil {
+			return iteration{steps: steps}
+		}
+		suffix := strconv.Itoa(index)
+		return iteration{steps: rewriteChildIDs(steps, suffix), bindings: map[string]any{each.As: items[index]}, suffix: suffix}
+	}
 
-	output := make(map[string]any, len(iterations)*len(steps))
+	output := make(map[string]any, count*len(steps))
 	var outputMu sync.Mutex
 
 	runOne := func(ctx context.Context, it iteration) error {
 		sub := newRunState(st.snapshot())
+		// Concrete checkpoint ids survive resume; template aliases are local to
+		// this branch, so $.charge never reads another iteration's output.
+		for _, child := range it.steps {
+			if value, ok := e.checkpoints.get(child.Common().ID); ok {
+				sub.set(child.Common().ID, value)
+				sub.set(templateID(child.Common().ID), value)
+			}
+		}
 		for name, value := range it.bindings {
 			sub.set(name, value)
 		}
@@ -713,21 +768,41 @@ func (e *execution) dispatchGroup(
 		return nil
 	}
 
-	if !parallel || len(iterations) == 1 {
-		for _, it := range iterations {
-			if err := runOne(ctx, it); err != nil {
+	if !parallel || count <= 1 {
+		for index := 0; index < count; index++ {
+			if e.isParked() {
+				break
+			}
+			if err := runOne(ctx, iterationAt(index)); err != nil {
 				return nil, err
 			}
 		}
 		return e.groupOutput(output), nil
 	}
-
 	g, gctx := errgroup.WithContext(ctx)
-	if e.rc.MaxParallelism > 0 {
-		g.SetLimit(e.rc.MaxParallelism)
-	}
-	for _, it := range iterations {
-		g.Go(func() error { return runOne(gctx, it) })
+	next := 0
+	var iterationMu sync.Mutex
+	for worker := 0; worker < count && worker < e.rc.MaxParallelism; worker++ {
+		g.Go(func() error {
+			for {
+				if err := gctx.Err(); err != nil {
+					return err
+				}
+				if e.isParked() {
+					return nil
+				}
+				iterationMu.Lock()
+				index := next
+				next++
+				iterationMu.Unlock()
+				if index >= count {
+					return nil
+				}
+				if err := runOne(gctx, iterationAt(index)); err != nil {
+					return err
+				}
+			}
+		})
 	}
 	if err := g.Wait(); err != nil {
 		return nil, err
@@ -745,35 +820,38 @@ func (e *execution) groupOutput(output map[string]any) any {
 	return output
 }
 
-func (e *execution) iterations(common wf.Control, steps []wf.Step, each *wf.ForEach, st *runState) ([]iteration, error) {
+func (e *execution) groupItems(common wf.Control, steps []wf.Step, each *wf.ForEach, st *runState) ([]any, error) {
 	if each == nil {
-		return []iteration{{steps: steps}}, nil
+		return nil, nil
 	}
-
 	from, err := EvalPath(each.From, st.snapshot())
 	if err != nil {
-		return nil, fmt.Errorf("workflow: step %q: forEach.from: %w", common.ID, err)
+		return nil, fmt.Errorf("workflow: step %q: foreach: %w", common.ID, err)
 	}
 	items, ok := from.([]any)
 	if !ok {
-		return nil, fmt.Errorf("workflow: step %q: forEach.from: %w: got %T",
-			common.ID, ErrPathType, from)
+		return nil, fmt.Errorf("workflow: step %q: foreach: %w: got %T", common.ID, ErrPathType, from)
 	}
+	units := len(flattenSteps(steps, nil))
+	if units == 0 {
+		return nil, fmt.Errorf("workflow: foreach: %w", ErrEmptyGroup)
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(items) > 10000/units || e.expanded > 10000-len(items)*units {
+		return nil, fmt.Errorf("workflow expanded step budget exceeded (10000)")
+	}
+	e.expanded += len(items) * units
+	return items, nil
+}
 
-	out := make([]iteration, 0, len(items))
-	for i, item := range items {
-		suffix := strconv.Itoa(i)
-		children := make([]wf.Step, 0, len(steps))
-		for _, child := range steps {
-			children = append(children, rewriteStepIDs(child, suffix))
-		}
-		out = append(out, iteration{
-			steps:    children,
-			bindings: map[string]any{each.As: item},
-			suffix:   suffix,
-		})
+func templateID(id string) string { base, _, _ := strings.Cut(id, ":"); return base }
+func (e *execution) completed(st *runState, id string, value any) {
+	st.set(id, value)
+	if id != templateID(id) {
+		st.set(templateID(id), value)
 	}
-	return out, nil
+	e.checkpoints.set(id, value)
 }
 
 // rewriteStepIDs gives one fanout iteration its own step ids, so the runtime
@@ -781,37 +859,47 @@ func (e *execution) iterations(common wf.Control, steps []wf.Step, each *wf.ForE
 func rewriteStepIDs(step wf.Step, suffix string) wf.Step {
 	switch s := step.(type) {
 	case wf.Call:
-		s.ID += ":" + suffix
+		s.Control = rewriteControl(s.Control, suffix)
 		return s
 	case wf.Publish:
-		s.ID += ":" + suffix
+		s.Control = rewriteControl(s.Control, suffix)
 		return s
 	case wf.Sleep:
-		s.ID += ":" + suffix
+		s.Control = rewriteControl(s.Control, suffix)
 		return s
 	case wf.WaitEvent:
-		s.ID += ":" + suffix
+		s.Control = rewriteControl(s.Control, suffix)
 		return s
 	case wf.WaitSignal:
-		s.ID += ":" + suffix
+		s.Control = rewriteControl(s.Control, suffix)
 		return s
 	case wf.SubWorkflow:
-		s.ID += ":" + suffix
+		s.Control = rewriteControl(s.Control, suffix)
 		return s
 	case wf.Local:
-		s.ID += ":" + suffix
+		s.Control = rewriteControl(s.Control, suffix)
 		return s
 	case wf.Parallel:
-		s.ID += ":" + suffix
+		s.Control = rewriteControl(s.Control, suffix)
 		s.Steps = rewriteChildIDs(s.Steps, suffix)
 		return s
 	case wf.Sequence:
-		s.ID += ":" + suffix
+		s.Control = rewriteControl(s.Control, suffix)
 		s.Steps = rewriteChildIDs(s.Steps, suffix)
 		return s
 	default:
 		return step
 	}
+}
+
+func rewriteControl(c wf.Control, suffix string) wf.Control {
+	c.ID += ":" + suffix
+	deps := make([]string, len(c.WaitFor))
+	for i, dep := range c.WaitFor {
+		deps[i] = dep + ":" + suffix
+	}
+	c.WaitFor = deps
+	return c
 }
 
 func rewriteChildIDs(steps []wf.Step, suffix string) []wf.Step {
@@ -825,7 +913,10 @@ func rewriteChildIDs(steps []wf.Step, suffix string) []wf.Step {
 // compensate walks the completed steps backwards and runs the reverse action of
 // every one that declared it.
 func (e *execution) compensate(ctx context.Context, steps []wf.Step, st *runState) error {
-	flat := flattenSteps(steps, nil)
+	flat, err := e.compensationSteps(steps, st)
+	if err != nil {
+		return err
+	}
 	var firstFailure error
 
 	for i := len(flat) - 1; i >= 0; i-- {
@@ -833,7 +924,8 @@ func (e *execution) compensate(ctx context.Context, steps []wf.Step, st *runStat
 			return fmt.Errorf("workflow: compensate run %s: %w", e.rc.RunID, err)
 		}
 
-		step := flat[i]
+		step := flat[i].step
+		scoped := flat[i].state
 		common := step.Common()
 		if common.Compensate == nil {
 			continue
@@ -846,7 +938,7 @@ func (e *execution) compensate(ctx context.Context, steps []wf.Step, st *runStat
 			continue
 		}
 
-		if err := e.compensateStep(ctx, step, st); err != nil {
+		if err := e.compensateStep(ctx, step, scoped); err != nil {
 			if errors.Is(err, ErrLeaseLost) {
 				// Another holder is compensating this run. Continuing would
 				// duplicate every reverse action it has left to do.
@@ -865,6 +957,98 @@ func (e *execution) compensate(ctx context.Context, steps []wf.Step, st *runStat
 		return firstFailure
 	}
 	return nil
+}
+
+type compensationUnit struct {
+	step  wf.Step
+	state *runState
+}
+
+func (e *execution) compensationSteps(steps []wf.Step, st *runState) ([]compensationUnit, error) {
+	var out []compensationUnit
+	var walk func([]wf.Step, *runState) error
+	walk = func(scope []wf.Step, state *runState) error {
+		ordered, err := dependencyOrder(scope)
+		if err != nil {
+			return err
+		}
+		for _, step := range scope {
+			if value, ok := st.get(step.Common().ID); ok {
+				state.set(templateID(step.Common().ID), value)
+			}
+		}
+		for _, step := range ordered {
+			if _, done := st.get(step.Common().ID); done {
+				out = append(out, compensationUnit{step, state})
+			}
+			var children []wf.Step
+			var each *wf.ForEach
+			switch g := step.(type) {
+			case wf.Parallel:
+				children = g.Steps
+				each = g.ForEach
+			case wf.Sequence:
+				children = g.Steps
+				each = g.ForEach
+			default:
+				continue
+			}
+			if each == nil {
+				if err := walk(children, newRunState(state.snapshot())); err != nil {
+					return err
+				}
+				continue
+			}
+			items, err := e.groupItems(step.Common(), children, each, state)
+			if err != nil {
+				return err
+			}
+			for index, item := range items {
+				childState := newRunState(state.snapshot())
+				childState.set(each.As, item)
+				if err := walk(rewriteChildIDs(children, strconv.Itoa(index)), childState); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if err := walk(steps, newRunState(st.snapshot())); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// dependencyOrder reconstructs a deterministic causal order without relying
+// on declaration order: a later-declared dependency still ran before its user.
+func dependencyOrder(scope []wf.Step) ([]wf.Step, error) {
+	done := map[string]bool{}
+	out := make([]wf.Step, 0, len(scope))
+	for len(out) < len(scope) {
+		progress := false
+		for _, step := range scope {
+			id := step.Common().ID
+			if done[id] {
+				continue
+			}
+			ready := true
+			for _, dep := range step.Common().WaitFor {
+				if !done[dep] {
+					ready = false
+					break
+				}
+			}
+			if ready {
+				out = append(out, step)
+				done[id] = true
+				progress = true
+			}
+		}
+		if !progress {
+			return nil, fmt.Errorf("workflow compensation has unresolved dependencies")
+		}
+	}
+	return out, nil
 }
 
 func (e *execution) compensateStep(ctx context.Context, step wf.Step, st *runState) error {

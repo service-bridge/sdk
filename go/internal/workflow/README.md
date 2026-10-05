@@ -82,10 +82,11 @@
 
 | Имя | Тип | По умолчанию | Что делает |
 |-----|-----|--------------|------------|
-| `Runner` · `NewRunner(RunnerConfig)` | struct · функция | — | Обход графа: уровни готовности по `waitFor`, батч ограничен `MaxParallelism` из назначения. |
+| `Runner` · `NewRunner(RunnerConfig)` | struct · функция | — | Обход графа по `waitFor`; единый лимит operation steps на весь run, включая вложенные группы. |
 | `Runner.Run(ctx, steps, RunContext) (Outcome, error)` | метод | — | Один прогон целиком. `steps` — из `Frozen.Steps`, не из исходного определения. |
-| `RunnerConfig` | struct | — | `Ops`, `Executor`, `Wrap`, `Logger`. |
-| `RunContext` | struct | — | `RunID`, `LeaseEpoch`, `State`, `Compensating`, `CancelReason`. |
+| `RunnerConfig` | struct | — | `Ops`, `Executor`, `WrapStep`, `Sleep`, `Logger`. |
+| `RunContext` | struct | — | `RunID`, `LeaseEpoch`, `State`, `Compensating`, `CancelReason`, `MaxParallelism`. |
+| `RunContext.MaxParallelism` | int | 64 при 0 | Global leaf-operation slots; 1..1024, группы слот не удерживают. |
 | `Outcome` | struct | — | Чем кончился прогон: состояние, парковка, терминальный статус. |
 | `Executor` | interface | — | `Call`, `Publish`, `StartRun` — мост к RPC-клиенту, публикации событий и запуску под-workflow. |
 | `CallSpec` · `PublishSpec` · `StartSpec` | struct | — | Разрешённые аргументы операции шага. |
@@ -147,6 +148,10 @@
 
 ### Исполнение
 
+Раннер использует единый semaphore для operation steps; group containers не удерживают слот и могут выполнять вложенные шаги даже при лимите 1. ForEach создаёт только текущие iteration scopes, с не более MaxParallelism workers; общий budget 10000 учитывает полный статический subtree каждой материализуемой итерации. Concrete IDs и waitFor получают одинаковые индексные суффиксы. Aliases доступны только внутри своей ветки, включая восстановление из concrete checkpoints после resume.
+
+Compensation восстанавливает конкретные fanout scopes и их alias bindings, затем обходит успешные шаги в обратном порядке зависимостей. Наличие checkpoint определяет выполнение: null output тоже компенсируется. Cross-scope waits и forward waits в sequence отклоняются при Validate; незавершимый граф никогда не возвращает success.
+
 **У раннера нет собственных ретраев, бэкоффа, размыкателей и таймаутов** (ADR-0003). Он читает ответ `FailStep` и исполняет решение рантайма — повторить, компенсировать, провалить прогон. В Node этот ответ отбрасывался, раннер жёстко слал «не повторяемо», и объявленная пользователем политика ретраев не работала вовсе. Незнакомое решение — громкая ошибка, а не догадка: догадка либо переисполнит шаг, который рантайм хочет компенсировать, либо бросит прогон, который рантайм ждёт повторённым.
 
 **Компенсация уважает «уже сделано» так же, как прямой путь.** В Node проверял только прямой путь, поэтому компенсирующий прогон, переназначенный после истечения лиза, начинал обратный обход заново и повторял уже выполненные возвраты средств — по одному лишнему возврату на каждое переназначение.
@@ -172,3 +177,5 @@
 Канал и идентичность приходят интерфейсами `ClientSource` и `Identity`, объявленными здесь же: пакет не импортирует `internal/connection`, а получает от него готовое.
 
 На него опираются: домен workflow корневого пакета (объявление хендлера, запуск прогонов, проверка целей `call` на `Start` через `StaticCallTargets`) и `internal/registry` — через `Frozen.JSON` и `Frozen.Fingerprint`, которые уезжают в `input_schema_json` и `contract_hash`.
+
+Граф с local closure требует `Definition.Version`, включённую в канонический fingerprint. Freeze копирует mutable executable containers, сохраняя closure. Client удерживает name:fingerprint версии и assignment никогда не разрешается по одному имени. Отсутствующая версия получает CompleteRun failed с unsupported_version. Разрыв stream, новая lease epoch или отказ heartbeat отменяют исполнение; duplicate live epoch игнорируется, stale completion подавляется. Очередь назначений ограничена 1024.
