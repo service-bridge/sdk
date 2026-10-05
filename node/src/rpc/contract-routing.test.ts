@@ -66,6 +66,7 @@ function mkInstanceCache(
 				methods.map((m) => [`${m.instanceId}:${m.type}:${m.name}`, m] as const),
 			),
 		onInstancesChange: () => () => {},
+		onMethodsChange: () => () => {},
 	} as unknown as WatchStream;
 
 	const cache = new InstanceCache();

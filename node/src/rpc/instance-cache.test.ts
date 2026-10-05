@@ -1,9 +1,12 @@
 import { describe, expect, it } from "bun:test";
+import { EventEmitter } from "node:events";
 import type {
 	MethodDescriptor,
+	RegisterRequest,
+	RegistryClient,
 	ServiceInstanceInfo,
 } from "../pb/servicebridge/v1/registry";
-import type { WatchStream } from "../registry/watch";
+import { WatchStream } from "../registry/watch";
 import { InstanceCache, type InstanceRetainer } from "./instance-cache";
 
 const HASH = "hash-1";
@@ -27,6 +30,9 @@ function stubWatch(
 					m,
 				]),
 			);
+		},
+		onMethodsChange(): () => void {
+			return () => {};
 		},
 		onInstancesChange(): () => void {
 			return () => {};
@@ -229,5 +235,107 @@ describe("InstanceCache lookup cost is independent of fleet size", () => {
 		// A linear scan over 6000 descriptors would be ~100× the 60-descriptor
 		// case; the bound is deliberately loose so timing noise cannot flake it.
 		expect(largeMs / smallMs).toBeLessThan(10);
+	});
+});
+
+// Exercise the real watch reducer: descriptor-only updates do not emit an
+// instance delta, but both serviceMap and the RPC index must observe them.
+describe("InstanceCache descriptor lifecycle", () => {
+	function fixture() {
+		const stream = new EventEmitter() as EventEmitter & { cancel(): void };
+		stream.cancel = () => {};
+		const watch = new WatchStream();
+		const client = {
+			registerAndWatch: () => stream,
+		} as unknown as RegistryClient;
+		const cache = new InstanceCache();
+		const retainer = recordingRetainer();
+		cache.bind(watch, retainer);
+		watch.start({} as RegisterRequest, client);
+		return { stream, watch, cache, retainer };
+	}
+
+	function snapshot(
+		stream: EventEmitter,
+		methods: MethodDescriptor[],
+		instances: ServiceInstanceInfo[],
+	) {
+		stream.emit("data", {
+			snapshot: {
+				methods,
+				instances,
+				eventSubscriptions: [],
+				outgoingCalls: [],
+			},
+		});
+	}
+
+	function update(
+		stream: EventEmitter,
+		added: MethodDescriptor[],
+		removed: MethodDescriptor[],
+	) {
+		stream.emit("data", {
+			update: { added, removed, addedInstances: [], removedInstances: [] },
+		});
+	}
+
+	it("makes a newly registered method callable without another instance event", () => {
+		const { stream, watch, cache } = fixture();
+		snapshot(stream, [], [mkInstance("inst-A")]);
+		const method = mkMethod("inst-A", "Charge");
+		update(stream, [method], []);
+		expect([...watch.snapshot().values()]).toContain(method);
+		expect(cache.descriptorFor("svc", "Charge")).toBe(method);
+		expect(cache.candidatesFor("svc", "Charge", HASH)).toHaveLength(1);
+		cache.dispose();
+		watch.stop();
+	});
+
+	it("removes a deregistered method and updates changed contracts without instance churn", () => {
+		const { stream, watch, cache } = fixture();
+		const method = mkMethod("inst-A", "Charge");
+		snapshot(stream, [method], [mkInstance("inst-A")]);
+		const replacement = mkMethod("inst-A", "Charge", "new-hash");
+		update(stream, [replacement], []);
+		expect(cache.candidatesFor("svc", "Charge", HASH)).toHaveLength(0);
+		expect(cache.candidatesFor("svc", "Charge", "new-hash")).toHaveLength(1);
+		update(stream, [], [replacement]);
+		expect(cache.descriptorFor("svc", "Charge")).toBeNull();
+		expect(cache.candidatesFor("svc", "Charge", "new-hash")).toHaveLength(0);
+		cache.dispose();
+		watch.stop();
+	});
+
+	it("indexes descriptors from snapshots with no direct endpoint", () => {
+		const { stream, watch, cache } = fixture();
+		const method = mkMethod("inst-gone", "Charge");
+		snapshot(stream, [method], []);
+		expect(cache.descriptorFor("svc", "Charge")).toBe(method);
+		expect(cache.candidatesFor("svc", "Charge", HASH)).toHaveLength(0);
+		cache.dispose();
+		watch.stop();
+	});
+	it("releases both subscriptions when rebinding and disposing", () => {
+		const first = fixture();
+		const second = fixture();
+		first.cache.bind(second.watch, first.retainer);
+		const afterBind = first.retainer.calls.length;
+		update(first.stream, [mkMethod("inst-A", "Charge")], []);
+		expect(first.retainer.calls).toHaveLength(afterBind);
+		snapshot(
+			second.stream,
+			[mkMethod("inst-B", "Refund")],
+			[mkInstance("inst-B")],
+		);
+		expect(first.cache.descriptorFor("svc", "Refund")?.name).toBe("Refund");
+		first.cache.dispose();
+		const afterDispose = first.retainer.calls.length;
+		update(second.stream, [mkMethod("inst-B", "Charge")], []);
+		expect(first.retainer.calls).toHaveLength(afterDispose);
+		expect(first.cache.descriptorFor("svc", "Charge")).toBeNull();
+		first.watch.stop();
+		second.cache.dispose();
+		second.watch.stop();
 	});
 });

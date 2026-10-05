@@ -58,9 +58,15 @@ export class InstanceCache {
 	private unsubscribe: (() => void) | null = null;
 
 	bind(watch: WatchStream, breakers: InstanceRetainer): void {
+		this.unsubscribe?.();
 		this.binding = { watch, breakers };
 		this.refresh();
-		this.unsubscribe = watch.onInstancesChange(() => this.refresh());
+		const unsubscribeInstances = watch.onInstancesChange(() => this.refresh());
+		const unsubscribeMethods = watch.onMethodsChange(() => this.refresh());
+		this.unsubscribe = () => {
+			unsubscribeInstances();
+			unsubscribeMethods();
+		};
 	}
 
 	dispose(): void {
