@@ -480,9 +480,11 @@ func (x *JobsHeartbeatRequest) GetInstanceId() string {
 }
 
 type JobsHeartbeatResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Next heartbeat cadence derived from the live instance timeout.
+	HeartbeatIntervalMs int64 `protobuf:"varint,1,opt,name=heartbeat_interval_ms,json=heartbeatIntervalMs,proto3" json:"heartbeat_interval_ms,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *JobsHeartbeatResponse) Reset() {
@@ -513,6 +515,13 @@ func (x *JobsHeartbeatResponse) ProtoReflect() protoreflect.Message {
 // Deprecated: Use JobsHeartbeatResponse.ProtoReflect.Descriptor instead.
 func (*JobsHeartbeatResponse) Descriptor() ([]byte, []int) {
 	return file_servicebridge_v1_jobs_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *JobsHeartbeatResponse) GetHeartbeatIntervalMs() int64 {
+	if x != nil {
+		return x.HeartbeatIntervalMs
+	}
+	return 0
 }
 
 var File_servicebridge_v1_jobs_proto protoreflect.FileDescriptor
@@ -560,8 +569,9 @@ const file_servicebridge_v1_jobs_proto_rawDesc = "" +
 	"\n" +
 	"service_id\x18\x01 \x01(\tR\tserviceId\x12\x1f\n" +
 	"\vinstance_id\x18\x02 \x01(\tR\n" +
-	"instanceId\"\x17\n" +
-	"\x15JobsHeartbeatResponse2\x91\x02\n" +
+	"instanceId\"K\n" +
+	"\x15JobsHeartbeatResponse\x122\n" +
+	"\x15heartbeat_interval_ms\x18\x01 \x01(\x03R\x13heartbeatIntervalMs2\x91\x02\n" +
 	"\x04Jobs\x12U\n" +
 	"\tSubscribe\x12&.servicebridge.v1.JobsSubscribeRequest\x1a\x1e.servicebridge.v1.JobExecution0\x01\x12T\n" +
 	"\tJobResult\x12\".servicebridge.v1.JobResultRequest\x1a#.servicebridge.v1.JobResultResponse\x12\\\n" +

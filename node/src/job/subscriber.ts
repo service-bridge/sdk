@@ -1,6 +1,10 @@
 // @internal — см. ./README.md
 
-import type { ClientReadableStream } from "@grpc/grpc-js";
+import {
+	type ClientReadableStream,
+	type ClientUnaryCall,
+	Metadata,
+} from "@grpc/grpc-js";
 import type { JobExecution, JobsClient } from "../pb/servicebridge/v1/jobs";
 import { StreamSupervisor } from "../registry/stream-supervisor";
 import type { ReconnectDelayOptions } from "../utils/reconnect-ladder";
@@ -54,8 +58,10 @@ export class JobSubscriber {
 		string,
 		{ epoch: number; controller: AbortController }
 	>();
-	private _heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+	private _heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
 	private _heartbeatFailures = 0;
+	private _heartbeatGeneration = 0;
+	private _heartbeatCall: ClientUnaryCall | null = null;
 	private readonly _semaphores: Map<string, Semaphore>;
 	private readonly supervisor: StreamSupervisor<
 		ClientReadableStream<JobExecution>,
@@ -275,36 +281,45 @@ export class JobSubscriber {
 	}
 
 	private startHeartbeat(): void {
+		this.stopHeartbeat();
 		this._heartbeatFailures = 0;
-		const timer = setInterval(() => {
-			if (this._closed) {
-				this.stopHeartbeat();
+		const generation = this._heartbeatGeneration;
+		const schedule = (interval: number) => {
+			if (this._closed || generation !== this._heartbeatGeneration) return;
+			this._heartbeatTimer = setTimeout(() => beat(interval), interval);
+			this._heartbeatTimer.unref();
+		};
+		const beat = (interval: number) => {
+			if (this._closed || generation !== this._heartbeatGeneration) return;
+			const id = this.d.identity();
+			if (!id) {
+				schedule(interval);
 				return;
 			}
-			const id = this.d.identity();
-			if (!id) return;
 			try {
-				this.d.rpcClient.heartbeat(
+				this._heartbeatCall = this.d.rpcClient.heartbeat(
 					{ serviceId: id.serviceId, instanceId: id.instanceId },
-					(err) => {
-						if (err) {
-							this.onHeartbeatFailure(err.message);
-						} else {
-							this._heartbeatFailures = 0;
-						}
+					new Metadata(),
+					{ deadline: Date.now() + interval },
+					(err, response) => {
+						if (this._closed || generation !== this._heartbeatGeneration)
+							return;
+						if (err) this.onHeartbeatFailure(err.message);
+						else this._heartbeatFailures = 0;
+						const hint = response?.heartbeatIntervalMs ?? 0;
+						schedule(
+							Number.isFinite(hint) && hint > 0
+								? Math.min(HEARTBEAT_INTERVAL_MS, Math.max(1, hint))
+								: interval,
+						);
 					},
 				);
 			} catch (err) {
-				// A synchronous throw means the channel is mid-teardown. Transient —
-				// killing the timer here would silently strand the lease until the
-				// runtime reclaims it, with nothing in the logs to explain why.
 				this.onHeartbeatFailure((err as Error).message);
+				schedule(interval);
 			}
-		}, HEARTBEAT_INTERVAL_MS);
-		// Heartbeat must not be the reason a finished process stays alive; the
-		// reconnect timer (inside the supervisor) is the one that holds the loop.
-		timer.unref();
-		this._heartbeatTimer = timer;
+		};
+		beat(HEARTBEAT_INTERVAL_MS);
 	}
 
 	private onHeartbeatFailure(reason: string): void {
@@ -319,8 +334,11 @@ export class JobSubscriber {
 	}
 
 	private stopHeartbeat(): void {
+		this._heartbeatGeneration++;
+		this._heartbeatCall?.cancel();
+		this._heartbeatCall = null;
 		if (this._heartbeatTimer) {
-			clearInterval(this._heartbeatTimer);
+			clearTimeout(this._heartbeatTimer);
 			this._heartbeatTimer = null;
 		}
 	}

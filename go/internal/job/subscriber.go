@@ -13,9 +13,8 @@ import (
 	"github.com/service-bridge/sdk/go/internal/telemetry"
 )
 
-// Defaults of the subscriber. The heartbeat period matches the runtime's
-// jobs.heartbeat_interval_ms; the threshold gives the stream two missed beats
-// before it is torn down and reopened.
+// Defaults of the subscriber. A runtime heartbeat hint can shorten the period;
+// the threshold gives the stream two missed beats before it is reopened.
 const (
 	DefaultHeartbeatInterval  = 5 * time.Second
 	DefaultHeartbeatThreshold = 3
@@ -352,40 +351,46 @@ func (s *Subscriber) sendResult(ctx context.Context, msg *pb.JobExecution, runEr
 func (s *Subscriber) heartbeat(ctx context.Context) {
 	defer s.wg.Done()
 
-	t := time.NewTicker(s.cfg.HeartbeatInterval)
+	interval := s.beat(ctx, s.cfg.HeartbeatInterval)
+	t := time.NewTimer(interval)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			s.beat(ctx)
+			interval = s.beat(ctx, interval)
+			t.Reset(interval)
 		}
 	}
 }
 
-func (s *Subscriber) beat(ctx context.Context) {
+func (s *Subscriber) beat(ctx context.Context, interval time.Duration) time.Duration {
 	id := s.cfg.Identity()
 	if id.ServiceID == "" || id.InstanceID == "" {
 		s.onHeartbeatFailure(ErrNoIdentity)
-		return
+		return interval
 	}
 	client, err := s.cfg.Clients.JobsClient(ctx)
 	if err != nil {
 		s.onHeartbeatFailure(err)
-		return
+		return interval
 	}
 
-	callCtx, cancel := context.WithTimeout(ctx, s.cfg.HeartbeatInterval)
+	callCtx, cancel := context.WithTimeout(ctx, interval)
 	defer cancel()
-	if _, err := client.Heartbeat(callCtx, &pb.JobsHeartbeatRequest{
-		ServiceId:  id.ServiceID,
-		InstanceId: id.InstanceID,
-	}); err != nil {
+	resp, err := client.Heartbeat(callCtx, &pb.JobsHeartbeatRequest{
+		ServiceId: id.ServiceID, InstanceId: id.InstanceID,
+	})
+	if err != nil {
 		s.onHeartbeatFailure(err)
-		return
+		return interval
 	}
 	s.hbFailures = 0
+	if hint := resp.GetHeartbeatIntervalMs(); hint > 0 && hint <= s.cfg.HeartbeatInterval.Milliseconds() {
+		return time.Duration(hint) * time.Millisecond
+	}
+	return interval
 }
 
 // onHeartbeatFailure is loud on purpose. A swallowed heartbeat failure means the

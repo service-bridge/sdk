@@ -60,7 +60,7 @@
 | `cfg.Clients` | `ClientSource` | — (обязательный) | Источник стаба. |
 | `cfg.Identity` | `func() Identity` | — (обязательный) | Идентичность по требованию: читается на каждый subscribe, хартбит и результат. |
 | `cfg.Jobs` | `*Declarations` | — (обязательный) | Резолв исполнения в обработчик и лимит одновременности. |
-| `cfg.HeartbeatInterval` | `time.Duration` | `5s` | Период хартбита. |
+| `cfg.HeartbeatInterval` | `time.Duration` | `5s` | Максимальный период хартбита. Первый запрос немедленный, runtime может сократить период ответом Heartbeat (timeout/3). |
 | `cfg.HeartbeatThreshold` | `int` | `3` | Сколько подряд неудачных хартбитов пересоздают стрим. |
 | `cfg.ResultTimeout` | `time.Duration` | `10s` | Потолок одного вызова `JobResult`. |
 | `cfg.Backoff` | `stream.Backoff` | `stream.NewBackoff()` | Лестница переподключения. |

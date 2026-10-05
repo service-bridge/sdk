@@ -42,9 +42,10 @@ type scriptedJobs struct {
 	heartbeats chan *pb.JobsHeartbeatRequest
 	results    chan *pb.JobResultRequest
 
-	subscribeCalls atomic.Int64
-	heartbeatFails atomic.Bool
-	resultFails    atomic.Bool
+	subscribeCalls    atomic.Int64
+	heartbeatFails    atomic.Bool
+	heartbeatInterval atomic.Int64
+	resultFails       atomic.Bool
 	// endStreamAfter, when positive, makes the Nth Subscribe return immediately
 	// so the subscriber has to reopen.
 	endStreamAfter atomic.Int64
@@ -88,7 +89,7 @@ func (s *scriptedJobs) Heartbeat(_ context.Context, req *pb.JobsHeartbeatRequest
 	if s.heartbeatFails.Load() {
 		return nil, status.Error(codes.Unavailable, "heartbeat refused")
 	}
-	return &pb.JobsHeartbeatResponse{}, nil
+	return &pb.JobsHeartbeatResponse{HeartbeatIntervalMs: s.heartbeatInterval.Load()}, nil
 }
 
 func (s *scriptedJobs) JobResult(_ context.Context, req *pb.JobResultRequest) (*pb.JobResultResponse, error) {
@@ -1109,5 +1110,37 @@ func TestSkipRedeliveryWaitsForHandlerAcrossIdentityReconnect(t *testing.T) {
 				t.Fatalf("stale result after reconnect: %v", result)
 			}
 		})
+	}
+}
+
+func TestHeartbeatNegotiatesBeforeDefaultPeriod(t *testing.T) {
+	t.Parallel()
+	srv, client := startJobs(t)
+	srv.heartbeatInterval.Store(20)
+	sub, err := job.NewSubscriber(job.SubscriberConfig{
+		Clients: &staticClients{client: client}, Identity: func() job.Identity { return job.Identity{ServiceID: "s", InstanceID: "i"} }, Jobs: job.NewDeclarations(), Logger: slog.New(&logSink{}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = sub.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Stop()
+	// All three beats must arrive well before the default five-second period.
+	for range 3 {
+		select {
+		case <-srv.heartbeats:
+		case <-time.After(time.Second):
+			t.Fatal("runtime cadence not negotiated immediately")
+		}
+	}
+	srv.heartbeatInterval.Store(10)
+	for range 2 {
+		select {
+		case <-srv.heartbeats:
+		case <-time.After(time.Second):
+			t.Fatal("changed cadence not consumed")
+		}
 	}
 }

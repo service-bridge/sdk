@@ -63,6 +63,7 @@ function makeHarness(
 		identity?: () => IdentityProvider | null;
 		domain?: JobDomain;
 		reconnectOpts?: ReconnectDelayOptions;
+		heartbeatIntervalMs?: () => number;
 	} = {},
 ): Harness {
 	const streams: FakeStream[] = [];
@@ -88,10 +89,17 @@ function makeHarness(
 			},
 			heartbeat: (
 				req: { serviceId: string; instanceId: string },
-				cb: (err: { message: string } | null) => void,
+				_metadata: unknown,
+				_options: unknown,
+				cb: (
+					err: { message: string } | null,
+					response?: { heartbeatIntervalMs: number },
+				) => void,
 			) => {
 				heartbeats.push(req);
-				cb(heartbeatError === null ? null : { message: heartbeatError });
+				cb(heartbeatError === null ? null : { message: heartbeatError }, {
+					heartbeatIntervalMs: opts.heartbeatIntervalMs?.() ?? 0,
+				});
 			},
 			// biome-ignore lint/suspicious/noExplicitAny: minimal grpc stub
 		} as any,
@@ -262,8 +270,34 @@ describe("JobSubscriber stream", () => {
 });
 
 describe("JobSubscriber heartbeat", () => {
+	it("NegotiatesImmediatelyAndTracksTheLiveRuntimeCadence", async () => {
+		let hint = 20;
+		const h = makeHarness({ heartbeatIntervalMs: () => hint });
+		const timerSpy = spyOn(globalThis, "setTimeout");
+		try {
+			h.sub.start();
+			expect(h.heartbeats).toHaveLength(1);
+			const deadline = Date.now() + 500;
+			while (h.heartbeats.length < 3 && Date.now() < deadline)
+				await Bun.sleep(1);
+			expect(h.heartbeats.length).toBeGreaterThanOrEqual(3);
+			expect(timerSpy.mock.calls.some((args) => args[1] === 20)).toBe(true);
+			hint = 10;
+			const before = h.heartbeats.length;
+			while (h.heartbeats.length === before && Date.now() < deadline)
+				await Bun.sleep(1);
+			expect(timerSpy.mock.calls.some((args) => args[1] === 10)).toBe(true);
+			await h.sub.stop();
+			const stoppedCount = h.heartbeats.length;
+			await Bun.sleep(40);
+			expect(h.heartbeats).toHaveLength(stoppedCount);
+		} finally {
+			await h.sub.stop();
+			timerSpy.mockRestore();
+		}
+	});
 	it("TimerIsUnrefd_DoesNotHoldTheProcess", async () => {
-		const setSpy = spyOn(globalThis, "setInterval");
+		const setSpy = spyOn(globalThis, "setTimeout");
 		try {
 			const h = makeHarness();
 			h.sub.start();
