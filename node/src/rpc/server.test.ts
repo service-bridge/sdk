@@ -61,7 +61,7 @@ function makeRequest(over: Partial<CallRequest> = {}): CallRequest {
 // peer when policy carries rpc.handle rules, so this is the shape for every
 // test that is not about acceptance.
 function makeUnaryCall(request: CallRequest = makeRequest()): unknown {
-	return { request };
+	return Object.assign(new EventEmitter(), { request, cancelled: false });
 }
 
 interface CapturedCallback {

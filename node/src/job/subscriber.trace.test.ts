@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 // subscriber.trace.test.ts — trace-context propagation for job dispatch.
 //
 // Keystone (service-bridge.ts::runHandlerWithTrace): a job handler must run
@@ -68,6 +69,14 @@ function makeExec(
 	return {
 		executionId: overrides.executionId ?? "exec-1",
 		jobName: overrides.jobName ?? "nightly",
+		fingerprint: createHash("sha256")
+			.update(
+				JSON.stringify({
+					version: "test-v1",
+					trigger: { interval: { everyMs: 1000 } },
+				}),
+			)
+			.digest("hex"),
 		scheduledAtUnixMs: Date.now(),
 		localScheduledAtUnixMs: Date.now(),
 		attempt: 1,
@@ -108,7 +117,11 @@ describe("JobSubscriber trace propagation", () => {
 		const fn: JobHandler = async () => {
 			seen = currentTraceContext();
 		};
-		domain.handle("nightly", { trigger: { interval: 1000 } }, fn);
+		domain.handle(
+			"nightly",
+			{ version: "test-v1", trigger: { interval: 1000 } },
+			fn,
+		);
 
 		const stream = makeFakeStream();
 		const { sub } = makeSubscriber(domain, stream);
@@ -135,10 +148,14 @@ describe("JobSubscriber trace propagation", () => {
 			await Promise.resolve();
 			nestedTrace = currentTraceContext()?.traceId;
 		}
-		domain.handle("nightly", { trigger: { interval: 1000 } }, async () => {
-			await Promise.resolve();
-			await nestedCall();
-		});
+		domain.handle(
+			"nightly",
+			{ version: "test-v1", trigger: { interval: 1000 } },
+			async () => {
+				await Promise.resolve();
+				await nestedCall();
+			},
+		);
 
 		const stream = makeFakeStream();
 		const { sub } = makeSubscriber(domain, stream);
@@ -158,10 +175,14 @@ describe("JobSubscriber trace propagation", () => {
 		const domain = newDomain();
 		let ran = false;
 		let seen: ReturnType<typeof currentTraceContext>;
-		domain.handle("nightly", { trigger: { interval: 1000 } }, async () => {
-			ran = true;
-			seen = currentTraceContext();
-		});
+		domain.handle(
+			"nightly",
+			{ version: "test-v1", trigger: { interval: 1000 } },
+			async () => {
+				ran = true;
+				seen = currentTraceContext();
+			},
+		);
 
 		const stream = makeFakeStream();
 		const { sub, results } = makeSubscriber(domain, stream);
@@ -181,10 +202,14 @@ describe("JobSubscriber trace propagation", () => {
 		const domain = newDomain();
 		let ran = false;
 		let seen: ReturnType<typeof currentTraceContext>;
-		domain.handle("nightly", { trigger: { interval: 1000 } }, async () => {
-			ran = true;
-			seen = currentTraceContext();
-		});
+		domain.handle(
+			"nightly",
+			{ version: "test-v1", trigger: { interval: 1000 } },
+			async () => {
+				ran = true;
+				seen = currentTraceContext();
+			},
+		);
 
 		const stream = makeFakeStream();
 		const { sub } = makeSubscriber(domain, stream);
@@ -205,10 +230,14 @@ describe("JobSubscriber trace propagation", () => {
 	it("ContextDoesNotLeakBetweenSequentialExecutions", async () => {
 		const domain = newDomain();
 		const observed: Array<ParsedXSbTrace | undefined> = [];
-		domain.handle("nightly", { trigger: { interval: 1000 } }, async () => {
-			const ctx = currentTraceContext();
-			observed.push(ctx ? { ...ctx } : undefined);
-		});
+		domain.handle(
+			"nightly",
+			{ version: "test-v1", trigger: { interval: 1000 } },
+			async () => {
+				const ctx = currentTraceContext();
+				observed.push(ctx ? { ...ctx } : undefined);
+			},
+		);
 
 		const stream = makeFakeStream();
 		const { sub } = makeSubscriber(domain, stream);

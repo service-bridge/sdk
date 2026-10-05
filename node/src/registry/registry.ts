@@ -58,7 +58,17 @@ export type RpcStreamHandlerFn<Req = unknown, Chunk = unknown> = (
 ) => AsyncIterable<Chunk>;
 
 // EventHandlerFn is the function shape accepted by Handle.event().
-export type EventHandlerFn = (payload: unknown) => Promise<void> | void;
+export interface EventHandlerContext {
+	attempt: number;
+	deliveryId: string;
+	eventId: string;
+	leaseToken: string;
+	signal: AbortSignal;
+}
+export type EventHandlerFn = (
+	payload: unknown,
+	context: EventHandlerContext,
+) => Promise<void> | void;
 
 const NO_EVENT_HANDLERS: readonly EventHandlerFn[] = [];
 
@@ -324,7 +334,16 @@ export class Handle {
 	// registration order — the in-process fan-out set for one delivered event.
 	// The returned array is the live bucket; callers must not mutate it.
 	eventHandlers(pattern: string): readonly EventHandlerFn[] {
-		return this.eventsByPattern.get(pattern) ?? NO_EVENT_HANDLERS;
+		const exact = this.eventsByPattern.get(pattern) ?? NO_EVENT_HANDLERS;
+		const matched = [...exact];
+		for (const [subscription, handlers] of this.eventsByPattern) {
+			if (
+				subscription !== pattern &&
+				matchEventPattern(subscription.split("."), pattern.split("."))
+			)
+				matched.push(...handlers);
+		}
+		return matched;
 	}
 
 	workflow(
@@ -640,4 +659,19 @@ export class Registry {
 
 	private _callEndpoint = "";
 	private _httpEndpoint = "";
+}
+
+function matchEventPattern(pattern: string[], name: string[]): boolean {
+	if (!pattern.length) return !name.length;
+	if (pattern[0] === "#")
+		return (
+			name.some((_part, index) =>
+				matchEventPattern(pattern.slice(1), name.slice(index)),
+			) || matchEventPattern(pattern.slice(1), [])
+		);
+	return (
+		!!name.length &&
+		(pattern[0] === "*" || pattern[0] === name[0]) &&
+		matchEventPattern(pattern.slice(1), name.slice(1))
+	);
 }

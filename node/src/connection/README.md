@@ -151,3 +151,5 @@ Module-level экспорты, **не** реэкспортируемые чер�
 Зависит на: `@grpc/grpc-js`, `@peculiar/x509`, `reflect-metadata`; внутренние домены `../registry`, `../rpc`, `../events`, `../workflow`, `../job`, `../telemetry`, `../serde`, `../sqlite`; pb-стабы `../pb/servicebridge/v1/{bootstrap,control,events,jobs,registry,telemetry,workflows}`.
 
 Зависят: `sdk/node/index.ts` (реэкспорт публичного API), HTTP-интеграции (`../http/*` через `sb.routes`), `sdk/node/tests/e2e/`.
+
+Bootstrap and runtime channels require exactly one URI SAN spiffe://service-bridge/runtime, in addition to CA chain and server EKU verification. Another SDK leaf signed by this CA is not the runtime.

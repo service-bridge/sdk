@@ -117,8 +117,13 @@ const plugin: FastifyPluginAsync<SbFastifyOptions> = async (
 			// can disconnect after its POST was fully read, before/during the reply;
 			// Fastify then never calls onResponse. Observe the response socket too.
 			let finished = false;
+			let responseFinished = false;
+			const responseFinish = () => {
+				responseFinished = true;
+			};
+			reply.raw.once("finish", responseFinish);
 			const abort = () => {
-				if (!reply.raw.writableFinished) {
+				if (!responseFinished) {
 					req.sbHttpFinish?.(Status.TIMEOUT, "client abort");
 				}
 			};
@@ -126,9 +131,14 @@ const plugin: FastifyPluginAsync<SbFastifyOptions> = async (
 				if (finished) return;
 				finished = true;
 				reply.raw.off("close", abort);
+				reply.raw.off("finish", responseFinish);
+				req.raw.socket.off("close", abort);
+				req.raw.off("aborted", abort);
 				op.handle.end(status, message);
 			};
 			reply.raw.once("close", abort);
+			req.raw.socket.once("close", abort);
+			req.raw.once("aborted", abort);
 			als.enterWith(op.scope);
 			// Request body (IN) — Fastify has already parsed it by preHandler.
 			if (op.capturing) {

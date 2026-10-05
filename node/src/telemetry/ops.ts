@@ -98,6 +98,7 @@ export class OpHandle {
 	private readonly params: ResolvedParams;
 	private readonly startedAtMs: number;
 	private ended = false;
+	private finalStatus: Status | null = null;
 	// Buffered attachments for "errors" mode — emitted on ERROR end, dropped on
 	// OK. Keyed by direction (1=IN, 2=OUT) so a re-capture of the same direction
 	// (e.g. OUT on retry) overwrites last-wins instead of buffering a duplicate.
@@ -178,6 +179,10 @@ export class OpHandle {
 	 * already-resolved mode also honours a per-handler narrowing, which a caller
 	 * asking the channel's mode directly would miss.
 	 */
+	get payloadMaxBytes(): number {
+		return this.params.payloadMaxBytes;
+	}
+
 	get capturing(): boolean {
 		return this.params.captureMode !== "none";
 	}
@@ -186,21 +191,30 @@ export class OpHandle {
 	 * Capture the inbound (request/input) payload for this op. Direction = IN.
 	 * "all" emits immediately; "errors" buffers until end; "none" is a no-op.
 	 */
-	captureIn(bytes: Uint8Array, contractHash: string): void {
-		this.capture(1, bytes, contractHash);
+	captureIn(
+		bytes: Uint8Array,
+		contractHash: string,
+		originalSize?: number,
+	): void {
+		this.capture(1, bytes, contractHash, originalSize);
 	}
 
 	/**
 	 * Capture the outbound (response/output) payload for this op. Direction = OUT.
 	 */
-	captureOut(bytes: Uint8Array, contractHash: string): void {
-		this.capture(2, bytes, contractHash);
+	captureOut(
+		bytes: Uint8Array,
+		contractHash: string,
+		originalSize?: number,
+	): void {
+		this.capture(2, bytes, contractHash, originalSize);
 	}
 
 	private capture(
 		direction: number,
 		bytes: Uint8Array,
 		contractHash: string,
+		observedSize?: number,
 	): void {
 		if (this.params.captureMode === "none") return;
 		const { bytes: capped, originalSize } = capPayload(
@@ -210,12 +224,17 @@ export class OpHandle {
 		const att: CapturedAttachment = {
 			direction,
 			bytes: capped,
-			originalSize,
+			originalSize: observedSize ?? originalSize,
 			contractHash,
 		};
-		if (this.params.captureMode === "all") {
+		if (
+			this.params.captureMode === "all" ||
+			(this.finalStatus !== null &&
+				this.finalStatus !== Status.SUCCESS &&
+				this.finalStatus !== Status.PENDING)
+		) {
 			this.emitPayload(att);
-		} else {
+		} else if (!this.ended) {
 			// "errors": hold until end() learns the status. Last-wins per direction.
 			this.bufferedPayloads.set(direction, att);
 		}
@@ -269,6 +288,7 @@ export class OpHandle {
 	end(status: Status, statusMessage?: string): void {
 		if (this.ended) return;
 		this.ended = true;
+		this.finalStatus = status;
 		this.flushBufferedPayloads(status);
 		this.enqueueEndFrame(status, statusMessage ?? "");
 	}

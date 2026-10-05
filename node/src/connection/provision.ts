@@ -1,3 +1,4 @@
+import { makeSpiffeCheck, RUNTIME_SPIFFE_URI } from "./spiffe";
 import "reflect-metadata";
 import * as grpc from "@grpc/grpc-js";
 import * as x509 from "@peculiar/x509";
@@ -64,7 +65,7 @@ export function buildPinnedCredentials(
 ): grpc.ChannelCredentials {
 	const caPem = derToPem(caCertDer);
 	const verifyOptions: Parameters<typeof grpc.credentials.createSsl>[3] = {
-		checkServerIdentity: () => undefined, // hostname check disabled, chain is enough
+		checkServerIdentity: makeSpiffeCheck(RUNTIME_SPIFFE_URI),
 	};
 	return grpc.credentials.createSsl(caPem, null, null, verifyOptions);
 }

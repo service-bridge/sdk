@@ -93,7 +93,11 @@ describe("jobs-lifecycle: survives runtime kill+restart", () => {
 		sb = new ServiceBridge(runtimeUrl, keys.serviceKey, FAST_OPTS);
 		sb.job.handle(
 			jobName,
-			{ trigger: { delayed: { at: registeredAt + 10_000 } }, maxAttempts: 3 },
+			{
+				version: "test-v1",
+				trigger: { delayed: { at: registeredAt + 10_000 } },
+				maxAttempts: 3,
+			},
 			async (ctx) => {
 				calls.push({ attempt: ctx.attempt, firedAt: Date.now() });
 			},
@@ -116,7 +120,11 @@ describe("jobs-lifecycle: survives runtime kill+restart", () => {
 		sb = new ServiceBridge(runtimeUrl, keys.serviceKey, FAST_OPTS);
 		sb.job.handle(
 			jobName,
-			{ trigger: { delayed: { at: registeredAt + 10_000 } }, maxAttempts: 3 },
+			{
+				version: "test-v1",
+				trigger: { delayed: { at: registeredAt + 10_000 } },
+				maxAttempts: 3,
+			},
 			async (ctx) => {
 				calls.push({ attempt: ctx.attempt, firedAt: Date.now() });
 			},
@@ -175,6 +183,7 @@ describe("jobs-lifecycle: catchup after a runtime-down gap", () => {
 		sb.job.handle(
 			jobName,
 			{
+				version: "test-v1",
 				trigger: { interval: 2_000 },
 				catchup: "fire_once",
 				overlap: "allow",
@@ -202,6 +211,7 @@ describe("jobs-lifecycle: catchup after a runtime-down gap", () => {
 		sb.job.handle(
 			jobName,
 			{
+				version: "test-v1",
 				trigger: { interval: 2_000 },
 				catchup: "fire_once",
 				overlap: "allow",
@@ -240,6 +250,7 @@ describe("jobs-lifecycle: catchup after a runtime-down gap", () => {
 		sb.job.handle(
 			jobName,
 			{
+				version: "test-v1",
 				trigger: { interval: 500 },
 				catchup: "skip",
 				overlap: "allow",
@@ -268,6 +279,7 @@ describe("jobs-lifecycle: catchup after a runtime-down gap", () => {
 		sb.job.handle(
 			jobName,
 			{
+				version: "test-v1",
 				trigger: { interval: 500 },
 				catchup: "skip",
 				overlap: "allow",
@@ -349,6 +361,7 @@ describe("jobs-lifecycle: heartbeat timeout reclaim", () => {
 		sbA.job.handle(
 			jobName,
 			{
+				version: "test-v1",
 				trigger: { delayed: { at: Date.now() + 1_000 } },
 				maxAttempts: 3,
 				leaseTtlMs: 30_000,
@@ -368,6 +381,7 @@ describe("jobs-lifecycle: heartbeat timeout reclaim", () => {
 		sbB.job.handle(
 			jobName,
 			{
+				version: "test-v1",
 				trigger: { delayed: { at: Date.now() + 1_000 } },
 				maxAttempts: 3,
 				leaseTtlMs: 30_000,
@@ -463,7 +477,11 @@ describe("jobs-lifecycle: SDK fully down before fire → fresh replica delivered
 		first = new ServiceBridge(url, keys.serviceKey, FAST_OPTS);
 		first.job.handle(
 			jobName,
-			{ trigger: { delayed: { at: Date.now() + 2_000 } }, maxAttempts: 3 },
+			{
+				version: "test-v1",
+				trigger: { delayed: { at: Date.now() + 2_000 } },
+				maxAttempts: 3,
+			},
 			async (ctx) => {
 				calls.push({ attempt: ctx.attempt });
 			},
@@ -483,7 +501,11 @@ describe("jobs-lifecycle: SDK fully down before fire → fresh replica delivered
 		second = new ServiceBridge(url, keys.serviceKey, FAST_OPTS);
 		second.job.handle(
 			jobName,
-			{ trigger: { delayed: { at: Date.now() + 60_000 } }, maxAttempts: 3 },
+			{
+				version: "test-v1",
+				trigger: { delayed: { at: Date.now() + 60_000 } },
+				maxAttempts: 3,
+			},
 			async (ctx) => {
 				calls.push({ attempt: ctx.attempt });
 			},
@@ -549,6 +571,7 @@ describe("jobs-lifecycle: stale lease_epoch rejected → execution re-dispatched
 		sb.job.handle(
 			jobName,
 			{
+				version: "test-v1",
 				trigger: { delayed: { at: Date.now() + 500 } },
 				maxAttempts: 5,
 				leaseTtlMs: 3_000,

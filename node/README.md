@@ -11,7 +11,7 @@ self-hosted, PostgreSQL, Express, Fastify, Hono, circuit breaker, idempotency, r
 [![npm version](https://img.shields.io/npm/v/service-bridge?color=cb3837&label=npm)](https://www.npmjs.com/package/service-bridge)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![TypeScript](https://img.shields.io/badge/types-included-3178c6.svg)](https://www.typescriptlang.org/)
-[![Node](https://img.shields.io/badge/node-%E2%89%A518-339933.svg)](https://nodejs.org/)
+[![Node](https://img.shields.io/badge/node-22%20%7C%2024%20%7C%2026-339933.svg)](https://nodejs.org/)
 
 **The Node.js / Bun SDK for [ServiceBridge](https://servicebridge.dev) — RPC, durable events, workflows, jobs, streaming and full observability over one self-hosted runtime. No broker. No sidecar. No tracing stack. Just one Go binary plus PostgreSQL.**
 
@@ -74,7 +74,7 @@ npm i service-bridge
 bun add service-bridge
 ```
 
-- **Runtime:** Node.js 18+ or any current Bun.
+- **Runtime:** Node.js 22, 24 or 26; Bun >=1.3.13 for core and Hono (Fastify requires native Node).
 - **Types:** included, written in TypeScript 5.
 - **Backend:** a running ServiceBridge runtime (gRPC control plane on `:14445`) backed by PostgreSQL 18+. See [Runtime setup](#runtime-setup).
 
@@ -340,10 +340,10 @@ const res2 = await sb.rpc.call("payment-svc", "Charge",
 | `timeout` | `string` | `"30s"` | Deadline, e.g. `"500ms"`, `"10s"`, `"2m"`. |
 | `requestId` | `string` | random UUID v4 | Correlation id carried to the callee. |
 | `transport` | `"direct" \| "proxy" \| "auto"` | `"auto"` | `direct` = caller→callee mTLS; `proxy` = via the runtime; `auto` = direct when an endpoint is known. |
-| `idempotencyKey` | `string` | none | Opts into runtime-side dedup; replays within the TTL return the cached response. |
+| `idempotencyKey` | `string` | none | Proxy correlation/cache key; does not prove business idempotency. |
 | `retry` | `Partial<RetryOpts>` | exp. backoff | `{ maxAttempts: 3, baseDelayMs: 200, factor: 2, maxDelayMs: 5000, jitter: 0.3 }`. Set `maxAttempts: 1` to disable. |
 
-Without an `idempotencyKey`, ambiguous failures (`INTERNAL` / `ABORTED` / `UNKNOWN`) are treated as non-retryable so a non-idempotent call is never silently repeated. Schema-version mismatches are filtered at routing time, so blue-green deploys route `v1→v1` and `v2→v2` automatically.
+Dispatched RPC failures are never automatically replayed, even with an idempotencyKey. Only proven local pre-dispatch failures may retry. Keys provide proxy correlation/cache; atomic business deduplication belongs with the effect. Contract hashes route schema-compatible peers.
 
 ### Events
 
@@ -663,3 +663,5 @@ This is an alpha release (`2.0.0-alpha`). The API is stabilising — issues and 
 ## License
 
 Licensed under the **MIT License** — see [LICENSE](./LICENSE). Free for any use, including commercial; you only need to keep the copyright and license notice (attribution to esurkov1 <esurkovv@yandex.ru>).
+
+Release tags run complete CI on the exact tagged commit before npm publication, including packed consumer checks on Node 22/24/26 and Bun. Service-key rotation revokes existing credentials: deploy a new bootstrap key and restart; repeated reconnect with the revoked key cannot recover.

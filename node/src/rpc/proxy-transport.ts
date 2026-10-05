@@ -1,4 +1,8 @@
-import { type ChannelCredentials, Metadata } from "@grpc/grpc-js";
+import {
+	type ChannelCredentials,
+	type ClientUnaryCall,
+	Metadata,
+} from "@grpc/grpc-js";
 import { type InvokeChunk, InvokeClient } from "../pb/servicebridge/v1/invoke";
 import { currentTraceContext } from "../telemetry/context";
 import { formatXSbTrace } from "../telemetry/wire-trace";
@@ -64,7 +68,9 @@ export class ProxyTransport {
 		idempotencyKey: string,
 		deadlineMs: number,
 		contractHash: Buffer,
+		signal?: AbortSignal,
 	): AsyncIterable<Uint8Array> {
+		signal?.throwIfAborted();
 		const deadline = new Date(Date.now() + deadlineMs);
 		const traceHeader = currentTraceHeader();
 		const stream = this.client.stream(
@@ -80,16 +86,23 @@ export class ProxyTransport {
 			buildTraceMetadata(traceHeader),
 			{ deadline },
 		);
-		for await (const chunk of stream as AsyncIterable<InvokeChunk>) {
-			if (chunk.errorCode) {
-				const err = new Error(chunk.errorMessage || chunk.errorCode);
-				err.name = chunk.errorCode;
-				throw err;
+		const abort = () => stream.cancel();
+		signal?.addEventListener("abort", abort, { once: true });
+		try {
+			for await (const chunk of stream as AsyncIterable<InvokeChunk>) {
+				if (chunk.errorCode) {
+					const err = new Error(chunk.errorMessage || chunk.errorCode);
+					err.name = chunk.errorCode;
+					throw err;
+				}
+				// The decoder already copied the chunk out of the wire buffer, so the
+				// payload is owned — handing it straight to the caller avoids a second
+				// full copy of every chunk.
+				yield chunk.payload;
 			}
-			// The decoder already copied the chunk out of the wire buffer, so the
-			// payload is owned — handing it straight to the caller avoids a second
-			// full copy of every chunk.
-			yield chunk.payload;
+		} finally {
+			signal?.removeEventListener("abort", abort);
+			stream.cancel?.();
 		}
 	}
 
@@ -104,11 +117,19 @@ export class ProxyTransport {
 		idempotencyKey: string,
 		deadlineMs: number,
 		contractHash: Buffer,
+		signal?: AbortSignal,
 	): Promise<Uint8Array> {
 		return new Promise((resolve, reject) => {
+			signal?.throwIfAborted();
+			let call: ClientUnaryCall | undefined;
+			const abort = () => {
+				call?.cancel();
+				reject(signal?.reason ?? new Error("rpc cancelled"));
+			};
+			signal?.addEventListener("abort", abort, { once: true });
 			const deadline = new Date(Date.now() + deadlineMs);
 			const traceHeader = currentTraceHeader();
-			this.client.unary(
+			call = this.client.unary(
 				{
 					targetServiceId,
 					method,
@@ -121,6 +142,7 @@ export class ProxyTransport {
 				buildTraceMetadata(traceHeader),
 				{ deadline },
 				(err, resp) => {
+					signal?.removeEventListener("abort", abort);
 					if (err) {
 						reject(err);
 						return;

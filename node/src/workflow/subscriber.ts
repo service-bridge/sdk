@@ -48,7 +48,10 @@ interface SubscriberDeps {
 	// `Step[]` (with `local.fn` retained — closures cannot survive
 	// JSON-roundtrip via the wire `frozenPlan`). Returns null when the SDK
 	// has no handler for that name.
-	lookupLocalGraph: (workflowName: string) => Step[] | null;
+	lookupLocalGraph: (
+		workflowName: string,
+		fingerprint: string,
+	) => Step[] | null;
 	sb?: ServiceBridge;
 	// reconnectOpts pins the backoff ladder/jitter; tests inject a short
 	// deterministic ladder so reconnect behaviour is observable in milliseconds.
@@ -67,6 +70,10 @@ interface FrozenPlan {
 
 export class WorkflowSubscriber {
 	private closed = false;
+	private readonly executions = new Map<
+		string,
+		{ epoch: number; controller: AbortController }
+	>();
 	private readonly supervisor: StreamSupervisor<
 		ClientReadableStream<RunAssignment>,
 		RunAssignment
@@ -93,6 +100,10 @@ export class WorkflowSubscriber {
 					);
 				});
 			},
+			onDisconnect: () => {
+				for (const execution of this.executions.values())
+					execution.controller.abort();
+			},
 			onError: (err) =>
 				this.d.logger.warn("workflow subscriber: stream error", err.message),
 			reconnectOpts: d.reconnectOpts,
@@ -112,6 +123,9 @@ export class WorkflowSubscriber {
 
 	close(): void {
 		this.closed = true;
+		for (const execution of this.executions.values())
+			execution.controller.abort();
+		this.executions.clear();
 		this.supervisor.stop();
 		this.leases.clear();
 		if (this.tickTimer !== null) {
@@ -147,6 +161,8 @@ export class WorkflowSubscriber {
 					{ runId, instanceId: id.instanceId, leaseEpoch },
 					(err) => {
 						if (err) {
+							if ([7, 9, 16].includes(err.code))
+								this.executions.get(runId)?.controller.abort();
 							this.d.logger.warn(
 								`workflow heartbeat ${runId} failed: ${err.message}`,
 							);
@@ -179,10 +195,14 @@ export class WorkflowSubscriber {
 		// `local.fn` closures (stripped by JSON.stringify on the registration
 		// path) are restored. ADR-W-002: the wire frozenPlan is for runtime
 		// canonicalization + fingerprint; the SDK runs against its own copy.
-		const localGraph = this.d.lookupLocalGraph(a.workflowName);
-		if (localGraph) {
-			plan.graph = localGraph;
+		const localGraph = this.d.lookupLocalGraph(a.workflowName, a.fingerprint);
+		if (!localGraph) {
+			this.d.logger.error(
+				`workflow run ${a.runId}: executable version ${a.workflowName}/${a.fingerprint} unavailable`,
+			);
+			return;
 		}
+		plan.graph = localGraph;
 		const inputJson =
 			a.input.length > 0 ? Buffer.from(a.input).toString("utf8") : "null";
 		const stateJson =
@@ -190,6 +210,9 @@ export class WorkflowSubscriber {
 		const state: Record<string, unknown> = JSON.parse(stateJson);
 		state.input = JSON.parse(inputJson);
 
+		this.executions.get(a.runId)?.controller.abort();
+		const controller = new AbortController();
+		this.executions.set(a.runId, { epoch: a.leaseEpoch, controller });
 		this.startHeartbeat(a.runId, a.leaseEpoch);
 
 		// ADR 0006 §3/ADR 0003 §1: trace context arrives in `a.xSbTrace` formatted as
@@ -210,6 +233,7 @@ export class WorkflowSubscriber {
 						state,
 						compensating: a.compensating,
 						maxParallelism: plan.maxParallelism ?? 0,
+						signal: controller.signal,
 					},
 					runnerDeps,
 				);
@@ -225,6 +249,7 @@ export class WorkflowSubscriber {
 							? "failed_compensated"
 							: "cancelled";
 				}
+				if (controller.signal.aborted) return;
 				await this.d.deps.ops.completeRun({
 					runId: a.runId,
 					finalState,
@@ -239,6 +264,8 @@ export class WorkflowSubscriber {
 				}
 			} finally {
 				this.stopHeartbeat(a.runId, a.leaseEpoch);
+				if (this.executions.get(a.runId)?.epoch === a.leaseEpoch)
+					this.executions.delete(a.runId);
 				// Telemetry: WORKFLOW.RUN END is emitted by the runtime when
 				// CompleteRun/Cancel commits. SDK no longer owns root-op lifecycle.
 			}

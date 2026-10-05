@@ -25,6 +25,8 @@ import {
 // Defaults are sourced from ServiceBridge.options.callDefaults, then overridden
 // by per-call values.
 export interface CallOpts {
+	/** Cancel local waiting and the underlying gRPC call. Remote effects may have happened. */
+	signal?: AbortSignal;
 	timeout?: string; // e.g. "10s", "500ms" — default "30s"
 	requestId?: string; // auto-generated UUID v4 if omitted
 	// transport selects how the call reaches the callee:
@@ -32,11 +34,9 @@ export interface CallOpts {
 	//   - "proxy"  : caller → runtime Invoke → callee (even if direct possible)
 	//   - "auto"   : direct if endpoint is known, else proxy (DEFAULT)
 	transport?: "direct" | "proxy" | "auto";
-	// idempotencyKey opts the call into runtime-side dedup (ADR 0001). When
-	// set, the runtime claims the key before forwarding and replays of the
-	// same key within the TTL return the cached response. Omit for read-only
-	// or otherwise non-idempotent calls — INTERNAL/ABORTED/UNKNOWN errors
-	// then surface as non-retryable.
+	// Correlation/cache key for proxy calls. A key never authorizes replay of
+	// an ambiguous dispatch; business dedup must be atomic with its effect.
+
 	idempotencyKey?: string;
 	// Retry policy. Defaults: maxAttempts=3, baseDelayMs=200, factor=2,
 	// maxDelayMs=5000, jitter=0.3. Set maxAttempts=1 to disable retry.
@@ -101,6 +101,7 @@ export class RpcClient {
 		payload: Req,
 		opts?: CallOpts,
 	): AsyncIterable<Chunk> {
+		opts?.signal?.throwIfAborted();
 		const descriptor = this.instances.descriptorFor(serviceName, methodName);
 		if (!descriptor) {
 			throw new Error(
@@ -165,6 +166,7 @@ export class RpcClient {
 						requestId,
 						idempotencyKey,
 						timeoutMs,
+						opts?.signal,
 					)
 				: proxy.callStream(
 						candidate.instance.serviceId,
@@ -174,6 +176,7 @@ export class RpcClient {
 						idempotencyKey,
 						timeoutMs,
 						schema.contractHashBytes,
+						opts?.signal,
 					);
 			for await (const bytes of source) {
 				yield schema.pair.output.decode(bytes) as Chunk;
@@ -205,6 +208,7 @@ export class RpcClient {
 		payload: Req,
 		opts?: CallOpts,
 	): Promise<Res> {
+		opts?.signal?.throwIfAborted();
 		const descriptor = this.instances.descriptorFor(serviceName, methodName);
 		if (!descriptor) {
 			throw new Error(
@@ -263,7 +267,7 @@ export class RpcClient {
 					);
 					throw err;
 				}
-				await sleep(backoffDelay(retry, attempt));
+				await sleep(backoffDelay(retry, attempt), opts?.signal);
 				continue;
 			}
 
@@ -309,6 +313,7 @@ export class RpcClient {
 								requestId,
 								idempotencyKey,
 								timeoutMs,
+								opts?.signal,
 							)
 						: await this.proxy.callUnary(
 								candidate.instance.serviceId,
@@ -318,6 +323,7 @@ export class RpcClient {
 								idempotencyKey,
 								timeoutMs,
 								schema.contractHashBytes,
+								opts?.signal,
 							);
 					callOp?.captureOut(respBytes, schema.contractHash);
 					return schema.pair.output.decode(respBytes) as Res;
@@ -340,7 +346,7 @@ export class RpcClient {
 				if (
 					transport === "auto" &&
 					useDirect &&
-					isPreDispatchConnectionFailure(err) &&
+					isRetryable(err, false) &&
 					attempt + 1 < retry.maxAttempts
 				) {
 					const remainingMs = deadlineAt - Date.now();
@@ -358,6 +364,7 @@ export class RpcClient {
 										idempotencyKey,
 										remainingMs,
 										schema.contractHashBytes,
+										opts?.signal,
 									),
 							);
 							callOp.captureOut(respBytes, schema.contractHash);
@@ -375,10 +382,6 @@ export class RpcClient {
 				}
 				if (
 					attempt === retry.maxAttempts - 1 ||
-					(useDirect &&
-						!hasIdempotency &&
-						(err as { code?: unknown })?.code === GRPC_CODE_UNAVAILABLE &&
-						!isPreDispatchConnectionFailure(err)) ||
 					!isRetryable(err, hasIdempotency)
 				) {
 					callOp.end(
@@ -387,7 +390,7 @@ export class RpcClient {
 					);
 					throw err;
 				}
-				await sleep(backoffDelay(retry, attempt));
+				await sleep(backoffDelay(retry, attempt), opts?.signal);
 			} finally {
 				release();
 			}
@@ -464,25 +467,8 @@ function formatRpcCallSubject(serviceName: string, methodName: string): string {
 function noLiveInstance(message: string): NoLiveInstanceError {
 	return Object.assign(new NoLiveInstanceError(message), {
 		code: GRPC_CODE_UNAVAILABLE,
+		preDispatch: true,
 	});
-}
-
-function isPreDispatchConnectionFailure(err: unknown): boolean {
-	const failure = err as {
-		code?: unknown;
-		message?: unknown;
-		cause?: { code?: unknown };
-	};
-	if (
-		failure?.code === "ECONNREFUSED" ||
-		failure?.cause?.code === "ECONNREFUSED"
-	) {
-		return true;
-	}
-	if (failure?.code !== GRPC_CODE_UNAVAILABLE) return false;
-	return /\b(?:ECONNREFUSED|No connection established|Failed to connect to all addresses)\b/i.test(
-		String(failure.message ?? ""),
-	);
 }
 
 // rpcCallMeta builds the RPC.CALL meta JSON. Written out instead of
@@ -500,8 +486,19 @@ function rpcCallMeta(
 	);
 }
 
-function sleep(ms: number): Promise<void> {
-	return new Promise((r) => setTimeout(r, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+	signal?.throwIfAborted();
+	return new Promise((resolve, reject) => {
+		const abort = () => {
+			clearTimeout(timer);
+			reject(signal?.reason ?? new Error("rpc cancelled"));
+		};
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", abort);
+			resolve();
+		}, ms);
+		signal?.addEventListener("abort", abort, { once: true });
+	});
 }
 
 function parseTimeout(s: string | undefined): number | undefined {

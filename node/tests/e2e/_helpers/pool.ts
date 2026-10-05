@@ -84,6 +84,7 @@ const SENTINEL_WF = "__sb_pool_sentinel__";
 
 function registerWorkflowSentinel(sb: ServiceBridge): void {
 	sb.workflow.handle(SENTINEL_WF, {
+		version: "test-v1",
 		steps: [{ type: "local", id: "noop", fn: async () => ({}) }],
 	});
 }

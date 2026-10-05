@@ -406,7 +406,7 @@ describe("Drainer", () => {
 		expect(row?.last_error).toBe("unspecified");
 	});
 
-	it("processes a batch in a single transaction", async () => {
+	it("claims atomically and completes the whole batch in one transaction", async () => {
 		for (let i = 0; i < 20; i++) {
 			insertPending(storage, `ev-tx-${String(i).padStart(2, "0")}`);
 		}
@@ -437,7 +437,7 @@ describe("Drainer", () => {
 		expect(
 			storage.prepare("SELECT COUNT(*) AS c FROM event_outbox").get(),
 		).toMatchObject({ c: 0 });
-		expect(txCalls).toBe(1);
+		expect(txCalls).toBe(3);
 		expect(storage.outboxRowCount()).toBe(0);
 	});
 
@@ -627,7 +627,7 @@ describe("Drainer", () => {
 		expect(capturedXSbTrace).toBe("");
 	});
 
-	it("stop() awaits current iteration completion", async () => {
+	it("stop() cancels the active publish and preserves the uncertain event", async () => {
 		let publishStarted = false;
 		let publishDone = false;
 
@@ -660,7 +660,9 @@ describe("Drainer", () => {
 
 		await drainer.stop();
 		// After stop(), the row should have been deleted (iteration completed)
-		expect(publishDone).toBe(true);
-		expect(getRow(storage, "ev-stop")).toBeNull();
+		expect(publishDone).toBe(false);
+		expect(getRow(storage, "ev-stop")?.status).toBe("pending");
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		expect(getRow(storage, "ev-stop")?.status).toBe("pending");
 	});
 });

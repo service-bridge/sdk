@@ -77,3 +77,5 @@ await app.register(sbFastify, { sb, host: process.env.POD_IP });
 Используется в:
 - `sdk/node/tests/e2e/http-fastify.test.ts`.
 - Прикладной код через subpath `service-bridge/fastify`.
+
+Fastify integration requires native Node.js 22, 24 or 26. Bun 1.3.13 does not emit socket/response lifecycle events when a client disconnects after sending a complete request body; this prevents reliable cancellation telemetry and this integration is not supported on that runtime.

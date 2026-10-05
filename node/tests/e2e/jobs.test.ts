@@ -107,7 +107,11 @@ describe("jobs", () => {
 		const sb = track(dedicated("primary"));
 		sb.job.handle(
 			jobName,
-			{ trigger: { delayed: { at: Date.now() + 1_000 } }, maxAttempts: 1 },
+			{
+				version: "test-v1",
+				trigger: { delayed: { at: Date.now() + 1_000 } },
+				maxAttempts: 1,
+			},
 			async (ctx) => {
 				calls.push({ attempt: ctx.attempt });
 			},
@@ -133,7 +137,12 @@ describe("jobs", () => {
 		const sb = track(dedicated("primary"));
 		sb.job.handle(
 			jobName,
-			{ trigger: { interval: 1_000 }, overlap: "allow", maxConcurrent: 10 },
+			{
+				version: "test-v1",
+				trigger: { interval: 1_000 },
+				overlap: "allow",
+				maxConcurrent: 10,
+			},
 			async () => {
 				callCount++;
 			},
@@ -162,7 +171,11 @@ describe("jobs", () => {
 		const sb = track(dedicated("primary"));
 		sb.job.handle(
 			jobName,
-			{ trigger: { delayed: { at: Date.now() + 500 } }, maxAttempts: 3 },
+			{
+				version: "test-v1",
+				trigger: { delayed: { at: Date.now() + 500 } },
+				maxAttempts: 3,
+			},
 			async (ctx) => {
 				calls.push({
 					attempt: ctx.attempt,
@@ -191,7 +204,11 @@ describe("jobs", () => {
 		const sb = track(dedicated("primary"));
 		sb.job.handle(
 			jobName,
-			{ trigger: { delayed: { at: Date.now() + 500 } }, maxAttempts: 2 },
+			{
+				version: "test-v1",
+				trigger: { delayed: { at: Date.now() + 500 } },
+				maxAttempts: 2,
+			},
 			async () => {
 				callCount++;
 				throw new Error("always fails");
@@ -220,7 +237,7 @@ describe("jobs", () => {
 		const sb = track(dedicated("primary"));
 		sb.job.handle(
 			jobName,
-			{ trigger: { interval: 200 }, overlap: "skip" },
+			{ version: "test-v1", trigger: { interval: 200 }, overlap: "skip" },
 			async () => {
 				active++;
 				totalCalls++;
@@ -250,7 +267,7 @@ describe("jobs", () => {
 		const sb = track(dedicated("primary"));
 		sb.job.handle(
 			jobName,
-			{ trigger: { interval: 200 }, overlap: "buffer_one" },
+			{ version: "test-v1", trigger: { interval: 200 }, overlap: "buffer_one" },
 			async () => {
 				active++;
 				if (active > maxConcurrent) maxConcurrent = active;
@@ -274,7 +291,12 @@ describe("jobs", () => {
 		const sb = track(dedicated("primary"));
 		sb.job.handle(
 			jobName,
-			{ trigger: { interval: 200 }, overlap: "allow", maxConcurrent: 1 },
+			{
+				version: "test-v1",
+				trigger: { interval: 200 },
+				overlap: "allow",
+				maxConcurrent: 1,
+			},
 			async () => {
 				active++;
 				if (active > maxConcurrent) maxConcurrent = active;
@@ -301,14 +323,24 @@ describe("jobs", () => {
 		const first = track(dedicated("primary"));
 		first.job.handle(
 			jobA,
-			{ trigger: { interval: 300 }, overlap: "allow", maxConcurrent: 5 },
+			{
+				version: "test-v1",
+				trigger: { interval: 300 },
+				overlap: "allow",
+				maxConcurrent: 5,
+			},
 			async () => {
 				callsA.push(Date.now());
 			},
 		);
 		first.job.handle(
 			jobB,
-			{ trigger: { interval: 300 }, overlap: "allow", maxConcurrent: 5 },
+			{
+				version: "test-v1",
+				trigger: { interval: 300 },
+				overlap: "allow",
+				maxConcurrent: 5,
+			},
 			async () => {
 				callsB.push(Date.now());
 			},
@@ -331,7 +363,12 @@ describe("jobs", () => {
 		const second = track(dedicated("primary"));
 		second.job.handle(
 			jobA,
-			{ trigger: { interval: 300 }, overlap: "allow", maxConcurrent: 5 },
+			{
+				version: "test-v1",
+				trigger: { interval: 300 },
+				overlap: "allow",
+				maxConcurrent: 5,
+			},
 			async () => {
 				callsA.push(Date.now());
 			},
@@ -365,7 +402,7 @@ describe("jobs", () => {
 			const sb = track(dedicated("primary"));
 			sb.job.handle(
 				jobName,
-				{ trigger: { delayed: { at: Date.now() + 500 } } },
+				{ version: "test-v1", trigger: { delayed: { at: Date.now() + 500 } } },
 				async () => {
 					handlerCalled = true;
 				},
@@ -419,7 +456,11 @@ describe("jobs", () => {
 		});
 		sb1.job.handle(
 			jobName,
-			{ trigger: { delayed: { at: Date.now() + 500 } }, maxAttempts: 1 },
+			{
+				version: "test-v1",
+				trigger: { delayed: { at: Date.now() + 500 } },
+				maxAttempts: 1,
+			},
 			async () => {
 				try {
 					await sb1.rpc.call(sb2ServiceName, method, {
@@ -474,7 +515,11 @@ describe("jobs", () => {
 		});
 		sb1.job.handle(
 			jobName,
-			{ trigger: { delayed: { at: Date.now() + 800 } }, maxAttempts: 1 },
+			{
+				version: "test-v1",
+				trigger: { delayed: { at: Date.now() + 800 } },
+				maxAttempts: 1,
+			},
 			async () => {
 				handlerCalled = true;
 				await sb1.event.publish(eventName, {
@@ -503,6 +548,7 @@ describe("jobs", () => {
 		// (the runtime resolves a run against definitions present at registration).
 		const sb2 = track(dedicated("second"));
 		sb2.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [{ type: "local", id: "step1", fn: async () => ({ ok: true }) }],
 		});
 		await connect(sb2);
@@ -515,7 +561,11 @@ describe("jobs", () => {
 			// Retries because the workflow rule is written after this client
 			// connects: a tick that lands first is denied, and the retry is how a
 			// job is meant to survive a dependency that is not ready yet.
-			{ trigger: { delayed: { at: Date.now() + 800 } }, maxAttempts: 3 },
+			{
+				version: "test-v1",
+				trigger: { delayed: { at: Date.now() + 800 } },
+				maxAttempts: 3,
+			},
 			async () => {
 				const result = await sb1.workflow.start(wfName, {});
 				runId = result.runId;
@@ -553,7 +603,7 @@ describe("jobs", () => {
 			const sb = track(dedicated("primary"));
 			sb.job.handle(
 				jobName,
-				{ trigger: { interval: 300 }, overlap: "skip" },
+				{ version: "test-v1", trigger: { interval: 300 }, overlap: "skip" },
 				async () => {
 					totalHandlerCalls++;
 				},

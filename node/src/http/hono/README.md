@@ -16,8 +16,9 @@
 | `collectHonoRoutes` | `(app: Hono, sb: ServiceBridge) => void` | — | Только сбор роутов в `sb.routes`, без публикации endpoint и без обёртки `fetch`. Низкоуровневый слой для тестов. Метод приводится к верхнему регистру; `method === "ALL"` (от `app.all(...)`) пропускается. |
 | `HonoEndpoint` | `interface { host?: string; port: number }` | — | Адрес, на котором фактически слушает Hono-сервер. `port` обязателен (Hono агностичен к серверу, не открывает сокет сам — должен совпадать с тем, что передан в `Bun.serve`/`serve`). `host` опционален. |
 | `HonoEndpoint.host` | `string \| undefined` | `127.0.0.1` (с одноразовым warn) | Advertise-host для HTTP-плоскости (ADR 0001). Если опущен — `resolveHttpAdvertiseHost()` → `127.0.0.1`. |
+| `HonoEndpoint.resolveRemoteAddress` | `(request, env, executionContext) => string \| null \| undefined` | absent | Real server peer address; required for explicit rateLimit. Forwarded headers require trustProxyHops. |
 | `HonoEndpoint.port` | `number` | — (обязателен) | Порт HTTP-сервера. |
-| `HonoEndpoint.security` | `HttpSecurityOptions` | scanner block + 300 req/min/client | Ранний отсев до `app.fetch`, route handler и HTTP telemetry. |
+| `HonoEndpoint.security` | `HttpSecurityOptions` | scanner block; limiter only with resolver | Early request guard before handler/telemetry. |
 
 ### Трейсинг и захват тел (поведение обёртки `app.fetch`)
 
@@ -27,7 +28,7 @@
 - `businessKey` = заголовок `Idempotency-Key`, иначе `"<METHOD> <pathname>"`.
 - downstream-цепочка выполняется внутри `runWithTrace(op.scope, …)`, чтобы handler и его `sb.rpc.call` / `event.publish` видели через ALS контекст, где `traceId` един с HTTP.HANDLE, а `parentOpId` = `opId` этого op'а (downstream вложен под HTTP.HANDLE, не отдельный корень).
 - эмитится HTTP.HANDLE-операция (`Channel.HTTP`, `kind: HttpHandle`) через общий `startHttpOp` (`../_common/http-op`).
-- тело запроса (через клон, чтобы не «съесть» стрим для handler) и тело ответа захватываются best-effort как raw-JSON (`contract: "raw/json"`); пустые/`{}`/`null` тела не пишутся. Пока `op.capturing === false`, ни `req.clone()`, ни `res.clone()` не вызываются вовсе.
+- Passive capture wraps body reads without clone/tee or read-ahead, retaining at most payloadMaxBytes per direction. Headers return immediately. Unread bodies are not captured.
 - статус операции: `statusForHttpCode` — HTTP `>= 400` (включая `>= 500`) → `Status.ERROR` (с текстом `HTTP <code>`), иначе `Status.SUCCESS`; исключение из цепочки → `Status.ERROR` с сообщением и ре-throw. На wire это единый словарь статусов (`success`/`error`).
 
 ### Пример использования (Bun)
@@ -77,7 +78,7 @@ serve({ fetch: app.fetch, port: 8080 });
 - **Обёртка `fetch`, а не `app.use`.** `Hono.use(...)` после регистрации роутов не догоняет уже сматченные роуты — порядок объявления матчит. Чтобы трейсинг и захват тел работали для всех роутов, оборачивается сам `app.fetch`.
 - **Pattern не нормализуется.** Сырой Hono-паттерн (`:id{[0-9]+}` и т. п.) уходит в registry as-is; нормализация — косметика на UI Service Map, а не задача SDK (`Route.pattern`).
 - **Вызов до `sb.start()` — рекомендованный flow.** Тогда endpoint попадает в первый `RegisterRequest` без restart. `publishHttp` безопасен до старта — `triggerRestart` тогда no-op.
-- **Тела захватываются через клон запроса/ответа — и только когда захват включён.** Чтение тела для capture не должно «съедать» стрим, который прочитает handler или вернёт клиент. Но клон стрима — самая дорогая часть захвата, поэтому он делается лишь при `HttpOp.capturing`: в дефолтном режиме `none` `OpHandle` всё равно выбросил бы байты, а клон и `text()` тела ответа платились бы на каждом запросе.
+- Passive bounded capture forwards cancellation/errors to the original stream. Late payload capture in errors mode respects the terminal HTTP status.
 
 ## Зависимости
 
@@ -94,3 +95,5 @@ serve({ fetch: app.fetch, port: 8080 });
 - `sdk/node/tests/e2e/http-hono.test.ts`.
 - `sdk/node/src/http/hono/plugin.test.ts`.
 - Прикладной код через subpath `service-bridge/hono`.
+
+Passive capture wraps body reads without tee/clone, retaining at most payloadMaxBytes per direction. Response headers are returned immediately; unread body is not captured. Late capture respects the terminal HTTP status. HonoEndpoint.resolveRemoteAddress(request, env, executionContext) must read the actual server peer address; without it the default per-client limiter is disabled. Explicit rateLimit requires this resolver. Proxy headers remain opt-in through trustProxyHops.

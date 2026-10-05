@@ -13,57 +13,31 @@ import {
 } from "./retry";
 
 describe("isRetryable", () => {
-	it("UNAVAILABLE retryable without an idempotency_key", () => {
-		// No connection was established — the callee provably did no work.
-		expect(isRetryable({ code: GRPC_CODE_UNAVAILABLE }, false)).toBe(true);
-		expect(isRetryable({ code: GRPC_CODE_UNAVAILABLE }, true)).toBe(true);
+	for (const code of [
+		GRPC_CODE_UNAVAILABLE,
+		GRPC_CODE_RESOURCE_EXHAUSTED,
+		GRPC_CODE_DEADLINE_EXCEEDED,
+		GRPC_CODE_INTERNAL,
+		GRPC_CODE_ABORTED,
+		GRPC_CODE_UNKNOWN,
+	]) {
+		it(`does not replay unknown outcome ${code}, even with a key`, () => {
+			expect(isRetryable({ code }, false)).toBe(false);
+			expect(isRetryable({ code }, true)).toBe(false);
+		});
+	}
+	it("retries locally identified failures before dispatch", () => {
+		expect(
+			isRetryable({ preDispatch: true, code: GRPC_CODE_UNAVAILABLE }, false),
+		).toBe(true);
 	});
-
-	it("RESOURCE_EXHAUSTED retryable without an idempotency_key", () => {
-		// Rejected before execution by the rate limiter — no side effect.
-		expect(isRetryable({ code: GRPC_CODE_RESOURCE_EXHAUSTED }, false)).toBe(
-			true,
-		);
-		expect(isRetryable({ code: GRPC_CODE_RESOURCE_EXHAUSTED }, true)).toBe(
-			true,
-		);
-	});
-
-	it("DEADLINE_EXCEEDED NOT retryable without an idempotency_key", () => {
-		// The deadline expired on the caller side; the handler may have completed
-		// the effect and answered late. Retrying blind would double-charge.
-		expect(isRetryable({ code: GRPC_CODE_DEADLINE_EXCEEDED }, false)).toBe(
-			false,
-		);
-	});
-
-	it("DEADLINE_EXCEEDED retryable with an idempotency_key", () => {
-		expect(isRetryable({ code: GRPC_CODE_DEADLINE_EXCEEDED }, true)).toBe(true);
-	});
-
-	it("INTERNAL retryable only with idempotency_key", () => {
-		expect(isRetryable({ code: GRPC_CODE_INTERNAL }, false)).toBe(false);
-		expect(isRetryable({ code: GRPC_CODE_INTERNAL }, true)).toBe(true);
-	});
-
-	it("ABORTED retryable only with idempotency_key", () => {
-		expect(isRetryable({ code: GRPC_CODE_ABORTED }, false)).toBe(false);
-		expect(isRetryable({ code: GRPC_CODE_ABORTED }, true)).toBe(true);
-	});
-
-	it("UNKNOWN retryable only with idempotency_key", () => {
-		expect(isRetryable({ code: GRPC_CODE_UNKNOWN }, false)).toBe(false);
-		expect(isRetryable({ code: GRPC_CODE_UNKNOWN }, true)).toBe(true);
-	});
-
-	it("INVALID_ARGUMENT / PERMISSION_DENIED never retryable", () => {
-		expect(isRetryable({ code: 3 /* INVALID_ARGUMENT */ }, true)).toBe(false);
-		expect(isRetryable({ code: 7 /* PERMISSION_DENIED */ }, true)).toBe(false);
-	});
-
-	it("errors without numeric code → not retryable", () => {
-		expect(isRetryable(new Error("plain"), true)).toBe(false);
-		expect(isRetryable({ code: "STRING_CODE" }, true)).toBe(false);
+	it("does not infer safety from message text", () => {
+		expect(
+			isRetryable(
+				{ code: GRPC_CODE_UNAVAILABLE, message: "ECONNREFUSED" },
+				true,
+			),
+		).toBe(false);
 	});
 });
 

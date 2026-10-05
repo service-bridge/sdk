@@ -337,3 +337,30 @@ describe("aggregator ↔ ring", () => {
 		expect(ringMetrics(ring).map((p) => p.value)).toEqual([4, 6]);
 	});
 });
+
+describe("bounded metric cardinality", () => {
+	test("enforces series/label budgets and retirement frees identity capacity", () => {
+		const points: MetricPoint[] = [];
+		const agg = new MetricsAggregator(
+			{
+				push: (_kind, point) => {
+					points.push(point as MetricPoint);
+				},
+			},
+			1,
+		);
+		const old = agg.counter("old", "requests");
+		old.inc(3);
+		expect(() =>
+			agg.counter("old", "requests", { requestId: "unbounded" }),
+		).toThrow(/budget|limit/);
+		agg.retireInstance("old");
+		expect(points.map((p) => [p.instanceId, p.value])).toEqual([["old", 3]]);
+		expect(() => old.inc()).toThrow(/retired/);
+		agg.counter("new", "requests").inc();
+		expect(agg.drain()[0]!.instanceId).toBe("new");
+		expect(() =>
+			agg.counter("new", "bad", { label: "x".repeat(1025) }),
+		).toThrow();
+	});
+});

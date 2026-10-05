@@ -34,6 +34,32 @@ describe("Storage", () => {
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	});
 
+	it("failed rows are inspectable, retryable with the same id and explicitly discardable", () => {
+		const storage = Storage.open({ dataDir: tmpDir });
+		for (const id of ["a", "b", "c"]) {
+			insertRow(storage, id);
+			storage.adjustOutboxRowCount(1);
+		}
+		storage
+			.prepare(
+				"UPDATE event_outbox SET status='failed', attempts=7, last_error='denied' WHERE id IN ('a','b')",
+			)
+			.run();
+		expect(storage.listFailed(1).map((row) => row.id)).toEqual(["a"]);
+		expect(storage.listFailed(1, "a").map((row) => row.id)).toEqual(["b"]);
+		expect(storage.retryFailed("a")).toBe(true);
+		expect(storage.retryFailed("a")).toBe(false);
+		expect(storage.discardFailed("c")).toBe(false);
+		expect(storage.discardFailed("b")).toBe(true);
+		expect(storage.outboxRowCount()).toBe(2);
+		expect(
+			storage
+				.prepare("SELECT status, attempts FROM event_outbox WHERE id='a'")
+				.get(),
+		).toEqual({ status: "pending", attempts: 7 });
+		storage.close();
+	});
+
 	it("open creates directory and db file", () => {
 		const dataDir = path.join(tmpDir, "nested", "data");
 		const storage = Storage.open({ dataDir });

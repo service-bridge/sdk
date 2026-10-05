@@ -68,6 +68,10 @@ export class JobSubscriber {
 					);
 				});
 			},
+			onDisconnect: () => {
+				this._stopping.abort();
+				if (!this._closed) this._stopping = new AbortController();
+			},
 			onError: (err) =>
 				this.d.logger.warn(`jobs subscriber: stream error: ${err.message}`),
 			reconnectOpts: d.reconnectOpts,
@@ -107,7 +111,7 @@ export class JobSubscriber {
 			return;
 		}
 
-		const reg = this.d.domain.lookup(exec.jobName);
+		const reg = this.d.domain.lookup(exec.jobName, exec.fingerprint);
 		if (!reg) {
 			this.d.logger.warn(
 				`jobs: no handler for job "${exec.jobName}", dropping execution ${exec.executionId}`,
@@ -115,8 +119,11 @@ export class JobSubscriber {
 			return;
 		}
 
-		const maxConcurrent = reg.opts.maxConcurrent ?? 0;
-		const sem = this.getSemaphore(exec.jobName, maxConcurrent);
+		const maxConcurrent = reg.opts.maxConcurrent ?? 32;
+		const sem = this.getSemaphore(
+			`${exec.jobName}:${exec.fingerprint}`,
+			maxConcurrent,
+		);
 
 		try {
 			await sem.acquire(this._stopping.signal);
@@ -144,7 +151,7 @@ export class JobSubscriber {
 		_opts: JobOpts,
 		instanceId: string,
 	): Promise<void> {
-		const abortCtrl = new AbortController();
+		const abortCtrl = this._stopping;
 		const ctx: JobHandlerCtx = {
 			jobName: exec.jobName,
 			executionId: exec.executionId,
@@ -163,8 +170,9 @@ export class JobSubscriber {
 
 		try {
 			await this.runWithTrace(xSbTrace, () => Promise.resolve(fn(ctx)));
-			this.sendResult(exec, instanceId, true);
+			if (!abortCtrl.signal.aborted) this.sendResult(exec, instanceId, true);
 		} catch (err) {
+			if (abortCtrl.signal.aborted) return;
 			const error = err as Error & { retryable?: boolean };
 			const retryable = error.retryable !== false;
 			this.sendResult(exec, instanceId, false, {
@@ -211,6 +219,7 @@ export class JobSubscriber {
 					},
 				};
 
+		if (this._closed || this._stopping.signal.aborted) return;
 		this.d.rpcClient.jobResult(request, (err) => {
 			if (err) {
 				this.d.logger.warn(
@@ -223,13 +232,13 @@ export class JobSubscriber {
 	private getSemaphore(jobName: string, maxConcurrent: number): Semaphore {
 		const existing = this._semaphores.get(jobName);
 		if (existing) return existing;
-		const limit = maxConcurrent > 0 ? maxConcurrent : Number.MAX_SAFE_INTEGER;
+		const limit = maxConcurrent > 0 ? maxConcurrent : 32;
 		// Unbounded wait queue, unlike the inbound RPC path which sheds load on a
 		// full queue. An execution arriving here already holds a runtime-issued
 		// lease and the runtime is the one rate-limiting dispatch; shedding it
 		// client-side would not reject a request, it would abandon work the
 		// runtime believes this instance owns until the lease expires.
-		const sem = new Semaphore(limit, Number.MAX_SAFE_INTEGER);
+		const sem = new Semaphore(limit, 1024);
 		this._semaphores.set(jobName, sem);
 		return sem;
 	}

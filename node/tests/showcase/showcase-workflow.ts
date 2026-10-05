@@ -385,6 +385,7 @@ function registerSurfaces(b: Bridges): void {
 	b.showcase.job.handle(
 		CLEANUP_JOB,
 		{
+			version: "test-v1",
 			trigger: { cron: "* * * * *" },
 			maxAttempts: 4,
 			retry: { initialMs: 200, maxMs: 1000, multiplier: 2, jitter: 0 },
@@ -398,6 +399,7 @@ function registerSurfaces(b: Bridges): void {
 	b.showcase.job.handle(
 		DELAYED_JOB,
 		{
+			version: "test-v1",
 			trigger: { delayed: { at: new Date(Date.now() + 5_000) } },
 		},
 		async () => {

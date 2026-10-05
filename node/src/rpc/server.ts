@@ -157,13 +157,18 @@ export class CallServer {
 		return this.advertised;
 	}
 
-	async stop(): Promise<void> {
+	async stop(timeoutMs = 1000): Promise<void> {
 		if (!this.server) return;
 		const server = this.server;
 		this.server = null;
 		this.advertised = null;
 		await new Promise<void>((resolve) => {
+			const timer = setTimeout(() => {
+				server.forceShutdown();
+				resolve();
+			}, timeoutMs);
 			server.tryShutdown((err) => {
+				clearTimeout(timer);
 				if (err) server.forceShutdown();
 				resolve();
 			});
@@ -172,8 +177,8 @@ export class CallServer {
 
 	// admit takes an execution slot, or throws SemaphoreExhaustedError when the
 	// server is past both its concurrency and queue bounds.
-	private async admit(): Promise<() => void> {
-		await this.admission.acquire();
+	private async admit(signal?: AbortSignal): Promise<() => void> {
+		await this.admission.acquire(signal);
 		let released = false;
 		return () => {
 			if (released) return;
@@ -196,15 +201,29 @@ export class CallServer {
 
 		let release: () => void;
 		try {
-			release = await this.admit();
+			const controller = new AbortController();
+			if (call.cancelled) controller.abort();
+			const cancel = () => controller.abort();
+			call.once("cancelled", cancel);
+			try {
+				release = await this.admit(controller.signal);
+			} finally {
+				call.off("cancelled", cancel);
+			}
 		} catch (err) {
 			callback({
-				code: grpc.status.RESOURCE_EXHAUSTED,
-				message: overloadMessage(err),
+				code: call.cancelled
+					? grpc.status.CANCELLED
+					: grpc.status.RESOURCE_EXHAUSTED,
+				message: call.cancelled ? "rpc: call cancelled" : overloadMessage(err),
 			});
 			return;
 		}
 
+		if (call.cancelled) {
+			release();
+			return;
+		}
 		const req = call.request;
 		const traceCtx = inboundTraceContext(req);
 		// The handler runs in the call's trace context (parent = caller CALL.op_id)
@@ -261,14 +280,24 @@ export class CallServer {
 
 		let release: () => void;
 		try {
-			release = await this.admit();
+			const controller = new AbortController();
+			if (call.cancelled) controller.abort();
+			const cancel = () => controller.abort();
+			call.once("cancelled", cancel);
+			try {
+				release = await this.admit(controller.signal);
+			} finally {
+				call.off("cancelled", cancel);
+			}
 		} catch (err) {
 			// Overload is a transport-level outcome, so it travels as a gRPC status
 			// rather than a StreamChunk error: grpc-js turns an 'error' event on the
 			// writable side into the call's final status.
 			call.emit("error", {
-				code: grpc.status.RESOURCE_EXHAUSTED,
-				details: overloadMessage(err),
+				code: call.cancelled
+					? grpc.status.CANCELLED
+					: grpc.status.RESOURCE_EXHAUSTED,
+				details: call.cancelled ? "rpc: call cancelled" : overloadMessage(err),
 			});
 			return;
 		}
@@ -281,6 +310,10 @@ export class CallServer {
 		// this the handler's generator keeps producing into a dead call.
 		call.on("cancelled", onCancelled);
 
+		if (call.cancelled) {
+			release();
+			return;
+		}
 		const req = call.request;
 		const traceCtx = inboundTraceContext(req);
 		// Handler runs in the call's trace context; no RPC.HANDLE op (ADR-0001).

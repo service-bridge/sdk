@@ -1,8 +1,9 @@
+import type { ReadableStreamDefaultReader as WebReader } from "node:stream/web";
 import type { Hono } from "hono";
 import type { ServiceBridge } from "../../connection/service-bridge";
 import { runWithTrace } from "../../telemetry/context";
 import { Status } from "../../telemetry/ops";
-import { bodyToBytes, RAW_JSON_CONTRACT } from "../_common/body-capture";
+import { RAW_JSON_CONTRACT } from "../_common/body-capture";
 import { startHttpOp, statusForHttpCode } from "../_common/http-op";
 import {
 	HttpRequestGuard,
@@ -21,6 +22,11 @@ export interface HonoEndpoint {
 	host?: string;
 	port: number;
 	security?: HttpSecurityOptions;
+	resolveRemoteAddress?: (
+		request: Request,
+		env: unknown,
+		executionContext: unknown,
+	) => string | null | undefined;
 }
 
 /**
@@ -62,10 +68,14 @@ export function attachHono(
 	sb: ServiceBridge,
 	endpoint: HonoEndpoint,
 ): void {
+	if (endpoint.security?.rateLimit && !endpoint.resolveRemoteAddress)
+		throw new Error(
+			"Hono rate limiting requires resolveRemoteAddress from the server adapter",
+		);
 	collectHonoRoutes(app, sb);
 	const host = resolveHttpAdvertiseHost(endpoint.host);
 	sb.routes.publishHttp({ host, port: endpoint.port });
-	installHonoTracing(app, sb, endpoint.security);
+	installHonoTracing(app, sb, endpoint);
 }
 
 const TRACE_FLAG = Symbol.for("servicebridge.hono.trace");
@@ -73,10 +83,15 @@ const TRACE_FLAG = Symbol.for("servicebridge.hono.trace");
 function installHonoTracing(
 	app: Hono,
 	sb: ServiceBridge,
-	security?: HttpSecurityOptions,
+	endpoint: HonoEndpoint,
 ): void {
-	// biome-ignore lint/suspicious/noExplicitAny: app не хранит произвольные поля в типах
-	const tagged = app as any;
+	const security = endpoint.security;
+	if (security?.rateLimit && !endpoint.resolveRemoteAddress) {
+		throw new Error(
+			"Hono rate limiting requires resolveRemoteAddress from the server adapter",
+		);
+	}
+	const tagged = app as Hono & { [TRACE_FLAG]?: boolean };
 	if (tagged[TRACE_FLAG]) return;
 	tagged[TRACE_FLAG] = true;
 
@@ -85,13 +100,18 @@ function installHonoTracing(
 	// chain в runWithTrace, чтобы handler и downstream user-code видели ALS,
 	// и эмитим HTTP.HANDLE op (start/end по response.status).
 	const origFetch = app.fetch.bind(app);
-	const guard = new HttpRequestGuard(security);
+	const guard = new HttpRequestGuard(
+		endpoint.resolveRemoteAddress
+			? security
+			: { ...security, rateLimit: false },
+	);
 	// biome-ignore lint/suspicious/noExplicitAny: env/executionCtx — рантайм-зависимы
 	(app as any).fetch = async (req: Request, env?: any, executionCtx?: any) => {
 		const url = new URL(req.url);
 		const decision = guard.check({
 			method: req.method,
 			pathname: `${url.pathname}${url.search}`,
+			remoteAddress: endpoint.resolveRemoteAddress?.(req, env, executionCtx),
 			forwardedFor: req.headers.get("x-forwarded-for"),
 		});
 		if (!decision.allowed) {
@@ -114,40 +134,98 @@ function installHonoTracing(
 			idempotencyKey: req.headers.get("idempotency-key"),
 		});
 		const handle = op.handle;
-		// Clone the request up front so reading its body for capture never
-		// consumes the stream the route handler will read. Cloning a stream is
-		// not free, so it happens only while capture is actually on.
-		const reqClone = op.capturing ? req.clone() : null;
+		const limit = handle.payloadMaxBytes ?? 65536;
+		const request =
+			op.capturing && req.body
+				? new Request(req, {
+						body: passiveCapture(req.body, limit, (bytes, size) =>
+							handle.captureIn(bytes, RAW_JSON_CONTRACT, size),
+						),
+						duplex: "half",
+					} as RequestInit)
+				: req;
 		return runWithTrace(op.scope, async () => {
-			// Клон типизирован структурно: глобальный `Request` в этом проекте
-			// резолвится в Bun-версию, а `req.clone()` — в undici-версию.
-			const captureBodies = async (
-				inClone: { text(): Promise<string> },
-				res: Response,
-			) => {
-				try {
-					const inBytes = bodyToBytes(await inClone.text());
-					if (inBytes) handle.captureIn(inBytes, RAW_JSON_CONTRACT);
-				} catch {
-					// unreadable request body — skip IN capture
-				}
-				try {
-					const outBytes = bodyToBytes(await res.clone().text());
-					if (outBytes) handle.captureOut(outBytes, RAW_JSON_CONTRACT);
-				} catch {
-					// unreadable response body — skip OUT capture
-				}
-			};
 			try {
-				const res = (await origFetch(req, env, executionCtx)) as Response;
-				if (reqClone) await captureBodies(reqClone, res);
+				const res = (await origFetch(request, env, executionCtx)) as Response;
 				const { status, message } = statusForHttpCode(res.status);
 				handle.end(status, message);
-				return res;
+				if (!op.capturing || !res.body) return res;
+				return new Response(
+					passiveCapture(res.body, limit, (bytes, size) =>
+						handle.captureOut(bytes, RAW_JSON_CONTRACT, size),
+					),
+					{
+						status: res.status,
+						statusText: res.statusText,
+						headers: res.headers,
+					},
+				);
 			} catch (err) {
 				handle.end(Status.ERROR, (err as Error).message);
 				throw err;
 			}
 		});
 	};
+}
+
+// Zero queue: read only when the application or response consumer pulls.
+function passiveCapture(
+	body: ReadableStream<Uint8Array>,
+	limit: number,
+	capture: (bytes: Uint8Array, size: number) => void,
+): ReadableStream<Uint8Array> {
+	let reader: WebReader<Uint8Array> | undefined;
+	const chunks: Uint8Array[] = [];
+	let retained = 0;
+	let size = 0;
+	let finished = false;
+	const finish = () => {
+		if (finished) return;
+		finished = true;
+		if (!retained) return;
+		const bytes = new Uint8Array(retained);
+		let offset = 0;
+		for (const chunk of chunks) {
+			bytes.set(chunk, offset);
+			offset += chunk.length;
+		}
+		chunks.length = 0;
+		capture(bytes, size);
+	};
+	return new ReadableStream(
+		{
+			async pull(controller) {
+				reader ??= body.getReader();
+				const active = reader;
+				try {
+					const next = await active.read();
+					if (next.done) {
+						finish();
+						active.releaseLock();
+						controller.close();
+						return;
+					}
+					size += next.value.byteLength;
+					const n = Math.min(
+						next.value.byteLength,
+						Math.max(0, limit - retained),
+					);
+					if (n) {
+						chunks.push(next.value.slice(0, n));
+						retained += n;
+					}
+					controller.enqueue(next.value);
+				} catch (err) {
+					finish();
+					controller.error(err);
+				}
+			},
+			async cancel(reason) {
+				finish();
+				if (reader) await reader.cancel(reason);
+				else await body.cancel(reason);
+			},
+		},
+		{ highWaterMark: 0 },
+	);
 }

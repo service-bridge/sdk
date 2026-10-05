@@ -110,7 +110,10 @@ describe("attachHono payload capture gating", () => {
 	async function roundtrip(mode: "none" | "all") {
 		const stub = makeSbStub(mode);
 		const app = new Hono();
-		app.post("/echo", (c) => c.json({ ok: true }));
+		app.post("/echo", async (c) => {
+			await c.req.text();
+			return c.json({ ok: true });
+		});
 		attachHono(app, stub.sb, { port: 1 });
 
 		const req = new Request("http://localhost/echo", {
@@ -127,7 +130,8 @@ describe("attachHono payload capture gating", () => {
 				return origClone();
 			},
 		});
-		await app.fetch(req);
+		const response = await app.fetch(req);
+		await response.text();
 		return { stub, clones: () => clones };
 	}
 
@@ -142,7 +146,7 @@ describe("attachHono payload capture gating", () => {
 
 	it('captures request and response bodies when capture mode is "all"', async () => {
 		const { stub, clones } = await roundtrip("all");
-		expect(clones()).toBe(1);
+		expect(clones()).toBe(0);
 		expect(stub.captures.map((c) => c.direction)).toEqual(["in", "out"]);
 	});
 
@@ -172,4 +176,51 @@ describe("attachHono payload capture gating", () => {
 		expect(await response.json()).toEqual({ error: "Not Found" });
 		expect(stub.started).toHaveLength(0);
 	});
+});
+
+it("returns streaming response headers without waiting for EOF", async () => {
+	const stub = makeSbStub("all");
+	const app = new Hono();
+	let source: ReadableStreamDefaultController<Uint8Array>;
+	app.get(
+		"/stream",
+		() =>
+			new Response(
+				new ReadableStream({
+					start(c) {
+						source = c;
+					},
+				}),
+			),
+	);
+	attachHono(app, stub.sb, { port: 1 });
+	const response = await app.fetch(new Request("http://localhost/stream"));
+	const reader = response.body!.getReader();
+	source!.enqueue(new TextEncoder().encode("data: one\n\n"));
+	expect(new TextDecoder().decode((await reader.read()).value)).toBe(
+		"data: one\n\n",
+	);
+	await reader.cancel();
+});
+it("uses the explicit server address resolver for independent client limits", async () => {
+	const stub = makeSbStub();
+	const app = new Hono();
+	app.get("/", (c) => c.text("ok"));
+	attachHono(app, stub.sb, {
+		port: 1,
+		resolveRemoteAddress: (_r, env) => (env as { ip: string }).ip,
+		security: { rateLimit: { limit: 1 } },
+	});
+	expect(
+		(await app.fetch(new Request("http://localhost/"), { ip: "1.1.1.1" }))
+			.status,
+	).toBe(200);
+	expect(
+		(await app.fetch(new Request("http://localhost/"), { ip: "2.2.2.2" }))
+			.status,
+	).toBe(200);
+	expect(
+		(await app.fetch(new Request("http://localhost/"), { ip: "1.1.1.1" }))
+			.status,
+	).toBe(429);
 });

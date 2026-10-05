@@ -67,6 +67,7 @@ interface SeriesBase {
 	readonly labels: Labels;
 	readonly unit: string;
 	dirty: boolean;
+	active: boolean;
 }
 
 type CounterSeries = SeriesBase & {
@@ -173,7 +174,21 @@ export class MetricsAggregator {
 	private readonly sink: MetricSink;
 	private readonly series = new Map<string, Series>();
 
-	constructor(sink: MetricSink) {
+	retireInstance(instanceId: string): void {
+		this.flush();
+		for (const [key, series] of this.series)
+			if (series.instanceId === instanceId) {
+				series.active = false;
+				this.series.delete(key);
+			}
+	}
+
+	constructor(
+		sink: MetricSink,
+		private readonly maxSeries = 10_000,
+	) {
+		if (!Number.isSafeInteger(maxSeries) || maxSeries < 1)
+			throw new Error("metric maxSeries must be a positive integer");
 		this.sink = sink;
 	}
 
@@ -188,6 +203,7 @@ export class MetricsAggregator {
 		) as CounterSeries;
 		return {
 			inc(amount = 1): void {
+				if (!s.active) throw new Error("metric instance retired");
 				s.sum += amount;
 				s.dirty = true;
 			},
@@ -205,6 +221,7 @@ export class MetricsAggregator {
 		) as GaugeSeries;
 		return {
 			set(value: number): void {
+				if (!s.active) throw new Error("metric instance retired");
 				s.value = value;
 				s.dirty = true;
 			},
@@ -240,6 +257,7 @@ export class MetricsAggregator {
 		const counts = s.counts;
 		return {
 			observe(value: number): void {
+				if (!s.active) throw new Error("metric instance retired");
 				let i = 0;
 				while (i < bnds.length && value > (bnds[i] as number)) i++;
 				counts[i] = (counts[i] as number) + 1;
@@ -311,6 +329,16 @@ export class MetricsAggregator {
 		unit: string,
 		init: () => object,
 	): Series {
+		if (
+			!name ||
+			name.length > 256 ||
+			Object.keys(labels).length > 32 ||
+			Object.entries(labels).some(
+				([key, value]) =>
+					key.length > 256 || typeof value !== "string" || value.length > 1024,
+			)
+		)
+			throw new Error("metric name/label budget exceeded");
 		const { keys, copy } = normalizeLabels(labels);
 		const key = seriesKey(kind, name, instanceId, keys, copy);
 		const existing = this.series.get(key);
@@ -322,6 +350,8 @@ export class MetricsAggregator {
 			}
 			return existing;
 		}
+		if (this.series.size >= this.maxSeries)
+			throw new Error(`metric series budget exceeded (${this.maxSeries})`);
 		const created = {
 			kind,
 			name,
@@ -329,6 +359,7 @@ export class MetricsAggregator {
 			labels: copy,
 			unit,
 			dirty: false,
+			active: true,
 			...init(),
 		} as Series;
 		this.series.set(key, created);

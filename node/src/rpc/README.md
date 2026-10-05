@@ -29,7 +29,7 @@
 | `timeout` | `string` | `"30s"` | Deadline на вызов. Формат `^\d+(ms\|s\|m)$`: `"10s"`, `"500ms"`, `"2m"`. Невалидная строка → `throw`. |
 | `requestId` | `string` | auto UUID v4 | Идентификатор запроса; прокидывается в транспорт. |
 | `transport` | `"direct" \| "proxy" \| "auto"` | `"auto"` | `"direct"` — caller → callee mTLS (ошибка, если у callee нет `call_endpoint`); `"proxy"` — через runtime `Invoke`; `"auto"` — direct если endpoint известен, иначе proxy. |
-| `idempotencyKey` | `string` | `""` (нет ключа) | Opt-in runtime-side dedup (ADR-0001). Пустая строка — wire-сигнал «нет ключа», runtime пропускает Claim/Save. Без ключа коды `INTERNAL`/`ABORTED`/`UNKNOWN` non-retryable. |
+| `idempotencyKey` | `string` | empty | Proxy correlation/cache key. Does not prove business idempotency or authorize replay after dispatch. |
 | `retry` | `Partial<RetryOpts>` | см. RetryOpts | Переопределение retry-политики для этого вызова. Не применяется к streaming. |
 
 ### RetryOpts
@@ -44,7 +44,7 @@
 | `maxDelayMs` | `number` | `5000` | Потолок задержки, мс. |
 | `jitter` | `number` | `0.3` | Доля случайного jitter в `[0, 1]`: `delay * (1 - jitter + random*2*jitter)`. |
 
-Retryable-коды: `UNAVAILABLE(14)`, `RESOURCE_EXHAUSTED(8)`, `DEADLINE_EXCEEDED(4)` — всегда; `INTERNAL(13)`, `ABORTED(10)`, `UNKNOWN(2)` — только при заданном `idempotencyKey` (ADR-0001). Ошибки без числового `.code` (application errors хендлера, schema errors) — non-retryable.
+Automatic retry is allowed only for proven local pre-dispatch failure (no live instance or channel readiness failure before sending). Any dispatched outcome, including UNAVAILABLE, RESOURCE_EXHAUSTED or deadline, is returned without replay regardless of key. Business deduplication must be atomic with the effect.
 
 **Streaming (`sb.stream` / `TypedClient` методы с `responseStream=true`) ретраи не применяет вообще** — включая сбой установки соединения на самом первом пике кандидата. Стрим выбирает инстанс один раз; любая ошибка (connect-failure, mid-stream разрыв) пробрасывается наружу без повторной попытки. Mid-stream replay ре-доставил бы уже полученные чанки (ADR-0001), а ретраить только connect-фазу — значит держать скрытую дву­режимность «до первого чанка ретраим, после — нет»; этого нет. Нужен retry на стриме — caller переоткрывает стрим сам.
 
@@ -144,3 +144,5 @@ X-SB-Trace прокидывается двумя путями:
 - `../connection/pem` (`derToPem`), `../connection/spiffe` (`SPIFFE_TRUST_DOMAIN`), `../connection/service-bridge` (тип `ServiceBridge` для эмиссии RPC.CALL).
 
 Используется: `sdk/node/src/connection/service-bridge.ts` (wire-up всех `@internal` классов в lifecycle) и `sdk/node/src/registry/registry.ts` (через `dispatch-port`).
+
+Retry разрешён только для локального отказа до dispatch. Wire status и idempotency key не доказывают безопасность повторения эффекта. Unknown outcome возвращается вызывающему коду; бизнес-дедупликация должна быть атомарной с эффектом.

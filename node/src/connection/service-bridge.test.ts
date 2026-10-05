@@ -578,11 +578,22 @@ describe("ServiceBridge telemetry identity", () => {
 		inflight.set(7);
 		latency.observe(1.5);
 
-		const points = (
+		const ring = (
 			sb as unknown as {
-				_telemetryRing: { metrics: { drain(): MetricPoint[] } };
+				_telemetryRing: {
+					metrics: { drain(): MetricPoint[] };
+					peek(n: number): Array<{ kind: string; message: unknown }>;
+				};
 			}
-		)._telemetryRing.metrics.drain();
+		)._telemetryRing;
+		// Rotation flushes and retires old series; include those flushed points.
+		const points = [
+			...ring
+				.peek(1000)
+				.filter((item) => item.kind === "metrics")
+				.map((item) => item.message as MetricPoint),
+			...ring.metrics.drain(),
+		];
 
 		const byName = (name: string) =>
 			points
@@ -1371,7 +1382,7 @@ describe("ServiceBridge non-retryable errors (H11)", () => {
 		sb.on("disconnected", (e) => disconnects.push(e));
 		sb.on("reconnecting", (e) => reconnects.push(e));
 
-		await sb.start();
+		await expect(sb.start()).rejects.toBeInstanceOf(ConnectionError);
 		await new Promise((r) => setTimeout(r, 50));
 
 		expect(disconnects.length).toBe(1);

@@ -98,6 +98,7 @@ export class Drainer {
 	private readonly sleepFn: (ms: number, signal: AbortSignal) => Promise<void>;
 
 	private running = false;
+	private abortPublish: (() => void) | null = null;
 	private pendingKick = false;
 	private wakeResolve: (() => void) | null = null;
 	private loopDone: Promise<void> = Promise.resolve();
@@ -130,6 +131,7 @@ export class Drainer {
 	// stop signals the loop to exit and waits for the current iteration to finish.
 	async stop(): Promise<void> {
 		this.running = false;
+		this.abortPublish?.();
 		this.kick(); // wake up from any wait
 		await this.loopDone;
 	}
@@ -139,25 +141,34 @@ export class Drainer {
 			const now = this.clockFn();
 			const { storage, rpcClient, identity, batchSize } = this.deps;
 
-			// Select pending rows whose next_attempt_at_ms is due.
-			const rows = storage
-				.prepare(SELECT_DUE_SQL)
-				.all(now, batchSize) as OutboxRow[];
-
-			if (rows.length === 0) {
+			let rows: OutboxRow[];
+			try {
+				rows = storage.transaction(() => {
+					const selected = storage
+						.prepare(SELECT_DUE_SQL)
+						.all(now, batchSize) as OutboxRow[];
+					if (selected.length) {
+						const ids = selected.map((row) => row.id);
+						storage
+							.prepare(
+								`UPDATE event_outbox SET status='inflight' WHERE id IN (${ids.map(() => "?").join(",")})`,
+							)
+							.run(...ids);
+					}
+					return selected;
+				});
+			} catch (err) {
+				this.deps.logger.error(
+					`drainer: local claim failed, retrying — ${String(err)}`,
+				);
+				await new Promise((resolve) => setTimeout(resolve, 100));
+				continue;
+			}
+			if (!rows.length) {
 				if (!this.running) break;
 				await this.waitForWork();
 				continue;
 			}
-
-			// Claim: mark rows as inflight so a crash-restart resets them.
-			const ids = rows.map((r) => r.id);
-			const placeholders = ids.map(() => "?").join(",");
-			storage
-				.prepare(
-					`UPDATE event_outbox SET status='inflight' WHERE id IN (${placeholders})`,
-				)
-				.run(...ids);
 
 			// Build and send PublishRequest.
 			const ident = identity();
@@ -196,21 +207,32 @@ export class Drainer {
 						message: string;
 					}[];
 				}>((resolve, reject) => {
-					rpcClient.publish(
+					let settled = false;
+					let call: { cancel(): void } | undefined;
+					const finish = (
+						err: Error | null,
+						response?: { results: typeof results },
+					) => {
+						if (settled) return;
+						settled = true;
+						clearTimeout(timer);
+						this.abortPublish = null;
+						if (err) reject(err);
+						else resolve(response ?? { results: [] });
+					};
+					const cancel = () => {
+						finish(new Error("events publish cancelled"));
+						call?.cancel?.();
+					};
+					const timer = setTimeout(cancel, 30_000);
+					this.abortPublish = cancel;
+					call = rpcClient.publish(
 						{
 							publisherServiceId: ident?.serviceId ?? "",
 							publisherInstanceId: ident?.instanceId ?? "",
 							events,
 						},
-						(err, res) => {
-							if (err) reject(err);
-							else
-								resolve(
-									res ?? {
-										results: [],
-									},
-								);
-						},
+						(err, res) => finish(err, res),
 					);
 				});
 				results = response.results;
@@ -224,7 +246,7 @@ export class Drainer {
 				// re-armed with the (saturating) backoff ladder and retried for as
 				// long as the outbox lives. That is the whole point of the outbox.
 				const message = netError.message;
-				storage.transaction(() => {
+				await this.completeWithRetry(() => {
 					for (const row of rows) {
 						this.rearm(row, message);
 					}
@@ -249,7 +271,10 @@ export class Drainer {
 			}[] = [];
 			let transientCount = 0;
 
-			storage.transaction(() => {
+			await this.completeWithRetry(() => {
+				doneIds.length = 0;
+				violations.length = 0;
+				transientCount = 0;
 				for (const row of rows) {
 					const entry = resultMap.get(row.id);
 					const status =
@@ -329,6 +354,28 @@ export class Drainer {
 		}
 	}
 
+	private async completeWithRetry(apply: () => void): Promise<void> {
+		for (;;) {
+			try {
+				this.deps.storage.transaction(apply);
+				return;
+			} catch (err) {
+				this.deps.logger.error(
+					`drainer: completion storage error: ${String(err)}`,
+				);
+				if (!this.running) return; // next Open recovers retained inflight rows
+				await new Promise<void>((resolve) => {
+					const timer = setTimeout(resolve, 100);
+					this.wakeResolve = () => {
+						clearTimeout(timer);
+						resolve();
+					};
+				});
+				this.wakeResolve = null;
+			}
+		}
+	}
+
 	// rearm schedules the row for another attempt on the backoff ladder. The
 	// last rung repeats forever — the runtime being down must not consume a
 	// delivery budget.
@@ -350,9 +397,19 @@ export class Drainer {
 			return;
 		}
 
-		const next = this.deps.storage.prepare(SELECT_NEXT_ATTEMPT_SQL).get() as {
-			next_at_ms: number | null;
-		} | null;
+		let next: { next_at_ms: number | null } | null;
+		try {
+			next = this.deps.storage
+				.prepare(SELECT_NEXT_ATTEMPT_SQL)
+				.get() as typeof next;
+		} catch (err) {
+			this.deps.logger.error(
+				`drainer: local scheduling read failed, retrying - ${String(err)}`,
+			);
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			return;
+		}
+
 		const nextAtMs = next?.next_at_ms ?? null;
 		if (nextAtMs !== null && nextAtMs <= this.clockFn()) return;
 

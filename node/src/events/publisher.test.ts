@@ -153,9 +153,14 @@ describe("Publisher", () => {
 
 	it("fireAndForget bypasses outbox and calls rpcClient directly", async () => {
 		let publishCalled = false;
-		const rpcClient = makeRpcClient((_req, cb) => {
+		const rpcClient = makeRpcClient((req, cb) => {
 			publishCalled = true;
-			cb(null, { results: [] });
+			cb(null, {
+				results: (req as { events: { id: string }[] }).events.map((e) => ({
+					eventId: e.id,
+					status: 1,
+				})),
+			});
 		});
 		const kicker = makeKicker();
 		const p = new Publisher(makeDeps({ rpcClient, drainer: kicker }));
@@ -219,7 +224,12 @@ describe("Publisher", () => {
 		const rpcClient = makeRpcClient((req, cb) => {
 			const events = (req as { events: { payloadJson: Uint8Array }[] }).events;
 			captured = events[0]?.payloadJson;
-			cb(null, { results: [] });
+			cb(null, {
+				results: (req as { events: { id: string }[] }).events.map((e) => ({
+					eventId: e.id,
+					status: 1,
+				})),
+			});
 		});
 		const p = new Publisher(makeDeps({ rpcClient }));
 

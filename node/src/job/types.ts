@@ -35,6 +35,8 @@ export interface RetryPolicy {
 
 // JobOpts is the options object passed to sb.job.handle(name, opts, fn).
 export interface JobOpts {
+	/** Immutable executable version. Change whenever handler behavior changes. */
+	version: string;
 	trigger: Trigger;
 	catchup?: CatchupPolicy;
 	overlap?: OverlapPolicy;

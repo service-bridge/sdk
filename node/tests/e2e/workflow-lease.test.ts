@@ -167,6 +167,7 @@ describe("workflow lease", () => {
 		const owner = dedicated("primary");
 		owners.push(owner);
 		owner.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [
 				{
 					type: "local",
@@ -246,6 +247,7 @@ describe("workflow lease", () => {
 		const ownerA = dedicated("primary");
 		owners.push(ownerA);
 		ownerA.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [
 				{
 					type: "local",
@@ -285,6 +287,7 @@ describe("workflow lease", () => {
 		const ownerB = dedicated("primary");
 		owners.push(ownerB);
 		ownerB.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [
 				{ type: "local", id: "hold", fn: async () => ({ on: "b" }) },
 				{
@@ -331,6 +334,7 @@ describe("workflow lease", () => {
 		const ownerA = dedicated("primary");
 		owners.push(ownerA);
 		ownerA.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [
 				{
 					type: "wait_signal",
@@ -383,6 +387,7 @@ describe("workflow lease", () => {
 		const ownerB = dedicated("primary");
 		owners.push(ownerB);
 		ownerB.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [
 				{
 					type: "wait_signal",
@@ -430,6 +435,7 @@ describe("workflow lease", () => {
 		// through AssignLease, which writes lease_holder_instance_id — the column
 		// RenewLease matches on.
 		owner.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [
 				{ type: "sleep", id: "nap", durationSec: 1 },
 				{
@@ -530,6 +536,7 @@ describe("workflow lease", () => {
 		owners.push(owner);
 		owner.service(calleeName, { rpc: [reserveM, chargeM, releaseM] });
 		owner.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [
 				{
 					type: "call",

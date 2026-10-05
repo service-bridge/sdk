@@ -1,6 +1,6 @@
 // @public — см. ./README.md
 
-import type { Registry } from "../registry/registry";
+import type { EventHandlerFn, Registry } from "../registry/registry";
 import type { SchemaSpec } from "../serde/serializer";
 import type { Publisher, PublishOpts } from "./publisher";
 
@@ -22,11 +22,24 @@ export class EventDomain {
 		this.registry._handle.publishEvent(name, spec);
 	}
 
-	handle(
-		pattern: string,
-		fn: (payload: unknown) => Promise<void> | void,
-	): void {
+	handle(pattern: string, fn: EventHandlerFn): void {
 		this.registry._handle.event(pattern, fn);
+	}
+
+	listFailed(limit?: number, afterId?: string) {
+		return this.requirePublisher().listFailed(limit, afterId);
+	}
+	retryFailed(id: string): boolean {
+		return this.requirePublisher().retryFailed(id);
+	}
+	discardFailed(id: string): boolean {
+		return this.requirePublisher().discardFailed(id);
+	}
+	private requirePublisher(): Publisher {
+		const publisher = this.getPublisher();
+		if (!publisher)
+			throw new Error("ServiceBridge: events publisher not ready");
+		return publisher;
 	}
 
 	async publish<T = unknown>(

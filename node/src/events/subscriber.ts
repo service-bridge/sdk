@@ -13,6 +13,7 @@ import type { EventHandlerFn } from "../registry/registry";
 import { StreamSupervisor } from "../registry/stream-supervisor";
 import type { SchemaPair } from "../serde/serializer";
 import type { ReconnectDelayOptions } from "../utils/reconnect-ladder";
+import { Semaphore } from "../utils/semaphore";
 import type { Logger } from "./publisher";
 
 // EventStream is the bidi Subscribe call. Typed from the generated client so
@@ -30,6 +31,7 @@ interface InboundDelivery {
 		xSbTrace?: string;
 	};
 	attempt: number;
+	leaseToken?: string;
 }
 
 // @internal
@@ -98,15 +100,20 @@ export class Subscriber {
 	// stays parallel (no FIFO requirement). Keys with no pending work are
 	// dropped from the map after their chain drains.
 	private partitionQueues = new Map<string, Promise<void>>();
+	private readonly slots: Semaphore;
+	private readonly stopping = new AbortController();
+	private streamController = new AbortController();
 
 	constructor(deps: SubscriberDeps) {
 		this.deps = deps;
 		this.maxInFlight = deps.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT;
+		this.slots = new Semaphore(this.maxInFlight, 0);
 		this.logger = deps.logger ?? { warn: console.warn, error: console.error };
 		this.runWithTrace = deps.runWithTrace;
 		this.supervisor = new StreamSupervisor({
 			open: () => this.openStream(),
 			onData: (msg, stream) => this.handleFrame(msg, stream),
+			onDisconnect: () => this.streamController.abort(),
 			onError: (err) =>
 				this.logger.warn("events: subscriber: stream error", err.message),
 			reconnectOpts: deps.reconnectOpts,
@@ -119,6 +126,8 @@ export class Subscriber {
 	}
 
 	async stop(): Promise<void> {
+		this.stopping.abort();
+		this.streamController.abort();
 		this.supervisor.stop();
 	}
 
@@ -129,6 +138,7 @@ export class Subscriber {
 		const id = this.deps.identity();
 		if (!id) return null;
 
+		this.streamController = new AbortController();
 		const stream = this.deps.rpcClient.subscribe();
 		stream.write(
 			SubscribeClientMessageFns.create({
@@ -147,11 +157,34 @@ export class Subscriber {
 		stream: EventStream,
 	): void {
 		const delivery = msg.delivery;
-		if (!delivery) return;
+		if (!delivery || this.stopping.signal.aborted) return;
+		const signal = this.streamController.signal;
 		const key = delivery.envelope?.partitionKey ?? "";
 		const xSbTrace = delivery.envelope?.xSbTrace ?? "";
-		const work = () =>
-			this.runWithTrace(xSbTrace, () => this.handleDelivery(stream, delivery));
+		const admitted = this.slots.acquire(signal);
+		const work = async () => {
+			try {
+				await admitted;
+			} catch {
+				this.sendNack(
+					stream,
+					delivery.deliveryId,
+					"local_overload",
+					delivery.envelope?.id,
+					delivery.leaseToken,
+				);
+				return;
+			}
+			try {
+				if (!signal.aborted)
+					await this.runWithTrace(xSbTrace, () =>
+						this.handleDelivery(stream, delivery, signal),
+					);
+			} finally {
+				this.slots.release();
+			}
+		};
+		void admitted.catch(() => {});
 		if (key === "") {
 			// No partition → parallel processing OK.
 			void work();
@@ -172,17 +205,24 @@ export class Subscriber {
 	private async handleDelivery(
 		stream: EventStream,
 		delivery: InboundDelivery,
+		signal: AbortSignal,
 	): Promise<void> {
-		const { deliveryId, envelope } = delivery;
+		const { deliveryId, envelope, leaseToken } = delivery;
 		if (!envelope) {
-			this.sendNack(stream, deliveryId, "missing envelope");
+			this.sendNack(
+				stream,
+				deliveryId,
+				"missing envelope",
+				undefined,
+				leaseToken,
+			);
 			return;
 		}
 
 		const { id: eventId, name, payload } = envelope;
 		const schemaEntry = this.deps.schemaIndex.get(name);
 		if (!schemaEntry) {
-			this.sendNack(stream, deliveryId, "no_schema", eventId);
+			this.sendNack(stream, deliveryId, "no_schema", eventId, leaseToken);
 			return;
 		}
 
@@ -190,7 +230,13 @@ export class Subscriber {
 		// routing (ADR-0002). Handlers must be idempotent.
 		const handlers = this.deps.handlers(name);
 		if (handlers.length === 0) {
-			this.sendAck(stream, deliveryId, eventId);
+			this.sendNack(
+				stream,
+				deliveryId,
+				"no_registered_handler",
+				eventId,
+				leaseToken,
+			);
 			return;
 		}
 
@@ -204,31 +250,41 @@ export class Subscriber {
 				deliveryId,
 				`decode_error: ${String(decodeErr)}`,
 				eventId,
+				leaseToken,
 			);
 			return;
 		}
 
 		for (const handler of handlers) {
+			if (signal.aborted) return;
 			try {
-				await handler(decoded);
+				await handler(decoded, {
+					attempt: delivery.attempt,
+					deliveryId,
+					eventId,
+					leaseToken: leaseToken ?? "",
+					signal,
+				});
 			} catch (err) {
-				this.sendNack(stream, deliveryId, String(err), eventId);
+				this.sendNack(stream, deliveryId, String(err), eventId, leaseToken);
 				return;
 			}
 		}
 
-		this.sendAck(stream, deliveryId, eventId);
+		if (!signal.aborted) this.sendAck(stream, deliveryId, eventId, leaseToken);
 	}
 
 	private sendAck(
 		stream: EventStream,
 		deliveryId: string,
 		eventId?: string,
+		leaseToken?: string,
 	): void {
 		try {
 			const msg: SubscribeClientMessage = {
 				ack: Ack.create({
 					deliveryId,
+					leaseToken: leaseToken ?? "",
 					eventId: eventId ? Buffer.from(eventId) : Buffer.alloc(0),
 				}),
 			};
@@ -243,11 +299,13 @@ export class Subscriber {
 		deliveryId: string,
 		errorMessage: string,
 		eventId?: string,
+		leaseToken?: string,
 	): void {
 		try {
 			const msg: SubscribeClientMessage = {
 				nack: Nack.create({
 					deliveryId,
+					leaseToken: leaseToken ?? "",
 					errorMessage,
 					eventId: eventId ? Buffer.from(eventId) : Buffer.alloc(0),
 				}),

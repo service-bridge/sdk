@@ -185,7 +185,17 @@ describe("Handle — hot-path lookups are indexed, not scanned", () => {
 
 		const handlers = h.eventHandlers("order.created");
 		expect(handlers).toHaveLength(2);
-		for (const fn of handlers) fn({});
+		for (const fn of handlers)
+			fn(
+				{},
+				{
+					attempt: 1,
+					eventId: "e",
+					deliveryId: "d",
+					leaseToken: "t",
+					signal: new AbortController().signal,
+				},
+			);
 		expect(seen).toEqual(["first", "second"]);
 		expect(h.eventHandlers("order.shipped")).toHaveLength(1);
 		expect(h.eventHandlers("unknown")).toHaveLength(0);

@@ -167,6 +167,7 @@ describe("workflow", () => {
 
 		owner = dedicated("primary");
 		owner.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [
 				{ type: "local", id: "step_one", fn: async () => ({ value: 1 }) },
 				{
@@ -214,6 +215,7 @@ describe("workflow", () => {
 
 		owner = dedicated("primary");
 		owner.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [
 				{
 					type: "local",
@@ -276,6 +278,7 @@ describe("workflow", () => {
 
 		owner = dedicated("primary");
 		owner.workflow.handle(wfName, {
+			version: "test-v1",
 			input: inputSchema,
 			steps: [{ type: "local", id: "noop", fn: async () => ({ ok: true }) }],
 		});
@@ -315,6 +318,7 @@ describe("workflow", () => {
 
 		owner = dedicated("primary");
 		owner.workflow.handle(wfName, {
+			version: "test-v1",
 			input: {
 				type: "object",
 				required: ["userId"],
@@ -352,6 +356,7 @@ describe("workflow", () => {
 
 		owner = dedicated("primary");
 		owner.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [
 				{ type: "local", id: "always", fn: async () => ({ ran: true }) },
 				{
@@ -402,6 +407,7 @@ describe("workflow", () => {
 			method: "orders_created",
 		});
 		owner.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [
 				{
 					type: "publish",
@@ -462,6 +468,7 @@ describe("workflow", () => {
 
 		owner = dedicated("primary");
 		owner.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [
 				{
 					type: "local",
@@ -537,6 +544,7 @@ describe("workflow", () => {
 
 		owner = dedicated("primary");
 		owner.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [
 				leaf("a"),
 				{
@@ -594,6 +602,7 @@ describe("workflow", () => {
 
 		owner = dedicated("primary");
 		owner.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [
 				{
 					type: "parallel",
@@ -645,6 +654,7 @@ describe("workflow", () => {
 
 		owner = dedicated("primary");
 		owner.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [
 				{
 					type: "parallel",
@@ -715,6 +725,7 @@ describe("workflow", () => {
 		owner = dedicated("primary");
 		owner.service(calleeName, { rpc: [method] });
 		owner.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [
 				{
 					type: "local",
@@ -786,9 +797,11 @@ describe("workflow", () => {
 
 		owner = dedicated("primary");
 		owner.workflow.handle(wfX, {
+			version: "test-v1",
 			steps: [{ type: "workflow", id: "call_y", workflow: wfY, input: {} }],
 		});
 		owner.workflow.handle(wfY, {
+			version: "test-v1",
 			steps: [{ type: "workflow", id: "call_x", workflow: wfX, input: {} }],
 		});
 		await connect(owner);
@@ -818,6 +831,7 @@ describe("workflow", () => {
 		// --- F1 graph: step_a ---
 		owner = dedicated("primary");
 		owner.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [{ type: "local", id: "step_a", fn: async () => ({ v: 1 }) }],
 		});
 		await connect(owner);
@@ -837,6 +851,7 @@ describe("workflow", () => {
 		await owner.stop();
 		owner = dedicated("primary");
 		owner.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [
 				{ type: "local", id: "step_x", fn: async () => ({ v: 99 }) },
 				{
@@ -870,6 +885,7 @@ describe("workflow", () => {
 
 		owner = dedicated("primary");
 		owner.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [
 				{ type: "local", id: "pre", fn: async () => ({ ready: true }) },
 				{
@@ -928,6 +944,7 @@ describe("workflow", () => {
 			method: "orders_created",
 		});
 		owner.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [
 				{
 					type: "wait_event",
@@ -1005,6 +1022,7 @@ describe("workflow", () => {
 			method: "orders_created",
 		});
 		owner.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [
 				{
 					type: "wait_event",
@@ -1086,6 +1104,7 @@ describe("workflow", () => {
 		owner = dedicated("primary");
 		owner.service(calleeName, { rpc: [method] });
 		owner.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [
 				{
 					type: "call",
@@ -1168,6 +1187,7 @@ describe("workflow", () => {
 		owner = dedicated("primary");
 		owner.service(calleeName, { rpc: [reserveM, chargeM, releaseM] });
 		owner.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [
 				// Step 1: call with compensate spec.
 				{

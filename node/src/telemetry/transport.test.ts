@@ -25,9 +25,10 @@ import {
 class MockStream extends EventEmitter {
 	written: TelemetryBatch[] = [];
 	ended = false;
+	acceptWrites = true;
 	write(msg: TelemetryBatch): boolean {
 		this.written.push(msg);
-		return true;
+		return this.acceptWrites;
 	}
 	end(): void {
 		this.ended = true;
@@ -35,6 +36,7 @@ class MockStream extends EventEmitter {
 	}
 	ack(partial: Partial<TelemetryAck> = {}): void {
 		this.emit("data", {
+			acknowledgedSequence: this.written.at(-1)?.sequence ?? 0,
 			receivedBytesHighWater: 0,
 			backpressureLevel: 0,
 			dropCountServerSide: 0,
@@ -105,6 +107,32 @@ describe("TelemetryTransport", () => {
 
 	afterEach(async () => {
 		await transport?.stop();
+	});
+
+	test("causal ACK cannot release future writes and write(false) blocks pumping until drain", async () => {
+		transport = new TelemetryTransport({
+			client,
+			ring,
+			maxBatchItems: 1,
+			maxInflightItems: 2,
+			flushIntervalMs: 60_000,
+		});
+		await transport.start();
+		client.current().acceptWrites = false;
+		ring.push("ops", op("first"));
+		ring.push("ops", op("second"));
+		await transport.flushNow();
+		expect(client.current().written).toHaveLength(1);
+		client.current().ack({ acknowledgedSequence: 0 });
+		client.current().ack({ acknowledgedSequence: 999 });
+		expect(ring.peek(10)).toHaveLength(2);
+		client.current().acceptWrites = true;
+		client.current().emit("drain");
+		expect(client.current().written).toHaveLength(2);
+		client.current().ack({ acknowledgedSequence: 1 });
+		expect(ring.peek(10)).toHaveLength(1);
+		client.current().ack({ acknowledgedSequence: 2 });
+		expect(ring.peek(10)).toHaveLength(0);
 	});
 
 	test("opens a stream on start and flushes ops batches as typed items", async () => {
@@ -228,13 +256,13 @@ describe("TelemetryTransport", () => {
 		// Op A is written and confirmed by two acks.
 		ring.push("ops", op("01900000-0000-7000-8000-0000000000a1"));
 		await transport.flushNow();
-		first.ack();
+		first.ack({ acknowledgedSequence: 1 });
 
 		// Op B is written by a flush that slips out AFTER the runtime built its ack
 		// but BEFORE that ack lands here — the runtime has not seen B yet.
 		ring.push("ops", op("01900000-0000-7000-8000-0000000000b2"));
 		await transport.flushNow();
-		first.ack();
+		first.ack({ acknowledgedSequence: 1 });
 
 		// Stream dies before any further ack. A was confirmed, B was not.
 		first.emit("error", new Error("transport gone"));
@@ -365,7 +393,7 @@ describe("TelemetryTransport", () => {
 		await new Promise((r) => setTimeout(r, 5));
 
 		expect(stream.ended).toBe(true);
-		expect(totalOps(stream.written)).toBeGreaterThan(0);
+		expect(totalOps(stream.written)).toBe(0);
 	});
 
 	test("reopens stream after disconnect", async () => {
@@ -531,6 +559,8 @@ describe("TelemetryTransport", () => {
 
 		await transport.flushNow();
 
+		expect(totalOps(stream.written)).toBe(1024);
+		stream.ack();
 		expect(totalOps(stream.written)).toBe(frames);
 		// 2000 frames in one 250ms tick is ≥ 8000 frames/s ≥ 4000 ops/s.
 		expect(totalOps(stream.written) / (250 / 1000)).toBeGreaterThan(512 * 2);

@@ -30,6 +30,7 @@ export interface StreamSupervisorDeps<S extends SupervisedStream, M> {
 	// onError reports a stream-level failure. Notification only — the supervisor
 	// owns the reconnect decision.
 	onError: (err: Error) => void;
+	onDisconnect?: () => void;
 	// reconnectOpts pins the backoff ladder/jitter; tests inject a short
 	// deterministic ladder so reconnect behaviour is observable in milliseconds.
 	reconnectOpts?: ReconnectDelayOptions;
@@ -116,12 +117,14 @@ export class StreamSupervisor<S extends SupervisedStream, M> {
 		stream.on("error", (err: Error) => {
 			if (this._stream !== stream) return;
 			this._stream = null;
+			this.d.onDisconnect?.();
 			this.d.onError(err);
 			this.scheduleReconnect();
 		});
 		stream.on("end", () => {
 			if (this._stream !== stream) return;
 			this._stream = null;
+			this.d.onDisconnect?.();
 			this.scheduleReconnect();
 		});
 	}
@@ -149,6 +152,7 @@ export class StreamSupervisor<S extends SupervisedStream, M> {
 	private closeCurrent(): void {
 		const old = this._stream;
 		this._stream = null;
+		if (old) this.d.onDisconnect?.();
 		old?.cancel?.();
 	}
 }

@@ -1,7 +1,7 @@
 // transport.ts — real bidi gRPC Telemetry.Report client.
 // Peeks typed messages from the TelemetryRing into TelemetryBatch frames, writes
 // them on the long-lived bidi stream, and commits (releases) them only after the
-// runtime acks — at-least-once delivery (C1). Reopens the stream on disconnect
+// runtime cumulative sequence acks — ingress acceptance/disposal, not persistence. Reopens the stream on disconnect
 // with an exponential backoff that resets on the first successful ack (C2).
 // @public — см. ./README.md
 
@@ -36,6 +36,7 @@ import type { RingItem, RingKind, TelemetryRing } from "./ring";
 export interface ClientTelemetryStream {
 	write(msg: TelemetryBatch): boolean;
 	end(): void;
+	cancel?(): void;
 	on(event: "data", listener: (ack: TelemetryAck) => void): unknown;
 	on(event: "end", listener: () => void): unknown;
 	on(event: "error", listener: (err: Error) => void): unknown;
@@ -86,6 +87,7 @@ export interface TelemetryTransportOptions {
 	flushIntervalMs?: number;
 	/** Max items per batch (per kind). Default 256. */
 	maxBatchItems?: number;
+	maxInflightItems?: number;
 	/**
 	 * Reconnect backoff options, shared with the events/job/workflow
 	 * subscribers (see ../utils/reconnect-ladder.ts). Default: the shared
@@ -99,9 +101,9 @@ export interface TelemetryTransportOptions {
 const DEFAULT_FLUSH_INTERVAL_MS = 250;
 const DEFAULT_MAX_BATCH_ITEMS = 256;
 
-/** One in-flight item plus the ack epoch during which it was written. */
+/** One in-flight item plus the stream sequence of its batch. */
 interface InflightEntry {
-	epoch: number;
+	sequence: number;
 	item: RingItem;
 }
 
@@ -111,11 +113,11 @@ interface InflightEntry {
  * - Drains the ring into TelemetryBatch frames on every flush tick and on every
  *   ack, tracking written items as in-flight.
  * - Commits (releases) in-flight items only once an ack proves the runtime saw
- *   them — at-least-once.
+ *   them for ingress acceptance/disposal.
  * - On `error`/`end` from the stream — drops the in-flight marker (items stay in
  *   the ring) and reopens with an exponential backoff.
  * - Reconnect backoff resets on the FIRST successful ack, not on openStream.
- * - On `drainReason` ack — flushes once more, closes the local end gracefully.
+ * - On `drainReason` ack — stops writing and closes the local end gracefully.
  *
  * @public — см. ./README.md
  */
@@ -135,15 +137,16 @@ export class TelemetryTransport {
 	private stopped = false;
 	private reconnectAttempt = 0;
 	// Items written on the current stream but not yet released, each tagged with
-	// the ack epoch it was written in. Released once an ack proves the runtime
+	// the stream sequence it was written in. Released once an ack proves the runtime
 	// received them; left in the ring (uncommitted) if the stream dies first.
 	private inflight: InflightEntry[] = [];
 	// Ids currently in-flight, so repeated flushes before an ack do not re-write
 	// the same items (peek leaves them in the ring).
 	private inflightIds = new Set<number>();
-	// Number of acks received on the current connection. Bumped by every ack; an
-	// item's epoch is the value at the moment it was written. See releaseConfirmed.
-	private ackEpoch = 0;
+	// Sequence numbers are strictly increasing within one stream.
+	private sequence = 0;
+	private writeBlocked = false;
+	private readonly maxInflightItems: number;
 	// Last drop counts we reported via onDrop, to fire only on increase.
 	private lastServerDrops = 0;
 	private lastRingDrops = 0;
@@ -153,6 +156,7 @@ export class TelemetryTransport {
 		this.ring = opts.ring;
 		this.flushIntervalMs = opts.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
 		this.maxBatchItems = opts.maxBatchItems ?? DEFAULT_MAX_BATCH_ITEMS;
+		this.maxInflightItems = opts.maxInflightItems ?? 1024;
 		this.reconnectOpts = opts.reconnectOpts;
 		this.onDrop = opts.onDrop;
 	}
@@ -186,6 +190,7 @@ export class TelemetryTransport {
 			} catch {
 				// Stream already torn down — nothing to do.
 			}
+			this.stream?.cancel?.();
 			this.stream = null;
 		}
 	}
@@ -215,7 +220,13 @@ export class TelemetryTransport {
 		// splintering them across the batches the loop below emits.
 		this.ring.metrics.flush();
 		let wrote = true;
-		while (wrote) wrote = this.writeBatchToStream();
+		while (
+			wrote &&
+			!this.writeBlocked &&
+			!this.draining &&
+			this.inflightIds.size < this.maxInflightItems
+		)
+			wrote = this.writeBatchToStream();
 	}
 
 	// writeBatchToStream selects the next un-written slice of the ring, writes one
@@ -227,26 +238,32 @@ export class TelemetryTransport {
 		if (!this.stream) return false;
 		const items = this.selectNextBatch();
 		if (items.length === 0) return false;
-		const byKind = groupByKind(items);
-		if (byKind.ops.length > 0) {
-			this.stream.write({ ops: OpBatch.fromPartial({ items: byKind.ops }) });
+		for (const kind of ["ops", "logs", "metrics", "payloads"] as const) {
+			if (this.writeBlocked) break;
+			const group = items.filter((it) => it.kind === kind);
+			if (!group.length) continue;
+			const sequence = ++this.sequence;
+			for (const item of group) {
+				this.inflightIds.add(item.id);
+				this.inflight.push({ sequence, item });
+			}
+			const byKind = groupByKind(group);
+			const batch: TelemetryBatch = { sequence };
+			if (kind === "ops")
+				batch.ops = OpBatch.fromPartial({ items: byKind.ops });
+			if (kind === "logs")
+				batch.logs = LogBatch.fromPartial({ items: byKind.logs });
+			if (kind === "metrics")
+				batch.metrics = MetricBatch.fromPartial({ items: byKind.metrics });
+			if (kind === "payloads")
+				batch.payloads = PayloadBatch.fromPartial({ items: byKind.payloads });
+			try {
+				this.writeBlocked = !this.stream.write(batch);
+			} catch {
+				this.handleStreamGone();
+				return false;
+			}
 		}
-		if (byKind.logs.length > 0) {
-			this.stream.write({ logs: LogBatch.fromPartial({ items: byKind.logs }) });
-		}
-		if (byKind.metrics.length > 0) {
-			this.stream.write({
-				metrics: MetricBatch.fromPartial({ items: byKind.metrics }),
-			});
-		}
-		if (byKind.payloads.length > 0) {
-			this.stream.write({
-				payloads: PayloadBatch.fromPartial({ items: byKind.payloads }),
-			});
-		}
-		for (const it of items) this.inflightIds.add(it.id);
-		for (const it of items)
-			this.inflight.push({ epoch: this.ackEpoch, item: it });
 		return true;
 	}
 
@@ -269,6 +286,7 @@ export class TelemetryTransport {
 			if (perKind[it.kind] >= this.maxBatchItems) continue;
 			perKind[it.kind]++;
 			taken.push(it);
+			if (taken.length >= this.maxInflightItems - this.inflightIds.size) break;
 		}
 		return taken;
 	}
@@ -277,14 +295,21 @@ export class TelemetryTransport {
 		if (this.stopped) return;
 		const stream = this.client.openStream();
 		this.stream = stream;
+		this.sequence = 0;
+		this.writeBlocked = false;
+		stream.on("drain", () => {
+			if (this.stream !== stream || this.stopped) return;
+			this.writeBlocked = false;
+			this.pump();
+		});
 		stream.on("data", (ack: TelemetryAck) => {
-			this.handleAck(ack);
+			if (this.stream === stream) this.handleAck(ack);
 		});
 		stream.on("error", () => {
-			this.handleStreamGone();
+			if (this.stream === stream) this.handleStreamGone();
 		});
 		stream.on("end", () => {
-			this.handleStreamGone();
+			if (this.stream === stream) this.handleStreamGone();
 		});
 	}
 
@@ -295,13 +320,13 @@ export class TelemetryTransport {
 
 		this.backpressureLevel = ack.backpressureLevel;
 
-		this.releaseConfirmed();
+		this.releaseConfirmed(ack.acknowledgedSequence);
 		this.reportDrops(ack);
 
 		// Credit-based pipelining: an ack is the cheapest signal that the runtime
 		// is keeping up, so refill the wire immediately instead of idling until the
 		// next timer tick. Costs nothing when the ring is empty.
-		this.pump();
+		if (!this.stopped && !ack.drainReason) this.pump();
 
 		if (ack.drainReason && !this.draining) {
 			this.draining = true;
@@ -316,31 +341,21 @@ export class TelemetryTransport {
 		}
 	}
 
-	// releaseConfirmed commits only the items an ack actually proves were seen.
-	//
-	// TelemetryAck carries no batch identifier and the runtime emits it on a fixed
-	// ticker, so an ack cannot name what it confirms. What it does prove is that
-	// the runtime's receive loop had consumed everything that reached it before
-	// the ack was emitted. An item written during epoch E left this process before
-	// ack E arrived here, so the runtime had it at most one network delay after
-	// ack E was emitted — comfortably before the next ack goes out one ack
-	// interval later. Epoch E is therefore confirmed by the ack that raises
-	// ackEpoch to E+2, one ack of lag. Releasing the current epoch as well (what a
-	// whole-inflight commit does) would drop items written by a flush that raced
-	// the ack in transit: they would vanish from the ring having never arrived.
-	private releaseConfirmed(): void {
-		this.ackEpoch++;
-		if (this.inflight.length === 0) return;
-		const confirmed: RingItem[] = [];
-		const held: InflightEntry[] = [];
-		for (const entry of this.inflight) {
-			if (entry.epoch < this.ackEpoch - 1) confirmed.push(entry.item);
-			else held.push(entry);
-		}
-		if (confirmed.length === 0) return;
+	// Cumulative sequence acknowledges runtime ingress acceptance/disposal, not
+	// a durable database commit. Never infer confirmation from elapsed time.
+	private releaseConfirmed(sequence: number): void {
+		if (
+			!Number.isSafeInteger(sequence) ||
+			sequence < 0 ||
+			sequence > this.sequence
+		)
+			return;
+		const confirmed = this.inflight
+			.filter((entry) => entry.sequence <= sequence)
+			.map((entry) => entry.item);
+		this.inflight = this.inflight.filter((entry) => entry.sequence > sequence);
 		this.ring.commit(confirmed);
-		for (const it of confirmed) this.inflightIds.delete(it.id);
-		this.inflight = held;
+		for (const item of confirmed) this.inflightIds.delete(item.id);
 	}
 
 	private reportDrops(ack: TelemetryAck): void {
@@ -364,7 +379,10 @@ export class TelemetryTransport {
 		this.inflight = [];
 		this.inflightIds.clear();
 		this.draining = false;
+		this.writeBlocked = false;
+		const retired = this.stream;
 		this.stream = null;
+		retired?.cancel?.();
 		if (this.stopped) return;
 		const delay = reconnectDelay(this.reconnectAttempt, this.reconnectOpts);
 		this.reconnectAttempt++;

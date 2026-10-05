@@ -25,7 +25,7 @@ export type TemplatableOpts<T> = {
 	[K in keyof T]: T[K] | JsonExpression;
 };
 
-export type TemplatableCallOpts = TemplatableOpts<CallOpts>;
+export type TemplatableCallOpts = TemplatableOpts<Omit<CallOpts, "signal">>;
 export type TemplatablePublishOpts = TemplatableOpts<PublishOpts>;
 export type TemplatableWorkflowStartOpts = TemplatableOpts<WorkflowStartOpts>;
 
@@ -113,7 +113,10 @@ export interface SequenceStep extends StepControlFields {
 // LocalStep — arbitrary JS executed inside the SDK. Use sparingly.
 export interface LocalStep extends StepControlFields {
 	type: "local";
-	fn: (state: Record<string, unknown>) => Promise<unknown>;
+	fn: (
+		state: Record<string, unknown>,
+		context: { signal?: AbortSignal },
+	) => Promise<unknown>;
 }
 
 export type Step =
@@ -132,6 +135,7 @@ export type SchemaShape = Record<string, unknown>;
 
 // WorkflowDef — passed to `sb.workflow.handle(name, def)`.
 export interface WorkflowDef {
+	version?: string;
 	input?: SchemaShape;
 	steps: Step[];
 	retry?: Partial<RetryOpts>;

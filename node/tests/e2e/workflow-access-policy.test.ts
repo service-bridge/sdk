@@ -73,6 +73,7 @@ describe("workflow-access-policy", () => {
 
 		const owner = dedicated("primary");
 		owner.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [{ type: "local", id: "s", fn: async () => ({ ok: true }) }],
 		});
 		await connect(owner);
@@ -112,9 +113,11 @@ describe("workflow-access-policy", () => {
 
 		const owner = dedicated("primary");
 		owner.workflow.handle(wfAllowed, {
+			version: "test-v1",
 			steps: [{ type: "local", id: "s", fn: async () => ({ ok: true }) }],
 		});
 		owner.workflow.handle(wfDenied, {
+			version: "test-v1",
 			steps: [{ type: "local", id: "s", fn: async () => ({ ok: true }) }],
 		});
 		await connect(owner);
@@ -162,6 +165,7 @@ describe("workflow-access-policy", () => {
 		// subOwner handles the sub-workflow.
 		const subOwner = dedicated("second");
 		subOwner.workflow.handle(subWf, {
+			version: "test-v1",
 			steps: [{ type: "local", id: "s", fn: async () => ({ sub: "ok" }) }],
 		});
 		await connect(subOwner);
@@ -172,6 +176,7 @@ describe("workflow-access-policy", () => {
 		// parentOwner owns the parent workflow and starts runs against itself.
 		const parentOwner = dedicated("primary");
 		parentOwner.workflow.handle(parentWf, {
+			version: "test-v1",
 			steps: [{ type: "workflow", id: "sub", workflow: subWf, input: {} }],
 		});
 		await connect(parentOwner);
@@ -261,6 +266,7 @@ describe("workflow-access-policy", () => {
 
 		const owner = dedicated("primary");
 		owner.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [{ type: "sleep", id: "long_pause", durationSec: 60 }],
 		});
 		await connect(owner);
@@ -309,6 +315,7 @@ describe("workflow-access-policy", () => {
 
 		const owner = dedicated("primary");
 		owner.workflow.handle(wfName, {
+			version: "test-v1",
 			steps: [{ type: "local", id: "s", fn: async () => ({}) }],
 		});
 		await connect(owner);

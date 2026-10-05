@@ -315,7 +315,7 @@ describe("Subscriber", () => {
 		await sub.stop();
 	});
 
-	it("NameMismatch_AutoAck", async () => {
+	it("NameMismatch_NackWithoutSilentLoss", async () => {
 		const handlerFn = mock(async () => {});
 		const { deps, fake } = makeDeps({
 			handlers: handlersFor([{ pattern: "payment.charged", fn: handlerFn }]),
@@ -331,7 +331,7 @@ describe("Subscriber", () => {
 		expect(handlerFn).not.toHaveBeenCalled();
 		const acked = fake.written.find(
 			// biome-ignore lint/suspicious/noExplicitAny: test assertion
-			(m: any) => m.ack?.deliveryId === "d-wc-2",
+			(m: any) => m.nack?.deliveryId === "d-wc-2",
 		);
 		expect(acked).toBeDefined();
 		await sub.stop();
@@ -601,4 +601,57 @@ describe("Subscriber", () => {
 		expect(fakes).toHaveLength(1);
 		await sub.stop();
 	});
+});
+
+it("enforces cross-partition credits, exposes attempt/token and aborts active stream work", async () => {
+	let seen: import("../registry/registry").EventHandlerContext | undefined;
+	let started = 0;
+	let release!: () => void;
+	const waiting = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const { deps, fake } = makeDeps({
+		handlers: () => [
+			async (_payload, context) => {
+				started++;
+				seen = context;
+				await waiting;
+			},
+		],
+	});
+	const sub = new Subscriber({ ...deps, maxInFlight: 1 });
+	sub.start();
+	const delivery = {
+		...makeDelivery("first").delivery,
+		attempt: 7,
+		leaseToken: "token-one",
+	};
+	fake.emitter.emit("data", { delivery });
+	fake.emitter.emit("data", {
+		delivery: { ...delivery, deliveryId: "overflow", leaseToken: "token-two" },
+	});
+	await wait(5);
+	expect(started).toBe(1);
+	expect(seen?.attempt).toBe(7);
+	expect(seen?.leaseToken).toBe("token-one");
+	expect(fake.written).toContainEqual(
+		expect.objectContaining({
+			nack: expect.objectContaining({
+				deliveryId: "overflow",
+				leaseToken: "token-two",
+			}),
+		}),
+	);
+	fake.emitter.emit("end");
+	expect(seen?.signal.aborted).toBe(true);
+	release();
+	await wait(5);
+	expect(
+		fake.written.some(
+			(message) =>
+				(message as { ack?: { deliveryId: string } }).ack?.deliveryId ===
+				"first",
+		),
+	).toBe(false);
+	await sub.stop();
 });

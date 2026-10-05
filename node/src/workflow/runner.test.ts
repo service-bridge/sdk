@@ -952,3 +952,208 @@ describe("runner — a failing step stops its level", () => {
 		expect(completes).toEqual([]);
 	});
 });
+
+describe("scoped fanout and cancellation regressions", () => {
+	it("honors sibling dependencies inside fanout and resolves template aliases", async () => {
+		const { ops } = makeOps();
+		const { sb } = makeSb();
+		const order: string[] = [];
+		const steps: Step[] = [
+			{
+				id: "group",
+				type: "parallel",
+				forEach: { from: "$.input.items", as: "item" },
+				steps: [
+					{
+						id: "b",
+						type: "local",
+						waitFor: ["a"],
+						fn: async (state) => {
+							order.push(`b:${state.item}`);
+							return state.a;
+						},
+					},
+					{
+						id: "a",
+						type: "local",
+						fn: async (state) => {
+							order.push(`a:${state.item}`);
+							return state.item;
+						},
+					},
+				],
+			},
+		];
+		const state = await run(
+			steps,
+			{
+				runId: "r",
+				leaseEpoch: 1,
+				state: { input: { items: [1, 2] } },
+				compensating: false,
+				maxParallelism: 2,
+			},
+			{ sb, ops },
+		);
+		expect(order.indexOf("a:1")).toBeLessThan(order.indexOf("b:1"));
+		expect(order.indexOf("a:2")).toBeLessThan(order.indexOf("b:2"));
+		expect(state.group).toEqual({ "a:0": 1, "b:0": 1, "a:1": 2, "b:1": 2 });
+	});
+	it("compensates null concrete outputs with restored fanout bindings in reverse order", async () => {
+		const { ops } = makeOps();
+		const { sb, calls } = makeSb();
+		const steps: Step[] = [
+			{
+				id: "group",
+				type: "parallel",
+				forEach: { from: "$.input.items", as: "item" },
+				steps: [
+					{
+						id: "charge",
+						type: "call",
+						service: "billing",
+						method: "charge",
+						input: "$.item",
+						compensate: {
+							service: "billing",
+							method: "refund",
+							input: "$.item",
+						},
+					},
+				],
+			},
+		];
+		await run(
+			steps,
+			{
+				runId: "r",
+				leaseEpoch: 2,
+				state: {
+					input: { items: ["first", "second"] },
+					"charge:0": null,
+					"charge:1": null,
+				},
+				compensating: true,
+				maxParallelism: 2,
+			},
+			{ sb, ops },
+		);
+		expect(calls.map((call) => call[2])).toEqual(["second", "first"]);
+	});
+	it("bounds atomic operations across nested groups with one shared semaphore", async () => {
+		const { ops } = makeOps();
+		const { sb } = makeSb();
+		let running = 0;
+		let peak = 0;
+		const steps: Step[] = [0, 1, 2].map((group) => ({
+			id: `g${group}`,
+			type: "parallel",
+			steps: [0, 1, 2, 3].map((item) => ({
+				id: `s${group}_${item}`,
+				type: "local",
+				fn: async () => {
+					running++;
+					peak = Math.max(peak, running);
+					await new Promise((resolve) => setTimeout(resolve, 2));
+					running--;
+					return null;
+				},
+			})),
+		}));
+		await run(
+			steps,
+			{
+				runId: "r",
+				leaseEpoch: 1,
+				state: { input: {} },
+				compensating: false,
+				maxParallelism: 2,
+			},
+			{ sb, ops },
+		);
+		expect(peak).toBe(2);
+	});
+	it("aborts cooperative local work without checkpointing its stale output", async () => {
+		const { ops, completes } = makeOps();
+		const { sb } = makeSb();
+		const controller = new AbortController();
+		let entered!: () => void;
+		const ready = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const promise = run(
+			[
+				{
+					id: "local",
+					type: "local",
+					fn: async (_state, context) => {
+						entered();
+						await new Promise((resolve) =>
+							context.signal!.addEventListener("abort", resolve, {
+								once: true,
+							}),
+						);
+						return "stale";
+					},
+				},
+			],
+			{
+				runId: "r",
+				leaseEpoch: 1,
+				state: { input: {} },
+				compensating: false,
+				maxParallelism: 1,
+				signal: controller.signal,
+			},
+			{ sb, ops },
+		);
+		await ready;
+		controller.abort();
+		await expect(promise).rejects.toThrow(/aborted/);
+		expect(completes).toEqual([]);
+	});
+});
+
+it("large fanout with zero/default cap completes every item with bounded concurrency", async () => {
+	const { ops, completes } = makeOps();
+	const { sb } = makeSb();
+	let running = 0;
+	let peak = 0;
+	const seen = new Set<number>();
+	const items = Array.from({ length: 1200 }, (_, idx) => idx);
+	await run(
+		[
+			{
+				id: "large",
+				type: "parallel",
+				forEach: { from: "$.input.items", as: "item" },
+				steps: [
+					{
+						id: "work",
+						type: "local",
+						fn: async (state) => {
+							running++;
+							peak = Math.max(peak, running);
+							await new Promise((resolve) => setTimeout(resolve, 1));
+							seen.add(state.item as number);
+							running--;
+							return state.item;
+						},
+					},
+				],
+			},
+		],
+		{
+			runId: "large",
+			leaseEpoch: 1,
+			state: { input: { items } },
+			compensating: false,
+			maxParallelism: 0,
+		},
+		{ sb, ops },
+	);
+	expect(seen.size).toBe(items.length);
+	expect(peak).toBeLessThanOrEqual(64);
+	expect(peak).toBeGreaterThan(1);
+	expect(completes).toHaveLength(items.length + 1);
+});

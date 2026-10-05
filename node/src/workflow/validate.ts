@@ -28,8 +28,8 @@ export class WorkflowValidationError extends ServiceBridgeError {
 }
 
 const ID_RE = /^[a-z0-9_]+$/;
-const MAX_DEPTH = 16;
-const MAX_STEPS = 512;
+const MAX_DEPTH = 10;
+const MAX_STEPS = 500;
 
 export interface ValidateOptions {
 	// Workflow name — used for self-ref check on `type: "workflow"` steps.
@@ -40,6 +40,24 @@ export function validate(def: WorkflowDef, opts: ValidateOptions): void {
 	if (!def || !Array.isArray(def.steps)) {
 		throw new WorkflowValidationError("def.steps must be an array");
 	}
+	if (
+		def.maxParallelism !== undefined &&
+		(!Number.isSafeInteger(def.maxParallelism) ||
+			def.maxParallelism < 0 ||
+			def.maxParallelism > 1024)
+	)
+		throw new WorkflowValidationError("maxParallelism must be 0..1024");
+	const containsLocal = (steps: Step[]): boolean =>
+		steps.some(
+			(step) =>
+				step.type === "local" ||
+				((step.type === "parallel" || step.type === "sequence") &&
+					containsLocal(step.steps)),
+		);
+	if (containsLocal(def.steps) && !def.version?.trim())
+		throw new WorkflowValidationError(
+			"local steps require an explicit executable version",
+		);
 	const counter = { count: 0 };
 	const allIds = new Set<string>();
 	walkSteps(def.steps, 0, allIds, counter, opts);
@@ -252,43 +270,30 @@ function validatePathSyntax(expr: string, ctx: string): void {
 
 // validateWaitFor — flat topo on top-level + recursive on groups; reports
 // cycles and unknown references.
-function validateWaitFor(steps: Step[], allIds: Set<string>): void {
+function validateWaitFor(steps: Step[], _allIds: Set<string>): void {
+	const byId = new Map(steps.map((step) => [step.id, step]));
 	const visited = new Set<string>();
 	const onStack = new Set<string>();
-	const byId = new Map<string, Step>();
-	indexById(steps, byId);
-
 	function visit(id: string): void {
 		if (visited.has(id)) return;
-		if (onStack.has(id)) {
+		if (onStack.has(id))
 			throw new WorkflowValidationError(
 				`waitFor cycle detected at step "${id}"`,
 			);
-		}
-		const step = byId.get(id);
-		if (!step) return; // unknown id surfaces below
 		onStack.add(id);
-		const deps = step.waitFor ?? [];
-		for (const dep of deps) {
-			if (!allIds.has(dep)) {
+		for (const dep of byId.get(id)!.waitFor ?? []) {
+			if (!byId.has(dep))
 				throw new WorkflowValidationError(
 					`step "${id}": waitFor references unknown step "${dep}"`,
 				);
-			}
 			visit(dep);
 		}
 		onStack.delete(id);
 		visited.add(id);
 	}
-
-	for (const id of byId.keys()) visit(id);
-}
-
-function indexById(steps: Step[], out: Map<string, Step>): void {
-	for (const s of steps) {
-		out.set(s.id, s);
-		if (s.type === "parallel" || s.type === "sequence") {
-			indexById(s.steps, out);
-		}
+	for (const step of steps) {
+		visit(step.id);
+		if (step.type === "parallel" || step.type === "sequence")
+			validateWaitFor(step.steps, _allIds);
 	}
 }

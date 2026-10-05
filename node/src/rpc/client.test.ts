@@ -192,7 +192,10 @@ function makeFailingProxyTransport(failCount: number): ProxyTransport {
 		callUnary: async () => {
 			calls++;
 			if (calls <= failCount) {
-				const err = Object.assign(new Error("UNAVAILABLE"), { code: 14 });
+				const err = Object.assign(new Error("UNAVAILABLE before dispatch"), {
+					code: 14,
+					preDispatch: true,
+				});
 				throw err;
 			}
 			return Buffer.from("{}");
@@ -448,6 +451,7 @@ describe("RpcClient caller-side CALL emission", () => {
 				directRequestId = requestId;
 				throw Object.assign(new Error("connect ECONNREFUSED 10.0.1.221"), {
 					code: 14,
+					preDispatch: true,
 				});
 			},
 		} as unknown as DirectTransport;

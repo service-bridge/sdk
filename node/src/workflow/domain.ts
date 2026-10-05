@@ -21,6 +21,7 @@ export type { WorkflowDef } from "./types";
 // CanonicalGraph is the on-wire shape that runtime persists in
 // `workflow_definitions.graph` (ADR-W-002).
 interface CanonicalGraph {
+	version?: string;
 	graph: WorkflowDef["steps"];
 	retry?: WorkflowDef["retry"];
 	maxParallelism?: number;
@@ -72,8 +73,10 @@ export class WorkflowDomain {
 		const steps = def.retry
 			? withRetryDefault(def.steps, def.retry)
 			: def.steps;
+		const frozenSteps = snapshotSteps(steps);
 		const canonical: CanonicalGraph = {
 			graph: steps,
+			version: def.version,
 			retry: def.retry,
 			maxParallelism: def.maxParallelism,
 			timeoutSec: def.timeoutSec,
@@ -85,7 +88,7 @@ export class WorkflowDomain {
 
 		this.registry._handle.workflow(
 			name,
-			steps,
+			frozenSteps,
 			inputSchema ? { input: inputSchema } : undefined,
 			graphBuf,
 			fp,
@@ -331,4 +334,18 @@ function mapRunError(
 		return new WorkflowAccessDeniedError(runId, reason);
 	}
 	return err as unknown as Error;
+}
+
+function snapshotSteps(steps: Step[]): Step[] {
+	const clone = (value: unknown): unknown => {
+		if (Array.isArray(value)) return Object.freeze(value.map(clone));
+		if (value && typeof value === "object")
+			return Object.freeze(
+				Object.fromEntries(
+					Object.entries(value).map(([key, item]) => [key, clone(item)]),
+				),
+			);
+		return value;
+	};
+	return clone(steps) as Step[];
 }

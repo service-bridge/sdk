@@ -1,3 +1,4 @@
+import { makeSpiffeCheck, RUNTIME_SPIFFE_URI } from "./spiffe";
 import "reflect-metadata";
 import * as grpc from "@grpc/grpc-js";
 import { ConfigurationError, type ServiceBridgeError } from "../errors";
@@ -744,27 +745,45 @@ export class ServiceBridge {
 	}
 
 	async start(): Promise<void> {
+		if (this._started)
+			throw new ConfigurationError("ServiceBridge is already started");
 		this.stopped = false;
 		this._started = true;
-		// Finalize any pending RPC handler schema loads before sending RegisterRequest.
-		await this._registry._handle.finalize();
-
-		// Open local SQLite outbox before connecting — drainer needs storage ready.
-		if (!this._storage) {
-			this._storage = Storage.open({ dataDir: this.opts.dataDir });
+		const gen = this.generation;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				(async () => {
+					await this._registry._handle.finalize();
+					if (this.stale(gen)) return;
+					if (!this._storage)
+						this._storage = Storage.open({ dataDir: this.opts.dataDir });
+					this._instanceCache.bind(this._watchStream, this._cb);
+					this._proxyTransport = null;
+					this._directTransport = null;
+					this._rpcClient = null;
+					this.registerWatchListeners();
+					await this.connect(1, true);
+				})(),
+				new Promise<never>((_resolve, reject) => {
+					timer = setTimeout(
+						() =>
+							reject(
+								new ConnectionError(
+									"startup",
+									new Error("startup deadline exceeded"),
+								),
+							),
+						30_000,
+					);
+				}),
+			]);
+		} catch (err) {
+			await this.stop();
+			throw err;
+		} finally {
+			if (timer) clearTimeout(timer);
 		}
-
-		// Start the inbound Call server if advertise is configured. We need the
-		// runtime-issued leaf cert + CA chain — those arrive from Bootstrap.Provision
-		// during connect(). Defer the actual bind until we have a ProvisionResult.
-		this._instanceCache.bind(this._watchStream, this._cb);
-		this._proxyTransport = null;
-		this._directTransport = null;
-		this._rpcClient = null;
-
-		this.registerWatchListeners();
-
-		await this.connect(1);
 	}
 
 	// registerWatchListeners subscribes the policy/telemetry-config listeners
@@ -897,8 +916,8 @@ export class ServiceBridge {
 
 		// Events teardown: subscriber → drainer → events client.
 		if (subscriber) await subscriber.stop();
-		if (drainer) await drainer.stop();
 		eventsClient?.close();
+		if (drainer) await drainer.stop();
 
 		proxyTransport?.close();
 	}
@@ -1098,7 +1117,7 @@ export class ServiceBridge {
 		return this.stopped || gen !== this.generation;
 	}
 
-	private async connect(attempt: number): Promise<void> {
+	private async connect(attempt: number, initial = false): Promise<void> {
 		if (this.stopped) return;
 		const gen = this.generation;
 		try {
@@ -1119,13 +1138,15 @@ export class ServiceBridge {
 			// i.e. transient, and loop forever blaming provisioning.
 			if (err instanceof ConfigurationError) {
 				this.emit("disconnected", { reason: err.message, error: err });
-				void this.stop();
-				throw err;
+				await this.stop();
+				if (initial) throw err;
+				return;
 			}
 			const sbErr = new ConnectionError("provision", err);
 			if (!isRetryable(sbErr.code)) {
 				this.emit("disconnected", { reason: sbErr.message, error: sbErr });
-				void this.stop();
+				await this.stop();
+				if (initial) throw sbErr;
 				return;
 			}
 			this.scheduleReconnect(attempt + 1, sbErr.message);
@@ -1192,6 +1213,8 @@ export class ServiceBridge {
 					serviceName: welcome.serviceName,
 					instanceId: prov.instanceId,
 				};
+				if (this._telemetryInstanceId !== prov.instanceId)
+					this._telemetryRing.metrics.retireInstance(this._telemetryInstanceId);
 				this._telemetryInstanceId = prov.instanceId;
 				this.maybeStartWorkflowSubscriber();
 				this.maybeStartJobSubscriber();
@@ -1431,9 +1454,9 @@ export class ServiceBridge {
 		const certPem = derToPem(prov.certDer, "CERTIFICATE");
 		const keyPem = derToPem(prov.privateKeyDer, "PRIVATE KEY");
 
-		// Server cert has no SAN; chain validates against the embedded CA cert.
+		// Chain and EKU verification plus exact runtime role URI.
 		const verifyOptions: Parameters<typeof grpc.credentials.createSsl>[3] = {
-			checkServerIdentity: () => undefined,
+			checkServerIdentity: makeSpiffeCheck(RUNTIME_SPIFFE_URI),
 		};
 
 		return grpc.credentials.createSsl(
@@ -1504,9 +1527,12 @@ export class ServiceBridge {
 				},
 			},
 			logger: { warn: console.warn, error: console.error },
-			lookupLocalGraph: (name) => {
+			lookupLocalGraph: (name, fingerprint) => {
 				const entry = this._registry._handle._entries.find(
-					(e) => e.type === MethodType.METHOD_TYPE_WORKFLOW && e.name === name,
+					(e) =>
+						e.type === MethodType.METHOD_TYPE_WORKFLOW &&
+						e.name === name &&
+						e.contractHashOverride === fingerprint,
 				);
 				return entry ? (entry.fn as unknown as Step[]) : null;
 			},
@@ -1644,6 +1670,10 @@ export class ServiceBridge {
 						serviceName: welcome.serviceName,
 						instanceId: newProv.instanceId,
 					};
+					if (this._telemetryInstanceId !== newProv.instanceId)
+						this._telemetryRing.metrics.retireInstance(
+							this._telemetryInstanceId,
+						);
 					this._telemetryInstanceId = newProv.instanceId;
 					this.emit("connected", {
 						sessionId: welcome.sessionId,

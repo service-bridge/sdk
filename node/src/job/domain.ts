@@ -33,21 +33,27 @@ export class JobDomain {
 
 	handle(name: string, opts: JobOpts, fn: JobHandler): void {
 		validateOpts(name, opts);
-		if (this._byName.has(name)) {
+		const canonical = canonicalJobSpec(opts);
+		const json = JSON.stringify(canonical);
+		const contractHash = sha256Hex(json);
+		const key = `${name}:${contractHash}`;
+		if (this._byName.has(key)) {
 			throw new Error(
 				`sb.job.handle: duplicate job name ${JSON.stringify(name)}`,
 			);
 		}
-		const canonical = canonicalJobSpec(opts);
-		const json = JSON.stringify(canonical);
-		const contractHash = sha256Hex(json);
 		this.registry._handle.job(name, contractHash, json, fn);
-		this._byName.set(name, { opts, fn });
+		this._byName.set(key, { opts: structuredClone(opts), fn });
 	}
 
 	/** @internal — used by JobSubscriber to dispatch incoming executions. */
-	lookup(name: string): { opts: JobOpts; fn: JobHandler } | undefined {
-		return this._byName.get(name);
+	lookup(
+		name: string,
+		fingerprint?: string,
+	): { opts: JobOpts; fn: JobHandler } | undefined {
+		if (fingerprint !== undefined)
+			return this._byName.get(`${name}:${fingerprint}`);
+		return [...this._byName].find(([key]) => key.startsWith(`${name}:`))?.[1];
 	}
 
 	/** @internal — used by ServiceBridge to skip subscriber startup when empty. */
@@ -62,6 +68,7 @@ export class JobDomain {
 // Field order and key names MUST stay aligned with the Go struct — any drift
 // silently changes contract_hash on either side.
 interface CanonicalJobSpec {
+	version: string;
 	trigger: CanonicalTrigger;
 	catchup?: CatchupPolicy;
 	overlap?: OverlapPolicy;
@@ -92,6 +99,7 @@ interface CanonicalTrigger {
 
 function canonicalJobSpec(opts: JobOpts): CanonicalJobSpec {
 	const out: CanonicalJobSpec = {
+		version: opts.version,
 		trigger: canonicalTrigger(opts.trigger),
 	};
 	if (opts.catchup) out.catchup = opts.catchup;
@@ -151,6 +159,9 @@ function validateOpts(name: string, opts: JobOpts): void {
 	}
 	if (!opts || typeof opts !== "object") {
 		throw new Error("sb.job.handle: opts is required");
+	}
+	if (typeof opts.version !== "string" || !opts.version.trim()) {
+		throw new Error("sb.job.handle: explicit executable version is required");
 	}
 	if (!opts.trigger) {
 		throw new Error("sb.job.handle: opts.trigger is required");

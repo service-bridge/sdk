@@ -9,7 +9,7 @@ export default defineConfig({
 		"testing/index": "src/testing/index.ts",
 	},
 	format: ["esm"],
-	target: "node18",
+	target: "node22",
 	outDir: "dist",
 	dts: true,
 	clean: true,

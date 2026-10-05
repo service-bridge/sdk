@@ -64,3 +64,5 @@ SDK-сторона интеграции с рантайм-подсистемой
 Runtime side: `runtime/internal/jobs/{canonical.go,register.go}` (адаптер `RegisterJobs` + parsing `CanonicalJobSpec`). Дата-плейн — gRPC-сервис `Jobs` (`Subscribe` / `JobResult` / `Heartbeat`).
 
 Используется: `connection/service-bridge` (монтирует `JobDomain` как `sb.job`, конструирует `JobSubscriber` с `runWithTrace`, который парсит `X-SB-Trace` через `../telemetry/wire-trace` и оборачивает handler в ALS из `../telemetry/context`).
+
+Each job requires an explicit `version` string identifying its immutable executable behavior. Register retained versions under the same name to finish old executions; changing a handler requires a new version. Frozen executions dispatch only to the exact fingerprint, including version and scheduling options. Drain old executions before removing their executable registration. Default local concurrency is 32 with at most 1024 queued executions per fingerprint; stop or stream loss aborts the handler signal and suppresses stale results.

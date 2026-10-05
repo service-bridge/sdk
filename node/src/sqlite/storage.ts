@@ -204,8 +204,54 @@ CREATE INDEX IF NOT EXISTS event_outbox_pending_order_idx
 		this.outboxRows += delta;
 	}
 
+	listFailed(limit = 100, afterId = ""): FailedOutboxEvent[] {
+		if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000)
+			throw new Error("outbox list limit must be 1..1000");
+		return this.prepare(
+			`SELECT id, name, attempts, last_error AS lastError FROM event_outbox WHERE status='failed' AND id > ? ORDER BY id LIMIT ?`,
+		).all(afterId, limit) as FailedOutboxEvent[];
+	}
+
+	retryFailed(id: string): boolean {
+		return this.transaction(() => {
+			if (
+				!this.prepare(
+					"SELECT id FROM event_outbox WHERE id=? AND status='failed'",
+				).get(id)
+			)
+				return false;
+			this.prepare(
+				"UPDATE event_outbox SET status='pending', next_attempt_at_ms=0, last_error='' WHERE id=? AND status='failed'",
+			).run(id);
+			return true;
+		});
+	}
+
+	discardFailed(id: string): boolean {
+		return this.transaction(() => {
+			if (
+				!this.prepare(
+					"SELECT id FROM event_outbox WHERE id=? AND status='failed'",
+				).get(id)
+			)
+				return false;
+			this.prepare(
+				"DELETE FROM event_outbox WHERE id=? AND status='failed'",
+			).run(id);
+			this.adjustOutboxRowCount(-1);
+			return true;
+		});
+	}
+
 	close(): void {
 		this.statements.clear();
 		this.db.close();
 	}
+}
+
+export interface FailedOutboxEvent {
+	id: string;
+	name: string;
+	attempts: number;
+	lastError: string;
 }

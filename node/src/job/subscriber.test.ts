@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 // subscriber.test.ts — JobSubscriber stream lifecycle and lease heartbeat.
 //
 // The stream state machine itself lives in registry/StreamSupervisor and is
@@ -308,6 +309,15 @@ describe("JobSubscriber concurrency", () => {
 		return {
 			executionId,
 			jobName: "nightly",
+			fingerprint: createHash("sha256")
+				.update(
+					JSON.stringify({
+						version: "test-v1",
+						trigger: { interval: { everyMs: 1000 } },
+						maxConcurrent: 1,
+					}),
+				)
+				.digest("hex"),
 			scheduledAtUnixMs: Date.now(),
 			localScheduledAtUnixMs: Date.now(),
 			attempt: 1,
@@ -327,7 +337,7 @@ describe("JobSubscriber concurrency", () => {
 		const release: Array<() => void> = [];
 		h.domain.handle(
 			"nightly",
-			{ trigger: { interval: 1000 }, maxConcurrent: 1 },
+			{ version: "test-v1", trigger: { interval: 1000 }, maxConcurrent: 1 },
 			async () => {
 				running++;
 				peak = Math.max(peak, running);
@@ -359,7 +369,7 @@ describe("JobSubscriber concurrency", () => {
 		let releaseFirst: (() => void) | null = null;
 		h.domain.handle(
 			"nightly",
-			{ trigger: { interval: 1000 }, maxConcurrent: 1 },
+			{ version: "test-v1", trigger: { interval: 1000 }, maxConcurrent: 1 },
 			async () => {
 				started++;
 				await new Promise<void>((r) => {

@@ -1,5 +1,6 @@
 import type { Identity, ServiceBridge } from "../connection/service-bridge";
 import type { EventsClient } from "../pb/servicebridge/v1/events";
+import { PublishStatus } from "../pb/servicebridge/v1/events";
 import type { SchemaPair } from "../serde/serializer";
 import type { Storage } from "../sqlite/storage";
 import { InvalidEventNameError, OutboxFullError } from "./errors";
@@ -73,6 +74,18 @@ export class Publisher {
 	// Throws InvalidEventNameError if name is malformed.
 	// Throws Error if schema not registered.
 	// Throws OutboxFullError if outbox cap exceeded.
+	listFailed(limit?: number, afterId?: string) {
+		return this.deps.storage.listFailed(limit, afterId);
+	}
+	retryFailed(id: string): boolean {
+		const restored = this.deps.storage.retryFailed(id);
+		if (restored) this.deps.drainer.kick();
+		return restored;
+	}
+	discardFailed(id: string): boolean {
+		return this.deps.storage.discardFailed(id);
+	}
+
 	async publish(
 		name: string,
 		payload: unknown,
@@ -126,8 +139,26 @@ export class Publisher {
 							},
 						],
 					},
-					(err) => {
-						if (err) reject(err);
+					(err, response) => {
+						if (err) {
+							reject(err);
+							return;
+						}
+						const result = response?.results.find(
+							(item) => item.eventId === eventId,
+						);
+						if (
+							!result ||
+							![
+								PublishStatus.PUBLISH_STATUS_ACCEPTED,
+								PublishStatus.PUBLISH_STATUS_REJECTED_DUPLICATE,
+							].includes(result.status)
+						)
+							reject(
+								new Error(
+									`events: publish rejected: ${result?.message || result?.status || "missing result"}`,
+								),
+							);
 						else resolve();
 					},
 				);

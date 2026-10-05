@@ -31,7 +31,7 @@
 
 ## Приватный контракт
 
-Не реэкспортируется через публичный `index.ts` пакета. Часть символов потребляется другими доменами SDK прямым импортом из файлов модуля (`Serializer`/`SchemaPair`/`SchemaSpec`-форма, `buildSchemaPair`, `computeContractHash`, `computeEventContractHash`); `SchemaPairCache`, `canonicalMessageDescriptor`, `attachWireDescriptor`, `wireDescriptor`, `emptyWireDescriptor`, `canonicalize` — серде-внутренние. Ключевые символы помечены `@public`/`@internal`-маркером в коде на месте символа (`computeContractHash` и `computeEventContractHash` — `@public`, остальное — `@internal`).
+Не реэкспортируется через публичный `index.ts` пакета. Часть символов потребляется другими доменами SDK прямым импортом из файлов модуля (`Serializer`/`SchemaPair`/`SchemaSpec`-форма, `buildSchemaPair`, `computeContractHash`, `computeEventContractHash`); `canonicalMessageDescriptor`, `attachWireDescriptor`, `wireDescriptor`, `emptyWireDescriptor`, `canonicalize` — серде-внутренние. Ключевые символы помечены `@public`/`@internal`-маркером в коде на месте символа (`computeContractHash` и `computeEventContractHash` — `@public`, остальное — `@internal`).
 
 | Имя | Тип | По умолчанию | Что делает |
 |-----|-----|--------------|------------|
@@ -48,7 +48,6 @@
 | `attachWireDescriptor(serializer, type)` | `(serializer: Serializer, type: protobuf.Type) => void` | нет | Привязывает дескриптор к сериализатору по identity. Вызывается фабриками сериализаторов модуля. |
 | `wireDescriptor(serializer)` | `(serializer: Serializer) => string` | нет | Возвращает дескриптор, с которым собран сериализатор. Бросает, если его нет. |
 | `canonicalize(value)` | `(value: unknown) => string` | нет | Детерминированная стрингификация: объекты — sorted keys рекурсивно, массивы сохраняют порядок, без пробелов. |
-| `SchemaPairCache` | class | нет | Дедупликация `SchemaPair` по ключу `SchemaSpec` (`get`/`clear`/`size`), с in-flight-промисами против гонок. |
 
 ### Формат canonical wire descriptor
 

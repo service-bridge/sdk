@@ -1,4 +1,8 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { execFile } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import { Status } from "../../telemetry/ops";
 import { makeSbStub } from "../_common/sb-stub";
@@ -128,42 +132,31 @@ describe("sbFastify plugin", () => {
 	});
 
 	it("ends a fully received POST when the client disconnects before its reply", async () => {
-		const stub = makeSbStub();
-		app = Fastify({ logger: false });
-		await app.register(sbFastify, { sb: stub.sb });
-		let entered!: () => void;
-		const handlerEntered = new Promise<void>((resolve) => {
-			entered = resolve;
-		});
-		let release!: () => void;
-		const waiting = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-
-		app.post("/delayed", async () => {
-			entered();
-			await waiting;
-			return { ok: true };
-		});
-		await app.listen({ port: 0, host: "127.0.0.1" });
-		const addr = app.server.address();
-		if (!addr || typeof addr !== "object") throw new Error("no address");
-		const ctrl = new AbortController();
-		const inflight = fetch(`http://127.0.0.1:${addr.port}/delayed`, {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ ids: [1, 2] }),
-			signal: ctrl.signal,
-		}).catch(() => {});
-		await handlerEntered;
-		ctrl.abort();
-		await inflight;
-		await new Promise((resolve) => setTimeout(resolve, 50));
-		release();
-		await new Promise((resolve) => setTimeout(resolve, 50));
-		expect(stub.endCalls).toEqual([
-			{ status: Status.TIMEOUT, message: "client abort" },
-		]);
+		// Native Node proves the TCP disconnect after request-body completion.
+		// Bun 1.3.13's HTTP shim does not emit the lifecycle events for this case.
+		const dir = mkdtempSync(join(import.meta.dir, ".abort-"));
+		try {
+			const result = await Bun.build({
+				entrypoints: [
+					join(import.meta.dir, "../../../tests/fixtures/fastify-abort.ts"),
+				],
+				target: "node",
+				format: "esm",
+				packages: "external",
+				outdir: dir,
+			});
+			expect(result.success).toBe(true);
+			const { stdout } = await promisify(execFile)(
+				"node",
+				[join(dir, "fastify-abort.js")],
+				{ timeout: 5000 },
+			);
+			expect(JSON.parse(stdout.trim())).toEqual([
+				{ status: Status.TIMEOUT, message: "client abort" },
+			]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	it("dedupes when route added twice with same method/pattern", async () => {

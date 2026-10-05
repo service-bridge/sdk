@@ -1,7 +1,6 @@
-import type { PeerCertificate } from "node:tls";
 import * as grpc from "@grpc/grpc-js";
 import { derToPem } from "../connection/pem";
-import { SPIFFE_TRUST_DOMAIN } from "../connection/spiffe";
+import { makeSpiffeCheck, SPIFFE_TRUST_DOMAIN } from "../connection/spiffe";
 import { CallClient, type StreamChunk } from "../pb/servicebridge/v1/call";
 import { currentTraceContext } from "../telemetry/context";
 import { formatXSbTrace } from "../telemetry/wire-trace";
@@ -146,7 +145,9 @@ export class DirectTransport {
 		requestId: string,
 		idempotencyKey: string,
 		deadlineMs: number,
+		signal?: AbortSignal,
 	): AsyncIterable<Uint8Array> {
+		signal?.throwIfAborted();
 		const key = targetKey(target);
 		const client = this.clientFor(key, target);
 		const traceHeader = currentTraceHeader();
@@ -162,6 +163,8 @@ export class DirectTransport {
 			buildTraceMetadata(traceHeader),
 			{ deadline: new Date(Date.now() + deadlineMs) },
 		);
+		const abort = () => stream.cancel();
+		signal?.addEventListener("abort", abort, { once: true });
 		try {
 			for await (const chunk of stream as AsyncIterable<StreamChunk>) {
 				if (chunk.errorCode) {
@@ -176,10 +179,13 @@ export class DirectTransport {
 		} catch (err) {
 			this.evict(key);
 			throw err;
+		} finally {
+			signal?.removeEventListener("abort", abort);
+			stream.cancel?.();
 		}
 	}
 
-	callUnary(
+	async callUnary(
 		target: DirectTarget,
 		method: string,
 		payload: Uint8Array,
@@ -187,12 +193,33 @@ export class DirectTransport {
 		requestId: string,
 		idempotencyKey: string,
 		deadlineMs: number,
+		signal?: AbortSignal,
 	): Promise<Uint8Array> {
+		signal?.throwIfAborted();
 		const key = targetKey(target);
 		const client = this.clientFor(key, target);
+		const deadline = new Date(Date.now() + deadlineMs);
+		await new Promise<void>((resolve, reject) => {
+			const abort = () => reject(signal?.reason ?? new Error("rpc cancelled"));
+			signal?.addEventListener("abort", abort, { once: true });
+			client.waitForReady(deadline, (err) => {
+				signal?.removeEventListener("abort", abort);
+				if (err) {
+					this.evict(key);
+					reject(Object.assign(err, { preDispatch: true }));
+				} else resolve();
+			});
+		});
 		const traceHeader = currentTraceHeader();
 		return new Promise((resolve, reject) => {
-			client.unary(
+			signal?.throwIfAborted();
+			let call: grpc.ClientUnaryCall | undefined;
+			const abort = () => {
+				call?.cancel();
+				reject(signal?.reason ?? new Error("rpc cancelled"));
+			};
+			signal?.addEventListener("abort", abort, { once: true });
+			call = client.unary(
 				{
 					method,
 					payload: asBuffer(payload),
@@ -202,8 +229,9 @@ export class DirectTransport {
 					xSbTrace: traceHeader,
 				},
 				buildTraceMetadata(traceHeader),
-				{ deadline: new Date(Date.now() + deadlineMs) },
+				{ deadline },
 				(err, resp) => {
+					signal?.removeEventListener("abort", abort);
 					if (err) {
 						// Drop the conn if it is permanently bad — next call will redial.
 						this.evict(key);
@@ -288,35 +316,4 @@ export class DirectTransport {
 	}
 }
 
-// makeSpiffeCheck returns a Node TLS checkServerIdentity callback that asserts
-// the peer cert's SAN URI matches `expectedUri`. Without this, gRPC would only
-// verify cert chain — different instances signed by the same CA could
-// impersonate each other.
-// @internal
-export function makeSpiffeCheck(
-	expectedUri: string,
-): (hostname: string, cert: PeerCertificate) => Error | undefined {
-	return (_hostname, cert) => {
-		const sanUris = extractSanUris(cert);
-		if (!sanUris.includes(expectedUri)) {
-			return new Error(
-				`rpc: SPIFFE mismatch — expected ${expectedUri}, got ${sanUris.join(", ") || "<none>"}`,
-			);
-		}
-		return undefined;
-	};
-}
-
-// extractSanUris reads URI SANs from a PeerCertificate. node:tls exposes them
-// via subjectaltname (string) and infoAccess; we parse subjectaltname for "URI:"
-// entries — same shape on Node and Bun.
-function extractSanUris(cert: PeerCertificate): string[] {
-	const sub = (cert as PeerCertificate & { subjectaltname?: string })
-		.subjectaltname;
-	if (!sub) return [];
-	return sub
-		.split(",")
-		.map((s) => s.trim())
-		.filter((s) => s.startsWith("URI:"))
-		.map((s) => s.slice(4));
-}
+export { makeSpiffeCheck } from "../connection/spiffe";

@@ -1,3 +1,4 @@
+import { Semaphore } from "../utils/semaphore";
 // Thin workflow runner — executes a frozen plan on the owner SDK.
 //
 // ADR-W-018: each case body is exactly
@@ -110,7 +111,8 @@ export interface RunContext {
 	leaseEpoch: number;
 	state: State;
 	compensating: boolean;
-	maxParallelism: number; // 0 = unlimited
+	maxParallelism: number; // 0 uses bounded default 64
+	signal?: AbortSignal;
 }
 
 // StepSpanInfo describes the USER.SUBOP step span the runner asks the caller to
@@ -145,6 +147,9 @@ export interface RunnerDeps {
 // groups.
 interface AbortFlag {
 	aborted: boolean;
+	expandedSteps: number;
+	slots?: Semaphore;
+	signal?: AbortSignal;
 }
 
 // Runtime decisions returned by FailStep (runtime/internal/workflow/server.go).
@@ -157,15 +162,40 @@ export async function run(
 	ctx: RunContext,
 	deps: RunnerDeps,
 ): Promise<State> {
+	if (
+		!Number.isSafeInteger(ctx.maxParallelism) ||
+		ctx.maxParallelism < 0 ||
+		ctx.maxParallelism > 1024
+	)
+		throw new Error("workflow maxParallelism must be 0..1024");
+	ctx = { ...ctx, maxParallelism: ctx.maxParallelism || 64 };
 	if (ctx.compensating) {
 		await runCompensation(steps, ctx, deps);
 		return ctx.state;
 	}
 
 	const completed = new Set<string>(Object.keys(ctx.state));
-	completed.delete("input"); // input is not a step id
-	const abort: AbortFlag = { aborted: false };
+	completed.delete("input");
+	const abort: AbortFlag = {
+		aborted: false,
+		expandedSteps: 0,
+		signal: ctx.signal,
+		slots:
+			ctx.maxParallelism > 0
+				? new Semaphore(ctx.maxParallelism, 10_000)
+				: undefined,
+	};
+	await runLevels(steps, ctx, deps, completed, abort);
+	return ctx.state;
+}
 
+async function runLevels(
+	steps: Step[],
+	ctx: RunContext,
+	deps: RunnerDeps,
+	completed: Set<string>,
+	abort: AbortFlag,
+): Promise<void> {
 	// Dependency-based scheduling — repeatedly find steps whose waitFor is
 	// satisfied and run them, honoring maxParallelism.
 	while (true) {
@@ -175,7 +205,14 @@ export async function run(
 			const deps = step.waitFor ?? [];
 			if (deps.every((d) => completed.has(d))) ready.push(step);
 		}
-		if (ready.length === 0) break;
+		if (ready.length === 0) {
+			const blocked = steps.filter((step) => !completed.has(step.id));
+			if (blocked.length)
+				throw new Error(
+					`workflow blocked dependencies: ${blocked.map((step) => step.id).join(", ")}`,
+				);
+			break;
+		}
 
 		const cap =
 			ctx.maxParallelism > 0
@@ -187,8 +224,6 @@ export async function run(
 			batch.map((s) => executeStep(s, ctx, deps, completed, abort)),
 		);
 	}
-
-	return ctx.state;
 }
 
 // settleAll awaits every unit of a concurrent level before re-throwing. With
@@ -227,7 +262,8 @@ async function executeStep(
 	completed: Set<string>,
 	abort: AbortFlag,
 ): Promise<void> {
-	if (abort.aborted) throw new StepAbortedError(step.id);
+	if (abort.aborted || abort.signal?.aborted)
+		throw new StepAbortedError(step.id);
 
 	// `when` predicate — skip if false.
 	if (
@@ -255,13 +291,15 @@ async function executeStep(
 
 		if (begin.alreadyDone) {
 			ctx.state[step.id] = begin.cachedOutput ?? null;
+			ctx.state[step.id.split(":")[0]!] = ctx.state[step.id];
 			completed.add(step.id);
 			return;
 		}
 
 		// A sibling failed while this step was checkpointing — its operation must
 		// not reach the outside world any more.
-		if (abort.aborted) throw new StepAbortedError(step.id);
+		if (abort.aborted || abort.signal?.aborted)
+			throw new StepAbortedError(step.id);
 
 		try {
 			// One USER.SUBOP step span per executed unit. Group steps
@@ -271,7 +309,21 @@ async function executeStep(
 			// sub-workflow ops parent to the span instead of the run root.
 			const role: StepSpanInfo["role"] =
 				step.type === "parallel" || step.type === "sequence" ? "group" : "step";
-			const runStep = () => dispatch(step, ctx, deps, abort);
+			const runStep = async () => {
+				if (
+					step.type === "parallel" ||
+					step.type === "sequence" ||
+					!abort.slots
+				)
+					return dispatch(step, ctx, deps, abort);
+				await abort.slots.acquire(abort.signal);
+				try {
+					if (abort.signal?.aborted) throw new StepAbortedError(step.id);
+					return await dispatch(step, ctx, deps, abort);
+				} finally {
+					abort.slots.release();
+				}
+			};
 			const output = deps.wrapStep
 				? await deps.wrapStep(
 						{
@@ -289,6 +341,7 @@ async function executeStep(
 			if (output === PARKED) {
 				throw new RunnerParkedError(step.id);
 			}
+			if (abort.signal?.aborted) throw new StepAbortedError(step.id);
 			await deps.ops.completeStep({
 				runId: ctx.runId,
 				stepId: step.id,
@@ -296,6 +349,7 @@ async function executeStep(
 				leaseEpoch: ctx.leaseEpoch,
 			});
 			ctx.state[step.id] = output ?? null;
+			ctx.state[step.id.split(":")[0]!] = ctx.state[step.id];
 			completed.add(step.id);
 			return;
 		} catch (err) {
@@ -320,7 +374,7 @@ async function executeStep(
 				throw failErr;
 			}
 			if (decision.nextAction === NEXT_ACTION_RETRY) {
-				await sleep(decision.retryDelaySec * 1000);
+				await sleep(decision.retryDelaySec * 1000, abort.signal);
 				continue;
 			}
 			// compensate / fail_run — the runtime owns the run from here.
@@ -339,9 +393,23 @@ function isRetriable(step: Step): boolean {
 	return typeof maxAttempts === "number" && maxAttempts > 1;
 }
 
-function sleep(ms: number): Promise<void> {
-	if (ms <= 0) return Promise.resolve();
-	return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		if (signal?.aborted) {
+			reject(new StepAbortedError("retry"));
+			return;
+		}
+		const done = () => {
+			signal?.removeEventListener("abort", cancel);
+			resolve();
+		};
+		const timer = setTimeout(done, ms);
+		const cancel = () => {
+			clearTimeout(timer);
+			reject(new StepAbortedError("retry"));
+		};
+		signal?.addEventListener("abort", cancel, { once: true });
+	});
 }
 
 const PARKED = Symbol("workflow.parked");
@@ -424,7 +492,12 @@ async function dispatchCall(
 	const method = evalLiteralOrPath(step.method as JsonExpression, ctx.state);
 	const input = evalLiteralOrPath(step.input, ctx.state);
 	const opts = step.opts ? evalOpts(step.opts, ctx.state) : undefined;
-	return deps.sb.rpc.call(asString(service), asString(method), input, opts);
+	return deps.sb.rpc.call(
+		asString(service),
+		asString(method),
+		input,
+		ctx.signal ? { ...opts, signal: ctx.signal } : opts,
+	);
 }
 
 async function dispatchPublish(
@@ -515,45 +588,50 @@ async function dispatchGroup(
 	deps: RunnerDeps,
 	abort: AbortFlag,
 ): Promise<unknown> {
-	// Iterations: each one is a (template-steps[], extra state bindings) pair.
-	const iterations: { steps: Step[]; bindings: State; suffix: string }[] = [];
+	// Create only the currently-running iteration scopes; never one promise or
+	// cloned graph per item. A shared expansion budget also bounds nested fanout.
+	let items: unknown[] | null = null;
 	if (step.forEach) {
-		const items = evalLiteralOrPath(step.forEach.from, ctx.state);
-		if (!Array.isArray(items)) {
-			throw new Error(
-				`workflow/runner: forEach.from must resolve to array (got ${typeof items})`,
-			);
-		}
-		items.forEach((item, idx) => {
-			iterations.push({
-				steps: step.steps.map((s) => rewriteStepIds(s, `${idx}`)),
-				bindings: { [step.forEach!.as]: item },
-				suffix: `${idx}`,
-			});
-		});
-	} else {
-		iterations.push({ steps: step.steps, bindings: {}, suffix: "" });
+		const value = evalLiteralOrPath(step.forEach.from, ctx.state);
+		if (!Array.isArray(value))
+			throw new Error("workflow/runner: forEach.from must resolve to array");
+		items = value;
+		abort.expandedSteps += items.length * step.steps.length;
+		if (abort.expandedSteps > 10_000)
+			throw new Error("workflow expanded step budget exceeded (10000)");
 	}
+	const count = items?.length ?? 1;
+	const iterationAt = (idx: number) =>
+		items
+			? {
+					steps: step.steps.map((s) => rewriteStepIds(s, `${idx}`)),
+					bindings: { [step.forEach!.as]: items![idx] },
+					suffix: `${idx}`,
+				}
+			: { steps: step.steps, bindings: {}, suffix: "" };
 
 	const groupOutput: Record<string, unknown> = {};
 	const runIteration = async (
-		it: (typeof iterations)[number],
+		it: ReturnType<typeof iterationAt>,
 	): Promise<void> => {
 		const subState: State = { ...ctx.state, ...it.bindings };
 		const subCtx: RunContext = { ...ctx, state: subState };
 		const runBranchBody = async (): Promise<void> => {
-			if (step.type === "parallel") {
-				await settleAll(
-					it.steps.map((s) =>
-						executeStep(s, subCtx, deps, new Set(Object.keys(subState)), abort),
-					),
-				);
-			} else {
-				const completed = new Set<string>(Object.keys(subState));
-				for (const s of it.steps) {
-					await executeStep(s, subCtx, deps, completed, abort);
-				}
+			const completed = new Set(Object.keys(subState));
+			for (const child of it.steps) {
+				if (Object.hasOwn(subState, child.id))
+					subState[child.id.split(":")[0]!] = subState[child.id];
 			}
+			if (step.type === "parallel")
+				await runLevels(it.steps, subCtx, deps, completed, abort);
+			else
+				for (const child of it.steps) {
+					if (!(child.waitFor ?? []).every((dep) => completed.has(dep)))
+						throw new Error(
+							`workflow sequence dependency not completed: ${child.id}`,
+						);
+					await executeStep(child, subCtx, deps, completed, abort);
+				}
 		};
 		// One branch span per iteration, nested under the group span (R1: each
 		// branch enters its own span scope inside its own async scope, so
@@ -579,15 +657,30 @@ async function dispatchGroup(
 	};
 
 	if (step.type === "parallel") {
-		await settleAll(iterations.map(runIteration));
+		let next = 0;
+		const worker = async () => {
+			while (next < count) {
+				if (abort.aborted || abort.signal?.aborted)
+					throw new StepAbortedError(step.id);
+				const idx = next++;
+				await runIteration(iterationAt(idx));
+			}
+		};
+		await settleAll(
+			Array.from({ length: Math.min(count, ctx.maxParallelism) }, worker),
+		);
 	} else {
-		for (const it of iterations) await runIteration(it);
+		for (let idx = 0; idx < count; idx++) await runIteration(iterationAt(idx));
 	}
 	return groupOutput;
 }
 
 function rewriteStepIds(step: Step, suffix: string): Step {
-	const copy: Step = { ...step, id: `${step.id}:${suffix}` };
+	const copy: Step = {
+		...step,
+		id: `${step.id}:${suffix}`,
+		waitFor: step.waitFor?.map((id) => `${id}:${suffix}`),
+	};
 	if (copy.type === "parallel" || copy.type === "sequence") {
 		copy.steps = copy.steps.map((c) => rewriteStepIds(c, suffix));
 	}
@@ -599,7 +692,7 @@ async function dispatchLocal(
 	ctx: RunContext,
 	_deps: RunnerDeps,
 ): Promise<unknown> {
-	return step.fn(ctx.state);
+	return step.fn(ctx.state, { signal: ctx.signal });
 }
 
 function evalOpts(
@@ -639,18 +732,47 @@ async function runCompensation(
 	ctx: RunContext,
 	deps: RunnerDeps,
 ): Promise<void> {
-	const flat: Step[] = [];
-	flatten(steps, flat);
-	const reversed = [...flat].reverse();
+	// Rebuild each frozen fanout scope from immutable run input/step outputs.
+	// Alias bindings are scoped per concrete execution, including after resume.
+	const concrete: Array<{ step: Step; state: State }> = [];
+	const walk = (scope: Step[], state: State, suffix = "") => {
+		const aliases: State = { ...state };
+		if (suffix)
+			for (const [id, value] of Object.entries(ctx.state)) {
+				if (id.endsWith(suffix)) aliases[id.slice(0, -suffix.length)] = value;
+			}
+		for (const template of scope) {
+			const step = suffix
+				? rewriteStepIds(template, suffix.slice(1))
+				: template;
+			if (Object.hasOwn(ctx.state, step.id))
+				concrete.push({ step, state: aliases });
+			if (template.type !== "parallel" && template.type !== "sequence")
+				continue;
+			if (template.forEach) {
+				const items = evalLiteralOrPath(template.forEach.from, aliases);
+				if (!Array.isArray(items))
+					throw new Error("workflow compensation fanout must resolve to array");
+				for (let idx = 0; idx < items.length; idx++)
+					walk(
+						template.steps,
+						{ ...aliases, [template.forEach.as]: items[idx] },
+						`${suffix}:${idx}`,
+					);
+			} else walk(template.steps, aliases, suffix);
+		}
+	};
+	walk(steps, ctx.state);
+	const reversed = concrete.reverse();
 	let firstFailure: unknown;
-	for (const step of reversed) {
+	for (const { step, state: compState } of reversed) {
 		if (!(step.type === "call" || step.type === "publish")) continue;
 		const comp = (step as { compensate?: CompensateSpec }).compensate;
 		if (!comp) continue;
-		if (ctx.state[step.id] === undefined || ctx.state[step.id] === null) {
+		if (!Object.hasOwn(ctx.state, step.id)) {
 			continue; // not completed → nothing to compensate
 		}
-		const input = evalLiteralOrPath(comp.input, ctx.state);
+		const input = evalLiteralOrPath(comp.input, compState);
 		const compStepId = `${step.id}.compensate`;
 		const begin = await deps.ops.beginStep({
 			runId: ctx.runId,
@@ -704,6 +826,7 @@ async function runCompensation(
 					)
 				: await executeCompensateOp();
 
+			if (ctx.signal?.aborted) throw new StepAbortedError(step.id);
 			await deps.ops.completeStep({
 				runId: ctx.runId,
 				stepId: compStepId,
@@ -736,13 +859,4 @@ async function runCompensation(
 	// compensated. The runtime re-assigns it; the already-done checkpoints above
 	// make the second pass skip everything that did succeed.
 	if (firstFailure !== undefined) throw firstFailure;
-}
-
-function flatten(steps: Step[], out: Step[]): void {
-	for (const s of steps) {
-		out.push(s);
-		if (s.type === "parallel" || s.type === "sequence") {
-			flatten(s.steps, out);
-		}
-	}
 }

@@ -157,3 +157,51 @@ describe("WorkflowDomain.handle", () => {
 		);
 	});
 });
+
+describe("immutable executable workflow versions", () => {
+	it("requires local version, retains exact hashes and snapshots nested input", () => {
+		const registry = new Registry();
+		const domain = new WorkflowDomain(registry);
+		const first = async () => "old";
+		expect(() =>
+			domain.handle("local", {
+				steps: [{ id: "a", type: "local", fn: first }],
+			}),
+		).toThrow(/version/);
+		const def: WorkflowDef = {
+			version: "v1",
+			steps: [{ id: "a", type: "local", fn: first }],
+		};
+		domain.handle("local", def);
+		const oldHash = registry._handle.incomingMethods()[0]!.contractHash;
+		def.steps[0]!.id = "mutated";
+		domain.handle("local", {
+			version: "v2",
+			steps: [{ id: "a", type: "local", fn: async () => "new" }],
+		});
+		const entries = registry._handle._entries.filter(
+			(e) => e.type === MethodType.METHOD_TYPE_WORKFLOW,
+		);
+		expect(entries).toHaveLength(2);
+		expect(entries[0]!.contractHashOverride).toBe(oldHash);
+		expect((entries[0]!.fn as WorkflowDef["steps"])[0]!.id).toBe("a");
+		expect(registry._handle.incomingMethods()[1]!.contractHash).not.toBe(
+			oldHash,
+		);
+	});
+});
+
+it("workflow executable version has cross-SDK canonical golden fingerprint", () => {
+	const registry = new Registry();
+	new WorkflowDomain(registry).handle("golden", {
+		version: "v1",
+		steps: [{ id: "a", type: "local", fn: async () => null }],
+	});
+	const entry = registry._handle.incomingMethods()[0]!;
+	expect(Buffer.from(entry.inputSchemaJson).toString()).toBe(
+		'{"graph":[{"id":"a","type":"local"}],"version":"v1"}',
+	);
+	expect(entry.contractHash).toBe(
+		"791a2a611a183307ab8abb8bf7fa99201ff70ee22623ae93785543f9dd5e99be",
+	);
+});

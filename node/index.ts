@@ -37,11 +37,13 @@ export type {
 	Trigger,
 } from "./src/job/index";
 export { JobDomain } from "./src/job/index";
+export type { EventHandlerContext } from "./src/registry/registry";
 export type { RetryOpts } from "./src/rpc/client";
 export type { RpcDomain } from "./src/rpc/domain";
 export { RpcAccessDeniedError } from "./src/rpc/errors";
 export { NoLiveInstanceError } from "./src/rpc/lb";
 export type { TypedClient } from "./src/rpc/typed-client";
+export type { FailedOutboxEvent } from "./src/sqlite/storage";
 // Everything needed to call sb.telemetry.startOp(): the params type names
 // Channel, and the kind is a per-channel numeric constant. Wrap the work in
 // the returned handle's run(fn) to make it the parent of everything inside.

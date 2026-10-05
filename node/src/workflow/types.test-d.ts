@@ -19,10 +19,11 @@ import type {
 // every declared key regardless of `?:` annotations.
 type _Required<T> = { [K in keyof T]-?: T[K] };
 
-// keyof CallOpts MUST be ⊆ keyof CallStep["opts"].
-type _CallAssert = keyof _Required<CallOpts> extends keyof _Required<
-	NonNullable<CallStep["opts"]>
->
+// Non-serializable AbortSignal is injected by the runner, never frozen.
+// keyof Omit<CallOpts, "signal"> MUST be ⊆ keyof CallStep["opts"].
+type _CallAssert = keyof _Required<
+	Omit<CallOpts, "signal">
+> extends keyof _Required<NonNullable<CallStep["opts"]>>
 	? true
 	: never;
 const _callOk: _CallAssert = true;

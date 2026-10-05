@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { Registry } from "../registry/registry";
 import { JobDomain } from "./domain";
+import type { JobOpts, Trigger } from "./types";
 
 const noop = async () => {};
 
@@ -14,21 +15,33 @@ describe("sb.job.handle — cron validation", () => {
 	test("rejects invalid cron expression client-side", () => {
 		const { domain } = newDomain();
 		expect(() =>
-			domain.handle("j", { trigger: { cron: "not a cron" } }, noop),
+			domain.handle(
+				"j",
+				{ version: "test-v1", trigger: { cron: "not a cron" } },
+				noop,
+			),
 		).toThrow(/cron/i);
 	});
 
 	test("accepts valid 5-field cron", () => {
 		const { domain } = newDomain();
 		expect(() =>
-			domain.handle("j", { trigger: { cron: "0 9 * * *" } }, noop),
+			domain.handle(
+				"j",
+				{ version: "test-v1", trigger: { cron: "0 9 * * *" } },
+				noop,
+			),
 		).not.toThrow();
 	});
 
 	test("rejects six-field cron client-side", () => {
 		const { domain } = newDomain();
 		expect(() =>
-			domain.handle("j", { trigger: { cron: "* * * * * *" } }, noop),
+			domain.handle(
+				"j",
+				{ version: "test-v1", trigger: { cron: "* * * * * *" } },
+				noop,
+			),
 		).toThrow(/5.field/i);
 	});
 });
@@ -36,9 +49,17 @@ describe("sb.job.handle — cron validation", () => {
 describe("sb.job.handle — duplicate guard", () => {
 	test("rejects duplicate name", () => {
 		const { domain } = newDomain();
-		domain.handle("dup", { trigger: { interval: 1000 } }, noop);
+		domain.handle(
+			"dup",
+			{ version: "test-v1", trigger: { interval: 1000 } },
+			noop,
+		);
 		expect(() =>
-			domain.handle("dup", { trigger: { interval: 2000 } }, noop),
+			domain.handle(
+				"dup",
+				{ version: "test-v1", trigger: { interval: 1000 } },
+				noop,
+			),
 		).toThrow(/duplicate/i);
 	});
 });
@@ -49,8 +70,13 @@ describe("sb.job.handle — trigger oneof validation", () => {
 		expect(() =>
 			domain.handle(
 				"j",
-				// biome-ignore lint/suspicious/noExplicitAny: malformed input on purpose
-				{ trigger: { cron: "0 * * * *", delayed: { at: new Date() } } as any },
+				{
+					version: "test-v1",
+					trigger: {
+						cron: "0 * * * *",
+						delayed: { at: new Date() },
+					} as Trigger,
+				},
 				noop,
 			),
 		).toThrow(/exactly one/i);
@@ -62,12 +88,12 @@ describe("sb.job.handle — trigger oneof validation", () => {
 			domain.handle(
 				"j",
 				{
+					version: "test-v1",
 					trigger: {
 						cron: "0 * * * *",
 						delayed: { at: new Date() },
 						interval: 1000,
-						// biome-ignore lint/suspicious/noExplicitAny: malformed input on purpose
-					} as any,
+					} as Trigger,
 				},
 				noop,
 			),
@@ -77,8 +103,7 @@ describe("sb.job.handle — trigger oneof validation", () => {
 	test("rejects zero triggers", () => {
 		const { domain } = newDomain();
 		expect(() =>
-			// biome-ignore lint/suspicious/noExplicitAny: malformed input on purpose
-			domain.handle("j", { trigger: {} as any }, noop),
+			domain.handle("j", { version: "test-v1", trigger: {} as Trigger }, noop),
 		).toThrow(/exactly one/i);
 	});
 });
@@ -87,21 +112,33 @@ describe("sb.job.handle — delayed validation", () => {
 	test("rejects invalid date string", () => {
 		const { domain } = newDomain();
 		expect(() =>
-			domain.handle("j", { trigger: { delayed: { at: "not a date" } } }, noop),
+			domain.handle(
+				"j",
+				{ version: "test-v1", trigger: { delayed: { at: "not a date" } } },
+				noop,
+			),
 		).toThrow(/delayed/i);
 	});
 
 	test("accepts Date", () => {
 		const { domain } = newDomain();
 		expect(() =>
-			domain.handle("j", { trigger: { delayed: { at: new Date() } } }, noop),
+			domain.handle(
+				"j",
+				{ version: "test-v1", trigger: { delayed: { at: new Date() } } },
+				noop,
+			),
 		).not.toThrow();
 	});
 
 	test("accepts number", () => {
 		const { domain } = newDomain();
 		expect(() =>
-			domain.handle("j", { trigger: { delayed: { at: Date.now() } } }, noop),
+			domain.handle(
+				"j",
+				{ version: "test-v1", trigger: { delayed: { at: Date.now() } } },
+				noop,
+			),
 		).not.toThrow();
 	});
 });
@@ -110,21 +147,33 @@ describe("sb.job.handle — interval validation", () => {
 	test("rejects 0", () => {
 		const { domain } = newDomain();
 		expect(() =>
-			domain.handle("j", { trigger: { interval: 0 } }, noop),
+			domain.handle(
+				"j",
+				{ version: "test-v1", trigger: { interval: 0 } },
+				noop,
+			),
 		).toThrow(/interval/i);
 	});
 
 	test("rejects negative", () => {
 		const { domain } = newDomain();
 		expect(() =>
-			domain.handle("j", { trigger: { interval: -100 } }, noop),
+			domain.handle(
+				"j",
+				{ version: "test-v1", trigger: { interval: -100 } },
+				noop,
+			),
 		).toThrow(/interval/i);
 	});
 
 	test("accepts positive", () => {
 		const { domain } = newDomain();
 		expect(() =>
-			domain.handle("j", { trigger: { interval: 100 } }, noop),
+			domain.handle(
+				"j",
+				{ version: "test-v1", trigger: { interval: 100 } },
+				noop,
+			),
 		).not.toThrow();
 	});
 });
@@ -135,6 +184,7 @@ describe("sb.job.handle — registry side effects (IncomingMethod{type=JOB})", (
 		domain.handle(
 			"daily",
 			{
+				version: "test-v1",
 				trigger: { cron: "0 9 * * *", tz: "Europe/Moscow" },
 				catchup: "fire_once",
 				overlap: "skip",
@@ -159,6 +209,7 @@ describe("sb.job.handle — registry side effects (IncomingMethod{type=JOB})", (
 		// input_schema_json is the canonical spec — parse it back
 		const json = new TextDecoder().decode(m.inputSchemaJson);
 		const spec = JSON.parse(json) as {
+			version: "test-v1";
 			trigger: { cron: { expr: string; tz: string } };
 			catchup: string;
 			overlap: string;
@@ -185,6 +236,7 @@ describe("sb.job.handle — registry side effects (IncomingMethod{type=JOB})", (
 		domain.handle(
 			"flaky",
 			{
+				version: "test-v1",
 				trigger: { interval: 60_000 },
 				retry: {
 					initialMs: 2_000,
@@ -219,7 +271,11 @@ describe("sb.job.handle — registry side effects (IncomingMethod{type=JOB})", (
 	test("delayed trigger serialises as runAtUnixMs", () => {
 		const { domain, registry } = newDomain();
 		const at = new Date("2026-06-01T12:00:00.000Z");
-		domain.handle("once", { trigger: { delayed: { at } } }, noop);
+		domain.handle(
+			"once",
+			{ version: "test-v1", trigger: { delayed: { at } } },
+			noop,
+		);
 		const m = registry._handle.incomingMethods()[0];
 		if (!m) throw new Error("missing entry");
 		const spec = JSON.parse(new TextDecoder().decode(m.inputSchemaJson));
@@ -228,7 +284,11 @@ describe("sb.job.handle — registry side effects (IncomingMethod{type=JOB})", (
 
 	test("interval trigger serialises as everyMs", () => {
 		const { domain, registry } = newDomain();
-		domain.handle("poll", { trigger: { interval: 5000 } }, noop);
+		domain.handle(
+			"poll",
+			{ version: "test-v1", trigger: { interval: 5000 } },
+			noop,
+		);
 		const m = registry._handle.incomingMethods()[0];
 		if (!m) throw new Error("missing entry");
 		const spec = JSON.parse(new TextDecoder().decode(m.inputSchemaJson));
@@ -240,6 +300,7 @@ describe("sb.job.handle — registry side effects (IncomingMethod{type=JOB})", (
 		domain.handle(
 			"d",
 			{
+				version: "test-v1",
 				trigger: { interval: 1000 },
 				deps: [{ rpc: "svc.M" }, { event: "topic" }, { workflow: "wf-name" }],
 			},
@@ -264,7 +325,7 @@ describe("sb.job.handle — lookup() for subscriber dispatch", () => {
 		const handler = async () => {};
 		domain.handle(
 			"x",
-			{ trigger: { interval: 1000 }, maxConcurrent: 7 },
+			{ version: "test-v1", trigger: { interval: 1000 }, maxConcurrent: 7 },
 			handler,
 		);
 		const entry = domain.lookup("x");
@@ -277,4 +338,36 @@ describe("sb.job.handle — lookup() for subscriber dispatch", () => {
 		const { domain } = newDomain();
 		expect(domain.lookup("nope")).toBeUndefined();
 	});
+});
+
+describe("immutable job executable versions", () => {
+	test("requires a version and retains exact old executable fingerprints", () => {
+		const { domain, registry } = newDomain();
+		expect(() =>
+			domain.handle(
+				"j",
+				{ trigger: { interval: 1000 } } as unknown as JobOpts,
+				noop,
+			),
+		).toThrow(/version/);
+		const old = async () => {};
+		domain.handle("j", { version: "v1", trigger: { interval: 1000 } }, old);
+		const fingerprint = registry._handle.incomingMethods()[0]!.contractHash;
+		domain.handle("j", { version: "v2", trigger: { interval: 1000 } }, noop);
+		expect(domain.lookup("j", fingerprint)?.fn).toBe(old);
+		expect(domain.lookup("j", "unknown")).toBeUndefined();
+		expect(registry._handle.incomingMethods()).toHaveLength(2);
+	});
+});
+
+test("job version canonical bytes match cross-SDK golden fingerprint", () => {
+	const { domain, registry } = newDomain();
+	domain.handle("golden", { version: "v1", trigger: { interval: 1000 } }, noop);
+	const entry = registry._handle.incomingMethods()[0]!;
+	expect(Buffer.from(entry.inputSchemaJson).toString()).toBe(
+		'{"version":"v1","trigger":{"interval":{"everyMs":1000}}}',
+	);
+	expect(entry.contractHash).toBe(
+		"1be70dfb3805071572dd48e43245ec178865dc98d254ac6840ff39a8f496b8c2",
+	);
 });
