@@ -1,3 +1,4 @@
+import type { FailedOutboxEvent } from "../sqlite/storage";
 import type { Identity, ServiceBridge } from "../connection/service-bridge";
 import type { EventsClient } from "../pb/servicebridge/v1/events";
 import { PublishStatus } from "../pb/servicebridge/v1/events";
@@ -74,7 +75,7 @@ export class Publisher {
 	// Throws InvalidEventNameError if name is malformed.
 	// Throws Error if schema not registered.
 	// Throws OutboxFullError if outbox cap exceeded.
-	listFailed(limit?: number, afterId?: string) {
+	listFailed(limit?: number, afterId?: string): FailedOutboxEvent[] {
 		return this.deps.storage.listFailed(limit, afterId);
 	}
 	retryFailed(id: string): boolean {

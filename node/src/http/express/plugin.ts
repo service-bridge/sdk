@@ -1,4 +1,4 @@
-import type { Express, NextFunction, Request, Response, Router } from "express";
+import type { Express, NextFunction, Request, Response } from "express";
 import type { ServiceBridge } from "../../connection/service-bridge";
 import { runWithTrace } from "../../telemetry/context";
 import { Status } from "../../telemetry/ops";
@@ -242,4 +242,4 @@ function hoistTraceMiddleware(app: Express): void {
 }
 
 // Re-export Router-related type so tests can build fake apps cleanly.
-export type { Router };
+export type { Router } from "express";

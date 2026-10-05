@@ -396,3 +396,25 @@ describe("JobSubscriber concurrency", () => {
 		).toBe(true);
 	});
 });
+
+it("unknown executable version reports permanent failure", async () => {
+	const h = makeHarness();
+	h.sub.start();
+	h.last().emit("data", {
+		executionId: "missing-1",
+		jobName: "removed",
+		fingerprint: "old",
+		leaseEpoch: 7,
+	});
+	await wait(5);
+	expect(h.results).toHaveLength(1);
+	expect(h.results[0]).toMatchObject({
+		executionId: "missing-1",
+		leaseEpoch: 7,
+		failure: {
+			retryable: false,
+			errorMessage: "unsupported_version: removed/old",
+		},
+	});
+	await h.sub.stop();
+});

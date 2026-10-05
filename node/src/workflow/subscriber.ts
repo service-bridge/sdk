@@ -197,9 +197,14 @@ export class WorkflowSubscriber {
 		// canonicalization + fingerprint; the SDK runs against its own copy.
 		const localGraph = this.d.lookupLocalGraph(a.workflowName, a.fingerprint);
 		if (!localGraph) {
-			this.d.logger.error(
-				`workflow run ${a.runId}: executable version ${a.workflowName}/${a.fingerprint} unavailable`,
-			);
+			const message = `unsupported_version: ${a.workflowName}/${a.fingerprint}`;
+			this.d.logger.error(`workflow run ${a.runId}: ${message}`);
+			await this.d.deps.ops.completeRun({
+				runId: a.runId,
+				leaseEpoch: a.leaseEpoch,
+				terminalStatus: "failed",
+				finalState: { error: { code: "unsupported_version", message } },
+			});
 			return;
 		}
 		plan.graph = localGraph;

@@ -113,12 +113,14 @@ export class JobSubscriber {
 
 		const reg = this.d.domain.lookup(exec.jobName, exec.fingerprint);
 		if (!reg) {
-			this.d.logger.warn(
-				`jobs: no handler for job "${exec.jobName}", dropping execution ${exec.executionId}`,
-			);
+			const message = `unsupported_version: ${exec.jobName}/${exec.fingerprint}`;
+			this.d.logger.warn(`jobs: ${message}`);
+			this.sendResult(exec, id.instanceId, false, {
+				errorMessage: message,
+				retryable: false,
+			});
 			return;
 		}
-
 		const maxConcurrent = reg.opts.maxConcurrent ?? 32;
 		const sem = this.getSemaphore(
 			`${exec.jobName}:${exec.fingerprint}`,

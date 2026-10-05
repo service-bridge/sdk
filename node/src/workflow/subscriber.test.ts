@@ -50,6 +50,7 @@ interface HeartbeatCall {
 }
 
 interface Harness {
+	completions: unknown[];
 	sub: WorkflowSubscriber;
 	streams: FakeStream[];
 	delays: number[];
@@ -72,6 +73,7 @@ function makeHarness(
 	const requests: Array<{ serviceId: string; instanceId: string }> = [];
 	const heartbeats: HeartbeatCall[] = [];
 	const warns: string[] = [];
+	const completions: unknown[] = [];
 	let heartbeatError: string | null = null;
 	let heartbeatThrows = false;
 
@@ -95,8 +97,14 @@ function makeHarness(
 		} as any,
 		identity:
 			opts.identity ?? (() => ({ serviceId: "svc-1", instanceId: "inst-1" })),
-		// biome-ignore lint/suspicious/noExplicitAny: these tests never run the runner
-		deps: {} as any,
+		deps: {
+			ops: {
+				completeRun: async (req: unknown) => {
+					completions.push(req);
+				},
+			},
+		// biome-ignore lint/suspicious/noExplicitAny: partial operations stub
+		} as any,
 		logger: {
 			warn: (...args: unknown[]) => warns.push(args.map(String).join(" ")),
 			error: () => {},
@@ -107,6 +115,7 @@ function makeHarness(
 	});
 
 	return {
+		completions,
 		sub,
 		delays,
 		streams,
@@ -413,4 +422,33 @@ describe("WorkflowSubscriber heartbeat", () => {
 			clearSpy.mockRestore();
 		}
 	});
+});
+
+it("unknown executable version reports a terminal failure", async () => {
+	const h = makeHarness();
+	h.sub.start();
+	h.last().emit("data", {
+		runId: "run-unknown",
+		workflowName: "removed",
+		fingerprint: "old",
+		leaseEpoch: 7,
+		frozenPlan: Buffer.from(JSON.stringify({ graph: [] })),
+		input: Buffer.alloc(0),
+		state: Buffer.alloc(0),
+	});
+	await wait(5);
+	expect(h.completions).toEqual([
+		{
+			runId: "run-unknown",
+			leaseEpoch: 7,
+			terminalStatus: "failed",
+			finalState: {
+				error: {
+					code: "unsupported_version",
+					message: "unsupported_version: removed/old",
+				},
+			},
+		},
+	]);
+	h.sub.close();
 });

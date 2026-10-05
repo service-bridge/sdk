@@ -1,3 +1,4 @@
+import type { FailedOutboxEvent } from "../sqlite/storage";
 // @public — см. ./README.md
 
 import type { EventHandlerFn, Registry } from "../registry/registry";
@@ -26,7 +27,7 @@ export class EventDomain {
 		this.registry._handle.event(pattern, fn);
 	}
 
-	listFailed(limit?: number, afterId?: string) {
+	listFailed(limit?: number, afterId?: string): FailedOutboxEvent[] {
 		return this.requirePublisher().listFailed(limit, afterId);
 	}
 	retryFailed(id: string): boolean {
