@@ -21,7 +21,7 @@ import { CircuitBreakerRegistry } from "./circuit-breaker";
 import { RpcClient } from "./client";
 import type { DirectTransport } from "./direct-transport";
 import { InstanceCache } from "./instance-cache";
-import type { Candidate, LoadBalancer } from "./lb";
+import { type Candidate, cbKey, type LoadBalancer } from "./lb";
 import type { ProxyTransport } from "./proxy-transport";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -774,4 +774,58 @@ describe("RpcClient caller-side CALL emission", () => {
 		expect(end.status).toBe(Status.ERROR);
 		expect(end.statusMessage).toBe(errMsg);
 	});
+});
+
+describe("RPC circuit breaker error classification", () => {
+	for (const streaming of [false, true]) {
+		for (const code of [3, 5, 7, 9, 16, 13, 14]) {
+			it(`${streaming ? "stream" : "unary"} code ${code} only opens the breaker for service failures`, async () => {
+				const candidate = makeCandidate("target-svc", "Charge", streaming);
+				const cb = new CircuitBreakerRegistry();
+				const error = Object.assign(new Error("Rejected"), { code });
+				const proxy = {
+					callUnary: async () => {
+						throw error;
+					},
+					callStream: async function* () {
+						yield Buffer.from("{}");
+						throw error;
+					},
+				} as unknown as ProxyTransport;
+				const client = new RpcClient(
+					proxy,
+					null,
+					makeInstanceCache("target-svc", "Charge", streaming),
+					() => makeSchemaPair(),
+					() => "caller-svc",
+					cb,
+					makeLB(candidate),
+					makeStubSb(makeRing()),
+				);
+				for (let i = 0; i < 10; i++) {
+					const invoke = async () => {
+						if (streaming) {
+							for await (const _chunk of client.stream(
+								"target-svc",
+								"Charge",
+								{},
+							)) {
+							}
+						} else {
+							await client.call(
+								"target-svc",
+								"Charge",
+								{},
+								{ retry: { maxAttempts: 1 } },
+							);
+						}
+					};
+					await expect(invoke()).rejects.toMatchObject({ code });
+				}
+				expect(cb.state(cbKey(candidate.instance))).toBe(
+					[13, 14].includes(code) ? "OPEN" : "CLOSED",
+				);
+			});
+		}
+	}
 });

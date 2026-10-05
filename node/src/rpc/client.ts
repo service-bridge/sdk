@@ -187,7 +187,11 @@ export class RpcClient {
 		} catch (err) {
 			endStatus = Status.ERROR;
 			endMsg = err instanceof Error ? err.message : String(err);
-			this.cb.recordFailure(cbKey(candidate.instance));
+			if (isApplicationRejection(err)) {
+				this.cb.recordSuccess(cbKey(candidate.instance));
+			} else {
+				this.cb.recordFailure(cbKey(candidate.instance));
+			}
 			throw err;
 		} finally {
 			callOp.end(endStatus, endMsg);
@@ -324,7 +328,11 @@ export class RpcClient {
 				return result;
 			} catch (err) {
 				lastErr = err;
-				this.cb.recordFailure(cbKey(candidate.instance));
+				if (isApplicationRejection(err)) {
+					this.cb.recordSuccess(cbKey(candidate.instance));
+				} else {
+					this.cb.recordFailure(cbKey(candidate.instance));
+				}
 				// A dead pod can remain in the local registry snapshot until its
 				// Control.Open teardown reaches this caller. Redialling that same
 				// endpoint only repeats ECONNREFUSED; the runtime proxy resolves the
@@ -536,4 +544,14 @@ export class SchemaRegistry {
 	asResolver(): SchemaResolver {
 		return (service, method) => this.get(service, method);
 	}
+}
+
+// A rejected request still proves that the callee can answer RPCs. Counting
+// validation, authorization and missing-data responses as pod failures would
+// block unrelated methods on the same healthy instance.
+function isApplicationRejection(err: unknown): boolean {
+	const code = (err as { code?: unknown })?.code;
+	return (
+		typeof code === "number" && [1, 3, 5, 6, 7, 9, 11, 12, 16].includes(code)
+	);
 }
