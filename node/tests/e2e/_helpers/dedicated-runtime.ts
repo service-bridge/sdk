@@ -14,7 +14,7 @@
 //   4. Spawn the full runtime with POSTGRES_DB=<isolated>.
 //   5. Return a handle with kill()/restart()/cleanup() methods.
 
-import { createConnection } from "node:net";
+import { createConnection, createServer } from "node:net";
 import { join } from "node:path";
 import { sleep } from "./fixtures";
 
@@ -224,10 +224,12 @@ async function waitForRuntimeReady(
 	grpcPort: number,
 	_bootstrapKey: string,
 	timeoutMs = 60_000,
+	signal?: AbortSignal,
 ): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	let lastErr: unknown;
 	while (Date.now() < deadline) {
+		signal?.throwIfAborted();
 		try {
 			await new Promise<void>((resolve, reject) => {
 				const socket = createConnection(grpcPort, "localhost");
@@ -349,9 +351,25 @@ export async function spawnIsolatedRuntime(
 	// (CA lives in Postgres runtime_ca, not on disk).
 	await seedRuntimeCa(dbName);
 
+	const observabilityPort = await new Promise<number>((resolve, reject) => {
+		const listener = createServer();
+		listener.once("error", reject);
+		listener.listen(0, "127.0.0.1", () => {
+			const address = listener.address();
+			if (!address || typeof address === "string") {
+				listener.close();
+				reject(new Error("failed to reserve an observability port"));
+				return;
+			}
+			listener.close((error) =>
+				error ? reject(error) : resolve(address.port),
+			);
+		});
+	});
 	const allSettings: Record<string, string> = {
 		"network.grpc_port": String(opts.grpcPort),
 		"network.ui_port": String(opts.uiPort),
+		"network.obsexport_port": String(observabilityPort),
 		...(opts.extraSettings ?? {}),
 	};
 	await updateSettings(dbName, allSettings);
@@ -365,21 +383,59 @@ export async function spawnIsolatedRuntime(
 		...(opts.extraEnv ?? {}),
 	};
 
+	let runtimeOutput = "";
+	async function drain(stream: ReadableStream<Uint8Array>): Promise<void> {
+		const reader = stream.getReader();
+		const decoder = new TextDecoder();
+		for (;;) {
+			const { value, done } = await reader.read();
+			if (done) break;
+			runtimeOutput = (
+				runtimeOutput + decoder.decode(value, { stream: true })
+			).slice(-8192);
+		}
+	}
 	function spawnProcess(): Bun.Subprocess {
-		return Bun.spawn([opts.binaryPath, "-pg-url", isolatedDsn(dbName)], {
-			cwd: RUNTIME_DIR,
-			stdout: "pipe",
-			stderr: "pipe",
-			env: spawnEnv,
-		});
+		runtimeOutput = "";
+		const spawned = Bun.spawn(
+			[opts.binaryPath, "-pg-url", isolatedDsn(dbName)],
+			{
+				cwd: RUNTIME_DIR,
+				stdout: "pipe",
+				stderr: "pipe",
+				env: spawnEnv,
+			},
+		);
+		void drain(spawned.stdout).catch(() => {});
+		void drain(spawned.stderr).catch(() => {});
+		return spawned;
 	}
 
 	let proc = spawnProcess();
-	await waitForRuntimeReady(
-		opts.grpcPort,
-		opts.bootstrapKey,
-		opts.readyTimeoutMs ?? 60_000,
-	);
+	async function waitUntilReady(key: string, timeoutMs: number): Promise<void> {
+		const controller = new AbortController();
+		try {
+			await Promise.race([
+				waitForRuntimeReady(opts.grpcPort, key, timeoutMs, controller.signal),
+				proc.exited.then((code) => {
+					throw new Error(`runtime exited during startup (${code})`);
+				}),
+			]);
+		} catch (error) {
+			await killProcessAndWait(proc);
+			throw new Error(
+				`${error instanceof Error ? error.message : String(error)}\n${runtimeOutput.replace(/postgres(?:ql)?:\/\/[^\s"']+/g, "[redacted database URL]")}`,
+			);
+		} finally {
+			controller.abort();
+		}
+	}
+	try {
+		await waitUntilReady(opts.bootstrapKey, opts.readyTimeoutMs ?? 60_000);
+	} catch (error) {
+		await dropDatabase(dbName);
+		throw error;
+	}
 
 	let killed = false;
 
@@ -405,7 +461,7 @@ export async function spawnIsolatedRuntime(
 			}
 			killed = false;
 			proc = spawnProcess();
-			await waitForRuntimeReady(opts.grpcPort, bootstrapKey, timeoutMs);
+			await waitUntilReady(bootstrapKey, timeoutMs);
 		},
 
 		async cleanup(): Promise<void> {
