@@ -304,6 +304,13 @@ describe("ServiceBridge connect lifecycle", () => {
 		});
 		await tick();
 		expect(provisionCalls).toBe(1);
+		const resources = sb as unknown as {
+			_proxyTransport: object;
+			_eventsClient: object;
+			_jobsClient: object;
+			_workflowsClient: object;
+		};
+		const before = { ...resources };
 
 		// Drop the stream → reconnect. The cert is still valid, so connect() must
 		// reuse the cached provision instead of calling provisionFn again.
@@ -314,6 +321,10 @@ describe("ServiceBridge connect lifecycle", () => {
 		});
 		await tick();
 
+		expect(resources._proxyTransport).not.toBe(before._proxyTransport);
+		expect(resources._eventsClient).not.toBe(before._eventsClient);
+		expect(resources._jobsClient).not.toBe(before._jobsClient);
+		expect(resources._workflowsClient).not.toBe(before._workflowsClient);
 		expect(reconnects.length).toBeGreaterThanOrEqual(1);
 		expect(provisionCalls).toBe(1);
 	});

@@ -870,8 +870,10 @@ export class ServiceBridge {
 	 * Every field is detached before the first await so a stop() racing a
 	 * rotation teardown cannot close the same resource twice.
 	 */
-	private async closeCertBoundResources(): Promise<void> {
-		const callServer = this._callServer;
+	private async closeCertBoundResources(
+		preserveCallServer = false,
+	): Promise<void> {
+		const callServer = preserveCallServer ? null : this._callServer;
 		const sampler = this._processSampler;
 		const telemetryTransport = this._telemetryTransport;
 		const telemetryClient = this._telemetryClient;
@@ -884,7 +886,7 @@ export class ServiceBridge {
 		const eventsClient = this._eventsClient;
 		const proxyTransport = this._proxyTransport;
 
-		this._callServer = null;
+		if (!preserveCallServer) this._callServer = null;
 		this._processSampler = null;
 		this._telemetryTransport = null;
 		this._telemetryClient = null;
@@ -1181,6 +1183,7 @@ export class ServiceBridge {
 		// GC'd while their internal backoff timers live, so we must close the
 		// predecessors explicitly before overwriting the fields — otherwise each
 		// reconnect permanently leaks two TLS channels (the production OOM).
+		this.session?.close();
 		this.controlClient?.close();
 		this.registryClient?.close();
 		this.registryClient = null;
@@ -1189,6 +1192,14 @@ export class ServiceBridge {
 
 		// Wire up RPC infrastructure BEFORE building RegisterRequest — call_endpoint
 		// must be present in the very first registration so callers see it.
+		// A container replacement can change DNS while the certificate remains valid.
+		// Rebuild runtime-facing channels on reconnect so subscribers and outbound
+		// calls resolve the current runtime address. Keep the inbound listener when
+		// its TLS material is unchanged, preserving direct in-flight calls.
+		if (this._rpcProvision === prov) {
+			await this.closeCertBoundResources(true);
+			if (this.stale(gen)) return;
+		}
 		await this.ensureRpcReady(prov, creds, gen);
 		if (this.stale(gen)) return;
 
@@ -1259,8 +1270,9 @@ export class ServiceBridge {
 	// ensureRpcReady starts the inbound CallServer (if advertise is set) and
 	// wires up the outbound ProxyTransport + DirectTransport + RpcClient plus the
 	// events / workflows / jobs / telemetry channels. Called from openSession and
-	// from rotateCert once a ProvisionResult is in hand. Reuses everything while
-	// the ProvisionResult is unchanged; rebuilds the cert-bound half when it is.
+	// from rotateCert once a ProvisionResult is in hand. The inbound listener is
+	// reused while the certificate is unchanged; runtime-facing channels are
+	// rebuilt on reconnect and all cert-bound resources on rotation.
 	private async ensureRpcReady(
 		prov: ProvisionResult,
 		creds: grpc.ChannelCredentials,
