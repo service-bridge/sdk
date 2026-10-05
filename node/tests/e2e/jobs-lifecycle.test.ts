@@ -579,6 +579,10 @@ describe("jobs-lifecycle: stale lease_epoch rejected → execution re-dispatched
 		const blocking = new Promise<void>((r) => {
 			unblock = r;
 		});
+		let unblockRetry!: () => void;
+		const retryBlocking = new Promise<void>((resolve) => {
+			unblockRetry = resolve;
+		});
 
 		sb = new ServiceBridge(runtime!.url, keys.serviceKey, FAST_OPTS);
 		sb.job.handle(
@@ -592,10 +596,16 @@ describe("jobs-lifecycle: stale lease_epoch rejected → execution re-dispatched
 			async (ctx) => {
 				calls.push(ctx.attempt);
 				if (ctx.attempt === 1) await blocking;
+				else await retryBlocking;
 			},
 		);
 		await sb.start();
 		await waitFor(() => sb!.identity() !== null, 5_000, "connected");
+
+		// DB in_flight precedes constructing/sending the assignment. Wait until
+		// the handler actually owns the first epoch before simulating reclaim.
+		await waitFor(() => calls[0] === 1, 10_000, "first handler entered");
+		expect(calls).toEqual([1]);
 
 		const runningId = async (): Promise<string | null> => {
 			const rows = (await db!`
@@ -616,7 +626,9 @@ describe("jobs-lifecycle: stale lease_epoch rejected → execution re-dispatched
 		expect(execId).not.toBeNull();
 
 		// Bump lease_epoch to simulate a runtime reclaim mid-flight.
-		await db!`UPDATE job_executions SET lease_epoch = lease_epoch + 1 WHERE id = ${execId}`;
+		const epochs =
+			await db!`UPDATE job_executions SET lease_epoch = lease_epoch + 1 WHERE id = ${execId} RETURNING lease_epoch`;
+		expect(Number(epochs[0].lease_epoch)).toBeGreaterThan(1);
 
 		// Unblock — the SDK now ACKs with the OLD (stale) epoch.
 		unblock!();
@@ -632,6 +644,7 @@ describe("jobs-lifecycle: stale lease_epoch rejected → execution re-dispatched
 			`) as Array<{ status: string }>;
 			return rows[0]?.status ?? null;
 		};
+		// The retry handler is blocked, so no valid newer ACK can race this check.
 		// Stale ACK must NOT mark success; still in_flight or reclaimed to pending.
 		expect(await latestStatus()).not.toBe("success");
 
@@ -641,5 +654,13 @@ describe("jobs-lifecycle: stale lease_epoch rejected → execution re-dispatched
 			"re-dispatched as attempt 2",
 		);
 		expect(calls[1]).toBeGreaterThanOrEqual(2);
+		expect(calls[1]).toBe(2);
+		expect(await latestStatus()).not.toBe("success");
+		unblockRetry();
+		await waitFor(
+			async () => (await latestStatus()) === "success",
+			30_000,
+			"current epoch ACK settles the execution",
+		);
 	}, 90_000);
 });
