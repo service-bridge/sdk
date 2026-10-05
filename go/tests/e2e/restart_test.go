@@ -36,7 +36,6 @@ func TestClientReconnectsAfterRuntimeRestart(t *testing.T) {
 		UIPort:     25444,
 		BinaryPath: binary,
 	})
-	t.Cleanup(rt.Cleanup)
 
 	key := bootstrapKey(t, domainMisc, 3)
 	method := uniqueName("restart.echo")

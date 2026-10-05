@@ -311,9 +311,18 @@ func spawnDedicatedRuntime(ctx context.Context, t *testing.T, opts spawnDedicate
 	seedRuntimeCaInto(ctx, t, dbName)
 	seedServicesInto(ctx, t, dbName)
 
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve observability port: %v", err)
+	}
+	observabilityPort := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatalf("release observability port: %v", err)
+	}
 	settings := map[string]string{
-		"network.grpc_port": strconv.Itoa(opts.GRPCPort),
-		"network.ui_port":   strconv.Itoa(opts.UIPort),
+		"network.obsexport_port": strconv.Itoa(observabilityPort),
+		"network.grpc_port":      strconv.Itoa(opts.GRPCPort),
+		"network.ui_port":        strconv.Itoa(opts.UIPort),
 	}
 	for k, v := range opts.ExtraSettings {
 		settings[k] = v
@@ -329,6 +338,7 @@ func spawnDedicatedRuntime(ctx context.Context, t *testing.T, opts spawnDedicate
 		UIPort:     opts.UIPort,
 		URL:        fmt.Sprintf("localhost:%d", opts.GRPCPort),
 	}
+	t.Cleanup(rt.Cleanup)
 	rt.spawnProcess(runtimeDir)
 	waitTCPReady(ctx, t, opts.GRPCPort, 60*time.Second)
 	return rt
