@@ -75,8 +75,8 @@ export interface SubscriberDeps {
 }
 
 // Subscriber opens a long-lived bidi Subscribe stream and dispatches inbound
-// EventDelivery messages to registered handlers by exact event name. Routing
-// + dedup live on the server (ADR-0002); handlers must be idempotent.
+// EventDelivery messages using the concrete event name and matching registered
+// patterns. Server routing determines delivery; handlers must be idempotent.
 // @public — см. ./README.md
 export class Subscriber {
 	private readonly deps: SubscriberDeps;
@@ -226,8 +226,8 @@ export class Subscriber {
 			return;
 		}
 
-		// Dispatch by exact name — server is the single source of truth for
-		// routing (ADR-0002). Handlers must be idempotent.
+		// Resolve registered patterns matching the delivered concrete name.
+		// Server routing determines delivery; handlers must be idempotent.
 		const handlers = this.deps.handlers(name);
 		if (handlers.length === 0) {
 			this.sendNack(

@@ -646,7 +646,7 @@ Every error below extends `ServiceBridgeError`, so one `instanceof` separates an
 
 **Where do I see traces, metrics and the DLQ?** In the runtime dashboard on `:14444`. Tracing, metrics and the dead-letter queue are operated there.
 
-**Node or Bun?** Both. Node 18+ or any current Bun. Bun-native APIs are used where available.
+**Node or Bun?** Node 22, 24 and 26, or Bun 1.3.13+. Packed-artifact CI checks the supported runtime matrix. The Bun 1.3.13 Node HTTP shim does not provide the disconnect lifecycle required by the Fastify integration; run that integration on Node.
 
 ---
 
@@ -665,3 +665,5 @@ This is an alpha release (`2.0.0-alpha`). The API is stabilising — issues and 
 Licensed under the **MIT License** — see [LICENSE](./LICENSE). Free for any use, including commercial; you only need to keep the copyright and license notice (attribution to esurkov1 <esurkovv@yandex.ru>).
 
 Release tags run complete CI on the exact tagged commit before npm publication, including packed consumer checks on Node 22/24/26 and Bun. Service-key rotation revokes existing credentials: deploy a new bootstrap key and restart; repeated reconnect with the revoked key cannot recover.
+
+Each client instance needs exclusive ownership of its outbox directory; do not share it between live instances. The local SQLite insert is durable publication intent, but it is not atomic with a transaction in an external business database. Applications needing that atomic boundary must persist business changes and publication intent together in their own transaction, then relay the intent.

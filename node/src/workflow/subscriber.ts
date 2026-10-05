@@ -182,6 +182,8 @@ export class WorkflowSubscriber {
 
 	private async dispatch(a: RunAssignment): Promise<void> {
 		if (this.closed) return;
+		const previous = this.executions.get(a.runId);
+		if (previous && previous.epoch >= a.leaseEpoch) return;
 		let plan: FrozenPlan;
 		try {
 			plan = JSON.parse(Buffer.from(a.frozenPlan).toString("utf8"));

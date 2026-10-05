@@ -47,6 +47,8 @@
 #   GW_ADDR        default: http://127.0.0.1:14444 (sb UI-gateway address)
 #   SB_USER        default: admin (UI account used to create services)
 #   SB_PASSWORD    default: admin (dev account; created on first boot)
+#   PG_USER        default: servicebridge (Docker database user)
+#   PG_DATABASE    default: service-bridge (Docker database name)
 #   PG_CONTAINER   default: servicebridge2-pg (docker container name for psql)
 #   PG_MODE        default: docker — how to reach psql; `direct` uses system
 #                  psql against POSTGRES_DSN (CI)
@@ -67,6 +69,8 @@ SB_USER=${SB_USER:-admin}
 SB_PASSWORD=${SB_PASSWORD:-admin}
 PG_CONTAINER=${PG_CONTAINER:-servicebridge2-pg}
 PG_MODE=${PG_MODE:-docker}
+PG_USER=${PG_USER:-servicebridge}
+PG_DATABASE=${PG_DATABASE:-service-bridge}
 
 # Per-domain service identities. Each e2e domain runs as its own process
 # against its own three identities (e2e-<domain>-1/2/3, pool.ts roles
@@ -89,7 +93,7 @@ case "$PG_MODE" in
       exit 2
     fi
     psql_cmd() {
-      docker exec -i "$PG_CONTAINER" psql -U servicebridge -d service-bridge -v ON_ERROR_STOP=1 -q -t -A "$@"
+      docker exec -i "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DATABASE" -v ON_ERROR_STOP=1 -q -t -A "$@"
     }
     ;;
   direct)

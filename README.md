@@ -115,3 +115,7 @@ Or pull either from the repo without installing: `npx degit service-bridge/sdk/n
 ## License
 
 Licensed under the **MIT License** — see [LICENSE](./LICENSE). Free for any use, including commercial; you only need to keep the copyright and license notice (attribution to esurkov1 <esurkovv@yandex.ru>).
+
+For `scripts/bootstrap-e2e-keys.sh`, Docker database access uses `PG_CONTAINER`, `PG_USER` (default `servicebridge`) and `PG_DATABASE` (default `service-bridge`). Direct mode uses `POSTGRES_DSN`. Go E2E uses corresponding `SB_E2E_PG_CONTAINER`, `SB_E2E_PG_USER`, `SB_E2E_PG_DATABASE` and `SB_E2E_PG_PASSWORD`; direct mode uses `SB_E2E_PG_DSN` or `TEST_DATABASE_URL`. The local CI runner supplies these values for its isolated database.
+
+The script override template is `scripts/e2e.env.example`; the local CI runner supplies these values automatically.

@@ -418,3 +418,67 @@ it("unknown executable version reports permanent failure", async () => {
 	});
 	await h.sub.stop();
 });
+
+it("ignores duplicate live leases and cancels superseded job execution", async () => {
+	const h = makeHarness();
+	let calls = 0;
+	let cancelled = false;
+	let release!: () => void;
+	const finish = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	h.domain.handle(
+		"leased",
+		{ version: "v1", trigger: { interval: 1000 }, maxConcurrent: 1 },
+		async (ctx) => {
+			calls++;
+			if (calls === 1)
+				await new Promise<void>((resolve) =>
+					ctx.signal.addEventListener(
+						"abort",
+						() => {
+							cancelled = true;
+							resolve();
+						},
+						{ once: true },
+					),
+				);
+			else await finish;
+		},
+	);
+	h.sub.start();
+	const exec = {
+		executionId: "same",
+		jobName: "leased",
+		fingerprint: createHash("sha256")
+			.update(
+				JSON.stringify({
+					version: "v1",
+					trigger: { interval: { everyMs: 1000 } },
+					maxConcurrent: 1,
+				}),
+			)
+			.digest("hex"),
+		leaseEpoch: 1,
+		attempt: 1,
+		scheduledAtUnixMs: 1,
+		localScheduledAtUnixMs: 1,
+		idempotencyKey: "same",
+		xSbTrace: "",
+	};
+	h.last().emit("data", exec);
+	await wait(5);
+	h.last().emit("data", exec);
+	await wait(5);
+	expect(calls).toBe(1);
+	h.last().emit("data", { ...exec, leaseEpoch: 2 });
+	await wait(5);
+	expect(cancelled).toBe(true);
+	expect(calls).toBe(2);
+	expect(h.results).toHaveLength(0);
+	release();
+	await wait(5);
+	expect(h.results).toHaveLength(1);
+	expect(h.results[0]).toMatchObject({ leaseEpoch: 2, success: {} });
+	await h.sub.stop();
+});

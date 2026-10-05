@@ -46,7 +46,15 @@ function openDatabase(path: string): SqliteDatabase {
 		const { Database } = req("bun:sqlite") as { Database: SqliteConstructor };
 		return new Database(path);
 	}
-	const Database = req("better-sqlite3") as SqliteConstructor;
+	let Database: SqliteConstructor;
+	try {
+		Database = req("better-sqlite3") as SqliteConstructor;
+	} catch (cause) {
+		throw new Error(
+			"Node requires the better-sqlite3 driver. Install it with npm install better-sqlite3 and allow its native build script.",
+			{ cause },
+		);
+	}
 	return new Database(path);
 }
 

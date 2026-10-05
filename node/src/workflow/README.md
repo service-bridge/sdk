@@ -164,3 +164,5 @@ WorkflowDef.version enters the canonical fingerprint and is required for local c
 Absent/zero maxParallelism now means 64; explicit limits must be integers 1..1024. Fanout creates at most maxParallelism active iteration scopes per group and shares one operation semaphore across nested groups. The shared dynamic expansion budget is 10,000 step instances per assignment; oversized nested fanout fails explicitly. Static graph caps match runtime: depth 10, 500 steps. AbortSignal is injected from the assignment, never part of frozen options.
 
 An assignment for an executable fingerprint absent from the retained local registry reports terminal `unsupported_version` (`failed` for workflows, non-retryable failure for jobs), so it cannot wait through repeated lease expiry.
+
+Expansion accounting includes complete static child subtrees before any fanout side effects. Compensation reverses execution dependency order within each scope, including forward waitFor declarations, and includes successful null outputs. Duplicate active lease epochs are ignored; a higher epoch cancels the previous execution.

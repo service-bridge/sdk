@@ -98,7 +98,7 @@ describe("HTTP→downstream trace nesting", () => {
 		});
 		const port = await new Promise<number>((resolve) => {
 			expressServer = app.listen(0, "127.0.0.1", () => {
-				resolve((expressServer?.address() as { port: number }).port);
+				resolve((expressServer!.address() as { port: number }).port);
 			});
 		});
 		attachExpress(app, sb, { port });

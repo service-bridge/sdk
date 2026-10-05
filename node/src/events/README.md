@@ -54,7 +54,7 @@ SDK-сторона Durable Events: domain namespace (`EventDomain`), публи�
 | `SubscriberDeps.reconnectOpts` | `ReconnectDelayOptions?` (`@internal`) | общая лестница + ±20% jitter | Тестовый hook: пиннит лестницу/jitter, чтобы reconnect-поведение наблюдалось за миллисекунды. |
 | `SubscriberDeps.onSchedule` | `((delayMs: number) => void)?` (`@internal`) | нет | Тестовый hook: наблюдает каждую задержку reconnect. См. `registry/README.md`. |
 | `SubscriberSchemaIndex` | interface (`@internal`) | — | `{ get(name): { contractHash, pair } \| undefined }` — schema-lookup для Subscriber (decode входящих). |
-| `SubscriberDeps.handlers` | `(pattern: string) => readonly EventHandlerFn[]` | — (обязателен) | Fan-out set для одного точного имени события. Композиционный корень отдаёт сюда `Handle.eventHandlers(pattern)` — индекс по pattern, поддерживаемый на регистрации. |
+| `SubscriberDeps.handlers` | `(pattern: string) => readonly EventHandlerFn[]` | — (обязателен) | Fan-out of exact and wildcard patterns matching the delivered concrete name via Handle.eventHandlers(name). |
 | `SubscriberIdentity` | interface (`@internal`) | — | `{ serviceId, instanceId }` — идентичность подписчика для `SubscribeInit`. |
 | `DrainerDeps.clockFn` | `(() => number)?` | `Date.now` | Test-only hook: источник текущего времени unix-ms. |
 | `DrainerDeps.sleepFn` | `((ms: number, signal: AbortSignal) => Promise<void>)?` | `setTimeout` | Test-only hook: задержка ожидания, отменяемая через `signal` при `kick()`. |
@@ -79,7 +79,7 @@ SDK-сторона Durable Events: domain namespace (`EventDomain`), публи�
 
 **UUID v7 — npm-пакет `uuidv7`.** Пакет хранит монотонный counter внутри процесса (sequential id'ы в пределах одной ms), даёт ту же защиту от clock skew, что требует ADR-0006, и работает под чистым Node (`node:crypto`) и под Bun одинаково. `ids.ts` реэкспортирует `uuidv7` как единую точку входа SDK; реализация не дублируется.
 
-**Subscriber dispatch по exact `event.name`** — никакого client-side AMQP matcher'а, никакого Seen dedup (ADR-0002). Routing — `registry.TopicMatch` на сервере. Fan-out set берётся одним `Handle.eventHandlers(name)` — Map-индекс, поддерживаемый на регистрации. Раньше на КАЖДУЮ доставку пересобирался весь список: фильтр по `_entries`, `map` со свежим объектом `{pattern, fn}` на каждый зарегистрированный обработчик и третий фильтр по имени — 60 аллокаций и три массива, чтобы найти один. Handler contract: at-least-once + idempotency required. События с непустым `partition_key` сериализуются в FIFO через per-partition promise-цепочку; пустой ключ обрабатывается параллельно.
+**Subscriber dispatch by concrete `event.name`.** Server TopicMatch determines delivery. Local Handle.eventHandlers(name) selects every matching exact and wildcard registration through matchEventPattern. Client Seen dedup is absent: the handler contract remains at-least-once with business idempotency. Nonempty partition_key serializes execution in FIFO order; empty keys run concurrently within the global cap.
 
 **Ack/Nack семантика.** Успешный handler → `Ack`. Отсутствие envelope/схемы, decode-ошибка, throw из handler → `Nack` с причиной; ретраи и DLQ — на стороне runtime (events = статус доставки, не клиентские ретраи). Reconnect-счётчик сбрасывается синхронно при получении фрейма на стриме (доказательство, что стрим жив), а не из async-пути handler→ack — иначе сброс гонялся бы с инкрементом счётчика в обработчиках `error`/`end`. Чистое закрытие стрима счётчик НЕ сбрасывает.
 

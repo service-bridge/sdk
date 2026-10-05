@@ -50,3 +50,5 @@ WAL-режим обеспечивает concurrent reads без блокиров
 
 - Использует: `bun:sqlite` (встроен в Bun) либо `better-sqlite3` (npm, под Node) — выбор в рантайме; `node:fs`, `node:module` (`createRequire`)
 - Используется: `sdk/node/src/connection/` (`service-bridge.ts` вызывает `Storage.open()` и владеет инстансом); `sdk/node/src/events/` (`publisher.ts`, `drainer.ts` принимают `Storage` как тип в опциях и ведут `adjustOutboxRowCount` на своих INSERT/DELETE)
+
+`better-sqlite3` is an optional installation dependency because Bun uses its built-in driver. Node requires the native driver and its installation script; a missing driver fails startup with an installation instruction.

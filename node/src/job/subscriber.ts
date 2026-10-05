@@ -45,6 +45,10 @@ export class JobSubscriber {
 	// Released on stop() so executions still queued on a per-job semaphore are
 	// dropped instead of starting a handler after shutdown.
 	private _stopping = new AbortController();
+	private readonly _active = new Map<
+		string,
+		{ epoch: number; controller: AbortController }
+	>();
 	private _heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 	private _heartbeatFailures = 0;
 	private readonly _semaphores = new Map<string, Semaphore>();
@@ -121,29 +125,40 @@ export class JobSubscriber {
 			});
 			return;
 		}
-		const maxConcurrent = reg.opts.maxConcurrent ?? 32;
-		const sem = this.getSemaphore(
-			`${exec.jobName}:${exec.fingerprint}`,
-			maxConcurrent,
-		);
-
+		const previous = this._active.get(exec.executionId);
+		if (previous && previous.epoch >= exec.leaseEpoch) return;
+		previous?.controller.abort();
+		const controller = new AbortController();
+		this._active.set(exec.executionId, { epoch: exec.leaseEpoch, controller });
+		const signal = AbortSignal.any([this._stopping.signal, controller.signal]);
 		try {
-			await sem.acquire(this._stopping.signal);
-		} catch (err) {
-			if (!(err instanceof SemaphoreAbortedError)) throw err;
-			// Without the signal a waiter queued behind a running handler would get
-			// its slot after stop() and run the handler on a subscriber that is
-			// already shut down. Dropping it is safe: the lease expires and the
-			// runtime re-assigns the execution.
-			this.d.logger.warn(
-				`jobs: stopped while queued, dropping execution ${exec.executionId}`,
+			const maxConcurrent = reg.opts.maxConcurrent ?? 32;
+			const sem = this.getSemaphore(
+				`${exec.jobName}:${exec.fingerprint}`,
+				maxConcurrent,
 			);
-			return;
-		}
-		try {
-			await this.run(exec, reg.fn, reg.opts, id.instanceId);
+
+			try {
+				await sem.acquire(signal);
+			} catch (err) {
+				if (!(err instanceof SemaphoreAbortedError)) throw err;
+				// Without the signal a waiter queued behind a running handler would get
+				// its slot after stop() and run the handler on a subscriber that is
+				// already shut down. Dropping it is safe: the lease expires and the
+				// runtime re-assigns the execution.
+				this.d.logger.warn(
+					`jobs: stopped while queued, dropping execution ${exec.executionId}`,
+				);
+				return;
+			}
+			try {
+				await this.run(exec, reg.fn, reg.opts, id.instanceId, signal);
+			} finally {
+				sem.release();
+			}
 		} finally {
-			sem.release();
+			if (this._active.get(exec.executionId)?.controller === controller)
+				this._active.delete(exec.executionId);
 		}
 	}
 
@@ -152,8 +167,8 @@ export class JobSubscriber {
 		fn: JobHandler,
 		_opts: JobOpts,
 		instanceId: string,
+		signal: AbortSignal,
 	): Promise<void> {
-		const abortCtrl = this._stopping;
 		const ctx: JobHandlerCtx = {
 			jobName: exec.jobName,
 			executionId: exec.executionId,
@@ -161,7 +176,7 @@ export class JobSubscriber {
 			localScheduledAt: new Date(exec.localScheduledAtUnixMs),
 			attempt: exec.attempt,
 			idempotencyKey: exec.idempotencyKey,
-			signal: abortCtrl.signal,
+			signal,
 		};
 
 		// xSbTrace is the canonical "<traceID>-<parentOpID>" header per
@@ -172,9 +187,9 @@ export class JobSubscriber {
 
 		try {
 			await this.runWithTrace(xSbTrace, () => Promise.resolve(fn(ctx)));
-			if (!abortCtrl.signal.aborted) this.sendResult(exec, instanceId, true);
+			if (!signal.aborted) this.sendResult(exec, instanceId, true);
 		} catch (err) {
-			if (abortCtrl.signal.aborted) return;
+			if (signal.aborted) return;
 			const error = err as Error & { retryable?: boolean };
 			const retryable = error.retryable !== false;
 			this.sendResult(exec, instanceId, false, {

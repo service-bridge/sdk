@@ -260,3 +260,35 @@ describe("validate — JsonExpression syntax", () => {
 		);
 	});
 });
+
+it("rejects reserved state IDs, foreach alias collisions and forward sequence waits", () => {
+	const invalid: WorkflowDef[] = [
+		{ steps: [{ id: "input", type: "sleep", durationSec: 1 }] },
+		{
+			steps: [
+				{
+					id: "batch",
+					type: "parallel",
+					forEach: { from: "$.input.items", as: "work" },
+					steps: [{ id: "work", type: "sleep", durationSec: 1 }],
+				},
+			],
+		},
+		{
+			steps: [
+				{
+					id: "batch",
+					type: "sequence",
+					steps: [
+						{ id: "early", type: "sleep", durationSec: 1, waitFor: ["late"] },
+						{ id: "late", type: "sleep", durationSec: 1 },
+					],
+				},
+			],
+		},
+	];
+	for (const graph of invalid)
+		expect(() => validate(graph, { workflowName: "wf" })).toThrow(
+			WorkflowValidationError,
+		);
+});

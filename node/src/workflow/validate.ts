@@ -61,6 +61,23 @@ export function validate(def: WorkflowDef, opts: ValidateOptions): void {
 	const counter = { count: 0 };
 	const allIds = new Set<string>();
 	walkSteps(def.steps, 0, allIds, counter, opts);
+	const checkBindings = (steps: Step[]): void => {
+		for (const step of steps) {
+			if (step.id === "input")
+				throw new WorkflowValidationError('step id "input" is reserved');
+			if (step.type === "parallel" || step.type === "sequence") {
+				if (
+					step.forEach &&
+					(step.forEach.as === "input" || allIds.has(step.forEach.as))
+				)
+					throw new WorkflowValidationError(
+						"forEach alias collides with a step or reserved input",
+					);
+				checkBindings(step.steps);
+			}
+		}
+	};
+	checkBindings(def.steps);
 	validateWaitFor(def.steps, allIds);
 }
 
@@ -270,7 +287,12 @@ function validatePathSyntax(expr: string, ctx: string): void {
 
 // validateWaitFor — flat topo on top-level + recursive on groups; reports
 // cycles and unknown references.
-function validateWaitFor(steps: Step[], _allIds: Set<string>): void {
+function validateWaitFor(
+	steps: Step[],
+	_allIds: Set<string>,
+	sequential = false,
+): void {
+	const position = new Map(steps.map((step, index) => [step.id, index]));
 	const byId = new Map(steps.map((step) => [step.id, step]));
 	const visited = new Set<string>();
 	const onStack = new Set<string>();
@@ -286,6 +308,10 @@ function validateWaitFor(steps: Step[], _allIds: Set<string>): void {
 				throw new WorkflowValidationError(
 					`step "${id}": waitFor references unknown step "${dep}"`,
 				);
+			if (sequential && position.get(dep)! > position.get(id)!)
+				throw new WorkflowValidationError(
+					"sequence waitFor cannot reference a later sibling",
+				);
 			visit(dep);
 		}
 		onStack.delete(id);
@@ -294,6 +320,6 @@ function validateWaitFor(steps: Step[], _allIds: Set<string>): void {
 	for (const step of steps) {
 		visit(step.id);
 		if (step.type === "parallel" || step.type === "sequence")
-			validateWaitFor(step.steps, _allIds);
+			validateWaitFor(step.steps, _allIds, step.type === "sequence");
 	}
 }

@@ -89,6 +89,10 @@ jobs:
           mkdir "$RUNNER_TEMP/consumer"
           cd "$RUNNER_TEMP/consumer"
           npm init -y
-          npm install "$RUNNER_TEMP"/service-bridge-*.tgz express fastify hono typescript
+          if [ "$SMOKE_RUNTIME" = bun ]; then
+            bun add "$RUNNER_TEMP"/service-bridge-*.tgz express fastify hono typescript@5
+          else
+            npm install "$RUNNER_TEMP"/service-bridge-*.tgz express fastify hono typescript@5
+          fi
           cp "$GITHUB_WORKSPACE/node/tests/fixtures/packed-smoke.mjs" smoke.mjs
           if [ "$SMOKE_RUNTIME" = bun ]; then bun smoke.mjs; else node smoke.mjs; fi

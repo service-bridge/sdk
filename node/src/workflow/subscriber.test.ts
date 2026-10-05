@@ -103,7 +103,7 @@ function makeHarness(
 					completions.push(req);
 				},
 			},
-		// biome-ignore lint/suspicious/noExplicitAny: partial operations stub
+			// biome-ignore lint/suspicious/noExplicitAny: partial operations stub
 		} as any,
 		logger: {
 			warn: (...args: unknown[]) => warns.push(args.map(String).join(" ")),

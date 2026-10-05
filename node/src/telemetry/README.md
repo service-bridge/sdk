@@ -128,3 +128,5 @@ Per-kind ring buffers, примитивы для emit'а ops/logs/metrics, real 
 Every wire batch carries increasing sequence; cumulative acknowledgedSequence releases only confirmed items. ACK means ingress acceptance/disposal (including observable drop), not durable database commit. Inflight is bounded to1024 items; write(false) pauses pumping until drain. Late streaming HTTP payload capture respects the retained terminal status.
 
 Metric cardinality is limited to 10,000 series, 32 labels, 256 characters per name/key and 1024 per value. Exceeding the budget throws. Identity rotation flushes and retires old series.
+
+Metric series default cap is 4096; histogram definitions are limited to 256 bounds. Identity rotation retires old instance series and retained handles rebind to the current identity.

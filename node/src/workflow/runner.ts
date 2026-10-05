@@ -596,7 +596,7 @@ async function dispatchGroup(
 		if (!Array.isArray(value))
 			throw new Error("workflow/runner: forEach.from must resolve to array");
 		items = value;
-		abort.expandedSteps += items.length * step.steps.length;
+		abort.expandedSteps += items.length * countStepUnits(step.steps);
 		if (abort.expandedSteps > 10_000)
 			throw new Error("workflow expanded step budget exceeded (10000)");
 	}
@@ -741,7 +741,7 @@ async function runCompensation(
 			for (const [id, value] of Object.entries(ctx.state)) {
 				if (id.endsWith(suffix)) aliases[id.slice(0, -suffix.length)] = value;
 			}
-		for (const template of scope) {
+		for (const template of dependencyOrder(scope)) {
 			const step = suffix
 				? rewriteStepIds(template, suffix.slice(1))
 				: template;
@@ -859,4 +859,40 @@ async function runCompensation(
 	// compensated. The runtime re-assigns it; the already-done checkpoints above
 	// make the second pass skip everything that did succeed.
 	if (firstFailure !== undefined) throw firstFailure;
+}
+
+function countStepUnits(steps: Step[]): number {
+	return steps.reduce(
+		(count, step) =>
+			count +
+			1 +
+			(step.type === "parallel" || step.type === "sequence"
+				? countStepUnits(step.steps)
+				: 0),
+		0,
+	);
+}
+
+function dependencyOrder(steps: Step[]): Step[] {
+	const byId = new Map(steps.map((step) => [step.id, step]));
+	const ordered: Step[] = [];
+	const visited = new Set<string>();
+	const visiting = new Set<string>();
+	const visit = (step: Step): void => {
+		if (visited.has(step.id)) return;
+		if (visiting.has(step.id))
+			throw new Error("workflow compensation dependency cycle");
+		visiting.add(step.id);
+		for (const id of step.waitFor ?? []) {
+			const dependency = byId.get(id);
+			if (!dependency)
+				throw new Error("workflow compensation dependency absent from scope");
+			visit(dependency);
+		}
+		visiting.delete(step.id);
+		visited.add(step.id);
+		ordered.push(step);
+	};
+	for (const step of steps) visit(step);
+	return ordered;
 }

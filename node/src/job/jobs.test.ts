@@ -371,3 +371,22 @@ test("job version canonical bytes match cross-SDK golden fingerprint", () => {
 		"1be70dfb3805071572dd48e43245ec178865dc98d254ac6840ff39a8f496b8c2",
 	);
 });
+
+test("job concurrency rejects unbounded and invalid limits before registration", () => {
+	const { domain, registry } = newDomain();
+	for (const maxConcurrent of [-1, 0.5, 1025, Infinity, NaN]) {
+		expect(() =>
+			domain.handle(
+				"bad",
+				{ version: "v1", trigger: { interval: 1000 }, maxConcurrent },
+				noop,
+			),
+		).toThrow(/maxConcurrent/);
+	}
+	expect(registry._handle.incomingMethods()).toHaveLength(0);
+	domain.handle(
+		"default",
+		{ version: "v1", trigger: { interval: 1000 }, maxConcurrent: 0 },
+		noop,
+	);
+});

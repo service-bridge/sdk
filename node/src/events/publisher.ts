@@ -1,9 +1,8 @@
-import type { FailedOutboxEvent } from "../sqlite/storage";
 import type { Identity, ServiceBridge } from "../connection/service-bridge";
 import type { EventsClient } from "../pb/servicebridge/v1/events";
 import { PublishStatus } from "../pb/servicebridge/v1/events";
 import type { SchemaPair } from "../serde/serializer";
-import type { Storage } from "../sqlite/storage";
+import type { FailedOutboxEvent, Storage } from "../sqlite/storage";
 import { InvalidEventNameError, OutboxFullError } from "./errors";
 import { uuidv7 } from "./ids";
 

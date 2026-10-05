@@ -116,6 +116,8 @@ function normalizeLabels(labels: Labels): { keys: string[]; copy: Labels } {
 }
 
 function validateBounds(bounds: readonly number[]): readonly number[] {
+	if (bounds.length > 256)
+		throw new Error("histogram bounds budget exceeded (256)");
 	if (bounds.length === 0) {
 		throw new Error("histogram bounds must not be empty");
 	}
@@ -185,7 +187,7 @@ export class MetricsAggregator {
 
 	constructor(
 		sink: MetricSink,
-		private readonly maxSeries = 10_000,
+		private readonly maxSeries = 4096,
 	) {
 		if (!Number.isSafeInteger(maxSeries) || maxSeries < 1)
 			throw new Error("metric maxSeries must be a positive integer");

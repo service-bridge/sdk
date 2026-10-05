@@ -163,6 +163,16 @@ function validateOpts(name: string, opts: JobOpts): void {
 	if (typeof opts.version !== "string" || !opts.version.trim()) {
 		throw new Error("sb.job.handle: explicit executable version is required");
 	}
+	if (
+		opts.maxConcurrent !== undefined &&
+		(!Number.isInteger(opts.maxConcurrent) ||
+			opts.maxConcurrent < 0 ||
+			opts.maxConcurrent > 1024)
+	) {
+		throw new Error(
+			"sb.job.handle: maxConcurrent must be an integer from 0 to 1024",
+		);
+	}
 	if (!opts.trigger) {
 		throw new Error("sb.job.handle: opts.trigger is required");
 	}

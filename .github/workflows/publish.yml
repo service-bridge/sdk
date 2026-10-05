@@ -24,6 +24,15 @@ jobs:
         working-directory: ./node
     steps:
       - uses: actions/checkout@v7
+      - name: Verify release tag matches package version
+        run: |
+          node <<'NODE'
+          const version = require('./package.json').version;
+          const expected = `v${version}`;
+          if (process.env.GITHUB_REF_TYPE !== 'tag' || process.env.GITHUB_REF_NAME !== expected) {
+            throw new Error(`Publishing requires tag ${expected}; received ${process.env.GITHUB_REF_TYPE}:${process.env.GITHUB_REF_NAME}`);
+          }
+          NODE
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.13

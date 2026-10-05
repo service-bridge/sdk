@@ -364,3 +364,16 @@ describe("bounded metric cardinality", () => {
 		).toThrow();
 	});
 });
+
+test("rejects histogram layouts beyond the memory budget", () => {
+	const metrics = new MetricsAggregator({ push: () => {} });
+	expect(() =>
+		metrics.histogram(
+			"instance",
+			"large",
+			"s",
+			{},
+			Array.from({ length: 257 }, (_, i) => i + 1),
+		),
+	).toThrow("budget");
+});

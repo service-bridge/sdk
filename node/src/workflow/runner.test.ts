@@ -1157,3 +1157,82 @@ it("large fanout with zero/default cap completes every item with bounded concurr
 	expect(peak).toBeGreaterThan(1);
 	expect(completes).toHaveLength(items.length + 1);
 });
+
+it("fanout budget counts every statically nested child before business dispatch", async () => {
+	const { ops } = makeOps();
+	const { sb } = makeSb();
+	let calls = 0;
+	const nested: Step = {
+		id: "nested",
+		type: "sequence",
+		steps: Array.from({ length: 100 }, (_, i) => ({
+			id: `work_${i}`,
+			type: "local",
+			fn: async () => {
+				calls++;
+				return null;
+			},
+		})),
+	};
+	await expect(
+		run(
+			[
+				{
+					id: "fanout",
+					type: "parallel",
+					forEach: { from: "$.input.items", as: "item" },
+					steps: [nested],
+				},
+			],
+			{
+				runId: "r",
+				leaseEpoch: 1,
+				state: { input: { items: Array.from({ length: 100 }, (_, i) => i) } },
+				compensating: false,
+				maxParallelism: 0,
+			},
+			{ ops, sb },
+		),
+	).rejects.toThrow();
+	expect(calls).toBe(0);
+});
+
+it("compensation reverses causal dependencies rather than declaration order", async () => {
+	const { ops } = makeOps();
+	const { sb } = makeSb();
+	const undone: string[] = [];
+	sb.rpc.call = async (_service, method) => {
+		undone.push(method);
+		return null;
+	};
+	await run(
+		[
+			{
+				id: "a",
+				type: "call",
+				service: "s",
+				method: "A",
+				waitFor: ["b"],
+				input: {},
+				compensate: { method: "UndoA", input: {} },
+			},
+			{
+				id: "b",
+				type: "call",
+				service: "s",
+				method: "B",
+				input: {},
+				compensate: { method: "UndoB", input: {} },
+			},
+		],
+		{
+			runId: "r",
+			leaseEpoch: 1,
+			state: { a: null, b: null },
+			compensating: true,
+			maxParallelism: 0,
+		},
+		{ ops, sb },
+	);
+	expect(undone).toEqual(["UndoA", "UndoB"]);
+});

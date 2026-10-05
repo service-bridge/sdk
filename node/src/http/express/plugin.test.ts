@@ -142,7 +142,7 @@ describe("attachExpress payload capture gating", () => {
 		});
 		const port = await new Promise<number>((resolve) => {
 			server = app.listen(0, "127.0.0.1", () => {
-				resolve((server?.address() as { port: number }).port);
+				resolve((server!.address() as { port: number }).port);
 			});
 		});
 		attachExpress(app, stub.sb, { port });
@@ -178,7 +178,7 @@ describe("attachExpress payload capture gating", () => {
 		const app = express();
 		const port = await new Promise<number>((resolve) => {
 			server = app.listen(0, "127.0.0.1", () => {
-				resolve((server?.address() as { port: number }).port);
+				resolve((server!.address() as { port: number }).port);
 			});
 		});
 		attachExpress(app, stub.sb, { port });

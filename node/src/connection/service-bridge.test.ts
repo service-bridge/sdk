@@ -1388,7 +1388,7 @@ describe("ServiceBridge non-retryable errors (H11)", () => {
 		expect(disconnects.length).toBe(1);
 		const unauth0 = disconnects[0];
 		expect(unauth0?.error).toBeInstanceOf(ConnectionError);
-		expect((unauth0?.error as ConnectionError).code).toBe(
+		expect((unauth0!.error as ConnectionError).code).toBe(
 			GrpcStatus.UNAUTHENTICATED,
 		);
 		expect(reconnects.length).toBe(0);
