@@ -260,7 +260,9 @@ func (s *Subscriber) dispatch(ctx context.Context, decl Declaration, msg *pb.Job
 // would abandon work the runtime believes is being done.
 func (s *Subscriber) acquire(ctx context.Context, decl Declaration) (func(), bool) {
 	limit := decl.Spec.MaxConcurrent
-	if limit <= 0 {
+	if decl.Spec.Overlap == "" || decl.Spec.Overlap == OverlapSkip {
+		limit = 1
+	} else if limit <= 0 {
 		limit = 32
 	}
 

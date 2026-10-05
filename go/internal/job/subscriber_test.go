@@ -407,6 +407,7 @@ func TestConcurrencyIsCappedPerJob(t *testing.T) {
 	var done atomic.Int64
 	capped := cronSpec(t)
 	capped.MaxConcurrent = 2
+	capped.Overlap = job.OverlapAllow
 	declare(t, decls, "capped", capped, func(ctx context.Context, _ job.Execution) error {
 		cur := live.Add(1)
 		for {
@@ -467,7 +468,9 @@ func TestUnlimitedJobsRunConcurrently(t *testing.T) {
 	decls := job.NewDeclarations()
 	release := make(chan struct{})
 	var live atomic.Int64
-	declare(t, decls, "free", cronSpec(t), func(context.Context, job.Execution) error {
+	spec := cronSpec(t)
+	spec.Overlap = job.OverlapAllow
+	declare(t, decls, "free", spec, func(context.Context, job.Execution) error {
 		live.Add(1)
 		<-release
 		return nil
@@ -1039,4 +1042,72 @@ func (s versionedJobsStream) Recv() (*pb.JobExecution, error) {
 		}
 	}
 	return msg, err
+}
+
+func TestSkipRedeliveryWaitsForHandlerAcrossIdentityReconnect(t *testing.T) {
+	for _, overlap := range []job.OverlapPolicy{"", job.OverlapSkip} {
+		t.Run(string(overlap), func(t *testing.T) {
+			srv, client := startJobs(t)
+			decls := job.NewDeclarations()
+			spec := cronSpec(t)
+			spec.Overlap = overlap
+			spec.MaxConcurrent = 8
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			var running, peak, calls atomic.Int64
+			declare(t, decls, "serial-reconnect", spec, func(context.Context, job.Execution) error {
+				active := running.Add(1)
+				for previous := peak.Load(); active > previous && !peak.CompareAndSwap(previous, active); previous = peak.Load() {
+				}
+				calls.Add(1)
+				// Application code may ignore its canceled context while finishing I/O.
+				<-release
+				running.Add(-1)
+				return nil
+			})
+			sub, err := job.NewSubscriber(job.SubscriberConfig{
+				Clients:  &staticClients{client: versionedJobsClient{JobsClient: client, decls: decls}},
+				Identity: (&rotatingIdentity{}).get, Jobs: decls,
+				HeartbeatInterval: 5 * time.Millisecond, HeartbeatThreshold: 1,
+				ResultTimeout: time.Second, Backoff: fastBackoff(), Logger: slog.New(&logSink{}),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := sub.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			defer func() { releaseOnce.Do(func() { close(release) }); sub.Stop() }()
+			first := <-srv.subscribes
+			srv.push <- execution("serial-reconnect", "same-execution")
+			waitFor(t, "first handler", func() bool { return calls.Load() == 1 })
+			srv.heartbeatFails.Store(true)
+			select {
+			case next := <-srv.subscribes:
+				if next.InstanceId == first.InstanceId {
+					t.Fatal("reconnect did not rotate identity")
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("no new subscription")
+			}
+			srv.heartbeatFails.Store(false)
+			retry := execution("serial-reconnect", "same-execution")
+			retry.LeaseEpoch++
+			srv.push <- retry
+			// Give the real gRPC receiver a turn while the first handler is blocked.
+			time.Sleep(20 * time.Millisecond)
+			if calls.Load() != 1 {
+				t.Fatalf("reassigned lease overlapped old handler: %d calls", calls.Load())
+			}
+			releaseOnce.Do(func() { close(release) })
+			waitFor(t, "reassigned handler", func() bool { return calls.Load() == 2 })
+			if peak.Load() != 1 {
+				t.Fatalf("skip peak concurrency=%d", peak.Load())
+			}
+			result := recvResult(t, srv)
+			if result.LeaseEpoch != retry.LeaseEpoch {
+				t.Fatalf("stale result after reconnect: %v", result)
+			}
+		})
+	}
 }
