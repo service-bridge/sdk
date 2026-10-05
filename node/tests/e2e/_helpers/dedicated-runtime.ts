@@ -275,6 +275,8 @@ async function killProcessAndWait(proc: Bun.Subprocess): Promise<void> {
 }
 
 export interface DedicatedRuntime {
+	/** Bounded runtime output for failure diagnostics; database URLs are redacted. */
+	logs(): string;
 	/** gRPC port the runtime is listening on. */
 	grpcPort: number;
 	/** gRPC URL: "localhost:<grpcPort>". */
@@ -440,6 +442,11 @@ export async function spawnIsolatedRuntime(
 	let killed = false;
 
 	const handle: DedicatedRuntime = {
+		logs: () =>
+			runtimeOutput.replace(
+				/postgres(?:ql)?:\/\/[^\s"']+/g,
+				"[redacted database URL]",
+			),
 		grpcPort: opts.grpcPort,
 		url: `localhost:${opts.grpcPort}`,
 		dbUrl: isolatedDbUrl(dbName),

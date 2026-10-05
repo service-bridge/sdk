@@ -422,14 +422,24 @@ describe("jobs-lifecycle: heartbeat timeout reclaim", () => {
 			sbB = undefined;
 		}
 
-		await waitFor(
-			() =>
-				otherReceiver === "A"
-					? callsOnA.some((c) => c.attempt === 2)
-					: callsOnB.some((c) => c.attempt === 2),
-			25_000,
-			`${otherReceiver} received reclaimed execution`,
-		);
+		try {
+			await waitFor(
+				() =>
+					otherReceiver === "A"
+						? callsOnA.some((c) => c.attempt === 2)
+						: callsOnB.some((c) => c.attempt === 2),
+				25_000,
+				`${otherReceiver} received reclaimed execution`,
+			);
+		} catch (error) {
+			console.error("job failover diagnostics", {
+				firstReceiver,
+				callsOnA,
+				callsOnB,
+			});
+			console.error(runtime!.logs());
+			throw error;
+		}
 
 		const reclaimedCall = (otherReceiver === "A" ? callsOnA : callsOnB).find(
 			(c) => c.attempt === 2,
