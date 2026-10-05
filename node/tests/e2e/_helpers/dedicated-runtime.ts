@@ -43,15 +43,17 @@ function isolatedDbUrl(dbName: string): string {
 /**
  * isolatedDsn builds the runtime -pg-url DSN for the isolated test database.
  * sslmode=disable matches the local dev Postgres which has no TLS.
+ * Each lifecycle fixture has 1–2 SDK clients: cap its pool at 8 so parallel
+ * fixtures and the ambient runtime fit PostgreSQL’s 100-connection CI budget.
  */
 function isolatedDsn(dbName: string): string {
-	return `postgres://${PG_USER}:${PG_PASSWORD}@${PG_HOST}:${PG_PORT}/${dbName}?sslmode=disable`;
+	return `postgres://${PG_USER}:${PG_PASSWORD}@${PG_HOST}:${PG_PORT}/${dbName}?sslmode=disable&pool_max_conns=8`;
 }
 
 async function createDatabase(dbName: string): Promise<void> {
 	// Use new Bun.SQL() for explicit-URL connections so we don't rely on the
 	// process-wide DATABASE_URL singleton (which is already claimed by policy-db.ts).
-	const db = new Bun.SQL(adminUrl());
+	const db = new Bun.SQL(adminUrl(), { max: 1 });
 	try {
 		// DDL identifiers cannot be parameterized; dbName is alphanumeric + _ only.
 		await db.unsafe(`CREATE DATABASE "${dbName}"`);
@@ -61,7 +63,7 @@ async function createDatabase(dbName: string): Promise<void> {
 }
 
 async function dropDatabase(dbName: string): Promise<void> {
-	const db = new Bun.SQL(adminUrl());
+	const db = new Bun.SQL(adminUrl(), { max: 1 });
 	try {
 		await db.unsafe(`DROP DATABASE IF EXISTS "${dbName}" WITH (FORCE)`);
 	} finally {
@@ -84,8 +86,8 @@ const PG_MAIN_DB =
  */
 async function seedServices(dbName: string): Promise<void> {
 	const mainUrl = `postgresql://${PG_USER}:${PG_PASSWORD}@${PG_HOST}:${PG_PORT}/${PG_MAIN_DB}`;
-	const srcDb = new Bun.SQL(mainUrl);
-	const dstDb = new Bun.SQL(isolatedDbUrl(dbName));
+	const srcDb = new Bun.SQL(mainUrl, { max: 1 });
+	const dstDb = new Bun.SQL(isolatedDbUrl(dbName), { max: 1 });
 	try {
 		const rows = (await srcDb`
 			SELECT id, name, key_id, secret_hash, status, persist_ops,
@@ -142,8 +144,8 @@ async function seedServices(dbName: string): Promise<void> {
  */
 async function seedRuntimeCa(dbName: string): Promise<void> {
 	const mainUrl = `postgresql://${PG_USER}:${PG_PASSWORD}@${PG_HOST}:${PG_PORT}/${PG_MAIN_DB}`;
-	const srcDb = new Bun.SQL(mainUrl);
-	const dstDb = new Bun.SQL(isolatedDbUrl(dbName));
+	const srcDb = new Bun.SQL(mainUrl, { max: 1 });
+	const dstDb = new Bun.SQL(isolatedDbUrl(dbName), { max: 1 });
 	try {
 		const rows = (await srcDb`
 			SELECT id, cert_der, key_der, created_at FROM runtime_ca WHERE id = 1
@@ -201,7 +203,7 @@ async function updateSettings(
 	dbName: string,
 	settings: Record<string, string>,
 ): Promise<void> {
-	const db = new Bun.SQL(isolatedDbUrl(dbName));
+	const db = new Bun.SQL(isolatedDbUrl(dbName), { max: 1 });
 	try {
 		for (const [key, value] of Object.entries(settings)) {
 			await db`
