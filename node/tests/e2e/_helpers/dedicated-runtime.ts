@@ -41,13 +41,11 @@ function isolatedDbUrl(dbName: string): string {
 }
 
 /**
- * isolatedDsn builds the runtime -pg-url DSN for the isolated test database.
+ * isolatedDsn builds the connection DSN for the isolated test database.
  * sslmode=disable matches the local dev Postgres which has no TLS.
- * Each lifecycle fixture has 1–2 SDK clients: cap its pool at 8 so parallel
- * fixtures and the ambient runtime fit PostgreSQL’s 100-connection CI budget.
  */
 function isolatedDsn(dbName: string): string {
-	return `postgres://${PG_USER}:${PG_PASSWORD}@${PG_HOST}:${PG_PORT}/${dbName}?sslmode=disable&pool_max_conns=8`;
+	return `postgres://${PG_USER}:${PG_PASSWORD}@${PG_HOST}:${PG_PORT}/${dbName}?sslmode=disable`;
 }
 
 async function createDatabase(dbName: string): Promise<void> {
@@ -402,7 +400,9 @@ export async function spawnIsolatedRuntime(
 	function spawnProcess(): Bun.Subprocess {
 		runtimeOutput = "";
 		const spawned = Bun.spawn(
-			[opts.binaryPath, "-pg-url", isolatedDsn(dbName)],
+			// pgxpool options belong to the running fixture, not the migration
+			// driver's plain pgx connection. Budget eight for its 1–2 SDK clients.
+			[opts.binaryPath, "-pg-url", `${isolatedDsn(dbName)}&pool_max_conns=8`],
 			{
 				cwd: RUNTIME_DIR,
 				stdout: "pipe",
