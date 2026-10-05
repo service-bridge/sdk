@@ -33,7 +33,8 @@ import { withDb } from "./_helpers/policy-db";
 const FAST_OPTS = {
 	reconnectIntervalMs: 500,
 	reconnectAttempts: 2,
-	certRefreshLeadMs: 60 * 60 * 1000,
+	certRefreshLeadMs: 60_000,
+	certRefreshJitterMs: 0,
 } as const;
 
 const ROLE_INDEX: Record<Role, number> = { primary: 1, second: 2, third: 3 };
@@ -157,7 +158,8 @@ describe("misc: connect lifecycle", () => {
 		sb = new ServiceBridge(url, corruptSecret(key), {
 			reconnectIntervalMs: 200,
 			reconnectAttempts: 2,
-			certRefreshLeadMs: 60 * 60 * 1000,
+			certRefreshLeadMs: 60_000,
+			certRefreshJitterMs: 0,
 		});
 
 		const events: { type: string; payload: unknown }[] = [];

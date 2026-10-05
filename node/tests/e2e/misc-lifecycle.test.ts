@@ -17,7 +17,8 @@ import { withDb } from "./_helpers/policy-db";
 const FAST_OPTS = {
 	reconnectIntervalMs: 500,
 	reconnectAttempts: 2,
-	certRefreshLeadMs: 60 * 60 * 1000,
+	certRefreshLeadMs: 60_000,
+	certRefreshJitterMs: 0,
 } as const;
 
 function env(): { url: string; key: string } {
@@ -116,7 +117,8 @@ describe("misc-lifecycle: connect FSM", () => {
 		sb = new ServiceBridge(url, badKey, {
 			reconnectIntervalMs: 200,
 			reconnectAttempts: 2,
-			certRefreshLeadMs: 60 * 60 * 1000,
+			certRefreshLeadMs: 60_000,
+			certRefreshJitterMs: 0,
 		});
 
 		const events: { type: string; payload: unknown }[] = [];

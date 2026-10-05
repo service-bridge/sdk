@@ -12,7 +12,8 @@ import { addRule, withDb } from "./policy-db";
 export const FAST_WF_OPTS = {
 	reconnectIntervalMs: 500,
 	reconnectAttempts: 3,
-	certRefreshLeadMs: 60 * 60 * 1000,
+	certRefreshLeadMs: 60_000,
+	certRefreshJitterMs: 0,
 } as const;
 
 // startWorkflowWhenAllowed — starts a run, retrying while two registrations are

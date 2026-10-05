@@ -56,7 +56,8 @@ function domainKeys(): { url: string; serviceKey: string } {
 const FAST_OPTS = {
 	reconnectIntervalMs: 500,
 	reconnectAttempts: 3,
-	certRefreshLeadMs: 60 * 60 * 1000,
+	certRefreshLeadMs: 60_000,
+	certRefreshJitterMs: 0,
 } as const;
 
 describe("jobs-lifecycle: survives runtime kill+restart", () => {

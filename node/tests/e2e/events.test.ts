@@ -76,7 +76,8 @@ function extraInstance(role: Role, tag: string): ServiceBridge {
 	return new ServiceBridge(url, key, {
 		reconnectIntervalMs: 500,
 		reconnectAttempts: 3,
-		certRefreshLeadMs: 60 * 60 * 1000,
+		certRefreshLeadMs: 60_000,
+		certRefreshJitterMs: 0,
 		advertise: { host: "127.0.0.1", port: 0 },
 		dataDir: `./.servicebridge-e2e/events-${tag}-${Date.now()}`,
 	});

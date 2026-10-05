@@ -36,9 +36,10 @@ const dataRoot = mkdtempSync(join(tmpdir(), "sb-e2e-pool-"));
 const POOL_OPTS = {
 	reconnectIntervalMs: 500,
 	reconnectAttempts: 3,
-	// Tests never run long enough to rotate certs; keep the lead huge so the
-	// refresh timer never fires and keeps the process alive past the suite.
-	certRefreshLeadMs: 60 * 60 * 1000,
+	// Certificates live for an hour. Rotate one minute before expiry,
+	// with no scheduling jitter in lifecycle fixtures.
+	certRefreshLeadMs: 60_000,
+	certRefreshJitterMs: 0,
 } as const;
 
 const ROLE_INDEX: Record<Role, number> = { primary: 1, second: 2, third: 3 };

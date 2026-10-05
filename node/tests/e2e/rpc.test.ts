@@ -43,7 +43,8 @@ const SCHEMA = {
 const OPTS = {
 	reconnectIntervalMs: 500,
 	reconnectAttempts: 2,
-	certRefreshLeadMs: 60 * 60 * 1000,
+	certRefreshLeadMs: 60_000,
+	certRefreshJitterMs: 0,
 } as const;
 
 const ADVERTISE = { host: "127.0.0.1", port: 0 } as const;
