@@ -13,8 +13,10 @@ import {
 	evaluatePeerAcceptance,
 	getPeerCertFromCall,
 	parsePeerSpiffeUri,
-	RUNTIME_PEER_COMMON_NAME,
 } from "./acceptance";
+
+const RUNTIME_PEER_COMMON_NAME = "servicebridge-runtime";
+const RUNTIME_SPIFFE_URI = "spiffe://service-bridge/runtime";
 
 const callerA = "aaaaaaaa-0000-0000-0000-000000000001";
 const callerB = "bbbbbbbb-0000-0000-0000-000000000002";
@@ -76,7 +78,7 @@ let noSanStrangerCert: CertFixture;
 beforeAll(async () => {
 	sdkLeafA = await issueCert("servicebridge-leaf", [spiffeUri(callerA)]);
 	sdkLeafB = await issueCert("servicebridge-leaf", [spiffeUri(callerB)]);
-	runtimeCert = await issueCert(RUNTIME_PEER_COMMON_NAME, []);
+	runtimeCert = await issueCert(RUNTIME_PEER_COMMON_NAME, [RUNTIME_SPIFFE_URI]);
 	foreignUriCert = await issueCert("servicebridge-leaf", [
 		"https://attacker.example/service/x",
 	]);
@@ -160,7 +162,7 @@ describe("classifyPeer", () => {
 		).toEqual({ kind: "service", serviceId: callerA });
 	});
 
-	it("identifies the runtime by CN when the cert has no URI SAN", () => {
+	it("identifies the runtime by its exact sole URI SAN", () => {
 		expect(classifyPeer(runtimeCert)).toEqual({ kind: "runtime" });
 	});
 
@@ -194,10 +196,23 @@ describe("classifyPeer", () => {
 		).toEqual({ kind: "service", serviceId: callerA });
 	});
 
-	it("reads the runtime CN from subject when no DER is present", () => {
-		expect(classifyPeer({ subject: { CN: RUNTIME_PEER_COMMON_NAME } })).toEqual(
-			{ kind: "runtime" },
-		);
+	it("rejects a runtime-looking CN without its URI identity", () => {
+		expect(
+			classifyPeer({ subject: { CN: RUNTIME_PEER_COMMON_NAME } }).kind,
+		).toBe("unknown");
+	});
+
+	it("rejects multiple identities and malformed runtime/service identities", async () => {
+		for (const uris of [
+			[RUNTIME_SPIFFE_URI, spiffeUri(callerA)],
+			[RUNTIME_SPIFFE_URI, RUNTIME_SPIFFE_URI],
+			[`${RUNTIME_SPIFFE_URI}?role=runtime`],
+			[`${spiffeUri(callerA)}/extra`],
+			[`${spiffeUri(callerA)}#runtime`],
+		]) {
+			const cert = await issueCert(RUNTIME_PEER_COMMON_NAME, uris);
+			expect(classifyPeer(cert).kind).toBe("unknown");
+		}
 	});
 
 	it("picks the SPIFFE URI out of a multi-entry SAN", () => {

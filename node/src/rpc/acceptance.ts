@@ -1,14 +1,7 @@
 import "reflect-metadata";
 import * as x509 from "@peculiar/x509";
-import { SPIFFE_TRUST_DOMAIN } from "../connection/spiffe";
+import { RUNTIME_SPIFFE_URI, SPIFFE_TRUST_DOMAIN } from "../connection/spiffe";
 import type { PolicyEvaluation } from "../pb/servicebridge/v1/registry";
-
-// RUNTIME_PEER_COMMON_NAME is the subject CN the runtime puts on the cert it
-// presents when it proxies a call to an SDK callee (tlsca.issueServerCert).
-// That cert carries no SAN at all, whereas every SDK leaf (tlsca.Issue) carries
-// a SPIFFE URI SAN — so "no URI SAN + this CN" positively identifies the
-// runtime instead of guessing from a failed parse.
-export const RUNTIME_PEER_COMMON_NAME = "servicebridge-runtime";
 
 // SpiffeIdentity is the parsed SPIFFE URI for a ServiceBridge peer.
 export interface SpiffeIdentity {
@@ -29,12 +22,12 @@ export type PeerIdentity =
 // spiffe://service-bridge/service/<serviceId>/instance/<instanceId>
 // Returns null for any other URI.
 export function parsePeerSpiffeUri(uri: string): SpiffeIdentity | null {
-	const prefix = `spiffe://${SPIFFE_TRUST_DOMAIN}/service/`;
-	if (!uri.startsWith(prefix)) return null;
-	const rest = uri.slice(prefix.length);
-	const parts = rest.split("/instance/");
-	if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
-	return { serviceId: parts[0], instanceId: parts[1] };
+	const match = uri.match(
+		new RegExp(
+			`^spiffe://${SPIFFE_TRUST_DOMAIN}/service/([a-zA-Z0-9_-]+)/instance/([a-zA-Z0-9_-]+)$`,
+		),
+	);
+	return match ? { serviceId: match[1]!, instanceId: match[2]! } : null;
 }
 
 // PeerCertLike is the subset of Node's TLS PeerCertificate this module reads.
@@ -46,7 +39,6 @@ export interface PeerCertLike {
 
 interface CertFacts {
 	uriSans: string[];
-	commonName: string;
 }
 
 // uriSansFromAltName pulls the URI entries out of Node's flattened
@@ -74,8 +66,7 @@ function certFactsFromDer(raw: Buffer | Uint8Array): CertFacts | null {
 				if (name.type === "url") uriSans.push(name.value);
 			}
 		}
-		const cn = parsed.subjectName.getField("CN")[0] ?? "";
-		return { uriSans, commonName: cn };
+		return { uriSans };
 	} catch {
 		return null;
 	}
@@ -102,27 +93,23 @@ export function classifyPeer(cert: PeerCertLike): PeerIdentity {
 			uriSans: cert.subjectaltname
 				? uriSansFromAltName(cert.subjectaltname)
 				: [],
-			commonName: cert.subject?.CN ?? "",
 		};
 	}
 
-	for (const uri of facts.uriSans) {
-		const id = parsePeerSpiffeUri(uri);
-		if (id) return { kind: "service", serviceId: id.serviceId };
-	}
-	if (facts.uriSans.length > 0) {
+	if (facts.uriSans.length !== 1) {
 		return {
 			kind: "unknown",
-			reason:
-				"peer certificate carries a URI SAN that is not a ServiceBridge SPIFFE identity",
+			reason: "peer certificate must carry exactly one SPIFFE URI SAN",
 		};
 	}
-	if (facts.commonName === RUNTIME_PEER_COMMON_NAME) {
-		return { kind: "runtime" };
-	}
+	const uri = facts.uriSans[0]!;
+	if (uri === RUNTIME_SPIFFE_URI) return { kind: "runtime" };
+	const id = parsePeerSpiffeUri(uri);
+	if (id) return { kind: "service", serviceId: id.serviceId };
 	return {
 		kind: "unknown",
-		reason: "peer certificate has no SPIFFE URI SAN and is not the runtime",
+		reason:
+			"peer certificate URI SAN is not a canonical ServiceBridge SPIFFE identity",
 	};
 }
 

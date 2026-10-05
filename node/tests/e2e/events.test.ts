@@ -604,7 +604,7 @@ describe("events", () => {
 		});
 		await connect(subscriber);
 
-		// Publisher shares the events gRPC channel used for listDlq below.
+		// The publisher creates the event; the subscriber owns its failed delivery.
 		const publisher = track(dedicated("primary"));
 		publisher.event.define(name, V1_SCHEMA);
 		await connect(publisher);
@@ -640,14 +640,14 @@ describe("events", () => {
 		const deadline = Date.now() + DLQ_MAX_WAIT_MS;
 		while (Date.now() < deadline) {
 			await sleep(5_000);
-			try {
-				const res = await listDlq(publisher, { limit: 50, cursor: "" });
-				dlqEntry = res.entries.find((e) => e.eventName === name);
-			} catch {
-				continue;
-			}
+			const res = await listDlq(subscriber, { limit: 50, cursor: "" });
+			dlqEntry = res.entries.find((e) => e.eventName === name);
 			if (dlqEntry) break;
 		}
+		const publisherPage = await listDlq(publisher, { limit: 50, cursor: "" });
+		expect(
+			publisherPage.entries.some((entry) => entry.eventName === name),
+		).toBe(false);
 
 		expect(dlqEntry).toBeDefined();
 		expect(dlqEntry!.eventName).toBe(name);

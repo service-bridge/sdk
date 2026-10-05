@@ -353,6 +353,7 @@ describe("jobs-lifecycle: heartbeat timeout reclaim", () => {
 		const callsOnA: Array<{ attempt: number; idempotencyKey: string }> = [];
 		const callsOnB: Array<{ attempt: number; idempotencyKey: string }> = [];
 		const runtimeUrl = runtime!.url;
+		const runAt = Date.now() + 1_000;
 
 		// Both replicas register the same job. The dispatcher picks one
 		// non-deterministically; whichever gets the first execution is the
@@ -362,7 +363,7 @@ describe("jobs-lifecycle: heartbeat timeout reclaim", () => {
 			jobName,
 			{
 				version: "test-v1",
-				trigger: { delayed: { at: Date.now() + 1_000 } },
+				trigger: { delayed: { at: runAt } },
 				maxAttempts: 3,
 				leaseTtlMs: 30_000,
 			},
@@ -382,7 +383,7 @@ describe("jobs-lifecycle: heartbeat timeout reclaim", () => {
 			jobName,
 			{
 				version: "test-v1",
-				trigger: { delayed: { at: Date.now() + 1_000 } },
+				trigger: { delayed: { at: runAt } },
 				maxAttempts: 3,
 				leaseTtlMs: 30_000,
 			},
@@ -472,6 +473,7 @@ describe("jobs-lifecycle: SDK fully down before fire → fresh replica delivered
 	test("fresh replica delivers the overdue execution exactly once", async () => {
 		const url = runtime!.url;
 		const jobName = uniqueName("recover");
+		const runAt = Date.now() + 2_000;
 		const calls: Array<{ attempt: number }> = [];
 
 		first = new ServiceBridge(url, keys.serviceKey, FAST_OPTS);
@@ -479,7 +481,7 @@ describe("jobs-lifecycle: SDK fully down before fire → fresh replica delivered
 			jobName,
 			{
 				version: "test-v1",
-				trigger: { delayed: { at: Date.now() + 2_000 } },
+				trigger: { delayed: { at: runAt } },
 				maxAttempts: 3,
 			},
 			async (ctx) => {
@@ -503,7 +505,7 @@ describe("jobs-lifecycle: SDK fully down before fire → fresh replica delivered
 			jobName,
 			{
 				version: "test-v1",
-				trigger: { delayed: { at: Date.now() + 60_000 } },
+				trigger: { delayed: { at: runAt } },
 				maxAttempts: 3,
 			},
 			async (ctx) => {

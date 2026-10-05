@@ -146,3 +146,5 @@ X-SB-Trace прокидывается двумя путями:
 Используется: `sdk/node/src/connection/service-bridge.ts` (wire-up всех `@internal` классов в lifecycle) и `sdk/node/src/registry/registry.ts` (через `dispatch-port`).
 
 Retry разрешён только для локального отказа до dispatch. Wire status и idempotency key не доказывают безопасность повторения эффекта. Unknown outcome возвращается вызывающему коду; бизнес-дедупликация должна быть атомарной с эффектом.
+
+Inbound peer roles require exactly one canonical URI SAN. The proxy runtime is identified only by spiffe://service-bridge/runtime; CN without that URI, multiple identities and malformed service URIs fail closed before executing a handler.
