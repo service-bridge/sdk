@@ -288,7 +288,6 @@ func (p *Publisher) sendNow(ctx context.Context, id, name string, enc Encoded, o
 		ContractHash:     enc.ContractHash,
 		PartitionKey:     o.PartitionKey,
 		IdempotencyKey:   o.IdempotencyKey,
-		FireAndForget:    true,
 		Headers:          o.Headers,
 		OccurredAtUnixMs: occurredAt,
 		XSbTrace:         trace,
