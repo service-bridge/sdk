@@ -1100,19 +1100,14 @@ export class ServiceBridge {
 					source: "server",
 				}),
 			};
-			const seen = { ring: 0, server: 0 };
 			this.telemetryTransport = new TelemetryTransport({
 				client: adaptTelemetryClient(telemetry),
 				ring: this.telemetryRing,
 				onDrop: (info) => {
 					// Drops are themselves telemetry: the runtime sees them as a
 					// counter, the host through its onDrop hook.
-					if (info.ringDrops > seen.ring)
-						dropped.ring.inc(info.ringDrops - seen.ring);
-					if (info.serverDrops > seen.server)
-						dropped.server.inc(info.serverDrops - seen.server);
-					seen.ring = info.ringDrops;
-					seen.server = info.serverDrops;
+					if (info.ringDrops > 0) dropped.ring.inc(info.ringDrops);
+					if (info.serverDrops > 0) dropped.server.inc(info.serverDrops);
 					try {
 						this.opts.onDrop?.(info);
 					} catch (err) {

@@ -81,7 +81,9 @@ export class CallFailure extends Error {
 
 /** A failure the callee's handler returned in the response body. */
 export function handlerFailure(code: string, message: string): CallFailure {
-	return new CallFailure(new HandlerError(code, message || code), false);
+	const error = new HandlerError(code, message || code);
+	Object.defineProperty(error, "remote", { value: true });
+	return new CallFailure(error, false);
 }
 
 /**

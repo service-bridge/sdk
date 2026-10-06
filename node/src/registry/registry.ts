@@ -554,7 +554,7 @@ const EVENT_PATTERN_RE = /^([a-z0-9_-]+|\*|#)(\.([a-z0-9_-]+|\*|#))*$/;
 // handlerFailure turns a thrown error into the handler's answer: a
 // HandlerError keeps its business code, anything else is "INTERNAL".
 function handlerFailure(err: unknown): UnaryResult {
-	if (err instanceof HandlerError)
+	if (err instanceof HandlerError && !err.remote)
 		return { errorCode: err.handlerCode, errorMessage: err.message };
 	return {
 		errorCode: "INTERNAL",

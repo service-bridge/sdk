@@ -174,6 +174,19 @@ export async function refresh(
 				);
 				return;
 			}
+			// The instance is stable for the life of the process; a leaf for
+			// another instance would silently change who this process is.
+			if (response.instanceId && response.instanceId !== previous.instanceId) {
+				reject(
+					new ConnectionError(
+						"refresh",
+						new Error(
+							`renewed leaf names instance ${response.instanceId}, this process is ${previous.instanceId}`,
+						),
+					),
+				);
+				return;
+			}
 			resolve({
 				certDer: Buffer.from(response.certDer),
 				caChainDer: Buffer.from(response.caChainDer),

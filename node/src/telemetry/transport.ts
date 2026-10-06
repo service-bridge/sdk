@@ -68,10 +68,10 @@ export function adaptTelemetryClient(
 }
 
 /**
- * Observability hook. Fires when the SDK learns about dropped telemetry — either
- * from the runtime (`serverDrops` rises) or from the local ring overflow
- * (`ringDrops` rises). Lets the host surface a metric/log so backpressure is not
- * silent (C4). @public — см. ./README.md
+ * Observability hook. Fires when telemetry was dropped since the previous
+ * report — by the runtime (`serverDrops`) or by the local ring overflow
+ * (`ringDrops`). Both are counts since the last call, as in the Go SDK.
+ * @public — см. ./README.md
  */
 export type DropObserver = (info: {
 	serverDrops: number;
@@ -391,11 +391,16 @@ export class TelemetryTransport {
 	// even while the stream is down.
 	private reportDrops(): void {
 		if (!this.onDrop) return;
-		const serverDrops = this.lastServerDropsSeen;
-		const ringDrops = this.ring.totalDropCount();
-		if (serverDrops > this.lastServerDrops || ringDrops > this.lastRingDrops) {
-			this.lastServerDrops = serverDrops;
-			this.lastRingDrops = ringDrops;
+		const server = this.lastServerDropsSeen;
+		const ring = this.ring.totalDropCount();
+		// The runtime's counter belongs to one stream: a value below the last
+		// one is a new stream counting from zero.
+		const serverDrops =
+			server >= this.lastServerDrops ? server - this.lastServerDrops : server;
+		const ringDrops = ring - this.lastRingDrops;
+		this.lastServerDrops = server;
+		this.lastRingDrops = ring;
+		if (serverDrops > 0 || ringDrops > 0) {
 			this.onDrop({
 				serverDrops,
 				ringDrops,

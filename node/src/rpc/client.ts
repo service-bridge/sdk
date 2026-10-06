@@ -198,8 +198,11 @@ export class RpcClient {
 		const unreachable: string[] = [];
 		let lastError: ServiceBridgeError | null = null;
 
+		let fallback = false;
 		for (let attempt = 0; attempt < retry.maxAttempts; attempt++) {
-			if (attempt > 0) {
+			// The switch to the proxy after a direct pre-dispatch failure is not a
+			// retry of the same path and waits for nothing.
+			if (attempt > 0 && !fallback) {
 				const pause = Math.min(
 					backoffDelay(retry, attempt - 1),
 					deadlineAt - Date.now(),
@@ -207,6 +210,7 @@ export class RpcClient {
 				if (pause <= 0) break;
 				await sleep(pause, opts.signal);
 			}
+			fallback = false;
 			let candidate: Candidate;
 			try {
 				candidate = this.pickCandidate(
@@ -283,6 +287,7 @@ export class RpcClient {
 				lastError = failure.error;
 				if (useDirect && transport === "auto") {
 					viaProxy = true;
+					fallback = true;
 					unreachable.push(candidate.instance.instanceId);
 				}
 			} finally {

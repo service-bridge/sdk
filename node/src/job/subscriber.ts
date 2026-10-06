@@ -342,7 +342,11 @@ export class JobSubscriber {
 						if (err) this.onHeartbeatFailure(err.message);
 						else this._heartbeatFailures = 0;
 						const hint = response?.heartbeatIntervalMs ?? 0;
-						schedule(Number.isFinite(hint) && hint > 0 ? hint : interval);
+						schedule(
+							Number.isFinite(hint) && hint > 0
+								? Math.max(100, hint)
+								: interval,
+						);
 					},
 				);
 			} catch (err) {

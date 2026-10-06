@@ -95,6 +95,12 @@ export class TimeoutError extends ServiceBridgeError {
  */
 export class HandlerError extends ServiceBridgeError {
 	readonly handlerCode: string;
+	/**
+	 * True when this error is another service's answer received by a call.
+	 * A handler that rethrows it answers "INTERNAL": the downstream business
+	 * code is not this service's to give.
+	 */
+	readonly remote: boolean = false;
 
 	constructor(handlerCode: string, message: string, options?: ErrorOptions) {
 		super("HANDLER", message, options);

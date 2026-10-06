@@ -275,22 +275,22 @@ describe("JobSubscriber stream", () => {
 
 describe("JobSubscriber heartbeat", () => {
 	it("NegotiatesImmediatelyAndTracksTheLiveRuntimeCadence", async () => {
-		let hint = 20;
+		let hint = 120;
 		const h = makeHarness({ heartbeatIntervalMs: () => hint });
 		const timerSpy = spyOn(globalThis, "setTimeout");
 		try {
 			h.sub.start();
 			expect(h.heartbeats).toHaveLength(1);
-			const deadline = Date.now() + 500;
+			const deadline = Date.now() + 3_000;
 			while (h.heartbeats.length < 3 && Date.now() < deadline)
 				await Bun.sleep(1);
 			expect(h.heartbeats.length).toBeGreaterThanOrEqual(3);
-			expect(timerSpy.mock.calls.some((args) => args[1] === 20)).toBe(true);
-			hint = 10;
+			expect(timerSpy.mock.calls.some((args) => args[1] === 120)).toBe(true);
+			hint = 20;
 			const before = h.heartbeats.length;
 			while (h.heartbeats.length === before && Date.now() < deadline)
 				await Bun.sleep(1);
-			expect(timerSpy.mock.calls.some((args) => args[1] === 10)).toBe(true);
+			expect(timerSpy.mock.calls.some((args) => args[1] === 100)).toBe(true);
 			await h.sub.stop();
 			const stoppedCount = h.heartbeats.length;
 			await Bun.sleep(40);

@@ -79,8 +79,8 @@ export class Subscriber {
 	}
 
 	/**
-	 * Stops taking new deliveries (they are nacked so the runtime redelivers
-	 * them elsewhere) and waits for the handlers already running, up to
+	 * Stops taking new deliveries (left unanswered: the runtime redelivers them
+	 * once this instance disconnects) and waits for the handlers already running, up to
 	 * timeoutMs. The stream stays open meanwhile so their acks still reach the
 	 * runtime.
 	 */
@@ -124,10 +124,9 @@ export class Subscriber {
 	private handleFrame(msg: SubscribeServerMessage, stream: EventStream): void {
 		const delivery = msg.delivery;
 		if (!delivery) return;
-		if (this.draining) {
-			this.nack(stream, delivery, "subscriber is draining");
-			return;
-		}
+		// A draining instance leaves new deliveries unanswered: they return to
+		// the runtime when it disconnects, without spending an attempt.
+		if (this.draining) return;
 		const signal = this.streamController.signal;
 		const key = delivery.envelope?.partitionKey ?? "";
 		const admitted = this.slots.acquire(signal);

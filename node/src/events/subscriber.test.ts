@@ -259,7 +259,7 @@ describe("Subscriber routing by matched_patterns", () => {
 });
 
 describe("Subscriber drain and lifecycle", () => {
-	it("drain nacks new deliveries and waits for the running ones", async () => {
+	it("drain leaves new deliveries unanswered and waits for the running ones", async () => {
 		let release!: () => void;
 		let finished = false;
 		const { sub, current } = makeSubscriber([
@@ -275,7 +275,7 @@ describe("Subscriber drain and lifecycle", () => {
 		const draining = sub.drain(1_000);
 		current().emitter.emit("data", delivery("d2", ["order.created"]));
 		await wait(2);
-		expect(nacks(current()).map((n) => n.deliveryId)).toEqual(["d2"]);
+		expect(nacks(current())).toHaveLength(0);
 		release();
 		await draining;
 		expect(finished).toBe(true);
