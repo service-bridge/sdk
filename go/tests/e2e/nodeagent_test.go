@@ -27,7 +27,6 @@ import (
 type agentConfig struct {
 	URL              string     `json:"url"`
 	Key              string     `json:"key"`
-	DataDir          string     `json:"dataDir"`
 	ProtoFile        string     `json:"protoFile"`
 	RPCMethod        string     `json:"rpcMethod"`
 	SubOpSubject     string     `json:"subOpSubject"`
