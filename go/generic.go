@@ -698,9 +698,14 @@ func (c *Client) wrapSpan(ctx context.Context, span wfi.Span, fn func(context.Co
 	return out, nil
 }
 
-// taskErrorCode is the code a failed task reports: the SDK error code when
-// there is one.
+// taskErrorCode is the code a failed task reports: the callee's business code
+// for a handler failure, so a workflow can tell failures apart; otherwise the
+// SDK error code when there is one.
 func taskErrorCode(err error) string {
+	var handlerErr *rpc.HandlerError
+	if errors.As(err, &handlerErr) && handlerErr.Code != "" {
+		return handlerErr.Code
+	}
 	var sbErr *Error
 	if errors.As(err, &sbErr) && sbErr.Code != "" {
 		return string(sbErr.Code)
