@@ -10,6 +10,7 @@ import type {
 	RegistryClient,
 } from "../pb/servicebridge/v1/registry";
 import type { WatchStream } from "../registry/watch";
+import { PROTOCOL_VERSION, SDK_LANGUAGE, SDK_VERSION } from "./handshake";
 
 export type ServerStream = ReturnType<ControlClient["open"]>;
 
@@ -110,6 +111,10 @@ export class Session {
 // Kept separate so tests can stub it without binding to the proto-generated
 // ControlClient interface.
 export function openControlStream(client: ControlClient): ServerStream {
-	const req: OpenRequestType = OpenRequest.create();
+	const req: OpenRequestType = OpenRequest.create({
+		protocolVersion: PROTOCOL_VERSION,
+		sdkLanguage: SDK_LANGUAGE,
+		sdkVersion: SDK_VERSION,
+	});
 	return client.open(req);
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/service-bridge/sdk/go/internal/connection"
 	pb "github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1"
 )
 
@@ -202,5 +203,8 @@ func (d *Declarations) BuildRegisterRequest() *pb.RegisterRequest {
 		CallEndpoint:       d.callEndpoint,
 		EventSubscriptions: append([]*pb.EventSubscription(nil), d.subs...),
 		HttpEndpoint:       d.httpEndpoint,
+		ProtocolVersion:    connection.ProtocolVersion,
+		SdkLanguage:        connection.SDKLanguage,
+		SdkVersion:         connection.SDKVersion,
 	}
 }
