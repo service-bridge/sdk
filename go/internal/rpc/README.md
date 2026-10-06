@@ -94,7 +94,7 @@
 | `Breaker` · `NewBreaker` · `BreakerConfig` · `DefaultBreakerConfig` · `BreakerFailure` · `BreakerKey` · `BreakerTicket` | — | окно 10 с, 10 вызовов, 50 %, open 30 с | Размыкатель на инстанс. |
 | `Direct` · `NewDirect` · `DirectConfig` · `DefaultIdleTTLMs` · `PeerDialer` · `GRPCPeerDialer` | — | idle 5 мин | Кеш mTLS-каналов к пирам с SPIFFE-пином. |
 | `Direct.DropRevoked(services, instances)` · `Direct.RetainInstances(live)` | методы | — | Закрыть каналы отозванных / ушедших инстансов. |
-| `Proxy` · `NewProxy` · `InvokeClientSource` · `EncodeContractHash` | — | — | Вызов через `Invoke` рантайма. |
+| `Proxy` · `NewProxy` · `InvokeClientSource` · `EncodeContractHash` | — | — | Вызов через `Invoke` рантайма. `InvokeClientSource.WaitReady(ctx)` — готовность канала к рантайму; её отказ — pre-dispatch доказательство. |
 | `ErrNoLease` · `ErrDirectClosed` · `ErrPeerIdentity` · `ErrInvalidConfig` | `error` | — | Отказы транспорта. |
 
 ## Приватный контракт
@@ -118,6 +118,8 @@
 **Повтор — только при доказательстве, что хендлер не запускался.** Три доказательства: локальный выбор не нашёл кандидата; канал к callee не стал ready до записи запроса (`waitForReady`, ошибка подключения — включая сбой TLS-пина); ответ со статусом и трейлером `x-sb-not-dispatched: 1`. Статус без трейлера, дедлайн, ответ хендлера и наличие idempotency key повтор не разрешают: эффект мог уже случиться. Стримы не повторяются никогда.
 
 **Трейлер только у временных отказов.** `UNAVAILABLE` (draining / not ready) и `RESOURCE_EXHAUSTED` — другой инстанс может ответить иначе. `PERMISSION_DENIED`, `NOT_FOUND`, `INVALID_ARGUMENT`, `FAILED_PRECONDITION` идут без трейлера: другой инстанс ответит так же.
+
+**Прокси повторяется только по доказательству.** Канал к рантайму не стал ready — ничего не отправлено; ответ рантайма с трейлером not-dispatched (его отказы «не отправлено» и проброшенный трейлер callee) — тоже. Голый `UNAVAILABLE` от прокси означает неизвестный исход и не повторяется.
 
 **Transport auto.** Прямой путь к инстансу с endpoint; доказанный pre-dispatch отказ прямого пути переключает следующую попытку на прокси без backoff — отказал путь, а не callee. Прокси-доказательство (трейлер от рантайма) транспорт не меняет.
 

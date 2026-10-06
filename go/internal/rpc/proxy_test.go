@@ -87,9 +87,12 @@ func (s *stubChunkStream) Recv() (*pb.InvokeChunk, error) {
 
 // stubInvokeSource hands out the same stub on every call.
 type stubInvokeSource struct {
-	client pb.InvokeClient
-	err    error
+	client   pb.InvokeClient
+	err      error
+	notReady error
 }
+
+func (s stubInvokeSource) WaitReady(context.Context) error { return s.notReady }
 
 func (s stubInvokeSource) InvokeClient(context.Context) (pb.InvokeClient, error) {
 	if s.err != nil {
@@ -261,5 +264,22 @@ func TestProxyReportsAMissingStub(t *testing.T) {
 	}
 	if _, err := p.Stream(context.Background(), &pb.InvokeRequest{Method: "Ping"}); err == nil {
 		t.Fatal("a missing stub must fail the stream")
+	}
+}
+
+// A runtime channel that never became ready sent nothing: the failure is
+// pre-dispatch proof, but not a direct-path one.
+func TestProxyChannelNotReadyIsPreDispatch(t *testing.T) {
+	stub := &stubInvoke{}
+	p, err := NewProxy(stubInvokeSource{client: stub, notReady: errors.New("connection refused")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = p.Unary(context.Background(), &pb.InvokeRequest{Method: "Ping"})
+	if !PreDispatch(err) || directPreDispatch(err) || !errors.Is(err, ErrPeerUnreachable) {
+		t.Fatalf("got %v", err)
+	}
+	if stub.calls != 0 {
+		t.Fatal("nothing may be sent over a channel that is not ready")
 	}
 }

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 
 	"github.com/service-bridge/sdk/go/internal/connection"
 	"github.com/service-bridge/sdk/go/internal/events"
@@ -1270,6 +1271,30 @@ func (ch *channel) Close() error {
 		return nil
 	}
 	return cc.Close()
+}
+
+// WaitReady blocks until the channel can carry a request. A channel that
+// fails to connect, or does not connect before ctx ends, has sent nothing.
+func (ch *channel) WaitReady(ctx context.Context) error {
+	ch.mu.Lock()
+	cc := ch.cc
+	ch.mu.Unlock()
+	if cc == nil {
+		return newError(CodeConnection, ch.name, "no credentials published yet", nil)
+	}
+	cc.Connect()
+	for {
+		state := cc.GetState()
+		switch state {
+		case connectivity.Ready:
+			return nil
+		case connectivity.TransientFailure, connectivity.Shutdown:
+			return fmt.Errorf("servicebridge: %s channel is %s", ch.name, state)
+		}
+		if !cc.WaitForStateChange(ctx, state) {
+			return fmt.Errorf("servicebridge: %s channel: %w", ch.name, ctx.Err())
+		}
+	}
 }
 
 func (ch *channel) JobsClient(context.Context) (pb.JobsClient, error) {

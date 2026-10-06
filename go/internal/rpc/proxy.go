@@ -18,6 +18,10 @@ var ErrInvalidConfig = errors.New("rpc: invalid configuration")
 // captured once keeps talking over a channel that is already closing.
 type InvokeClientSource interface {
 	InvokeClient(ctx context.Context) (pb.InvokeClient, error)
+	// WaitReady blocks until the channel to the runtime can carry a request,
+	// or fails when it cannot within ctx. A failure here proves nothing was
+	// sent.
+	WaitReady(ctx context.Context) error
 }
 
 // Proxy calls the callee through the runtime. The runtime resolves the target
@@ -51,11 +55,17 @@ func EncodeContractHash(hash string) []byte {
 }
 
 // Unary invokes the method through the runtime and returns its response
-// payload.
+// payload. Only two failures are retryable: the channel to the runtime never
+// became ready (nothing was sent), and a refusal carrying the not-dispatched
+// trailer. A bare status from the runtime leaves the outcome unknown.
 func (p *Proxy) Unary(ctx context.Context, req *pb.InvokeRequest) ([]byte, error) {
 	client, err := p.clients.InvokeClient(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("rpc: proxy unary %s: %w", req.GetMethod(), err)
+	}
+	if err := p.clients.WaitReady(ctx); err != nil {
+		return nil, fmt.Errorf("rpc: proxy unary %s: %w", req.GetMethod(),
+			&NotDispatchedError{Err: fmt.Errorf("%w: runtime: %w", ErrPeerUnreachable, err)})
 	}
 	var trailer metadata.MD
 	resp, err := client.Unary(ctx, req, grpc.Trailer(&trailer))
