@@ -99,7 +99,7 @@ func setup() error {
 	}
 	suite.keys = vars
 
-	for _, domain := range []string{domainRPC, domainEvents, domainJobs, domainWorkflow, domainMisc, domainXLang} {
+	for _, domain := range []string{domainRPC, domainEvents, domainJobs, domainWorkflow, domainMisc, domainXLang, domainConformance} {
 		for i := 1; i <= 3; i++ {
 			if vars[keyVar(domain, i)] == "" {
 				return fmt.Errorf("%s carries no %s: add domain %q to DOMAINS in scripts/bootstrap-e2e-keys.sh and rerun it",

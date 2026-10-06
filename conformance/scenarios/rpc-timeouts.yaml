@@ -1,0 +1,29 @@
+# Deadlines: the default, an explicit one, and what passing it looks like.
+scenarios:
+  - name: a call without a timeout carries the 30s default deadline
+    callee:
+      rpc:
+        - {method: info, behaviour: info}
+    steps:
+      - call: {method: info, payload: {}}
+        expect:
+          # n is the deadline the handler sees, in ms from now.
+          reply: {nMin: 20000, nMax: 30000}
+
+  - name: an explicit timeout reaches the handler as its deadline
+    callee:
+      rpc:
+        - {method: info, behaviour: info}
+    steps:
+      - call: {method: info, timeoutMs: 4000, payload: {}}
+        expect:
+          reply: {nMin: 1000, nMax: 4000}
+
+  - name: a handler slower than the timeout fails with TIMEOUT, not retryable
+    callee:
+      rpc:
+        - {method: slow, behaviour: {sleepMs: 3000}}
+    steps:
+      - call: {method: slow, timeoutMs: 500, payload: {text: late}}
+        expect:
+          error: {code: TIMEOUT, retryable: false}

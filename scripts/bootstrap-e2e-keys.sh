@@ -82,7 +82,7 @@ PG_DATABASE=${PG_DATABASE:-service-bridge}
 # stream per instance: a Go and a Node instance sharing one identity would fight
 # over it and the loser gets AlreadyExists. `go-xlang` hosts the cross-language
 # pair — index 1 is the Go process, index 2 the Node agent it spawns.
-DOMAINS="access-policy events jobs rpc workflow http misc go-rpc go-events go-jobs go-workflow go-misc go-xlang"
+DOMAINS="access-policy events jobs rpc workflow http misc go-rpc go-events go-jobs go-workflow go-misc go-xlang conformance"
 
 case "$PG_MODE" in
   docker)

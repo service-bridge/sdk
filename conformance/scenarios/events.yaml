@@ -1,0 +1,42 @@
+# Subscriptions: wildcard routing by matched pattern and runtime-side filters.
+# Event names and patterns are relative; the runner prefixes a namespace.
+scenarios:
+  - name: a published event reaches the subscriber with its payload
+    requires: runtime-next
+    caller:
+      events: [order.placed]
+    callee:
+      subscriptions:
+        - {pattern: order.placed}
+    steps:
+      - publish: {event: order.placed, payload: {orderId: o-1, amount: 42.5, currency: EUR}}
+      - deliveries:
+          - {pattern: order.placed, event: order.placed, orderId: o-1, amount: 42.5, currency: EUR}
+
+  - name: one event matching two patterns runs both handlers once
+    requires: runtime-next
+    caller:
+      events: [order.paid]
+    callee:
+      subscriptions:
+        - {pattern: order.*}
+        - {pattern: order.paid}
+    steps:
+      - publish: {event: order.paid, payload: {orderId: o-2, currency: USD}}
+      - deliveries:
+          - {pattern: order.*, event: order.paid, orderId: o-2}
+          - {pattern: order.paid, event: order.paid, orderId: o-2}
+
+  - name: a filter is evaluated by the runtime on the payload
+    requires: runtime-next
+    caller:
+      events: [invoice.issued]
+    callee:
+      subscriptions:
+        - pattern: invoice.issued
+          filter: {$.currency: EUR}
+    steps:
+      - publish: {event: invoice.issued, payload: {orderId: usd-1, currency: USD}}
+      - publish: {event: invoice.issued, payload: {orderId: eur-1, currency: EUR}}
+      - deliveries:
+          - {pattern: invoice.issued, event: invoice.issued, orderId: eur-1}

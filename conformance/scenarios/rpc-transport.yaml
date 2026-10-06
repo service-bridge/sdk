@@ -1,0 +1,50 @@
+# Every transport reaches the callee and carries the same answer, whichever
+# SDK sits on each side.
+scenarios:
+  - name: auto is the default transport and reaches the callee
+    callee:
+      rpc:
+        - {method: echo, behaviour: echo}
+    steps:
+      - call: {method: echo, payload: {text: hello, n: 7}}
+        expect:
+          reply: {text: hello, n: 7, handledBy: $callee.sdk}
+
+  - name: direct reaches the callee without the runtime
+    callee:
+      rpc:
+        - {method: echo, behaviour: echo}
+    steps:
+      - call: {method: echo, transport: direct, payload: {text: direct, n: 1}}
+        expect:
+          reply: {text: direct, n: 1, handledBy: $callee.sdk}
+
+  - name: proxy reaches the callee through the runtime
+    callee:
+      rpc:
+        - {method: echo, behaviour: echo}
+    steps:
+      - call: {method: echo, transport: proxy, payload: {text: proxied, n: 2}}
+        expect:
+          reply: {text: proxied, n: 2, handledBy: $callee.sdk}
+
+  - name: the callee sees the caller's service and idempotency key
+    callee:
+      rpc:
+        - {method: info, behaviour: info}
+    steps:
+      - call: {method: info, transport: direct, idempotencyKey: key-direct, payload: {}}
+        expect:
+          reply: {text: $caller.serviceId, handledBy: key-direct}
+      - call: {method: info, transport: proxy, idempotencyKey: key-proxy, payload: {}}
+        expect:
+          reply: {text: $caller.serviceId, handledBy: key-proxy}
+
+  - name: a method nobody serves has no live instance
+    caller:
+      # Declared as a dependency, never registered by the callee.
+      deps: [absent]
+    steps:
+      - call: {method: absent, timeoutMs: 3000, payload: {}}
+        expect:
+          error: {code: NO_LIVE_INSTANCE, retryable: true}
