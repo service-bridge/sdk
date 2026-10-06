@@ -74,6 +74,7 @@ function op(opId: string): OpReport {
 		traceId: "01900000-0000-7000-8000-000000000001",
 		opId,
 		parentOpId: "",
+		peerInstanceId: "",
 		channel: Channel.RPC,
 		kind: RpcCall,
 		subject: "rpc.call:s/m",

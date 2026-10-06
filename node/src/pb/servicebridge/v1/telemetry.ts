@@ -124,10 +124,15 @@ export interface OpReport {
   finishedAtMs?: number | undefined;
   status: Status;
   statusMessage: string;
-  /** per-kind structured meta; cap 8KB */
+  /** per-kind structured meta; cap 8KB; on END merged into the row */
   metaJson: Buffer;
   /** free-form key-value; cap 2KB */
   attrsJson: Buffer;
+  /**
+   * RPC.CALL: the callee instance that served the call. The runtime keys the
+   * callee's health on it (successes and failures alike).
+   */
+  peerInstanceId: string;
 }
 
 /**
@@ -200,7 +205,12 @@ export interface TelemetryAck {
   dropCountServerSide: number;
   /** non-empty → graceful close requested */
   drainReason: string;
-  /** Highest sequence processed by runtime ingress, not a persistence guarantee. */
+  /**
+   * Highest batch sequence whose items are all committed (or deliberately not
+   * stored by policy). When an item of the stream is lost (overload, write
+   * failure) the ACK stops advancing and the stream ends with UNAVAILABLE;
+   * the SDK reconnects and resends from acknowledged_sequence + 1.
+   */
   acknowledgedSequence: number;
 }
 
@@ -686,6 +696,7 @@ function createBaseOpReport(): OpReport {
     statusMessage: "",
     metaJson: Buffer.alloc(0),
     attrsJson: Buffer.alloc(0),
+    peerInstanceId: "",
   };
 }
 
@@ -735,6 +746,9 @@ export const OpReport: MessageFns<OpReport> = {
     }
     if (message.attrsJson.length !== 0) {
       writer.uint32(138).bytes(message.attrsJson);
+    }
+    if (message.peerInstanceId !== "") {
+      writer.uint32(146).string(message.peerInstanceId);
     }
     return writer;
   },
@@ -872,6 +886,14 @@ export const OpReport: MessageFns<OpReport> = {
             message.attrsJson = Buffer.from(reader.bytes());
             continue;
           }
+          case 18: {
+            if (tag !== 146) {
+              break;
+            }
+
+            message.peerInstanceId = reader.string();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -904,6 +926,7 @@ export const OpReport: MessageFns<OpReport> = {
     message.statusMessage = object.statusMessage ?? "";
     message.metaJson = object.metaJson ?? Buffer.alloc(0);
     message.attrsJson = object.attrsJson ?? Buffer.alloc(0);
+    message.peerInstanceId = object.peerInstanceId ?? "";
     return message;
   },
 };
