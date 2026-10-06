@@ -1,3 +1,8 @@
+import {
+	PROTOCOL_VERSION,
+	SDK_LANGUAGE,
+	SDK_VERSION,
+} from "../connection/handshake";
 import { RouteCollector } from "../http/route";
 import type {
 	IncomingMethod as PbIncomingMethod,
@@ -650,9 +655,9 @@ export class Registry {
 			callEndpoint: this._callEndpoint,
 			eventSubscriptions,
 			httpEndpoint: this._httpEndpoint,
-			protocolVersion: 0,
-			sdkLanguage: "node",
-			sdkVersion: "",
+			protocolVersion: PROTOCOL_VERSION,
+			sdkLanguage: SDK_LANGUAGE,
+			sdkVersion: SDK_VERSION,
 		};
 	}
 

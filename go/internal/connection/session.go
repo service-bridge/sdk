@@ -307,7 +307,11 @@ func newSession(ctx context.Context, dialer Dialer, creds Credentials, log *slog
 	}
 
 	streamCtx, cancel := context.WithCancel(ctx)
-	stream, err := pb.NewControlClient(conn).Open(streamCtx, &pb.OpenRequest{})
+	stream, err := pb.NewControlClient(conn).Open(streamCtx, &pb.OpenRequest{
+		ProtocolVersion: ProtocolVersion,
+		SdkLanguage:     SDKLanguage,
+		SdkVersion:      SDKVersion,
+	})
 	if err != nil {
 		cancel()
 		if cerr := conn.Close(); cerr != nil {
