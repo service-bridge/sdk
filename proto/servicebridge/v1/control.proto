@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package servicebridge.v1;
+
+// Control plane stream. After Telemetry feature heartbeat moved out — Control
+// несёт только server-driven signalling: Welcome (один раз) и Drain (при
+// shutdown). Cert refresh — отдельным unary RPC.
+service Control {
+  rpc Open(OpenRequest) returns (stream ServerControl);
+
+  // RefreshCert reissues the caller's leaf cert via the existing mTLS
+  // session (SPIFFE from cert == source of truth, no argon2).
+  rpc RefreshCert(RefreshCertRequest) returns (RefreshCertResponse);
+}
+
+message OpenRequest {}
+
+message RefreshCertRequest {
+  bytes csr_der = 1;
+}
+
+message RefreshCertResponse {
+  bytes  cert_der       = 1;
+  bytes  ca_chain_der   = 2;
+  int64  not_after_unix = 3;
+  string instance_id    = 4;
+}
+
+message ServerControl {
+  oneof kind {
+    Welcome welcome = 1;
+    Drain   drain   = 2;
+  }
+}
+
+message Welcome {
+  string session_id   = 1;
+  string service_id   = 2;
+  string service_name = 3;
+}
+
+message Drain {
+  string reason = 1;
+}

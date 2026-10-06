@@ -384,7 +384,7 @@ const file_servicebridge_v1_control_proto_rawDesc = "" +
 	"\x06reason\x18\x01 \x01(\tR\x06reason2\xaf\x01\n" +
 	"\aControl\x12H\n" +
 	"\x04Open\x12\x1d.servicebridge.v1.OpenRequest\x1a\x1f.servicebridge.v1.ServerControl0\x01\x12Z\n" +
-	"\vRefreshCert\x12$.servicebridge.v1.RefreshCertRequest\x1a%.servicebridge.v1.RefreshCertResponseBCZAgithub.com/service-bridge/runtime/internal/pb/servicebridge/v1;pbb\x06proto3"
+	"\vRefreshCert\x12$.servicebridge.v1.RefreshCertRequest\x1a%.servicebridge.v1.RefreshCertResponseb\x06proto3"
 
 var (
 	file_servicebridge_v1_control_proto_rawDescOnce sync.Once

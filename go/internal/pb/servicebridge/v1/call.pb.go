@@ -254,7 +254,7 @@ const file_servicebridge_v1_call_proto_rawDesc = "" +
 	"\rerror_message\x18\x03 \x01(\tR\ferrorMessage2\x98\x01\n" +
 	"\x04Call\x12F\n" +
 	"\x05Unary\x12\x1d.servicebridge.v1.CallRequest\x1a\x1e.servicebridge.v1.CallResponse\x12H\n" +
-	"\x06Stream\x12\x1d.servicebridge.v1.CallRequest\x1a\x1d.servicebridge.v1.StreamChunk0\x01BCZAgithub.com/service-bridge/runtime/internal/pb/servicebridge/v1;pbb\x06proto3"
+	"\x06Stream\x12\x1d.servicebridge.v1.CallRequest\x1a\x1d.servicebridge.v1.StreamChunk0\x01b\x06proto3"
 
 var (
 	file_servicebridge_v1_call_proto_rawDescOnce sync.Once

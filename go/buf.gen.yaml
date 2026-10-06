@@ -1,18 +1,12 @@
 version: v2
-
-# Runtime stubs live under runtime/internal/pb, so an external module cannot
-# import them. The SDK generates its own copy from the same .proto sources with
-# its own go_package. servicebridge/ui is the dashboard-only surface — excluded.
+# Go SDK stubs from ../proto (the contract's source of truth). Run through
+# ../scripts/gen-proto.sh. The .proto files carry no go_package: each Go
+# consumer maps them with M options. Plugins are pinned and run via `go run`;
+# the runtime pins the same protoc-gen-go / protoc-gen-go-grpc versions.
 inputs:
-  - directory: ../../runtime/proto
-    paths:
-      - ../../runtime/proto/servicebridge/v1
-
-# Plugins run locally: buf.build remote plugin execution needs a registry login,
-# a local toolchain keeps generation reproducible and offline.
-# scripts/gen-proto.sh pins their versions.
+  - directory: ../proto
 plugins:
-  - local: protoc-gen-go
+  - local: ["go", "run", "google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11"]
     out: internal/pb
     opt:
       - paths=source_relative
@@ -26,8 +20,7 @@ plugins:
       - Mservicebridge/v1/telemetry.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
       - Mservicebridge/v1/ui.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
       - Mservicebridge/v1/workflows.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
-
-  - local: protoc-gen-go-grpc
+  - local: ["go", "run", "google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2"]
     out: internal/pb
     opt:
       - paths=source_relative

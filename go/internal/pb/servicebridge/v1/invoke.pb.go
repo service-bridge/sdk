@@ -267,7 +267,7 @@ const file_servicebridge_v1_invoke_proto_rawDesc = "" +
 	"\rerror_message\x18\x03 \x01(\tR\ferrorMessage2\xa0\x01\n" +
 	"\x06Invoke\x12J\n" +
 	"\x05Unary\x12\x1f.servicebridge.v1.InvokeRequest\x1a .servicebridge.v1.InvokeResponse\x12J\n" +
-	"\x06Stream\x12\x1f.servicebridge.v1.InvokeRequest\x1a\x1d.servicebridge.v1.InvokeChunk0\x01BCZAgithub.com/service-bridge/runtime/internal/pb/servicebridge/v1;pbb\x06proto3"
+	"\x06Stream\x12\x1f.servicebridge.v1.InvokeRequest\x1a\x1d.servicebridge.v1.InvokeChunk0\x01b\x06proto3"
 
 var (
 	file_servicebridge_v1_invoke_proto_rawDescOnce sync.Once

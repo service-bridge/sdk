@@ -1,0 +1,238 @@
+syntax = "proto3";
+
+package servicebridge.v1;
+
+service Registry {
+  rpc RegisterAndWatch(RegisterRequest) returns (stream RegistryEvent);
+}
+
+enum MethodType {
+  METHOD_TYPE_UNSPECIFIED = 0;
+  METHOD_TYPE_RPC         = 1;
+  METHOD_TYPE_EVENT       = 2;
+  METHOD_TYPE_WORKFLOW    = 3;
+  METHOD_TYPE_JOB         = 4;
+  METHOD_TYPE_HTTP        = 5;
+}
+
+// CaptureMode is one channel's payload capture policy. The runtime is the
+// single authority: it resolves each channel's mode from runtime settings and
+// pushes the whole CaptureModes set to every SDK over RegisterAndWatch. SDKs
+// apply the mode for an op's channel as its effective capture mode; a per-handler
+// override may only narrow it (privacy ordering NONE < ERRORS < ALL), never
+// widen it.
+enum CaptureMode {
+  CAPTURE_MODE_UNSPECIFIED = 0;
+  CAPTURE_MODE_ALL         = 1;
+  CAPTURE_MODE_ERRORS      = 2;
+  CAPTURE_MODE_NONE        = 3;
+}
+
+// CaptureModes carries the per-channel payload capture policy pushed to SDKs.
+// One CaptureMode per op channel; the runtime resolves each from its matching
+// <channel>.payload_capture setting. The SDK picks the mode for an op's channel.
+// Jobs carry no input/output payload (JobExecution has no args, the handler
+// returns void), so the job channel has no capture mode — field 5 is reserved.
+message CaptureModes {
+  CaptureMode rpc      = 1;
+  CaptureMode http     = 2;
+  CaptureMode event    = 3;
+  CaptureMode workflow = 4;
+  reserved 5;
+  reserved "job";
+  // telemetry_enabled gates the telemetry transport on the SDK side. Resolved
+  // from the telemetry.enable runtime setting. SDK stops/skips the transport
+  // when false; default fail-safe before first snapshot is enabled=true.
+  bool  telemetry_enabled  = 6;
+  // payload_max_bytes is the per-direction byte cap for captured payloads,
+  // resolved from telemetry.payload_max_bytes. SDK uses this instead of any
+  // constructor-provided value. Fallback before first snapshot: 65536.
+  int32 payload_max_bytes  = 7;
+}
+
+message IncomingMethod {
+  MethodType type               = 1;
+  string     name               = 2;
+  bytes      input_schema_json  = 3;
+  bytes      output_schema_json = 4;
+  bool       streaming          = 5;
+  // SDK-supplied contract hash (hex SHA-256). Runtime stores opaque,
+  // does not recompute. Empty for non-RPC method types (event/workflow/job/http).
+  string     contract_hash      = 6;
+}
+
+message PublishedEvent {
+  string name          = 1;
+  bytes  schema_json   = 2;
+  // SDK-supplied contract hash (hex SHA-256) of the Protobuf descriptor for
+  // this event's payload schema. Empty when the publisher declared the event
+  // without a schema. Runtime stores opaque, does not recompute (ADR-0001).
+  string contract_hash = 3;
+}
+
+message OutgoingDep {
+  string     service_name = 1;
+  string     method_name  = 2;
+  MethodType type         = 3;
+}
+
+message EventSubscription {
+  string pattern = 1;
+  bool   durable = 2;
+}
+
+message RegisterRequest {
+  repeated IncomingMethod   incoming            = 1;
+  repeated PublishedEvent   published           = 2;
+  repeated OutgoingDep      outgoing            = 3;
+  string                    call_endpoint       = 4;
+  repeated EventSubscription event_subscriptions = 5;
+  // Public HTTP host:port of this SDK instance (ADR 0001 — HTTP lives in user
+  // app). Used only by Service Map / Discovery; runtime does not proxy HTTP.
+  // Empty when SDK has no HTTP integration registered.
+  string                    http_endpoint       = 6;
+}
+
+message MethodDescriptor {
+  string     service_name  = 1;
+  string     service_id    = 2;
+  string     instance_id   = 3;
+  MethodType type          = 4;
+  string     name          = 5;
+  string     contract_hash = 6;
+  bool       published     = 7;
+  bytes      input_schema  = 8;
+  bytes      output_schema = 9;
+  bool       streaming     = 10;
+}
+
+message ServiceInstanceInfo {
+  string instance_id   = 1;
+  string service_id    = 2;
+  string service_name  = 3;
+  string call_endpoint = 4;
+  string status        = 5;
+  // Public HTTP host:port of this instance (ADR 0001). Empty when instance has
+  // no HTTP integration or after disconnect.
+  string http_endpoint = 6;
+  // Start of the current unhealthy window for this instance (ADR-0007).
+  // Unix-ms timestamp; 0 when the instance is healthy. SDK-side LB treats it as a hint.
+  int64 is_unhealthy_since_unix_ms = 7;
+}
+
+message RegistrySnapshot {
+  repeated MethodDescriptor    methods   = 1;
+  repeated ServiceInstanceInfo instances = 2;
+  // ── Service-map enrichment (ADR-0004) ────────────────────────────────────
+  // Per-service event subscriptions visible to the caller. Combined with
+  // event publishers from `methods` (METHOD_TYPE_EVENT + published=true) this
+  // lets UI / SDK draw the full pub/sub graph including wildcards.
+  repeated EventSubscriptionDescriptor event_subscriptions = 3;
+  // Per-service outgoing call declarations from sb.service(...). One row per
+  // (caller_service, target_service, target_method, target_type) tuple.
+  repeated OutgoingCallDescriptor outgoing_calls = 4;
+  // Policy evaluation for the caller of this RegisterAndWatch stream — the
+  // caller's effective capabilities + rules + per-declaration warnings.
+  PolicyEvaluation policy = 5;
+  reserved 6;
+  reserved "capture_mode";
+  // Per-channel payload capture modes. Always stamped on the snapshot so the
+  // SDK has an effective mode per channel from the first frame (before any
+  // update).
+  CaptureModes capture_modes = 7;
+}
+
+message RegistryUpdate {
+  repeated MethodDescriptor    added             = 1;
+  repeated MethodDescriptor    removed           = 2;
+  repeated ServiceInstanceInfo added_instances   = 3;
+  repeated ServiceInstanceInfo removed_instances = 4;
+  // Same enrichment as RegistrySnapshot.* but incremental.
+  repeated EventSubscriptionDescriptor added_event_subscriptions   = 5;
+  repeated EventSubscriptionDescriptor removed_event_subscriptions = 6;
+  repeated OutgoingCallDescriptor      added_outgoing_calls        = 7;
+  repeated OutgoingCallDescriptor      removed_outgoing_calls      = 8;
+  // When policy changes (NOTIFY policy_changed touches caller), runtime
+  // re-emits the full PolicyEvaluation. Not incremental on purpose: policy
+  // edits are rare and the evaluation is small.
+  PolicyEvaluation policy = 9;
+
+  // Derived from per-field diff after a policy push. peer_id is in
+  // added_peers when it first appears in the caller's scope; in removed_peers
+  // when the last method/instance/subscription from that peer disappears from
+  // scope. SDK uses these to update serviceMap and close stale direct-conns.
+  repeated string added_peers   = 10;
+  repeated string removed_peers = 11;
+
+  reserved 12;
+  reserved "capture_mode";
+  // Re-emitted full per-channel capture modes when any channel's mode changes.
+  // Like policy, not incremental: the whole set is sent on change.
+  CaptureModes capture_modes = 13;
+}
+
+message RegistryEvent {
+  oneof kind {
+    RegistrySnapshot snapshot = 1;
+    RegistryUpdate   update   = 2;
+  }
+}
+
+// ── Service-map descriptors (ADR-0004) ─────────────────────────────────────
+
+message EventSubscriptionDescriptor {
+  string service_id   = 1;
+  string service_name = 2;
+  string pattern      = 3;  // AMQP pattern, supports * and #
+  bool   durable      = 4;
+}
+
+message OutgoingCallDescriptor {
+  string     caller_service_id   = 1;
+  string     caller_service_name = 2;
+  string     target_service_id   = 3;
+  string     target_service_name = 4;
+  string     target_method       = 5;
+  MethodType target_type         = 6;  // RPC, WORKFLOW, HTTP
+}
+
+// ── Policy (ADR-0004) ──────────────────────────────────────────────────────
+
+message PolicyEvaluation {
+  // Capability flags currently enabled for the caller — names of the four
+  // booleans on services that are TRUE: "rpc.handle", "event.handle",
+  // "workflow.handle", "job.handle".
+  repeated string capabilities = 1;
+  // The caller's effective egress rules.
+  repeated PolicyRule egress = 2;
+  // The caller's effective acceptance rules.
+  repeated PolicyRule acceptance = 3;
+  // Per-declaration violations from the most recent registration.
+  repeated PolicyViolation warnings = 4;
+}
+
+message PolicyRule {
+  // 'rpc.call' | 'workflow.run' | 'event.publish' for egress;
+  // 'rpc.handle' | 'workflow.handle' | 'event.handle' for acceptance.
+  string action            = 1;
+  // For rpc.*/workflow.*: peer service UUID (target for egress, caller for
+  // acceptance). Empty string for event.* (no per-service routing).
+  string peer_service_id   = 2;
+  // Human-readable peer service name (for UI / sb-policy show).
+  string peer_service_name = 3;
+  // Method name pattern (literal or '*') for rpc.*/workflow.*; AMQP pattern
+  // for event.*.
+  string target_name       = 4;
+}
+
+message PolicyViolation {
+  // Declaration type, e.g. 'rpc.call', 'event.handle', 'event.publish',
+  // 'rpc.handle' (capability), etc.
+  string declaration  = 1;
+  // Concrete value, e.g. 'payments/charge', 'orders.*'.
+  string value        = 2;
+  // 'capability' | 'self_egress' | 'self_acceptance' | 'peer_acceptance'.
+  string deny_side    = 3;
+  // Human-readable explanation.
+  string reason       = 4;
+}

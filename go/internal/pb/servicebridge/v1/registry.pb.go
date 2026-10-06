@@ -1621,7 +1621,7 @@ const file_servicebridge_v1_registry_proto_rawDesc = "" +
 	"\x13CAPTURE_MODE_ERRORS\x10\x02\x12\x15\n" +
 	"\x11CAPTURE_MODE_NONE\x10\x032d\n" +
 	"\bRegistry\x12X\n" +
-	"\x10RegisterAndWatch\x12!.servicebridge.v1.RegisterRequest\x1a\x1f.servicebridge.v1.RegistryEvent0\x01BCZAgithub.com/service-bridge/runtime/internal/pb/servicebridge/v1;pbb\x06proto3"
+	"\x10RegisterAndWatch\x12!.servicebridge.v1.RegisterRequest\x1a\x1f.servicebridge.v1.RegistryEvent0\x01b\x06proto3"
 
 var (
 	file_servicebridge_v1_registry_proto_rawDescOnce sync.Once

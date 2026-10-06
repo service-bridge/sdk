@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package servicebridge.v1;
+
+// Invoke — proxy RPC сервис на рантайме.
+// Принимает вызов от caller-SDK, резолвит инстанс target-сервиса, проксирует Call.Unary к нему.
+// Payload — passthrough bytes, рантайм не декодирует.
+service Invoke {
+  rpc Unary(InvokeRequest) returns (InvokeResponse);
+  // Stream — proxy server-side streaming. Runtime получает один запрос,
+  // открывает Call.Stream к выбранному callee, пробрасывает chunks обратно.
+  rpc Stream(InvokeRequest) returns (stream InvokeChunk);
+}
+
+message InvokeRequest {
+  string target_service_id = 1; // UUID of the target service (services.id)
+  string method          = 2;
+  bytes  payload         = 3;
+  string request_id      = 4;
+  string idempotency_key = 5;
+
+  // X-SB-Trace propagation: carried via gRPC metadata "x-sb-trace" (ADR 0006 §3).
+  string x_sb_trace = 6;   // "traceID-parentOpID" canonical format; empty if no context
+
+  // Caller-side contract hash for (method input, output) schemas. Resolver
+  // filters target instances to those advertising the same hash on this
+  // method (ADR-0001). Empty for non-RPC paths or when the caller has no
+  // schema registered — matched only against instances that advertise an
+  // empty hash for the method.
+  bytes contract_hash = 7;
+}
+
+message InvokeResponse {
+  bytes  payload       = 1;
+  string error_code    = 2;
+  string error_message = 3;
+}
+
+// InvokeChunk — proxy-mirror of StreamChunk. Bytes-level passthrough.
+message InvokeChunk {
+  bytes  payload       = 1;
+  string error_code    = 2;
+  string error_message = 3;
+}

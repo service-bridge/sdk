@@ -91,6 +91,10 @@ Both modules live under `go/` rather than at the repository root, so their relea
 
 Each SDK directory holds its own README with install instructions, a quick start and the full API reference.
 
+## Protocol contract
+
+The gRPC contract between every SDK and the runtime lives here, in [`proto/servicebridge/v1`](./proto/servicebridge/v1) — the single source of truth. The runtime generates its server stubs from this directory at a pinned commit; each SDK generates its own client stubs. `bash scripts/gen-proto.sh` regenerates the Go (`go/internal/pb`) and Node (`node/src/pb`) stubs with pinned plugin versions; CI fails when committed stubs drift from the `.proto` sources.
+
 ## AI coding skill
 
 Building with an AI agent like Claude Code? Each language SDK ships its own skill so the agent writes correct code on the first try — the real RPC, events, workflows, jobs and HTTP-integration API, grounded in the shipped SDK rather than guessed. Copy the one for your language into the agent's skills directory:

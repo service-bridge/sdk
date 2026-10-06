@@ -1,0 +1,127 @@
+syntax = "proto3";
+
+package servicebridge.v1;
+
+service Events {
+  rpc Publish(PublishRequest) returns (PublishResponse);
+  rpc Subscribe(stream SubscribeClientMessage) returns (stream SubscribeServerMessage);
+  rpc ReplayDlq(ReplayDlqRequest) returns (ReplayDlqResponse);
+  rpc ListDlq(ListDlqRequest) returns (ListDlqResponse);
+}
+
+message EventEnvelope {
+  string id               = 1;
+  string name             = 2;
+  bytes  payload          = 3;
+  string contract_hash    = 4;
+  string partition_key    = 5;
+  string idempotency_key  = 6;
+  bool   fire_and_forget  = 7;
+  map<string, string> headers = 8;
+  int64  occurred_at_unix_ms = 9;
+
+  // X-SB-Trace propagation: carried in EventEnvelope for publisher→consumer.
+  string x_sb_trace = 10;   // "traceID-parentOpID" canonical format (ADR 0006 §3)
+
+  // payload_json — JSON-encoded view of the same payload, populated by the
+  // publisher SDK alongside the canonical protobuf `payload`. Used by the
+  // workflow signal router to evaluate JSON-path `wait_event` filters
+  // without decoding the protobuf form (runtime treats payload as opaque
+  // bytes per ADR-0002). Empty when publisher cannot produce JSON.
+  bytes  payload_json = 11;
+}
+
+message PublishRequest {
+  string publisher_service_id  = 1;
+  string publisher_instance_id = 2;
+  repeated EventEnvelope events = 3;
+}
+
+message PublishStatusEntry {
+  string        event_id = 1;
+  PublishStatus status   = 2;
+  string        message  = 3;
+}
+
+message PublishResponse {
+  repeated PublishStatusEntry results = 1;
+}
+
+enum PublishStatus {
+  PUBLISH_STATUS_UNSPECIFIED            = 0;
+  PUBLISH_STATUS_ACCEPTED               = 1;
+  PUBLISH_STATUS_REJECTED_DUPLICATE     = 3;
+  PUBLISH_STATUS_REJECTED_INVALID_NAME  = 5;
+  // ADR-0004: publisher does not have event.publish action rule matching this
+  // event name (or its capability is disabled). Per-envelope reject — other
+  // events in the batch proceed.
+  PUBLISH_STATUS_REJECTED_FORBIDDEN     = 6;
+}
+
+message SubscribeInit {
+  string subscriber_service_id  = 1;
+  string subscriber_instance_id = 2;
+  int32  max_in_flight          = 3;
+}
+
+message Ack {
+  string delivery_id = 1;
+  bytes  event_id    = 2;
+  string lease_token = 3;
+}
+
+message Nack {
+  string delivery_id    = 1;
+  string error_message  = 2;
+  bytes  event_id       = 3;
+  string lease_token    = 4;
+}
+
+message SubscribeClientMessage {
+  oneof kind {
+    SubscribeInit init = 1;
+    Ack           ack  = 2;
+    Nack          nack = 3;
+  }
+}
+
+message EventDelivery {
+  string        delivery_id = 1;
+  EventEnvelope envelope    = 2;
+  int32         attempt     = 3;
+  string        lease_token = 4;
+}
+
+message SubscribeServerMessage {
+  oneof kind {
+    EventDelivery delivery = 1;
+  }
+}
+
+message ReplayDlqRequest {
+  string event_id = 1;
+}
+
+message ReplayDlqResponse {
+  string event_id = 1;
+}
+
+message ListDlqRequest {
+  int32  limit  = 1;
+  string cursor = 2;
+}
+
+message DlqEntry {
+  string event_id          = 1;
+  string event_name        = 2;
+  string consumer_service  = 3;
+  string last_error        = 4;
+  int64  dlq_at_unix_ms    = 5;
+  int32  replay_count      = 6;
+  int32  total_attempts    = 7;
+}
+
+message ListDlqResponse {
+  repeated DlqEntry entries     = 1;
+  string            next_cursor = 2;
+}

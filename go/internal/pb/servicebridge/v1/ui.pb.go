@@ -615,7 +615,7 @@ const file_servicebridge_v1_ui_proto_rawDesc = "" +
 	"\vtarget_name\x18\x04 \x01(\tR\n" +
 	"targetName2a\n" +
 	"\x02UI\x12[\n" +
-	"\x0fGetServiceGraph\x12(.servicebridge.v1.GetServiceGraphRequest\x1a\x1e.servicebridge.v1.ServiceGraphBCZAgithub.com/service-bridge/runtime/internal/pb/servicebridge/v1;pbb\x06proto3"
+	"\x0fGetServiceGraph\x12(.servicebridge.v1.GetServiceGraphRequest\x1a\x1e.servicebridge.v1.ServiceGraphb\x06proto3"
 
 var (
 	file_servicebridge_v1_ui_proto_rawDescOnce sync.Once

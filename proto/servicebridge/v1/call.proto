@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package servicebridge.v1;
+
+// Call — inbound RPC сервер SDK-инстанса.
+// Используется и в direct-режиме (caller → callee), и в proxy-режиме (runtime → callee).
+service Call {
+  rpc Unary(CallRequest) returns (CallResponse);
+  // Stream — server-side streaming: каллер шлёт один запрос, callee стримит
+  // chunks (например, LLM token streaming). Bidirectional streaming не в scope.
+  rpc Stream(CallRequest) returns (stream StreamChunk);
+}
+
+message CallRequest {
+  string method          = 1;
+  bytes  payload         = 2;
+  string caller_service  = 3;
+  string request_id      = 4;
+  string idempotency_key = 5;
+
+  // X-SB-Trace propagation: trace_id and parent_op_id are carried via gRPC
+  // metadata under "x-sb-trace" key (ADR 0006 §3). Not in the wire message itself.
+  string x_sb_trace = 6;   // "traceID-parentOpID" canonical format; empty if no context
+}
+
+message CallResponse {
+  bytes  payload       = 1;
+  string error_code    = 2;
+  string error_message = 3;
+}
+
+// StreamChunk — один элемент server-streaming ответа.
+message StreamChunk {
+  bytes  payload       = 1;
+  string error_code    = 2;
+  string error_message = 3;
+}

@@ -251,7 +251,7 @@ const file_servicebridge_v1_bootstrap_proto_rawDesc = "" +
 	"instanceId\x12$\n" +
 	"\x0enot_after_unix\x18\x06 \x01(\x03R\fnotAfterUnix2a\n" +
 	"\tBootstrap\x12T\n" +
-	"\tProvision\x12\".servicebridge.v1.ProvisionRequest\x1a#.servicebridge.v1.ProvisionResponseB2Z0github.com/service-bridge/runtime/internal/pb;pbb\x06proto3"
+	"\tProvision\x12\".servicebridge.v1.ProvisionRequest\x1a#.servicebridge.v1.ProvisionResponseb\x06proto3"
 
 var (
 	file_servicebridge_v1_bootstrap_proto_rawDescOnce sync.Once

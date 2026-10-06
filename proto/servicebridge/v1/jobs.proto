@@ -1,0 +1,69 @@
+syntax = "proto3";
+
+package servicebridge.v1;
+
+// Jobs — data-plane RPCs for runtime-triggered scheduled tasks.
+//
+// Registration is NOT here: it flows through Registry.RegisterAndWatch as
+// IncomingMethod{type=METHOD_TYPE_JOB, ...} just like RPC / Event / Workflow.
+// The canonical job spec (trigger, catchup, overlap, deps, retry policy)
+// travels in IncomingMethod.input_schema_json. Mirrors workflow's pattern.
+service Jobs {
+  // Owner-side: server-stream of JobExecution pushes for this instance.
+  rpc Subscribe(JobsSubscribeRequest) returns (stream JobExecution);
+
+  // Owner-side: report execution outcome. Stale ACK is silently dropped.
+  rpc JobResult(JobResultRequest) returns (JobResultResponse);
+
+  // Owner-side: application-level heartbeat.
+  rpc Heartbeat(JobsHeartbeatRequest) returns (JobsHeartbeatResponse);
+}
+
+message JobsSubscribeRequest {
+  string service_id  = 1;
+  string instance_id = 2;
+}
+
+message JobExecution {
+  string execution_id        = 1;
+  string job_definition_id   = 2;
+  string job_name            = 3;
+  int64  scheduled_at_unix_ms = 4;
+  int64  local_scheduled_at_unix_ms = 5;
+  uint32 attempt             = 6;
+  uint64 lease_epoch         = 7;
+  string idempotency_key     = 8;
+  string x_sb_trace = 9;   // "traceID-parentOpID" canonical format (ADR 0006 §3)
+  string fingerprint = 10; // Immutable registered handler contract version.
+}
+
+message JobResultRequest {
+  string execution_id  = 1;
+  string instance_id   = 2;
+  uint64 lease_epoch   = 3;
+  oneof outcome {
+    JobSuccess success = 4;
+    JobFailure failure = 5;
+  }
+}
+
+message JobSuccess {}
+
+message JobFailure {
+  string error_message = 1;
+  bool   retryable     = 2;
+}
+
+message JobResultResponse {
+  bool accepted = 1;
+}
+
+message JobsHeartbeatRequest {
+  string service_id  = 1;
+  string instance_id = 2;
+}
+
+message JobsHeartbeatResponse {
+  // Next heartbeat cadence derived from the live instance timeout.
+  int64 heartbeat_interval_ms = 1;
+}

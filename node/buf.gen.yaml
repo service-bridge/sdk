@@ -1,0 +1,16 @@
+version: v2
+# Node SDK stubs from ../proto (the contract's source of truth). Run through
+# ../scripts/gen-proto.sh. ts-proto is pinned to an exact version in
+# package.json.
+inputs:
+  - directory: ../proto
+plugins:
+  - local: node_modules/.bin/protoc-gen-ts_proto
+    out: src/pb
+    opt:
+      - outputServices=grpc-js
+      - esModuleInterop=true
+      - env=node
+      - useOptionals=messages
+      - exportCommonSymbols=false
+      - outputJsonMethods=false

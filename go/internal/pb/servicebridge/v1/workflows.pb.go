@@ -1810,7 +1810,7 @@ const file_servicebridge_v1_workflows_proto_rawDesc = "" +
 	"\vCompleteRun\x12$.servicebridge.v1.CompleteRunRequest\x1a\x16.google.protobuf.Empty\x12Q\n" +
 	"\bFailStep\x12!.servicebridge.v1.FailStepRequest\x1a\".servicebridge.v1.FailStepResponse\x12=\n" +
 	"\x04Park\x12\x1d.servicebridge.v1.ParkRequest\x1a\x16.google.protobuf.Empty\x12G\n" +
-	"\tHeartbeat\x12\".servicebridge.v1.HeartbeatRequest\x1a\x16.google.protobuf.EmptyBCZAgithub.com/service-bridge/runtime/internal/pb/servicebridge/v1;pbb\x06proto3"
+	"\tHeartbeat\x12\".servicebridge.v1.HeartbeatRequest\x1a\x16.google.protobuf.Emptyb\x06proto3"
 
 var (
 	file_servicebridge_v1_workflows_proto_rawDescOnce sync.Once

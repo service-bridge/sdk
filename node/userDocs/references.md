@@ -28,7 +28,7 @@
 ## Runtime
 
 - [`runtime/README.md`](../../../runtime/README.md) — как запустить runtime; env только для подключения к Postgres, остальная конфигурация (порты, таймауты, квоты) живёт в БД и правится в UI
-- [`runtime/proto/servicebridge/v1/`](../../../runtime/proto/servicebridge/v1/) — proto-контракты gRPC между SDK и runtime
+- [`sdk/proto/servicebridge/v1/`](../../proto/servicebridge/v1/) — proto-контракты gRPC между SDK и runtime
 
 Порты по умолчанию: gRPC control-plane (mTLS, для SDK) — `14445`, UI-gateway (h2c, админ-консоль) — `14444`.
 

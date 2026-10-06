@@ -1,0 +1,214 @@
+syntax = "proto3";
+
+package servicebridge.v1;
+
+import "google/protobuf/empty.proto";
+
+// Workflows — durable workflow execution service.
+// Caller-side RPCs: Start, Cancel, Signal, Query, Await, Replay.
+// Owner-side RPCs: Subscribe, BeginStep, CompleteStep, FailStep, Park, Heartbeat.
+service Workflows {
+  // Caller-side
+  rpc Start(StartRunRequest)   returns (StartRunResponse);
+  rpc Cancel(CancelRunRequest) returns (google.protobuf.Empty);
+  rpc Signal(SignalRunRequest) returns (google.protobuf.Empty);
+  rpc Query(QueryRunRequest)   returns (QueryRunResponse);
+  rpc Await(AwaitRunRequest)   returns (stream RunStatusUpdate);
+  rpc Replay(ReplayRunRequest) returns (ReplayRunResponse);
+
+  // Owner-side
+  rpc Subscribe(SubscribeRequest)       returns (stream RunAssignment);
+  rpc BeginStep(BeginStepRequest)       returns (BeginStepResponse);
+  rpc CompleteStep(CompleteStepRequest) returns (google.protobuf.Empty);
+  rpc CompleteRun(CompleteRunRequest)   returns (google.protobuf.Empty);
+  rpc FailStep(FailStepRequest)         returns (FailStepResponse);
+  rpc Park(ParkRequest)                 returns (google.protobuf.Empty);
+  rpc Heartbeat(HeartbeatRequest)       returns (google.protobuf.Empty);
+}
+
+// ---------------------------------------------------------------------------
+// Caller-side messages
+// ---------------------------------------------------------------------------
+
+message StartRunRequest {
+  string workflow_name    = 1;
+  bytes  input            = 2;  // JSON-encoded workflow input
+  string idempotency_key  = 3;
+  uint32 timeout_sec      = 4;  // 0 = no global timeout override
+
+  // X-SB-Trace propagation from caller.
+  string x_sb_trace = 5;   // "traceID-parentOpID" canonical format (ADR 0006 §3)
+
+  // parent_run_id — when non-empty, the request originates from a workflow
+  // step on an in-flight parent run. Runtime enforces dynamic cycle
+  // detection (ADR 0003 §7) by walking the ancestor chain via this id.
+  // Empty for top-level starts initiated by external callers.
+  string parent_run_id = 8;
+}
+
+message StartRunResponse {
+  string run_id = 1;
+}
+
+message CancelRunRequest {
+  string run_id = 1;
+}
+
+message SignalRunRequest {
+  string run_id      = 1;
+  string signal_name = 2;
+  bytes  payload     = 3;
+}
+
+message QueryRunRequest {
+  string run_id = 1;
+}
+
+message QueryRunResponse {
+  string run_id         = 1;
+  string status         = 2;
+  bytes  state          = 3;  // JSON-encoded run state map
+  repeated StepInfo steps = 4;
+}
+
+message StepInfo {
+  string step_id        = 1;
+  string status         = 2;
+  bytes  output         = 3;
+  string last_error     = 4;
+  string compensated_by = 5;  // step_id of the compensation step, if compensated
+}
+
+message AwaitRunRequest {
+  string run_id = 1;
+}
+
+message RunStatusUpdate {
+  string run_id = 1;
+  string status = 2;
+  bytes  state  = 3;  // JSON-encoded final state; non-empty only on terminal status
+}
+
+message ReplayRunRequest {
+  string run_id      = 1;
+  string from_step_id = 2;
+}
+
+message ReplayRunResponse {
+  string run_id = 1;  // new run id
+}
+
+// ---------------------------------------------------------------------------
+// Owner-side messages
+// ---------------------------------------------------------------------------
+
+message SubscribeRequest {
+  string service_id   = 1;  // UUID
+  string instance_id  = 2;  // UUID
+}
+
+message RunAssignment {
+  string run_id           = 1;
+  string workflow_name    = 2;
+  string fingerprint      = 3;
+  bytes  frozen_plan      = 4;   // canonical JSON graph
+  bytes  input            = 5;   // JSON-encoded workflow input
+  bytes  state            = 6;   // JSON-encoded current state (checkpointed outputs)
+  uint64 lease_epoch      = 7;
+  uint32 max_parallelism  = 8;
+
+  // X-SB-Trace propagation — workflow root op.
+  string x_sb_trace = 9;   // "traceID-parentOpID" canonical format (ADR 0006 §3)
+
+  // Compensation: if set, SDK must execute compensation steps.
+  bool   compensating  = 12;
+  // cancel_reason mirrors workflow_runs.cancel_reason. Values: '' | 'user_cancel' | 'step_failure'.
+  string cancel_reason = 13;
+}
+
+message BeginStepRequest {
+  string run_id        = 1;
+  string step_id       = 2;
+  string parent_step_id = 3;  // empty for top-level steps
+  string kind          = 4;   // call|publish|sleep|wait_event|wait_signal|workflow|parallel|sequence|local
+  bytes  input_snapshot = 5;  // JSON-encoded resolved inputs
+  uint64 lease_epoch   = 6;
+  string instance_id   = 7;   // UUID of the claiming SDK instance
+}
+
+message BeginStepResponse {
+  // If the step was already completed (idempotent replay), cached_output is
+  // non-nil and the SDK must use it without re-executing.
+  bytes  cached_output = 1;
+  bool   already_done  = 2;
+  uint64 lease_epoch   = 3;
+}
+
+message CompleteStepRequest {
+  string run_id        = 1;
+  string step_id       = 2;
+  bytes  output        = 3;   // JSON-encoded step output
+  uint64 lease_epoch   = 4;
+}
+
+message FailStepRequest {
+  string run_id        = 1;
+  string step_id       = 2;
+  string error_code    = 3;
+  string error_message = 4;
+  uint64 lease_epoch   = 5;
+  bool   retriable     = 6;
+}
+
+message FailStepResponse {
+  // Runtime's decision after the failure.
+  string next_action = 1;  // "retry" | "compensate" | "fail_run"
+  uint32 retry_delay_sec = 2;
+}
+
+message ParkRequest {
+  string run_id      = 1;
+  string step_id     = 2;
+  uint64 lease_epoch = 3;
+
+  oneof wait_spec {
+    SleepSpec       sleep       = 4;
+    EventWaitSpec   event_wait  = 5;
+    SignalWaitSpec  signal_wait = 6;
+    NestedRunSpec   nested_run  = 7;
+  }
+}
+
+message SleepSpec {
+  uint32 duration_sec = 1;
+}
+
+message EventWaitSpec {
+  string event       = 1;
+  string filter_json = 2;  // JSON-encoded {"$.path": "expected"} filter; empty = match all
+  uint32 timeout_sec = 3;  // 0 = no timeout
+}
+
+message SignalWaitSpec {
+  string signal      = 1;
+  uint32 timeout_sec = 2;  // 0 = no timeout
+}
+
+message NestedRunSpec {
+  string child_run_id = 1;
+}
+
+message CompleteRunRequest {
+  string run_id         = 1;
+  bytes  final_state    = 2;   // JSON-encoded final state map (output of last step)
+  uint64 lease_epoch    = 3;
+  // terminal_status: 'success' | 'failed_compensated' | 'cancelled'.
+  // If empty, defaults to 'success'.
+  string terminal_status = 4;
+}
+
+message HeartbeatRequest {
+  string run_id      = 1;
+  string instance_id = 2;  // UUID
+  uint64 lease_epoch = 3;
+}

@@ -1,0 +1,279 @@
+syntax = "proto3";
+
+package servicebridge.v1;
+
+// Telemetry — unified channel for ops, logs, metrics, payloads.
+//
+// One bidi stream per SDK instance carries TelemetryBatch (oneof kind).
+// Server-side acks via TelemetryAck provide flow control.
+// Read-side unary RPCs serve the UI dashboard.
+//
+// ADR 0007: single stream per identity binding → one disconnect event for
+// ABANDONED sweep, one HTTP/2 stream per SDK instance.
+service Telemetry {
+  rpc Report(stream TelemetryBatch) returns (stream TelemetryAck);
+
+  rpc ListTraces    (ListTracesRequest)    returns (ListTracesResponse);
+  rpc GetTrace      (GetTraceRequest)      returns (GetTraceResponse);
+  rpc GetOperation  (GetOperationRequest)  returns (GetOperationResponse);
+  rpc GetPayload    (GetPayloadRequest)    returns (GetPayloadResponse);
+  rpc QueryLogs     (QueryLogsRequest)     returns (QueryLogsResponse);
+  rpc QueryMetrics  (QueryMetricsRequest)  returns (QueryMetricsResponse);
+}
+
+// TelemetryBatch is the request message for the Report bidi stream.
+// Each batch carries exactly one kind of payload.
+// @public — см. ./README.md
+message TelemetryBatch {
+  // Strictly increasing within this stream. ACK only covers processed batches.
+  uint64 sequence = 5;
+  oneof kind {
+    OpBatch      ops      = 1;
+    LogBatch     logs     = 2;
+    MetricBatch  metrics  = 3;
+    PayloadBatch payloads = 4;
+  }
+}
+
+message OpBatch      { repeated OpReport          items = 1; }
+message LogBatch     { repeated Log               items = 1; }
+message MetricBatch  { repeated MetricPoint       items = 1; }
+message PayloadBatch { repeated PayloadAttachment items = 1; }
+
+// Channel classifies the transport/execution context of an operation.
+// Mirrors the SQL CHECK constraint in migration 051.
+// source of truth: migrations/051_operations.up.sql
+enum Channel {
+  CHANNEL_UNSPECIFIED = 0;
+  HTTP                = 1;
+  RPC                 = 2;
+  EVENT               = 3;
+  WORKFLOW            = 4;
+  JOB                 = 5;
+  USER                = 6;
+}
+
+// Status represents the lifecycle state of an operation.
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  PENDING            = 1;
+  SUCCESS            = 2;
+  ERROR              = 3;
+  TIMEOUT            = 4;
+  ABANDONED          = 5;
+}
+
+// OpReport is a single operation lifecycle event.
+// finished_at_ms absent = START frame; present = END frame (ADR 0007 §2).
+// actor identity is taken from the mTLS cert on the server side (ADR-0006).
+// @public — см. ./README.md
+message OpReport {
+  string  trace_id          = 1;   // UUIDv7 canonical string
+  string  op_id             = 2;   // UUIDv7 canonical string
+  string  parent_op_id      = 3;   // empty for root
+  Channel channel           = 4;
+  uint32  kind              = 5;   // per-channel kind value; see enums.go
+  string  subject           = 6;   // ADR 0007 §4 format: "channel.kind:actor/target"
+  reserved 7, 8;
+  reserved "actor_service_id", "actor_instance_id";
+  string  peer_service_id   = 9;   // UUID canonical string, optional
+  string  business_key      = 10;  // idempotency/correlation key per kind
+  int32   attempt           = 11;
+  int64   started_at_ms     = 12;  // unix-ms
+  optional int64 finished_at_ms = 13;  // unix-ms; absent = START, present = END
+  Status  status            = 14;
+  string  status_message    = 15;
+  bytes   meta_json         = 16;  // per-kind structured meta; cap 8KB
+  bytes   attrs_json        = 17;  // free-form key-value; cap 2KB
+}
+
+enum LogLevel {
+  LOG_LEVEL_UNSPECIFIED = 0;
+  LOG_LEVEL_DEBUG       = 1;
+  LOG_LEVEL_INFO        = 2;
+  LOG_LEVEL_WARN        = 3;
+  LOG_LEVEL_ERROR       = 4;
+}
+
+// Log is a structured log entry.
+// trace_id and op_id are optional UUID canonical strings.
+// @public — см. ./README.md
+message Log {
+  int64    at_unix_ms  = 1;
+  LogLevel level       = 2;
+  string   message     = 3;
+  bytes    fields_json = 4;   // JSON-encoded Record<string, unknown>
+  string   trace_id    = 5;   // UUID canonical, optional
+  string   op_id       = 6;   // UUID canonical, optional (renamed from span_id)
+  string   instance_id = 7;
+  string   source      = 8;   // 'sdk' | 'console' | 'runtime'
+}
+
+enum MetricKind {
+  METRIC_KIND_UNSPECIFIED = 0;
+  METRIC_KIND_COUNTER     = 1;
+  METRIC_KIND_GAUGE       = 2;
+  METRIC_KIND_HISTOGRAM   = 3;
+}
+
+// MetricPoint is a single metric observation.
+// @public — см. ./README.md
+message MetricPoint {
+  int64               at_unix_ms   = 1;
+  string              name         = 2;
+  MetricKind          kind         = 3;
+  map<string, string> labels       = 4;
+  string              instance_id  = 5;
+  double              value        = 6;
+  string              unit         = 7;   // UCUM: 's', 'By', '1'
+  bytes               buckets_json = 8;   // [{le, count}] JSON for histograms
+}
+
+// PayloadAttachment carries a captured request/response payload.
+// @public — см. ./README.md
+message PayloadAttachment {
+  string trace_id      = 1;   // UUID canonical
+  string op_id         = 2;   // UUID canonical
+  uint32 direction     = 3;   // 1=IN, 2=OUT
+  bytes  bytes         = 4;
+  int32  original_size = 5;
+  string contract_hash = 6;
+}
+
+// TelemetryAck is sent periodically by the server on the Report stream.
+// It provides flow control and signals drain.
+// @public — см. ./README.md
+message TelemetryAck {
+  uint64 received_bytes_high_water = 1;
+  uint32 backpressure_level        = 2;  // 0=normal, 1=slow, 2=pause
+  uint64 drop_count_server_side    = 3;
+  string drain_reason              = 4;  // non-empty → graceful close requested
+  // Highest sequence processed by runtime ingress, not a persistence guarantee.
+  uint64 acknowledged_sequence     = 5;
+}
+
+// ─── Query messages ───────────────────────────────────────────────────────────
+
+message ListTracesRequest {
+  repeated Channel channel_filter  = 1;
+  repeated Status  status_filter   = 2;
+  int64            from_ms         = 3;
+  int64            to_ms           = 4;
+  string           service_id      = 5;
+  string           text_query      = 6;  // searched in subject + business_key
+  uint32           limit           = 7;
+  string           cursor          = 8;
+}
+
+message TraceSummary {
+  string trace_id        = 1;   // UUIDv7
+  string root_subject    = 2;
+  string root_service_id = 3;
+  int64  started_at_ms   = 4;
+  int64  duration_ms     = 5;
+  uint32 op_count        = 6;
+  Status overall_status  = 7;
+  bool   has_running     = 8;
+}
+
+message ListTracesResponse {
+  repeated TraceSummary traces      = 1;
+  string                next_cursor = 2;
+}
+
+message GetTraceRequest {
+  string trace_id = 1;
+  uint32 limit    = 2;
+  string cursor   = 3;
+}
+
+message OperationView {
+  string  op_id             = 1;
+  string  trace_id          = 2;
+  string  parent_op_id      = 3;
+  Channel channel           = 4;
+  uint32  kind              = 5;
+  string  subject           = 6;
+  string  actor_service_id  = 7;
+  string  actor_instance_id = 8;
+  string  peer_service_id   = 9;
+  string  business_key      = 10;
+  int32   attempt           = 11;
+  int64   started_at_ms     = 12;
+  optional int64 finished_at_ms = 13;
+  Status  status            = 14;
+  string  status_message    = 15;
+  bytes   meta_json         = 16;
+  bytes   attrs_json        = 17;
+  reserved 18, 19;
+  reserved "decoded_payload_in", "decoded_payload_out";
+}
+
+message GetTraceResponse {
+  repeated OperationView ops         = 1;
+  string                 next_cursor = 2;
+  bool                   truncated   = 3;
+}
+
+message GetOperationRequest {
+  string op_id = 1;
+}
+
+message GetOperationResponse {
+  OperationView op = 1;
+}
+
+message GetPayloadRequest {
+  string trace_id  = 1;
+  string op_id     = 2;
+  uint32 direction = 3;  // 1=IN, 2=OUT
+}
+
+message GetPayloadResponse {
+  bytes  raw_bytes     = 1;
+  bytes  decoded_bytes = 2;
+  int32  original_size = 3;
+  string contract_hash = 4;
+  bool   schema_drift  = 5;
+}
+
+message QueryLogsRequest {
+  string   service_id   = 1;
+  string   instance_id  = 2;
+  int64    from_unix_ms = 3;
+  int64    to_unix_ms   = 4;
+  LogLevel min_level    = 5;
+  string   trace_id     = 6;   // UUID canonical, optional filter
+  string   text_query   = 7;
+  uint32   limit        = 8;
+  string   cursor       = 9;
+}
+
+message QueryLogsResponse {
+  repeated Log entries     = 1;
+  string       next_cursor = 2;
+}
+
+message QueryMetricsRequest {
+  string              service_id    = 1;
+  string              instance_id   = 2;
+  string              name          = 3;
+  int64               from_unix_ms  = 4;
+  int64               to_unix_ms    = 5;
+  map<string, string> label_filters = 6;
+  uint32              step_seconds  = 7;
+  repeated double     percentiles   = 8;
+}
+
+message MetricSeries {
+  string              name        = 1;
+  map<string, string> labels      = 2;
+  string              instance_id = 3;
+  repeated int64      ts_unix_ms  = 4;
+  repeated double     values      = 5;  // bucket average
+  repeated double     max_values  = 6;  // bucket peak (parallel to values), preserves spikes hidden by the average
+}
+
+message QueryMetricsResponse {
+  repeated MetricSeries series = 1;
+}
