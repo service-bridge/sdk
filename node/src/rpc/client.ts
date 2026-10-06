@@ -194,6 +194,8 @@ export class RpcClient {
 		// runtime proxy: a dead pod may still sit in the local snapshot while
 		// the runtime already knows a live instance.
 		let viaProxy = transport === "proxy";
+		// Instances the direct path could not reach: the proxy tries them last.
+		const unreachable: string[] = [];
 		let lastError: ServiceBridgeError | null = null;
 
 		for (let attempt = 0; attempt < retry.maxAttempts; attempt++) {
@@ -252,6 +254,7 @@ export class RpcClient {
 				idempotencyKey,
 				deadline,
 				signal: opts.signal,
+				excludeInstanceIds: unreachable,
 			};
 			try {
 				const respBytes = await runWithTrace(
@@ -278,7 +281,10 @@ export class RpcClient {
 					throw failure.error;
 				}
 				lastError = failure.error;
-				if (useDirect && transport === "auto") viaProxy = true;
+				if (useDirect && transport === "auto") {
+					viaProxy = true;
+					unreachable.push(candidate.instance.instanceId);
+				}
 			} finally {
 				release();
 			}

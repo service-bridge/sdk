@@ -238,6 +238,8 @@ describe("RpcClient.call retries", () => {
 		});
 		expect(rec.direct).toHaveLength(1);
 		expect(rec.proxy).toHaveLength(1);
+		// The runtime is told which instance the direct path could not reach.
+		expect(rec.proxy[0]?.excludeInstanceIds).toEqual(["inst-1"]);
 	});
 
 	it("never replays a dispatched failure", async () => {

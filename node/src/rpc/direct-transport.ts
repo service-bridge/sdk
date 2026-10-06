@@ -30,6 +30,9 @@ export interface WireCall {
 	idempotencyKey: string;
 	deadline: Date;
 	signal?: AbortSignal;
+	// Proxy only: instances this call failed to reach directly; the runtime
+	// tries them last.
+	excludeInstanceIds?: string[];
 }
 
 // IDLE_TTL_MS bounds how long a channel survives without being used. A pod
