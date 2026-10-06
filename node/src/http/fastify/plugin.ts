@@ -154,12 +154,12 @@ const plugin: FastifyPluginAsync<SbFastifyOptions> = async (
 	fastify.addHook("onListen", async () => {
 		const addr = netAddressOf(fastify.server);
 		if (!addr) {
-			fastify.log.warn(
-				"[servicebridge/fastify] could not read server address — http_endpoint not published",
+			sb.diagnostics.warn(
+				"fastify: could not read the server address — http_endpoint not published",
 			);
 			return;
 		}
-		const host = opts.host ?? resolveHttpAdvertiseHost(addr.address);
+		const host = opts.host ?? resolveHttpAdvertiseHost(addr.address, sb.diagnostics);
 		sb.routes.publishHttp({ host, port: addr.port });
 	});
 };

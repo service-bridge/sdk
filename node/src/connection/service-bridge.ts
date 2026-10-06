@@ -546,6 +546,14 @@ export class ServiceBridge {
 		return this.telemetryApi.log;
 	}
 
+	/**
+	 * The SDK's own diagnostics sink (ServiceBridgeOptions.logger), for the HTTP
+	 * integrations. @internal
+	 */
+	get diagnostics(): Logger {
+		return this.log;
+	}
+
 	/** instance_id of this process ("" before the first Welcome). */
 	instanceIdString(): string {
 		return this.telemetryInstanceId;

@@ -62,7 +62,7 @@ export function attachHono(
 	endpoint: HonoEndpoint,
 ): void {
 	collectHonoRoutes(app, sb);
-	const host = resolveHttpAdvertiseHost(endpoint.host);
+	const host = resolveHttpAdvertiseHost(endpoint.host, sb.diagnostics);
 	sb.routes.publishHttp({ host, port: endpoint.port });
 	installHonoTracing(app, sb, endpoint);
 }

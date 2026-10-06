@@ -95,7 +95,11 @@ export function makeSbStub(captureMode: CaptureMode = "none"): SbStub {
 			};
 		},
 	};
-	const sb = { routes, telemetry } as unknown as ServiceBridge;
+	const sb = {
+		routes,
+		telemetry,
+		diagnostics: { debug() {}, info() {}, warn() {}, error() {} },
+	} as unknown as ServiceBridge;
 	return {
 		sb,
 		routes,

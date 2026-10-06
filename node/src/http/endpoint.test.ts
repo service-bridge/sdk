@@ -1,18 +1,13 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { _resetHostWarn, resolveHttpAdvertiseHost } from "./endpoint";
 
+let sink: string[] = [];
+const log = { warn: (m: string) => sink.push(m) };
+
 function captureWarnings(fn: () => void): string[] {
-	const seen: string[] = [];
-	const orig = console.warn;
-	console.warn = (msg: unknown) => {
-		seen.push(String(msg));
-	};
-	try {
-		fn();
-	} finally {
-		console.warn = orig;
-	}
-	return seen;
+	sink = [];
+	fn();
+	return sink;
 }
 
 describe("resolveHttpAdvertiseHost", () => {
@@ -25,7 +20,7 @@ describe("resolveHttpAdvertiseHost", () => {
 	it("returns the explicit host as-is and never warns", () => {
 		_resetHostWarn();
 		const warnings = captureWarnings(() => {
-			expect(resolveHttpAdvertiseHost("internal.example")).toBe(
+			expect(resolveHttpAdvertiseHost("internal.example", log)).toBe(
 				"internal.example",
 			);
 		});
@@ -35,7 +30,7 @@ describe("resolveHttpAdvertiseHost", () => {
 	it("treats an empty host as absent", () => {
 		_resetHostWarn();
 		const warnings = captureWarnings(() => {
-			expect(resolveHttpAdvertiseHost("")).toBe("127.0.0.1");
+			expect(resolveHttpAdvertiseHost("", log)).toBe("127.0.0.1");
 		});
 		expect(warnings).toHaveLength(1);
 	});
@@ -43,9 +38,9 @@ describe("resolveHttpAdvertiseHost", () => {
 	it("warns exactly once across repeated fallbacks", () => {
 		_resetHostWarn();
 		const warnings = captureWarnings(() => {
-			resolveHttpAdvertiseHost();
-			resolveHttpAdvertiseHost();
-			resolveHttpAdvertiseHost();
+			resolveHttpAdvertiseHost(undefined, log);
+			resolveHttpAdvertiseHost(undefined, log);
+			resolveHttpAdvertiseHost(undefined, log);
 		});
 		expect(warnings).toHaveLength(1);
 		expect(warnings[0]).toContain("http advertise host not configured");
@@ -54,14 +49,14 @@ describe("resolveHttpAdvertiseHost", () => {
 	it("warns again after _resetHostWarn", () => {
 		_resetHostWarn();
 		const first = captureWarnings(() => {
-			resolveHttpAdvertiseHost();
+			resolveHttpAdvertiseHost(undefined, log);
 		});
 		const silent = captureWarnings(() => {
-			resolveHttpAdvertiseHost();
+			resolveHttpAdvertiseHost(undefined, log);
 		});
 		_resetHostWarn();
 		const second = captureWarnings(() => {
-			resolveHttpAdvertiseHost();
+			resolveHttpAdvertiseHost(undefined, log);
 		});
 		expect(first).toHaveLength(1);
 		expect(silent).toHaveLength(0);

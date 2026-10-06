@@ -121,7 +121,7 @@ export function attachExpress(
 			});
 		}
 	}
-	const host = resolveHttpAdvertiseHost(endpoint.host);
+	const host = resolveHttpAdvertiseHost(endpoint.host, sb.diagnostics);
 	sb.routes.publishHttp({ host, port: endpoint.port });
 
 	installTraceMiddleware(app, sb, endpoint);
