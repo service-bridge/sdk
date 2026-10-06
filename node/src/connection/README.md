@@ -2,13 +2,13 @@
 
 ## Зона ответственности
 
-Bounded context жизненного цикла соединения SDK↔runtime: парсинг bootstrap-ключа, обмен ключа на mTLS-сертификат через `Bootstrap.Provision`, ведение server-стрима `Control.Open` (Welcome/Drain), reconnect, overlap-ротация cert'а через `Control.RefreshCert`. `ServiceBridge` — корневой объект SDK: владеет реестром, RPC/event/workflow/job-доменами и telemetry-инфраструктурой, собирает их в один граф зависимостей и управляет их lifecycle вместе с сессией.
+Жизненный цикл соединения SDK↔runtime: разбор bootstrap-ключа, обмен ключа на mTLS-сертификат (`Bootstrap.Provision`), стрим `Control.Open` (Welcome/Drain), стрим реестра, reconnect, продление сертификата (`Control.RefreshCert`) и упорядоченная остановка. `ServiceBridge` — корневой объект SDK: собирает граф зависимостей (реестр, RPC/event/workflow/job-домены, транспорты, телеметрию) и владеет их ресурсами.
 
-Не делает: не хранит креды на диск, не запускает прикладную бизнес-логику, не реализует сам транспорт Direct RPC / доставку событий (это домены `rpc`, `events`, `workflow`, `job`, `telemetry`).
+Не делает: не хранит креды на диске, не реализует транспорт RPC, доставку событий и workflow (домены `rpc`, `events`, `workflow`, `job`, `telemetry`).
 
 ## Публичный контракт
 
-Реэкспортируется через `sdk/node/index.ts`: `ServiceBridge`, `ServiceBridgeError`, и типы `AdvertiseConfig`, `CallOpts`, `ConnectedEvent`, `DisconnectedEvent`, `Identity`, `MethodDescriptor`, `MethodType`, `PolicyViolationEvent`, `ReconnectingEvent`, `RpcHandlerOpts`, `SchemaSpec`, `ServiceBridgeOptions`, `ServiceDeps`, `WorkflowHandlerOpts`.
+Реэкспортируется через `sdk/node/index.ts`: `ServiceBridge`, `ConnectionError`, типы событий и опций.
 
 ### `class ServiceBridge`
 
@@ -16,140 +16,97 @@ Bounded context жизненного цикла соединения SDK↔runti
 new ServiceBridge(url: string, key: string, options?: ServiceBridgeOptions)
 ```
 
-| Имя | Тип | По умолчанию | Что делает |
-|-----|-----|--------------|------------|
-| `url` | `string` | — (обязательный) | Адрес рантайма `host:port`. |
-| `key` | `string` | — (обязательный) | Bootstrap-ключ формата `sb.<base64url(proto.Marshal(BootstrapKeyPayload{key_id, secret, ca_cert_der}))>`. CA-cert встроен в ключ как доверенный якорь. |
-| `options` | `ServiceBridgeOptions` | `{}` | Tuning, см. ниже. |
-
-Методы и свойства:
-
-| Член | Тип / возвращает | Эффект |
-|------|------------------|--------|
-| `.service(name, deps)` | `void` | Декларирует исходящие зависимости (`rpc`/`workflows`/`http`). Вызывается до `start()`. |
-| `.on(event, handler)` | `this` | Подписка на `connected` / `reconnecting` / `disconnected` / `policy_violation`. Цепляется. |
-| `.start()` | `Promise<void>` | Финализирует pending schema-loads, открывает SQLite outbox, провижионит cert, открывает mTLS-канал, поднимает inbound CallServer (если `advertise`), запускает RegisterAndWatch-стрим и `Control.Open`. |
-| `.stop()` | `Promise<void>` | Гасит refresh-таймер, закрывает session, CallServer, транспорты, telemetry, subscriber'ы, drainer, storage. Идемпотентно. Отменяет и незавершённый `connect()`/ротацию: всё, что они успели начать, после `stop()` не достраивается. |
-| `.identity()` | `Identity \| null` | Идентификатор текущей живой сессии (`sessionId`/`serviceId`/`serviceName`/`instanceId`); `null` до первого Welcome / во время reconnect / после `stop()`. |
-| `.instanceIdString()` | `string` | `instance_id` текущей сессии (12-симв. Crockford-base32). Пустая строка до первого Welcome. Используется HTTP-плагинами для автотрейсинга. |
-| `.serviceMap()` | `ReadonlyMap<string, ServiceMapEntry>` | Живой снепшот реестра по `serviceName`. Пустой до первого снепшота от runtime. |
-| `.policyEvaluation()` | `PolicyEvaluation \| null` | Последний `PolicyEvaluation`, пушнутый runtime в снепшоте реестра. `null` до первого снепшота. |
-| `.useSchema(service, method, spec)` | `Promise<void>` | Регистрирует `SchemaPair` для конкретного outgoing RPC. Вызывается до `sb.rpc.call()` этого метода. |
-| `.client(service, protoFile, opts?)` | `Promise<TypedClient>` | High-level: читает `.proto`, декларирует методы service-блока как зависимости, грузит схемы, возвращает proxy с типизированными вызовами. Вызывается до `start()`. `opts.methods` ограничивает подмножество; `opts.callDefaults` — дефолты per-client. |
-| `.stream(service, method, payload, opts?)` | `AsyncIterable<Chunk>` | Server-streaming RPC. Отмена for-await закрывает gRPC-стрим. Бросает, если rpc-клиент ещё не готов (до `connected`). |
-| `.rpc` | `RpcDomain` | RPC-домен: `.handle()`, `.handleStream()`, `.call()`. |
-| `.event` | `EventDomain` | Event-домен: `.define()`, `.handle()`, `.publish()`. |
-| `.workflow` | `WorkflowDomain` | Workflow-домен: `.handle()`, `.start()`, `.signal()`, `.cancel()`. |
-| `.job` | `JobDomain` | Job-домен: `.handle(name, opts, fn)`. См. [job/README.md](../job/README.md). |
-| `.telemetry` | `TelemetryAPI` | Surface эмита: `.startOp(params)`, `.enabled()`, `.captureModeForChannel(channel)`, `.log.{debug,info,warn,error}(msg, fields?)`, `.counter/gauge/histogram(name, ...)`. До `start()` ops/logs/metrics буферизуются в ring; transport их flush'нет после connect. Хендлы (`log`, `counter`, `gauge`, `histogram`) можно брать до `start()` — `instance_id` они читают в момент эмиссии, а не создания: эмиссии до первого Welcome уходят с пустым `instance_id`, дальше хендл сам переходит на актуальный (включая смену на ротации cert'а). См. [telemetry/README.md](../telemetry/README.md). |
-| `.logger` | `ReturnType<typeof makeLogger>` | Эквивалент `sb.telemetry.log` как top-level convenience. |
-
-`ServiceMapEntry`, `ServiceInstanceInfo`, `TelemetryAPI` экспортируются из `service-bridge.ts`, но **не** реэкспортируются через `index.ts`; это типы возвращаемых значений публичных методов. `ServiceMapEntry = { methods: MethodDescriptor[]; instances: ServiceInstanceInfo[]; eventSubscriptions: EventSubscriptionDescriptor[]; outgoingCalls: OutgoingCallDescriptor[] }`. Последние два массива заполняются для своего сервиса и сервисов в outgoing-dep scope (ADR-0004), иначе пустые.
+| Член | Тип / возвращает | Что делает |
+|------|------------------|------------|
+| `url` | `string` | Адрес runtime `host:port`. |
+| `key` | `string` | Bootstrap-ключ `sb.<base64url(BootstrapKeyPayload)>`; CA внутри ключа — доверенный якорь. |
+| `.start()` | `Promise<void>` | Провижининг, Call-сервер, `Control.Open`, реестр. Резолвится после Welcome **и** первого snapshot реестра в пределах `startTimeoutMs`; иначе бридж останавливается и ошибка бросается (`TimeoutError`, `ConnectionError`, `ConfigurationError`, `ValidationError`). Повтор — `StateError`. |
+| `.ready()` | `Promise<void>` | Резолвится, когда текущая сессия жива и её snapshot применён (сразу, если уже). Отклоняется после остановки. |
+| `.stop()` | `Promise<void>` | Упорядоченная остановка (см. «Архитектурные решения»). Идемпотентна. |
+| `.on(event, handler)` | `this` | `connected` / `reconnecting` / `disconnected` / `draining` / `policy_violation`. Исключение в handler'е логируется и не мешает остальным. |
+| `.service(name, deps)` | `void` | Исходящие зависимости (`rpc`/`workflows`/`http`) до `start()`. |
+| `.client(service, protoFile, opts?)` | `Promise<TypedClient>` | Typed-клиент по `.proto`: объявляет методы зависимостями, грузит схемы. До `start()`. `opts.callDefaults` — между `ServiceBridgeOptions.callDefaults` и опциями вызова. |
+| `.useSchema(service, method, spec)` | `Promise<void>` | Схема вызывающего для одного метода. |
+| `.stream(service, method, payload, opts?)` | `AsyncIterable<Chunk>` | Server-streaming RPC; до `start()` — `StateError`. |
+| `.identity()` | `Identity \| null` | `{ sessionId, serviceId, serviceName, instanceId }` живой сессии. `instanceId` стабилен на весь процесс. |
+| `.instanceIdString()` | `string` | `instance_id` (пусто до первого Welcome). |
+| `.serviceMap()` | `ReadonlyMap<string, ServiceMapEntry>` | Живой вид реестра по имени сервиса. |
+| `.policyEvaluation()` | `PolicyEvaluation \| null` | Последняя политика от runtime. |
+| `.rpc` / `.event` / `.workflow` / `.job` | домены | См. README доменов. |
+| `.telemetry` / `.logger` | `TelemetryAPI` | Ops, логи (`sb.logger` — структурные логи в runtime), метрики. |
 
 ### `interface ServiceBridgeOptions`
 
 | Имя | Тип | По умолчанию | Что делает |
 |-----|-----|--------------|------------|
-| `reconnectIntervalMs` | `number \| undefined` | `undefined` (ladder) | Задержка между попытками reconnect. Не задано → общий джиттерный `utils/reconnect-ladder` (растущие rung'и `[1s,5s,15s,30s,60s]` ±20% джиттера), чтобы флот не долбил рантайм синхронно на фиксированном тике. Явное число → плоская задержка (детерминированный override для тюнинга/тестов). |
-| `reconnectAttempts` | `number` | `3` | Кол-во попыток до `disconnected{reason:'exhausted'}` + auto-stop. `0` = без лимита. |
-| `advertise` | `AdvertiseConfig \| false \| undefined` | `undefined` | `{ host, port }` — поднять inbound Call gRPC сервер (`port=0` → ОС выбирает). `undefined` — `127.0.0.1:0` с одноразовым warn. `false` — caller-only, inbound сервер не поднимается. |
-| `callDefaults` | `CallOpts \| undefined` | `{}` | Дефолтные опции для каждого `sb.rpc.call()` / `sb.stream()` (`timeout` default `"30s"`, `requestId` авто). Перебиваются per-call аргументом. |
-| `failOnPolicyViolation` | `boolean` | `false` | `true` — любой policy-warning в снепшоте реестра роняет `start()` через `disconnected{reason:'policy'}` + `stop()`. `false` — только warn + `policy_violation`-события (ADR-0004). |
-| `dataDir` | `string` | `"./.servicebridge"` | Каталог local SQLite outbox (`sdk.db`); прокидывается в `../sqlite/storage.ts`. |
-| `maxOutboxRows` | `number` | `100000` | Максимум строк в local SQLite outbox до `OutboxFullError`. |
-| `eventsDrainerBatch` | `number` | `50` | Размер batch'а drainer'а событий. |
-| `eventsMaxInFlight` | `number` | `32` | Максимум in-flight event-доставок на subscriber-стрим. |
-| `rpcMaxConcurrentCalls` | `number` | `256` | Сколько входящих RPC-хендлеров исполняется одновременно на Call-сервере. Ограничивает память на стороне callee: каждый допущенный вызов держит распакованный запрос плюс всё, что аллоцирует хендлер. |
-| `rpcMaxQueuedCalls` | `number` | равно `rpcMaxConcurrentCalls` | Сколько входящих вызовов ждут свободного слота. Сверх этой глубины вызывающий получает `RESOURCE_EXHAUSTED` — нагрузка сбрасывается, а не копится. `0` — отклонять всё, что не может стартовать сразу. |
+| `reconnectIntervalMs` | `number?` | лестница 1s/5s/15s/30s/60s ±20% | Плоская задержка reconnect вместо лестницы. |
+| `reconnectAttempts` | `number` | `0` (без лимита) | Сколько **подряд идущих** неудач допустимо; счётчик сбрасывается на Welcome. Превышение → `disconnected` + остановка. |
+| `advertise` | `AdvertiseConfig \| false` | `127.0.0.1:0` + warn | Адрес Call-сервера; `false` — только вызывающий. |
+| `callDefaults` | `CallOpts` | `{}` | Дефолты всех исходящих вызовов: `sb.rpc.call`, `sb.stream`, typed-клиенты. |
+| `failOnPolicyViolation` | `boolean` | `false` | Остановиться при warning'е политики. |
+| `publishTimeoutMs` | `number` | `30000` | Ожидание ACK publish. |
+| `maxPendingPublishes` | `number` | `10000` | Очередь publish до `QUEUE_FULL`. |
+| `eventsMaxInFlight` | `number` | `32` | Параллельные доставки. |
+| `rpcMaxConcurrentCalls` | `number` | `256` | Одновременные входящие handler'ы. |
+| `rpcMaxQueuedCalls` | `number` | = `rpcMaxConcurrentCalls` | Очередь входящих до `RESOURCE_EXHAUSTED`. |
+| `startTimeoutMs` | `number` | `30000` | Дедлайн `start()`. |
+| `stopTimeoutMs` | `number` | `10000` | Дедлайн дренажа в `stop()`. |
+| `logger` | `Logger` | warn/error в консоль | Диагностика SDK (`{debug,info,warn,error}(message, attrs?)`). |
+| `telemetry.onDrop` | `DropObserver?` | нет | Сообщение о потерянной телеметрии (ring/runtime). |
 
-Telemetry-transport on/off и payload cap управляются runtime-настройками (`telemetry.enable` и `telemetry.payload_max_bytes`) и приходят в SDK через `CaptureModes.telemetry_enabled` / `CaptureModes.payload_max_bytes` в registry snapshot. Fail-safe до первого snapshot: transport включён, cap = 65536.
-
-### `class ServiceBridgeError`
-
-```ts
-new ServiceBridgeError(scope: string, cause: unknown)
-```
-
-| Имя | Тип | Что делает |
-|-----|-----|------------|
-| `.code` | `number` | gRPC Status код (`16` = UNAUTHENTICATED, `-1` = не gRPC). |
-| `.cause` | `unknown` | Оригинальный объект ошибки (через `Error.cause`). |
+Неверное значение опции → `ConfigurationError` в конструкторе.
 
 ### События (`sb.on(...)`)
 
 | Имя | Payload | Когда |
 |-----|---------|-------|
-| `connected` | `{ sessionId, serviceId, serviceName }` | Сервер прислал `Welcome` на `Control.Open` (на старте и после каждой успешной overlap-ротации). |
-| `reconnecting` | `{ attempt, delayMs, reason }` | Соединение упало, запланирован retry. `attempt` — номер следующей попытки. |
-| `disconnected` | `{ reason, error? }` | `reason='exhausted'` — попытки исчерпаны, SDK остановлен. `reason='drain: ...'` — сервер прислал `Drain`. `reason='policy violations...'` — при `failOnPolicyViolation`. `error` (`ServiceBridgeError`) — если причина non-retryable gRPC (без retry). |
-| `policy_violation` | `PolicyViolationEvent` (`declaration`/`value`/`denySide`/`reason`) | На каждый warning из `PolicyEvaluation.warnings` снепшота реестра И на call-time запретах (`rpc.call`/`workflow.run`/`event.publish`) — единый канал; дублируется в `console.warn`. |
+| `connected` | `{ sessionId, serviceId, serviceName, runtimeVersion }` | Welcome новой сессии (старт и каждый reconnect). |
+| `reconnecting` | `{ attempt, delayMs, reason }` | Сессия потеряна или попытка не удалась; `attempt` — номер подряд идущей неудачи. |
+| `draining` | `{ reason }` | Runtime объявил остановку (`Drain`); reconnect последует после закрытия стрима. |
+| `disconnected` | `{ reason, error }` | Бридж остановился окончательно: неустранимая ошибка или исчерпан `reconnectAttempts`. |
+| `policy_violation` | `{ declaration, value, denySide, reason }` | Warning политики из snapshot и call-time запреты (`rpc.call`, `event.publish`). |
+
+### `class ConnectionError extends ServiceBridgeError`
+
+`code: "CONNECTION"`, `grpcCode: number` — статус runtime (`-1`, если его не было).
 
 ## Приватный контракт
 
-Module-level экспорты, **не** реэкспортируемые через `index.ts`. Используются другими доменами SDK и тестами этого пакета (`@internal`).
-
 | Имя | Файл | Тип | Что делает |
 |-----|------|-----|------------|
-| `parseBootstrapKey(raw)` | `key.ts` | `(string) => BootstrapKey` | Декодит `sb.<base64url>` → `BootstrapKeyPayload` → `{keyID, secret, caCertDer}`. Бросает на кривом prefix/base64/пустых полях. |
-| `BootstrapKey` | `key.ts` | `interface` | `{ keyID, secret, caCertDer: Buffer }`. |
-| `provision(url, key, clientFactory?)` | `provision.ts` | `(string, BootstrapKey, BootstrapClientFactory?) => Promise<ProvisionResult>` | Генерит keypair+CSR, делает `Bootstrap.Provision`, возвращает leaf cert + chain. Bootstrap-канал одноразовый: закрывается в `finally` на всех путях (успех/ошибка/пустой ответ), иначе каждая попытка reconnect навсегда утекает TLS-канал. `clientFactory` — инжектируемая фабрика канала (`@internal`, дефолт `newBootstrapClient`); тесты считают create/close без живого рантайма. |
-| `BootstrapClientFactory` | `provision.ts` | `type` | `(url, caCertDer) => BootstrapClient`. Инжектируемая фабрика bootstrap-канала для `provision()`. |
-| `refresh(client, previous)` | `provision.ts` | `(ControlClient, ProvisionResult) => Promise<ProvisionResult>` | Перевыпуск cert через `Control.RefreshCert` на живом mTLS-канале (без argon2). Новый `instance_id`; `serviceId`/`serviceName` переносятся. |
-| `ProvisionResult` | `provision.ts` | `interface` | `{ certDer, caChainDer, serviceId, serviceName, instanceId, notAfterUnix: bigint, privateKey, privateKeyDer }`. `notAfterUnix` — секунды, пересчитанные из wire-поля `not_after_unix_ms`. `privateKeyDer` (PKCS#8) материализуется один раз для синхронной сборки mTLS-кредов. |
-| `Keypair` | `provision.ts` | `interface` | `{ privateKey, publicKey, csrDer }`. |
-| `generateKeypairAndCSR()` | `provision.ts` | `() => Promise<Keypair>` | EC P-256 + PKCS#10 CSR через `@peculiar/x509`. |
-| `buildPinnedCredentials(caCertDer)` | `provision.ts` | `(Buffer) => grpc.ChannelCredentials` | `createSsl` с встроенной CA + отключённой hostname-проверкой. |
-| `newBootstrapClient(url, caCertDer)` | `provision.ts` | `(string, Buffer) => BootstrapClient` | Конструирует pinned gRPC-клиент Bootstrap. |
-| `parseURL(url)` | `provision.ts` | `(string) => { host, port }` | Парсит и валидирует `host:port`. |
-| `Session` | `session.ts` | `class` | Обёртка над live-соединением: ведёт стримы `Control.Open` (Welcome/Drain) и `Registry.RegisterAndWatch`. `close()`, `isClosed()`, `updateRegistration(req)` (рестарт watch с новым `RegisterRequest`). Флаг `expectedClose` подавляет reconnect при намеренном закрытии. **`close()` отменяет только стрим**; gRPC-каналы (`controlClient`/`registryClient`) принадлежат `ServiceBridge` и закрываются им. |
-| `SessionCallbacks` | `session.ts` | `interface` | `{ onWelcome, onDrain, onError, onEnd }`. |
-| `ServerStream` | `session.ts` | `type` | `ReturnType<ControlClient["open"]>`. |
-| `openControlStream(client)` | `session.ts` | `(ControlClient) => ServerStream` | Конструирует `Control.Open` server-stream; выделен для тестового стаба. Вызывается вплотную к `new Session(...)` — стрим не должен ждать `await` без листенера `'error'`. |
-| `derToPem(der, label?)` | `pem.ts` | `(Buffer, string) => Buffer` | DER → PEM (label по умолчанию `"CERTIFICATE"`). |
-| `isRetryable(code)` | `service-bridge-error.ts` | `(number) => boolean` | `false` для UNAUTHENTICATED / PERMISSION_DENIED / NOT_FOUND / INVALID_ARGUMENT; `true` для всех остальных (включая `-1`). |
-| `SPIFFE_TRUST_DOMAIN` | `spiffe.ts` | `const string` | `"service-bridge"`; синхронен с `connection.SPIFFETrustDomain` в Go-runtime. |
-
-### `interface ServiceBridgeInternalHooks extends ServiceBridgeOptions` (`@internal`, не экспортируется)
-
-Конструктор `ServiceBridge` принимает `options` как `ServiceBridgeOptions | ServiceBridgeInternalHooks`; hooks подменяют I/O для тестов.
-
-| Имя | Тип | По умолчанию | Что делает |
-|-----|-----|--------------|------------|
-| `certRefreshLeadMs` | `number` | `1_800_000` (30 мин) | За сколько ms до `notAfter` запускать ротацию cert. |
-| `certRefreshJitterMs` | `number` | `300_000` (5 мин) | Случайный сдвиг refresh-задержки для размазывания herd'а клиентов. |
-| `rotationHandshakeTimeoutMs` | `number` | `10_000` | Сколько ждать `Welcome` на новой сессии при overlap-rotation (heartbeat'ов в Control нет — Welcome единственный liveness-сигнал). |
-| `provisionFn` | `(url, key) => Promise<ProvisionResult>` | реальный RPC | Подмена `Bootstrap.Provision`. |
-| `refreshFn` | `(client, prev) => Promise<ProvisionResult>` | реальный RPC | Подмена `Control.RefreshCert`. |
-| `clientFactory` | `(url, creds) => ControlClient` | `new ControlClient` | Подмена конструктора Control-клиента. |
-| `registryClientFactory` | `(url, creds) => RegistryClient` | `new RegistryClient` | Подмена конструктора Registry-клиента. |
+| `parseBootstrapKey(raw)` | `key.ts` | function | `sb.<base64url>` → `{ keyID, secret, caCertDer }`. |
+| `provision(url, key, clientFactory?)` | `provision.ts` | function | Ключ + CSR → leaf. Bootstrap-канал закрывается в `finally`. |
+| `refresh(client, previous)` | `provision.ts` | function | `Control.RefreshCert`: новый leaf, тот же `instance_id`. |
+| `ProvisionResult` | `provision.ts` | interface | `{ certDer, caChainDer, serviceId, serviceName, instanceId, notAfterUnixMs, privateKey, privateKeyDer }`; срок — unix-ms (ADR-0006). |
+| `generateKeypairAndCSR()` | `provision.ts` | function | P-256 ключ (WebCrypto) + PKCS#10 из `csr.ts`. |
+| `buildCsr(keys, cn?)` | `csr.ts` | function | DER PKCS#10 на WebCrypto, без внешних библиотек. |
+| `CertificateStore` | `tls-material.ts` | class | In-memory `CertificateProvider` grpc-js: `channelCredentials(check)`, `serverCredentials()`, `update(material)`, `pem()`. |
+| `CLIENT_CHANNEL_OPTIONS` | `tls-material.ts` | const | Keepalive клиентских каналов: 30 s / 10 s, `permit_without_calls`. |
+| `Session` / `openControlStream` | `session.ts` | class / function | Стрим `Control.Open` с handshake (`protocol_version`, `sdk_language`, `sdk_version`); `close()` гасит колбэки. |
+| `PROTOCOL_VERSION` / `SDK_LANGUAGE` / `SDK_VERSION` | `handshake.ts` | const | `1`, `"node"`, версия пакета (тест сверяет с `package.json`). |
+| `isTerminal(grpcCode)` | `service-bridge-error.ts` | function | `UNAUTHENTICATED`, `PERMISSION_DENIED`, `NOT_FOUND`, `INVALID_ARGUMENT`, `FAILED_PRECONDITION` — остановка без reconnect. |
+| `ServiceBridge.diagnostics` | `service-bridge.ts` | getter | Логгер SDK для HTTP-интеграций. |
+| `ServiceBridge._startInMemory(rt)` | `service-bridge.ts` | method | Запуск на in-memory runtime для `service-bridge/testing`. |
+| `ServiceBridgeInternalHooks` | `service-bridge.ts` | interface | Тестовые подмены: `certRefreshLeadMs`, `certRefreshJitterMs`, `provisionFn`, `refreshFn`, `controlClientFactory`, `registryClientFactory`, `_disableTelemetryTransport`. |
 
 ## Архитектурные решения и почему
 
-- **`ServiceBridge` — корневой граф зависимостей SDK.** Здесь явно собираются Registry, RPC/event/workflow/job-домены, transports, circuit breaker, load balancer и telemetry. Lifecycle telemetry, subscriber'ов, drainer'а и storage совпадает с lifecycle сессии и управляется из `start()`/`stop()`.
-- **CA cert встроен в bootstrap-ключ** как доверенный якорь: `@grpc/grpc-js` валидирует chain до `checkServerIdentity`; встроенный cert — единственный надёжный путь (Bun's `getPeerCertificate` не отдаёт полный chain).
-- **Hostname-проверка выключена** через `checkServerIdentity: () => undefined`. У серверного cert'а нет SAN; доверие — chain-валидацией к встроенной CA.
-- **Heartbeat'ов в Control нет.** `Control.Open` — read-only server-stream (Welcome/Drain); liveness держит telemetry-стрим. Cert refresh — отдельный unary `Control.RefreshCert`.
-- **Lifecycle gRPC-каналов: ровно один владелец, детерминированный close.** Каждый созданный канал имеет одного владельца и закрывается на всех путях (ошибка/успех/reconnect/rotation/stop) — иначе утечка памяти в цикле реконнекта (grpc-js не GC'ит незакрытый канал: внутри живут backoff-таймеры, канал сам продолжает открывать TCP+TLS). Конкретно: bootstrap-канал `provision()` — `finally` close; `controlClient` и `registryClient` живут полями `ServiceBridge`, закрываются перед перезаписью на каждом `openSession` (reconnect) и в `stop()`; overlap-rotation закрывает **старую** пару только после Welcome на новой (на rollback — закрывает **новую** пару, которая не была принята). `Session.close()` / `WatchStream.stop()` отменяют только стримы поверх канала, сам канал закрывает владелец (`ServiceBridge`). EventsClient/JobsClient/WorkflowsClient/TelemetryClient и inbound CallServer живут ровно столько, сколько живёт cert, из которого они построены (см. следующий пункт), и закрываются в `stop()`.
-- **Ротация cert'а пересобирает ВСЕ cert-bound каналы, а не только Control + Registry.** `grpc.credentials.createSsl` (и `ServerCredentials.createSsl` у CallServer) копируют PEM внутрь канала при создании — канал не «подхватит» новый cert сам, re-resolve касается только DNS. Поэтому `ensureRpcReady` сравнивает `ProvisionResult` по идентичности объекта: тот же объект (транспортный reconnect на закэшированном cert'е) — ничего не трогаем; новый объект (свежий Provision или ротация) — `closeCertBoundResources()` гасит ProxyTransport, RpcClient, EventsClient (+ drainer/publisher/subscriber), WorkflowsClient (+ subscriber), JobsClient (+ subscriber), TelemetryClient (+ transport/sampler) и CallServer, после чего они строятся заново на новых кредах. Без этого после `notAfter` RPC, события, workflow-чекпоинты, результаты job'ов и телеметрия ломались разом, пока Control и Registry выглядели здоровыми. DirectTransport — исключение: он ротируется на месте через `updateCredentials` (у него свой per-peer кэш каналов с TTL по `notAfterUnix`). CallServer при пересборке ре-биндится на уже выданный порт, чтобы `advertise.port = 0` не сдвинул endpoint, который вызывающие уже разрешили.
-- **Reconnect переиспользует валидный leaf cert, не ре-провижинится.** `connect()` берёт закэшированный `lastProvision`, если до `notAfter` остаётся больше `certRefreshLeadMs`; `Bootstrap.Provision` (64 MiB argon2 на рантайме) зовётся только на первом подключении или когда cert у края истечения (обычно его опережает refresh-таймер через лёгкий `Control.RefreshCert`). Транспортный обрыв стрима больше не запускает argon2 на каждый reconnect — иначе flaky-сеть превращалась в шторм memory-hard хешей на рантайме. Ротация кладёт свой `ProvisionResult` в `lastProvision`: иначе кэш судит о свежести по вытесненному cert'у и каждый следующий reconnect всё равно форсит argon2 и новый `instanceId`.
-- **Overlap rotation ждёт `Welcome`** на новой сессии перед закрытием старой: иначе окно гонки, когда новая сессия в БД, а `Control.Open` ещё не установлен. При неуспехе — rollback на старую сессию + `reconnecting`.
-- **Сессия, принятая ротацией, остаётся под надзором.** `SessionCallbacks` ротации ветвятся по флагу `welcomed`: до Welcome `onError`/`onEnd` решают судьбу swap-промиса (rollback), после Welcome — это единственный надзор за живой сессией, и оба зовут `scheduleReconnect`. Замыкание на уже разрешённый промис делало обрыв стрима после ротации невидимым: ни `reconnecting`, ни `disconnected`, ни повторного connect'а, а watch-стрим самовосстанавливался и `serviceMap()` продолжал выглядеть живым.
-- **`stop()` отменяет незавершённый connect через generation-счётчик.** `connect` → `openSession` → `ensureRpcReady` и `rotateCert` снимают `generation` на входе и сверяют его после каждого `await`; расхождение (его двигает только `stop()`) — тихий выход с закрытием того, что успели создать. Без этого `await sb.start(); await sb.stop()` пропускал teardown вперёд, а разрешившийся Provision поднимал шесть gRPC-клиентов, биндил CallServer и стартовал drainer/subscriber/телеметрию уже после остановки — недостижимые, незакрываемые, процесс не завершался.
-- **`Control.Open`-стрим открывается и отдаётся `Session` в одном синхронном проходе.** `ClientReadableStream` — голый EventEmitter: `'error'`, прилетевший до навешивания листенера в конструкторе `Session`, это необработанное исключение и падение процесса вместо события `reconnecting`. Поэтому `openControlStream` стоит последним в `openSession`/`rotateCert`, и между ним и `new Session(...)` не должно появиться ни одного `await`.
-- **`Session.close()` ставит `expectedClose=true`** — иначе при overlap-rotation `onEnd` старой session порождает фантомный `reconnecting`.
-- **Compensation marker wire**: `maybeStartWorkflowSubscriber()` собирает `wrapStep`, оборачивающий каждый исполняемый unit (шаг / fanout-группа / ветка / компенсация) в `USER.SUBOP`-op через `sb.telemetry.startOp`, строя дерево run → step → op. Для компенсаций `meta` несёт `is_compensation: true` + `compensates_for_step_id` + `workflow_run_id`; wrapper не дублирует wire-вызов — настоящий `rpc.call`/`event.publish` живёт внутри и эмитит свои каноничные op'ы.
-- **Identity читается по требованию, а не копируется в момент создания хендла.** `instance_id` появляется только на первом Welcome и меняется на каждой ротации cert'а (`Control.RefreshCert` выдаёт новый). Поэтому всё, что живёт дольше одной сессии, получает геттер, а не значение: логгер (`makeLazyLogger`), ops/метрики (`makeTelemetryAPI`), `RpcClient.callerService`, drainer, publisher, event/workflow/job-подписчики, `makeRuntimeOps`, `ProcessSampler`. Для метрик это особенно важно: агрегатор ключует серию на `(kind, name, instance_id, labels)`, и счётчик, взятый пользователем до `start()`, при жадном резолве навсегда залипал бы на пустом `instance_id` и рос параллельно той серии, что заводится после подключения — пользователь видел бы два ряда вместо одного. `lazySeries` перепривязывает хендл при смене identity и кэширует результат до следующей смены, так что в установившемся режиме эмиссия стоит одно сравнение строк.
-- **`@peculiar/x509`** для CSR — даёт `Pkcs10CertificateRequestGenerator` через Web Crypto без нативной openssl.
-- **`privateKeyDer` материализуется один раз** при provision (async export), хранится в `ProvisionResult`, чтобы `buildMTLSCredentials` собирал PEM синхронно.
-- **`certRefreshLeadMs` / `certRefreshJitterMs` / `rotationHandshakeTimeoutMs` — приватные hooks**, не публичные опции: связаны с серверной корректностью протокола, их перенастройка без понимания контракта его ломает.
-- **Лимиты входящих RPC пробрасываются нерезолвленными.** `rpcMaxConcurrentCalls` / `rpcMaxQueuedCalls` кладутся в `ResolvedOptions` как `number | undefined` и уходят в `CallServer` как есть — в отличие от остальных опций, которые здесь же получают дефолт. Дефолт (`256` и «очередь = конкурентность») живёт рядом с семафором, который его исполняет (`../rpc/server.ts`); продублировать число здесь означало бы два источника правды для одной границы. Валидация значений — там же, в `../utils/semaphore.ts`.
-- **Конфигурация только через `ServiceBridgeOptions`** — SDK не читает `process.env`. Настройки (`advertise`, `dataDir`, `maxOutboxRows`, `eventsDrainerBatch`, `eventsMaxInFlight`) задаются явными опциями конструктора.
-- **Telemetry enable + payload cap управляются рантаймом**: `telemetry.enable` → `CaptureModes.telemetry_enabled` → `WatchStream.pushedTelemetryConfig().enabled`; `telemetry.payload_max_bytes` → `CaptureModes.payload_max_bytes` → `WatchStream.pushedTelemetryConfig().payloadMaxBytes`. Ops ring byte budget — внутренняя константа `DEFAULT_TELEMETRY_RING_SIZE` (256 KiB), не управляется конструктором. `ServiceBridge` не держит копию флага: и гейт запуска transport'а, и публичный `sb.telemetry.enabled()` читают `WatchStream` напрямую, поэтому разъехаться не могут. `enabled()` — гейт эмиссии для горячих путей: `startOp` собирает START-кадр и кладёт его в ring независимо от флага, так что откладывать работу внутри `startOp` бессмысленно — вызывающий проверяет флаг и пропускает весь блок целиком, включая meta, которую иначе пришлось бы сериализовать.
+- **start() ждёт Welcome и первый snapshot (NSDK-10).** До snapshot у SDK нет ни вида на mesh (вызов упал бы «no descriptor»), ни политики доступа (Call-сервер не знает, кого пускать). Поэтому `start()` резолвится только когда оба есть; `ready()` даёт то же после reconnect.
+- **Reconnect считает подряд идущие неудачи (NSDK-01).** Счётчик сбрасывается на Welcome, по умолчанию лимита нет: сервис, сдавшийся посреди rolling restart runtime, требует человека. Остановка — только на неустранимых кодах (`isTerminal`), несовместимом протоколе (Welcome или `FAILED_PRECONDITION`) и `INVALID_ARGUMENT` стрима реестра (невалидный фильтр подписки).
+- **Каналы строятся один раз; ротация меняет только TLS-материал (NSDK-03, решение 1).** `instance_id` стабилен, поэтому продление сертификата не должно трогать ни один стрим. Все клиентские каналы получают креды от одного `CertificateStore` (grpc-js `CertificateProvider`): `update()` меняет то, что предъявит следующее рукопожатие, установленные соединения и стримы (jobs, доставки, входящие RPC) продолжают работать. `Control.Open` не переоткрывается — runtime считает второй Open того же инстанса заменой сессии. Call-сервер перебиндится на тот же порт со свежими кредами и даёт своим in-flight вызовам доработать: in-place смена secure context поддерживается не всеми runtime (Bun).
+- **Reconnect переиспользует leaf.** Пока до `notAfter` больше `certRefreshLeadMs`, Provision не вызывается; RefreshCert с `RESOURCE_EXHAUSTED` (лимит частоты) повторяется через 60 с.
+- **Keepalive (NSDK-11).** 30 s / 10 s на всех клиентских каналах — совместимо с политикой runtime (MinTime 10 s). grpc-js на сервере политику пингов не применяет.
+- **Drain.** `Drain{reason}` → событие `draining` и info-лог; reconnect — после закрытия стрима runtime, без error-логов.
+- **Упорядоченный stop.** 1) снять анонс (перерегистрация с пустым `call_endpoint`, чтобы пиры перестали выбирать инстанс); 2) Call-сервер отвечает `UNAVAILABLE` + `x-sb-not-dispatched`, подписчики перестают брать работу; 3) дождаться in-flight вызовов, доставок и jobs; 4) дослать очередь publish; 5) финальный flush телеметрии с ожиданием ACK (≤ 2 с); 6) закрыть стримы, каналы и сервер. Всё в пределах `stopTimeoutMs`.
+- **Logger вместо console.** Диагностика SDK идёт в `options.logger`; по умолчанию только warn/error в консоль.
+- **Изоляция слушателей (NSDK-13).** Исключение в `sb.on(...)` логируется и не ломает ни бридж, ни другие слушатели.
+- **CSR без `@peculiar/x509`.** PKCS#10 для P-256 — несколько десятков строк DER поверх WebCrypto; библиотека тянула `reflect-metadata` глобально (NSDK-15).
+- **Identity читается по требованию.** Логгер, метрики, подписчики и транспорты получают геттеры: идентичность появляется на Welcome (и меняется только при свежем Provision после долгого простоя).
 
 ## Зависимости
 
-Зависит на: `@grpc/grpc-js`, `@peculiar/x509`, `reflect-metadata`; внутренние домены `../registry`, `../rpc`, `../events`, `../workflow`, `../job`, `../telemetry`, `../serde`, `../sqlite`; pb-стабы `../pb/servicebridge/v1/{bootstrap,control,events,jobs,registry,telemetry,workflows}`.
+Зависит на: `@grpc/grpc-js`; домены `../registry`, `../rpc`, `../events`, `../workflow`, `../job`, `../telemetry`, `../serde`; `../errors`, `../logger`; pb-стабы `../pb/servicebridge/v1/*`.
 
-Зависят: `sdk/node/index.ts` (реэкспорт публичного API), HTTP-интеграции (`../http/*` через `sb.routes`), `sdk/node/tests/e2e/`.
+Зависят: `sdk/node/index.ts`, HTTP-интеграции (`sb.routes`, `sb.diagnostics`), `../testing`, `tests/e2e`.
 
-Bootstrap and runtime channels require exactly one URI SAN spiffe://service-bridge/runtime, in addition to CA chain and server EKU verification. Another SDK leaf signed by this CA is not the runtime.
+Каналы к runtime требуют ровно один URI SAN `spiffe://service-bridge/runtime` поверх проверки цепочки и EKU.

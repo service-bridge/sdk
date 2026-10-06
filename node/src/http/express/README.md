@@ -2,9 +2,9 @@
 
 ## Зона ответственности
 
-Интеграция SDK с Express 4 / 5. Обходит router stack пользовательского `app` (включая sub-routers), кладёт собранные роуты в `sb.routes`, публикует HTTP-endpoint (`host:port`) в registry для Service Map (ADR 0001) и ставит на `app` один trace+telemetry middleware (X-SB-Trace propagation + HTTP.HANDLE op с захватом тела).
+Интеграция SDK с Express 4 / 5. Обходит router stack пользовательского `app` (включая sub-routers), кладёт собранные роуты в `sb.routes`, публикует HTTP-endpoint (`host:port`) в registry для Service Map (ADR 0001) и ставит на `app` один telemetry middleware (HTTP.HANDLE op с захватом тела).
 
-Не делает: не запускает HTTP-сервер — `app.listen()` остаётся за пользователем; не вмешивается в маршрутизацию и не меняет ответы (тело только читается для capture).
+Не делает: не запускает HTTP-сервер — `app.listen()` остаётся за пользователем; не вмешивается в маршрутизацию и не меняет ответы (тело только читается для capture); не защищает периметр (rate limit, фильтры сканеров — задача ingress/WAF приложения).
 
 ## Публичный контракт
 
@@ -29,16 +29,16 @@
 | Поле | Тип | По умолчанию | Что делает |
 |------|-----|--------------|------------|
 | `port` | `number` | — (обязателен) | Порт, на котором фактически слушает Express. Передаётся явно: при bind на `0` реальный порт в момент сбора роутов неизвестен. |
-| `host` | `string` | `127.0.0.1` (с одноразовым warn) | Advertise-host. Если опущен — fallback `127.0.0.1` с одноразовым `console.warn`. Для cross-host передавай явный `host`. |
-| `security` | `HttpSecurityOptions` | scanner block + 300 req/min/client | Ранний отсев secret/CMS probes и per-client rate limit до route handler и telemetry. |
+| `host` | `string` | `127.0.0.1` (с одноразовым warn) | Advertise-host. Если опущен — fallback `127.0.0.1` с одноразовым warn в logger SDK. Для cross-host передавай явный `host`. |
+| `trustTraceHeader` | `boolean` | `false` | Принимать входящий `X-SB-Trace` и встраивать запрос в trace вызывающего. По умолчанию заголовок игнорируется (публичный edge не даёт клиентам встраиваться в чужие trace); включать для HTTP-сервера, к которому ходят только другие сервисы ServiceBridge. |
 
 ### Trace + telemetry middleware
 
 Ставится автоматически внутри `attachExpress`. Отдельного публичного API нет.
 
-- Стартует HTTP.HANDLE через общий `startHttpOp` (`../_common/http-op`): заголовок `x-sb-trace` → `TraceContext`, `subject = "http.handle:${method}/${path}"`, `businessKey` = заголовок `Idempotency-Key` или `"${method} ${path}"`. Downstream chain идёт в `runWithTrace(op.scope, () => next())`. Route handlers и их `sb.rpc.call` / `event.publish` видят через ALS контекст, где `traceId` един с HTTP.HANDLE, а `parentOpId` = `opId` этого op'а — downstream вложен под HTTP.HANDLE, а не отдельный корень.
+- Шаблон роута находится до маршрутизации тем же способом, что и Express (`layer.match` по router stack, включая mount-префиксы); не совпало — `"*"`. HTTP.HANDLE стартует через общий `startHttpOp` (`../_common/http-op`): `subject = "http.handle:<METHOD>/<route>"`, meta `{method, route}` на старте и `{status}` на финише, `businessKey` = `Idempotency-Key` или `"<METHOD> <route>"` (без query). `X-SB-Trace` учитывается только при `trustTraceHeader`. Downstream chain идёт в `runWithTrace(op.scope, () => next())`. Route handlers и их `sb.rpc.call` / `event.publish` видят через ALS контекст, где `traceId` един с HTTP.HANDLE, а `parentOpId` = `opId` этого op'а — downstream вложен под HTTP.HANDLE, а не отдельный корень.
 - Захватывает тело запроса (IN) и ответа (OUT) как raw-JSON (`RAW_JSON_CONTRACT`); пустые тела не пишутся. Пока `op.capturing === false` (эффективный режим op'а — `none`), обёртка `res.json`/`res.send` не ставится и тела не сериализуются вовсе.
-- Завершает op статусом из единого словаря: `statusForHttpCode` даёт `SUCCESS` (код < 400) и `ERROR` (код ≥ 400); `TIMEOUT` (`client abort`) ставится, когда соединение закрылось без `res.end`.
+- Завершает op: `SUCCESS` (код < 400), `ERROR` «HTTP <код>» (≥ 400), `TIMEOUT` «client abort» (соединение закрылось без `res.end`).
 
 ### Пример использования
 

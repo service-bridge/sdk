@@ -51,21 +51,22 @@
 | `Registry.routes` | `RouteCollector` | — | Public-but-undocumented; пишут только интеграции `servicebridge/{express,fastify,hono}` (ADR 0001) |
 | `Registry.service(name, deps)` | `(string, ServiceDeps) => void` | — | Объявляет исходящие зависимости; каждый метод → `OutgoingDep` с типом RPC/WORKFLOW/HTTP |
 | `Registry.setCallEndpoint(endpoint)` | `(string) => void` | — | Задаёт `call_endpoint` для `RegisterRequest` |
-| `Registry.buildRegisterRequest()` | `() => RegisterRequest` | — | Собирает proto: incoming (+ HTTP-роуты как METHOD_TYPE_HTTP), published, outgoing, call/http endpoints, event_subscriptions (dedup по pattern) |
+| `Registry.buildRegisterRequest()` | `() => RegisterRequest` | — | Собирает proto: incoming (+ HTTP-роуты как METHOD_TYPE_HTTP), published, outgoing, call/http endpoints, event_subscriptions `{pattern, filter}`, handshake (`protocol_version`, `sdk_language`, `sdk_version`) |
 | `Handle` | class @internal | — | Хранилище incoming-хендлеров и published-events. Доступ — через domain-классы |
-| `Handle.rpc(name, fn, opts)` | — | — | Регистрирует unary RPC-хендлер; `opts.schema` async-грузит `SchemaPair` |
+| `Handle.rpc(name, fn, opts)` | — | — | Регистрирует unary RPC-хендлер `fn(req, ctx)`; `opts.schema` async-грузит `SchemaPair`; повтор имени — `ValidationError` |
 | `Handle.stream(name, fn, opts)` | — | — | Регистрирует server-streaming RPC; `fn` — `AsyncIterable`/async-generator |
-| `Handle.event(pattern, fn)` | — | — | Регистрирует обработчик Durable Event; `pattern` — точное имя или AMQP wildcard. Схема payload-а живёт у publisher'а (`publishEvent`) |
-| `Handle.publishEvent(name, spec?)` | — | `spec` undefined | Объявляет published event (publisher-side). `spec` — `SchemaSpec`; async-загрузка в общий `pending[]`. `contractHash` считается через `computeEventContractHash(pair.input)`: у события нет ответа, объявленный в spec output в идентичность не входит. Idempotent re-define по reference identity `spec`; иной spec — throws (ADR-0002) |
-| `Handle.getPublishedEvent(name)` | `{contractHash, pair} \| undefined` | — | Schema-lookup для Publisher / Subscriber. undefined для schema-less event или до finalize() |
+| `Handle.event(pattern, fn, opts?)` | — | — | Подписка: один handler на шаблон (дубль или невалидный шаблон — `ValidationError`), своя схема `opts.schema` (async-загрузка), `opts.filter` → JSON-строка. В `published` не попадает |
+| `Handle.subscription(pattern)` | `SubscriptionEntry \| undefined` | — | Handler процесса для совпавшего шаблона (по `matched_patterns` доставки) |
+| `Handle.subscriptionCount()` / `Handle.eventSubscriptions()` | — | — | Число подписок / `{pattern, filter}[]` для `RegisterRequest` |
+| `SubscriptionEntry` | interface | — | `{ pattern, filter, fn, schemaPair? }` |
+| `Handle.publishEvent(name, spec)` | — | — | Объявляет published event (publisher-side). `spec` — `SchemaSpec` (обязателен); async-загрузка в общий `pending[]`. `contractHash` считается через `computeEventContractHash(pair.input)`: у события нет ответа, объявленный в spec output в идентичность не входит. Idempotent re-define по reference identity `spec`; иной spec — `ValidationError` (ADR-0002) |
+| `Handle.getPublishedEvent(name)` | `{contractHash, pair} \| undefined` | — | Schema-lookup для Publisher; undefined до finalize() |
 | `Handle.workflow(name, steps, opts?, graphJson?, contractHash?)` | — | — | Регистрирует workflow. `graphJson` (ADR-W-002) перекрывает schema-derived input; `contractHash` едет как `IncomingMethod.contract_hash` |
 | `Handle.job(name, contractHash, specJson, fn)` | — | — | Регистрирует scheduled job. `specJson` — canonical spec (CanonicalJobSpec); `fn` хранится локально, не едет по wire |
 | `Handle.finalize()` | `Promise<void>` | — | Ожидает async-загрузок `SchemaPair` (rpc/stream + publishEvent). Вызывается `ServiceBridge.start()` до `buildRegisterRequest()` |
-| `Handle.incomingMethods()` | `PbIncomingMethod[]` | — | Все типы КРОМЕ EVENT (события едут только через `event_subscriptions`); contract_hash из override или из `SchemaPair` |
-| `Handle.publishedEvents()` | `PbPublishedEvent[]` | — | Published events для `RegisterRequest`; каждый несёт `contractHash` (или "" для schema-less) |
-| `Handle.asDispatchPort()` | `DispatchPort` | — | Boundary для `CallServer`: decode/encode по `SchemaPair`, маппинг ошибок в `errorCode` (NOT_FOUND, FAILED_PRECONDITION, INTERNAL, INVALID_ARGUMENT); `captureMode(method)` — per-handler override |
-| `Handle._declareForTests(name, streaming?)` | — | `streaming=false` | Регистрирует RPC-запись без схемы. Только unit-тесты |
-| `Handle._declarePublishedEventForTests(name)` | — | — | Регистрирует published event без `.proto`-загрузки. Только unit-тесты |
+| `Handle.incomingMethods()` | `PbIncomingMethod[]` | — | RPC, workflow, job; contract_hash из override или из `SchemaPair` |
+| `Handle.publishedEvents()` | `PbPublishedEvent[]` | — | Published events для `RegisterRequest` с `contractHash` |
+| `Handle.asDispatchPort()` | `DispatchPort` | — | Boundary для `CallServer`: decode/encode по `SchemaPair`; отказ до handler'а — `status` (NOT_FOUND, FAILED_PRECONDITION, INVALID_ARGUMENT), ответ handler'а — `errorCode` (код `HandlerError` или `INTERNAL`); `captureMode(method)` — per-handler override |
 | `WatchStream` | class @internal | — | Управляет gRPC-стримом `RegisterAndWatch`; держит кеш дескрипторов, instances, event-subs, outgoing-calls, policy, per-channel capture modes. Конструктор принимает опциональный `ReconnectDelayOptions` (тестовый hook лестницы) |
 | `WatchStream.start(req, client, onError?)` | — | `onError=() => {}` | Открывает стрим, запоминает `(req, client)` для авторестартов, сбрасывает retry-состояние. Упавший стрим (`"error"`/`"end"`) сам рестартует по общей лестнице `utils/reconnect-ladder`; один pending-таймер на инстанс (error+end одного обрыва не множат циклы), события устаревших стримов отбрасываются по identity-guard. Пришедший `"data"` сбрасывает лестницу. `onError` — нотификация, не управление рестартом |
 | `WatchStream.stop()` | — | — | Гасит retry-таймер, `stream.cancel()`; не закрывает gRPC-канал |
@@ -75,6 +76,8 @@
 | `WatchStream.eventSubscriptionsSnapshot()` | `Map<string, EventSubscriptionDescriptor>` | — | Копия event-subs; ключ `"${serviceId}\|${pattern}"` (ADR-0004) |
 | `WatchStream.outgoingCallsSnapshot()` | `Map<string, OutgoingCallDescriptor>` | — | Копия outgoing-calls; ключ `(caller, target, method, type)` (ADR-0004) |
 | `WatchStream.policyEvaluation()` | `PolicyEvaluation \| null` | `null` | Последняя `PolicyEvaluation` (ADR-0004) |
+| `WatchStream.hasSnapshot()` / `onSnapshot(fn)` | — | — | Применён ли snapshot текущим поколением стрима (сбрасывается на stop/restart) / подписка на каждый snapshot |
+| `WatchStream.isRevoked(serviceId, instanceId)` / `onRevoked(fn)` | — | — | Отзыв из `RegistryUpdate.revoked_services/instances` (решение 12): инстанс — навсегда, сервис — пока не появится его инстанс, которого не было в момент отзыва |
 | `WatchStream.captureModeForChannel(channel)` | `CaptureMode` | `"none"` | Runtime-pushed эффективный payload-режим для op-канала из `capture_modes` (rpc/http/event/workflow). `"none"` до первого snapshot и для непереданных каналов (fail-safe) |
 | `WatchStream.onCaptureModes(fn)` | `() => void` | — | Подписка на изменение per-channel capture modes; возвращает unsubscribe |
 | `WatchStream.pushedTelemetryConfig()` | `PushedTelemetryConfig` | `{enabled:true,payloadMaxBytes:65536}` | Runtime-pushed глобальные телеметрические настройки: `enabled` из `telemetry.enable`, `payloadMaxBytes` из `telemetry.payload_max_bytes`. Fail-safe до первого snapshot: включён, cap=65536 |
@@ -107,7 +110,9 @@
 - **Per-channel capture modes**: runtime — единственный источник истины по payload-capture и пушит весь набор `CaptureModes` (rpc/http/event/workflow) на каждый snapshot/update. SDK берёт режим для канала операции как эффективный. Job-канала нет (jobs не несут payload — поле 5 в proto reserved). Per-handler `captureMode` может только сужать runtime-режим.
 - **Кеш — `Map<string, MethodDescriptor>`**: snapshot полностью заменяет кеш; update делает точечные set/delete. Удаление несуществующего ключа — no-op (гонка дисконнект-до-снепшота). `removed_peers` чистит все кеши (methods/instances/event-subs/outgoing), привязанные к выпавшему из scope peer'у.
 - **`Handle` внутри `Registry`**: все декларации (RPC, stream, события, workflow, jobs, HTTP-роуты) едут единым `RegisterRequest` через `Registry.RegisterAndWatch`. `Handle` владеет всеми async-loadable декларациями (incoming + published) в одном `pending[]`; `finalize()` ждёт их перед сериализацией. `Registry` хранит outgoing-deps (`service()`), роуты (`routes`) и endpoints.
-- **EVENT не в `incomingMethods()`**: подписки едут только через `RegisterRequest.event_subscriptions`, dedup по pattern — серверный `event_subscriptions` имеет PRIMARY KEY `(subscriber_id, pattern)`. In-process fan-out на несколько хендлеров одного pattern делает SDK сам (ADR 0002).
+- **Подписки — не входящие методы и не published (NSDK-08).** Едут только через `RegisterRequest.event_subscriptions` `{pattern, filter}`; один handler на шаблон, потому что runtime ключует подписку (и фильтр) по шаблону. Локального матчинга шаблонов нет: доставка сама называет совпавшие шаблоны (`matched_patterns`).
+- **Любой snapshot — полная замена состояния.** Runtime может прислать повторный snapshot в том же стриме (отставший watcher); кеши, инстансы, policy и capture modes заменяются целиком.
+- **Handshake в каждом `RegisterRequest`** (`protocol_version`, `sdk_language`, `sdk_version`), как и в `OpenRequest`.
 
 ## Зависимости
 

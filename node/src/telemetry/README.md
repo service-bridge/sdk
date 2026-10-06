@@ -35,14 +35,14 @@ Per-kind ring buffers, примитивы для emit'а ops/logs/metrics, real 
 | `CaptureMode` | `"all" \| "errors" \| "none"` | — | Payload capture policy |
 | `CapturedAttachment` | interface | — | `{direction (1=IN/2=OUT), bytes, originalSize, contractHash}` — одна capped-сторона захваченного payload |
 | `TelemetryTransport` | class | - | Bounded delivery to ingress acceptance/disposal using cumulative sequence ACK; reconnect resets after first ACK. |
-| `TelemetryTransport.start()` / `.stop()` | `Promise<void>` | — | Lifecycle; `stop()` дренит остаток ring'а и закрывает локальный конец стрима. Flush-таймер `unref()`'ится — не удерживает процесс живым |
+| `TelemetryTransport.start()` / `.stop(timeoutMs?)` | `Promise<void>` | `2000` | Lifecycle; `stop()` пишет остаток ring'а, ждёт ACK последнего пакета не дольше `timeoutMs`, затем закрывает стрим (NSDK-12). Flush-таймер `unref()`'ится |
 | `TelemetryTransport.flushNow()` | `Promise<void>` | — | Немедленный flush-цикл: drain аггрегатора метрик в ring, затем batch за batch пока в ring есть неотправленное |
 | `TelemetryTransportOptions.client` | `TelemetryClientLike` | — (required) | Источник bidi-стрима (`openStream()`) |
 | `TelemetryTransportOptions.ring` | `TelemetryRing` | — (required) | Ring, из которого транспорт peek'ает батчи |
 | `TelemetryTransportOptions.flushIntervalMs` | `number?` | `250` | Период flush-таймера (ms). Один тик дренит ring целиком, а не одну пачку |
 | `TelemetryTransportOptions.maxBatchItems` | `number?` | `256` | Max items per kind в ОДНОЙ пачке. Не потолок пропускной способности: flush-цикл пишет столько пачек, сколько нужно |
 | `TelemetryTransportOptions.reconnectOpts` | `ReconnectDelayOptions?` | shared `RECONNECT_LADDER_MS` + ±20% jitter | Reconnect backoff options; тот же тип, что у events/job/workflow subscriber'ов (`../utils/reconnect-ladder.ts`) |
-| `TelemetryTransportOptions.onDrop` | `DropObserver?` | — | Хук наблюдаемости: вызывается при росте server-side или local ring drop-счётчиков |
+| `TelemetryTransportOptions.onDrop` | `DropObserver?` | — | Хук наблюдаемости: вызывается при росте server-side или local ring drop-счётчиков — на каждом ACK и каждом flush-тике (ring-потери видны и при оборванном стриме). Бридж передаёт сюда `ServiceBridgeOptions.telemetry.onDrop` и сам считает дельты в метрику `sb_sdk_telemetry_dropped_total{source="ring"\|"server"}`. |
 | `DropObserver` | `type` | — | `(info: {serverDrops, ringDrops, backpressureLevel}) => void` |
 | `adaptTelemetryClient(client)` | `TelemetryClientLike` | — | Wrap generated `TelemetryClient` for transport |
 | `TelemetryClientLike` | interface | — | Minimal client shape (`openStream(): ClientTelemetryStream`), тип реэкспортируется для интеграторов/моков |
