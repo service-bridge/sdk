@@ -60,20 +60,18 @@ export type { RetryOpts } from "./src/rpc/client";
 export type { RpcHandlerContext } from "./src/rpc/dispatch-port";
 export type { RpcDomain } from "./src/rpc/domain";
 export type { TypedClient } from "./src/rpc/typed-client";
-// Everything needed to call sb.telemetry.startOp(): the params type names
-// Channel, and the kind is a per-channel numeric constant. Wrap the work in
-// the returned handle's run(fn) to make it the parent of everything inside.
+// Everything needed to call sb.telemetry.startOp(). The runtime stores only
+// the op kinds an SDK may report: USER.SUBOP (application spans), HTTP.HANDLE
+// (the HTTP integrations) and RPC.CALL (the SDK's own); the others are written
+// by the runtime itself. Wrap the work in the returned handle's run(fn) to make
+// it the parent of everything inside.
 export {
 	Channel,
-	EventDeliver,
-	EventPublish,
 	HttpHandle,
-	JobExec,
 	type OpHandle,
 	type StartOpParams,
 	Status,
 	UserSubOp,
-	WorkflowRun,
 } from "./src/telemetry/index";
 export type { DropObserver } from "./src/telemetry/transport";
 export type { WorkflowDomain } from "./src/workflow/domain";

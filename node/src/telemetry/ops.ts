@@ -52,6 +52,8 @@ export interface StartOpParams {
 	kind: number;
 	subject: string;
 	peerServiceId?: string;
+	/** RPC.CALL: the callee instance serving the call (keys its health). */
+	peerInstanceId?: string;
 	businessKey?: string;
 	attempt?: number;
 	startedAtMs?: number;
@@ -83,6 +85,7 @@ interface ResolvedParams {
 	kind: number;
 	subject: string;
 	peerServiceId: string;
+	peerInstanceId: string;
 	businessKey: string;
 	attempt: number;
 	metaJson: Buffer;
@@ -139,6 +142,7 @@ export class OpHandle {
 			kind: params.kind,
 			subject: params.subject,
 			peerServiceId: params.peerServiceId ?? "",
+			peerInstanceId: params.peerInstanceId ?? "",
 			businessKey: params.businessKey ?? "",
 			attempt: params.attempt ?? 0,
 			metaJson: params.metaJson ?? EMPTY_JSON_OBJECT,
@@ -165,6 +169,11 @@ export class OpHandle {
 	 * the final value so a single RPC.CALL row reflects how many tries it took
 	 * (ADR-0001). No new row is minted per attempt.
 	 */
+	/** RPC.CALL: the instance a retry or a fallback moved the call to. */
+	setPeerInstance(instanceId: string): void {
+		this.params.peerInstanceId = instanceId;
+	}
+
 	setAttempt(attempt: number): void {
 		this.params.attempt = attempt;
 	}
@@ -314,7 +323,7 @@ export class OpHandle {
 			kind: this.params.kind,
 			subject: this.params.subject,
 			peerServiceId: this.params.peerServiceId,
-			peerInstanceId: "",
+			peerInstanceId: this.params.peerInstanceId,
 			businessKey: this.params.businessKey,
 			attempt: this.params.attempt,
 			startedAtMs: this.startedAtMs,
@@ -341,7 +350,7 @@ export class OpHandle {
 			kind: this.params.kind,
 			subject: "",
 			peerServiceId: "",
-			peerInstanceId: "",
+			peerInstanceId: this.params.peerInstanceId,
 			businessKey: "",
 			attempt: this.params.attempt,
 			startedAtMs: 0,

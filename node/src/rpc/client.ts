@@ -122,6 +122,7 @@ export class RpcClient {
 			kind: RpcCall,
 			subject: formatRpcCallSubject(serviceName, methodName),
 			peerServiceId: candidate.instance.serviceId,
+			peerInstanceId: useDirect ? candidate.instance.instanceId : "",
 			attempt: 0,
 			metaJson: rpcCallMeta(methodName, !useDirect, requestId, idempotencyKey),
 		});
@@ -236,6 +237,7 @@ export class RpcClient {
 					kind: RpcCall,
 					subject: formatRpcCallSubject(serviceName, methodName),
 					peerServiceId: candidate.instance.serviceId,
+					peerInstanceId: useDirect ? candidate.instance.instanceId : "",
 					attempt,
 					metaJson: rpcCallMeta(
 						methodName,
@@ -247,6 +249,8 @@ export class RpcClient {
 				callOp.captureIn(reqBytes, schema.contractHash);
 			} else {
 				callOp.setAttempt(attempt);
+				// Via the proxy the runtime picks the instance and knows it.
+				callOp.setPeerInstance(useDirect ? candidate.instance.instanceId : "");
 			}
 
 			const release = this.d.lb.acquire(candidate.instance.instanceId);

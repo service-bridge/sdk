@@ -193,6 +193,9 @@ describe("RpcClient.call telemetry", () => {
 		expect(start.subject).toBe("rpc.call:target-svc/Charge");
 		expect(start.status).toBe(Status.PENDING);
 		expect(end.status).toBe(Status.SUCCESS);
+		// The direct path knows which instance served the call (health key).
+		expect(start.peerInstanceId).toBe("inst-1");
+		expect(end.peerInstanceId).toBe("inst-1");
 	});
 
 	it("captures request and response when the runtime pushes capture=all", async () => {
