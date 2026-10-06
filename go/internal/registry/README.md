@@ -20,7 +20,8 @@
 | `AddIncoming(spec IncomingSpec)` | `error` | — | Объявляет один входящий хендлер. Отклоняет формы, на которые рантайм отвечает `InvalidArgument`. |
 | `AddHTTPRoute(httpMethod, pattern string)` | `error` | — | Объявляет роут собственного HTTP-сервера приложения. Имя = `"<METHOD> <pattern>"`, без схем и contract hash. |
 | `PublishEvent(name string, schemaJSON []byte, contractHash string)` | `error` | — | Объявляет событие, которое сервис публикует. |
-| `SubscribeEvent(pattern string, durable bool)` | `error` | — | Объявляет подписку. Повторный тот же `pattern` схлопывается в одну строку. |
+| `SubscribeEvent(pattern, filter string)` | `error` | — | Объявляет подписку с JSON фильтр-выражением (пусто — без фильтра). Повторный `pattern` — `ErrDuplicateSubscription`. |
+| `ErrDuplicateSubscription` | `error` | — | Шаблон уже объявлен. |
 | `AddOutgoing(serviceName, methodName string, typ pb.MethodType)` | `error` | — | Объявляет зависимость от чужого метода. Дубли по `(service, method, type)` схлопываются. |
 | `SetCallEndpoint(endpoint string)` | — | пусто | Адрес, по которому пиры дозваниваются для Direct RPC. |
 | `SetHTTPEndpoint(endpoint string)` | — | пусто | Адрес собственного HTTP-сервера приложения. |
@@ -81,6 +82,9 @@
 | `InstancesOf(service string)` | `[]*pb.ServiceInstanceInfo` | `nil` | Известные инстансы сервиса. |
 | `Instance(instanceID string)` | `(*pb.ServiceInstanceInfo, bool)` | — | Поиск инстанса по id. |
 | `Policy()` | `*pb.PolicyEvaluation` | `nil` | Последняя оценка политики. `nil` до первого снапшота. |
+| `Ready()` | `bool` | `false` | Применён ли первый снапшот (до него входящие вызовы не принимаются). |
+| `Revoked(serviceID, instanceID string)` | `bool` | `false` | Отозван ли сервис или инстанс. |
+| `RevokedSets()` | `(services, instances map[string]struct{})` | — | Копии множеств отзыва. |
 | `Capture()` | `CaptureState` | `DefaultCaptureState()` | Пришедшая от рантайма авторизация телеметрии. |
 | `EachMethod(fn func(*pb.MethodDescriptor) bool)` | — | — | Обход всех дескрипторов; `false` останавливает. Колбэк работает под read-lock. |
 | `EachInstance(fn func(*pb.ServiceInstanceInfo) bool)` | — | — | То же для инстансов. |
@@ -99,6 +103,7 @@
 | `AddedMethods` / `RemovedMethods` | `[]*pb.MethodDescriptor` | `nil` | Появившиеся и исчезнувшие дескрипторы. |
 | `AddedInstances` / `RemovedInstances` | `[]*pb.ServiceInstanceInfo` | `nil` | Появившиеся и исчезнувшие инстансы. |
 | `AddedPeers` / `RemovedPeers` | `[]string` | `nil` | Пиры, вошедшие в scope политики и вышедшие из него. |
+| `RevokedServices` / `RevokedInstances` | `[]string` | `nil` | Отзывы, объявленные кадром. |
 | `Policy` | `*pb.PolicyEvaluation` | `nil` | Не-nil, когда приехала новая оценка. Приходит целиком. |
 | `Capture` | `*CaptureState` | `nil` | Не-nil, когда авторизация телеметрии изменилась. |
 
@@ -121,13 +126,15 @@
 | `Watch.Cache()` | `*Cache` | — | Живой вид меша; доступен сразу после конструктора. |
 | `Watch.Start(ctx context.Context)` | `error` | — | Открывает стрим и держит его до отмены `ctx` или `Stop`. Повторный вызов — `stream.ErrAlreadyStarted`. |
 | `Watch.Stop()` | — | — | Закрывает стрим и освобождает горутины. Терминально. |
-| `Watch.Restart()` | — | — | Немедленно переоткрывает стрим (ротация сертификата, изменение объявлений после старта). |
-| `Watch.Ready(ctx context.Context)` | `error` | — | Блокируется до первого снапшота, т.е. до подтверждённой регистрации. |
+| `Watch.Restart()` | — | — | Немедленно переоткрывает стрим (новая сессия, изменение объявлений после старта). |
+| `Watch.Ready(ctx context.Context)` | `error` | — | Блокируется, пока текущий стрим не применил снапшот; после терминального отказа возвращает его. |
+| `Watch.Reregister(ctx context.Context)` | `error` | — | Переоткрывает стрим со свежим `RegisterRequest` и ждёт следующего снапшота — подтверждения. Так `Stop` снимает `call_endpoint`. |
 | `cfg.Clients` | `ClientSource` | — (обязательный) | Источник стаба `Registry` на каждое открытие. |
 | `cfg.Request` | `func() *pb.RegisterRequest` | — (обязательный) | Строит кадр регистрации на каждое открытие. |
 | `cfg.OnChange` | `func(Change)` | `nil` | Что сделал каждый кадр. Выполняется на горутине watch. |
 | `cfg.OnPolicyWarnings` | `func([]*pb.PolicyViolation)` | `nil` | Нарушения, о которых рантайм сообщает вместо отказа в регистрации. |
 | `cfg.OnError` | `func(error)` | `nil` | Сбои стрима. Переподключение идёт в любом случае. |
+| `cfg.OnTerminal` | `func(error)` | `nil` | Рантайм отверг саму регистрацию (`INVALID_ARGUMENT` — например, невалидный фильтр или дубль шаблона, `FAILED_PRECONDITION`, отказ идентичности). Watch остановлен. |
 | `cfg.Backoff` | `stream.Backoff` | `stream.NewBackoff()` | Лестница переподключения. |
 | `cfg.Logger` | `*slog.Logger` | `slog.Default()` | Логгер. |
 | `ClientSource` | интерфейс | — | `RegistryClient(ctx context.Context) (pb.RegistryClient, error)`. |
@@ -159,7 +166,11 @@
 
 **Правила рантайма продублированы на клиенте.** `AddIncoming`/`AddOutgoing` отклоняют ровно те формы, на которые `runtime/internal/registry/server.go` отвечает `InvalidArgument` (события в `incoming`, `output_schema_json` у `JOB`/`HTTP`, `JOB` без спецификации, `EVENT`/`JOB` в исходящих зависимостях). Плохое объявление падает там, где оно написано, а не через round trip на старте. Тест `TestBuildRegisterRequestNeverProducesAFrameTheRuntimeRejects` держит эти два списка синхронными.
 
-**Дедуп на стороне объявлений.** У `event_subscriptions` на сервере `PRIMARY KEY (subscriber_id, pattern)`: второй ряд с тем же паттерном откатывает всю регистрацию. Fan-out по нескольким хендлерам одного паттерна — внутреннее дело SDK. Исходящие зависимости схлопываются по `(service, method, type)`, чтобы сгенерированный клиент и ручное объявление не раздували кадр.
+**Один шаблон — одна подписка.** Рантайм отвечает `INVALID_ARGUMENT` на дубль шаблона и на невалидный фильтр, и это терминально (`OnTerminal`): повторная регистрация того же запроса ответит так же. Дубль ловится уже при объявлении.
+
+**Отзыв.** `revoked_instances` (instance id) действует до конца процесса; `revoked_services` (UUID сервиса) снимается, когда инстанс этого сервиса снова появляется в `added_instances` или снапшоте.
+
+**Готовность — на поток.** `Ready` отражает текущий стрим: после переподключения он снова ждёт снапшот, поэтому `Client.Ready` говорит правду и во время реконнекта. Исходящие зависимости схлопываются по `(service, method, type)`, чтобы сгенерированный клиент и ручное объявление не раздували кадр.
 
 **Схемы исходящих зависимостей живут рядом с объявлениями, а не рядом с типизированным хендлом.** Значение `Method[Req, Resp]`, которое отдаёт `NewMethod`, знает свои типы, но шаг `call` в workflow до этого значения не доезжает: он держит имя сервиса и имя метода — иногда вычисленные из состояния прогона — и JSON-дерево. Без общей таблицы такой шаг может уйти на провод только с пустым contract hash, а пустой хеш совпадает только с пустым и не находит ни одного типизированного хендлера. Таблица заполняется там же, где объявляется само ребро, поэтому «объявил зависимость, но забыл схему» невыразимо.
 
@@ -183,4 +194,4 @@
 
 Опирается на: `internal/pb/servicebridge/v1` (контракт `Registry`), `internal/stream` (супервизор и лестница переподключения), `google.golang.org/protobuf/proto` (типы в `CallSchema`), stdlib (`sync`, `sort`, `log/slog`, `context`).
 
-На него опираются: `internal/connection` (поднимает watch после провижининга идентичности и дёргает `Restart` на ротации), будущий call-путь (кандидаты для Direct RPC), телеметрия (`Capture()` как источник авторизации захвата), корневой `generic.go` (`NewMethod` наполняет `CallSchemas`, шаг `call` в workflow её читает).
+На него опираются: корневой пакет (поднимает watch на каждой сессии, `Reregister` при остановке, `Ready`), `internal/rpc` (`Cache` как `CandidateSource` и `AdmissionSource`), телеметрия (`Capture()` как источник авторизации захвата), корневой `generic.go` (`NewMethod` наполняет `CallSchemas`, шаг `call` в workflow её читает).

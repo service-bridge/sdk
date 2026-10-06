@@ -2,12 +2,14 @@ package connection
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/service-bridge/sdk/go/internal/stream"
@@ -26,7 +28,16 @@ const (
 	// leaves shorter than the rotation lead would otherwise put every client
 	// into a refresh hot loop the moment it connects.
 	DefaultMinRotateDelay = 5 * time.Second
+
+	// DefaultRotateRetry is the wait after a failed renewal. RefreshCert is rate
+	// limited on the runtime (ResourceExhausted), and a transient failure well
+	// ahead of expiry has time to heal; neither needs a tighter loop.
+	DefaultRotateRetry = 60 * time.Second
 )
+
+// ErrDrained is the cause of a session the runtime closed after announcing a
+// drain. The reconnect that follows is routine and is logged as such.
+var ErrDrained = errors.New("connection: runtime drained the session")
 
 // terminalCodes are the gRPC codes no ladder can fix: the identity is rejected,
 // the service is unknown, or the request itself is malformed. Retrying them
@@ -37,6 +48,9 @@ var terminalCodes = map[codes.Code]struct{}{
 	codes.PermissionDenied: {},
 	codes.NotFound:         {},
 	codes.InvalidArgument:  {},
+	// The runtime refuses a protocol revision it does not speak with
+	// FAILED_PRECONDITION; reconnecting to the same runtime cannot change it.
+	codes.FailedPrecondition: {},
 }
 
 // LifecycleConfig wires the connection lifecycle. See ./README.md.
@@ -57,6 +71,7 @@ type LifecycleConfig struct {
 	RotateLead     time.Duration
 	RotateJitter   time.Duration
 	MinRotateDelay time.Duration
+	RotateRetry    time.Duration
 
 	Random func() float64
 	Now    func() time.Time
@@ -88,6 +103,12 @@ type Lifecycle struct {
 	rotateNow chan struct{}
 	done      chan struct{}
 	final     sync.Once
+
+	// cert is the leaf every TLS configuration presents on its next handshake,
+	// and tlsConfig is the one configuration all channels are built from. A
+	// renewal swaps cert and nothing else.
+	cert      atomic.Pointer[tls.Certificate]
+	tlsConfig *tls.Config
 
 	mu        sync.Mutex
 	started   bool
@@ -140,6 +161,9 @@ func NewLifecycle(cfg LifecycleConfig) (*Lifecycle, error) {
 	if cfg.MinRotateDelay <= 0 {
 		cfg.MinRotateDelay = DefaultMinRotateDelay
 	}
+	if cfg.RotateRetry <= 0 {
+		cfg.RotateRetry = DefaultRotateRetry
+	}
 	if cfg.Random == nil {
 		cfg.Random = rand.Float64
 	}
@@ -150,19 +174,27 @@ func NewLifecycle(cfg LifecycleConfig) (*Lifecycle, error) {
 		cfg.Logger = slog.Default()
 	}
 
-	return &Lifecycle{
+	l := &Lifecycle{
 		cfg:       cfg,
 		rotateNow: make(chan struct{}, 1),
 		done:      make(chan struct{}),
-	}, nil
+	}
+	l.tlsConfig = RotatingTLSConfig(cfg.CACert, l.cert.Load)
+	return l, nil
+}
+
+// credentials is the material one lease publishes: the shared rotating TLS
+// configuration plus the lease itself for consumers that need the raw leaf.
+func (l *Lifecycle) credentials(lease Lease) Credentials {
+	return Credentials{Addr: l.cfg.Addr, Lease: lease, TLS: l.tlsConfig}
 }
 
 // Credentials exposes the registry every mTLS consumer registers with.
 func (l *Lifecycle) Credentials() *CredentialRegistry { return l.cfg.Credentials }
 
-// Identity reports the identity of the live session. It satisfies
-// IdentitySource: consumers must call it per use, because every rotation mints
-// a fresh instanceID under the same serviceID.
+// Identity reports the identity of the live session. Consumers call it per use:
+// a re-provisioned lease (after the old one expired offline) carries a new
+// instance.
 func (l *Lifecycle) Identity() SessionIdentity {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -283,7 +315,7 @@ func (l *Lifecycle) run(ctx context.Context) {
 	defer timer.Stop()
 	l.armRotation(timer)
 
-	attempt, rotateAttempt := 0, 0
+	attempt := 0
 
 	for {
 		sess := l.currentSession()
@@ -312,6 +344,9 @@ func (l *Lifecycle) run(ctx context.Context) {
 
 		case <-sess.done:
 			cause := sess.endErr
+			if sess.drained.Load() {
+				cause = fmt.Errorf("%w: %w", ErrDrained, cause)
+			}
 			l.cfg.Logger.Info("connection: control stream ended", "session_id", l.Identity().SessionID, "error", cause)
 			l.drop(ctx, sess)
 			if isTerminal(cause) {
@@ -323,20 +358,20 @@ func (l *Lifecycle) run(ctx context.Context) {
 			}
 
 		case <-timer.C:
-			if !l.rotateOnce(ctx, sess, timer, &rotateAttempt) {
+			if !l.rotateOnce(ctx, sess, timer) {
 				return
 			}
 
 		case <-l.rotateNow:
-			if !l.rotateOnce(ctx, sess, timer, &rotateAttempt) {
+			if !l.rotateOnce(ctx, sess, timer) {
 				return
 			}
 		}
 	}
 }
 
-// leaseSource yields the certificate one connect attempt runs on. It is the
-// ONLY difference between a first connect, a reconnect and a rotation.
+// leaseSource yields the certificate one connect attempt runs on: the cached
+// leaf, or a freshly provisioned one.
 type leaseSource func(ctx context.Context) (Lease, error)
 
 // connect is the connection path. Every session in the SDK is born here, so
@@ -357,11 +392,8 @@ func (l *Lifecycle) connect(attemptCtx, sessionCtx context.Context, source lease
 	if err != nil {
 		return err
 	}
-	creds := Credentials{
-		Addr:  l.cfg.Addr,
-		Lease: lease,
-		TLS:   MutualTLSConfig(l.cfg.CACert, lease.TLSCert),
-	}
+	l.cert.Store(&lease.TLSCert)
+	creds := l.credentials(lease)
 
 	endpoint, err := l.startInbound(attemptCtx)
 	if err != nil {
@@ -380,6 +412,11 @@ func (l *Lifecycle) connect(attemptCtx, sessionCtx context.Context, source lease
 	if err != nil {
 		l.discard(attemptCtx, sess)
 		return err
+	}
+	if v := welcome.GetProtocolVersion(); v != 0 && v != ProtocolVersion {
+		l.discard(attemptCtx, sess)
+		return newError(KindProtocol, op,
+			fmt.Sprintf("runtime speaks protocol %d, this SDK speaks %d", v, ProtocolVersion), nil)
 	}
 
 	id := SessionIdentity{
@@ -431,7 +468,7 @@ func (l *Lifecycle) connect(attemptCtx, sessionCtx context.Context, source lease
 // denial of service, so the cached leaf is reused until it enters the renewal
 // window, where it needs replacing anyway.
 func (l *Lifecycle) leaseForConnect(ctx context.Context) (Lease, error) {
-	if lease, ok := l.cachedLease(); ok && l.cfg.Now().Before(lease.NotAfter.Add(-l.cfg.RotateLead)) {
+	if lease, ok := l.cachedLease(); ok && l.cfg.Now().Before(time.UnixMilli(lease.NotAfterUnixMs).Add(-l.cfg.RotateLead)) {
 		return lease, nil
 	}
 	return l.cfg.Provisioner.Provision(ctx)
@@ -546,7 +583,11 @@ func (l *Lifecycle) waitLadder(ctx context.Context, attempt *int, cause error) b
 	delay := l.cfg.Backoff.Delay(*attempt)
 	*attempt++
 	l.cfg.Observer.Reconnecting(*attempt, cause)
-	l.cfg.Logger.Warn("connection: reconnect scheduled",
+	level := slog.LevelWarn
+	if errors.Is(cause, ErrDrained) {
+		level = slog.LevelInfo
+	}
+	l.cfg.Logger.Log(ctx, level, "connection: reconnect scheduled",
 		"attempt", *attempt, "delay_ms", delay.Milliseconds(), "cause", cause)
 
 	timer := time.NewTimer(delay)
@@ -573,8 +614,14 @@ func (l *Lifecycle) finish(cause error) {
 	l.final.Do(func() { l.cfg.Observer.Disconnected(cause) })
 }
 
-// isTerminal reports whether err carries a gRPC code no retry can fix.
+// IsTerminal reports whether err ends the lifecycle: a gRPC code no retry can
+// fix, or a protocol revision the runtime does not speak.
+func IsTerminal(err error) bool { return isTerminal(err) }
+
 func isTerminal(err error) bool {
+	if errors.Is(err, ErrProtocol) {
+		return true
+	}
 	var carrier interface{ GRPCStatus() *status.Status }
 	if !errors.As(err, &carrier) {
 		return false

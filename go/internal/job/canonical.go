@@ -265,7 +265,7 @@ func (s Spec) CanonicalJSON() ([]byte, error) {
 		Retry:         s.Retry,
 	}
 	for _, d := range s.Deps {
-		c.Deps = append(c.Deps, canonicalDep{Kind: d.Kind, Target: d.Target})
+		c.Deps = append(c.Deps, canonicalDep(d))
 	}
 	out, err := json.Marshal(c)
 	if err != nil {

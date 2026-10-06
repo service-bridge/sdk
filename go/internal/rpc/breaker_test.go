@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -363,5 +364,29 @@ func TestBreakerConfigNormalizesOutOfRangeValues(t *testing.T) {
 	}
 	if b.Allows(k) {
 		t.Fatal("a normalized config must still trip on the default thresholds")
+	}
+}
+
+func TestBreakerFailureFollowsTheErrorModel(t *testing.T) {
+	failures := []error{
+		status.Error(codes.Unavailable, "x"), status.Error(codes.DeadlineExceeded, "x"),
+		status.Error(codes.ResourceExhausted, "x"), status.Error(codes.Internal, "x"),
+		status.Error(codes.Unknown, "x"), status.Error(codes.DataLoss, "x"), status.Error(codes.Aborted, "x"),
+		&NotDispatchedError{Err: ErrPeerUnreachable, Direct: true},
+	}
+	for _, err := range failures {
+		if !BreakerFailure(err) {
+			t.Errorf("%v must count against the instance", err)
+		}
+	}
+	successes := []error{
+		nil, handlerError("VALIDATION", "no"), status.Error(codes.PermissionDenied, "x"),
+		status.Error(codes.NotFound, "x"), status.Error(codes.InvalidArgument, "x"),
+		status.Error(codes.Canceled, "x"), errors.New("local"),
+	}
+	for _, err := range successes {
+		if BreakerFailure(err) {
+			t.Errorf("%v means the instance answered; it must not count", err)
+		}
 	}
 }

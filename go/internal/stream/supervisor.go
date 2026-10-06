@@ -39,6 +39,11 @@ type Config[M any, S Receiver[M]] struct {
 	// owns the reconnect decision. A clean close is not an error and is not
 	// reported here.
 	OnError func(err error)
+	// Terminal, when set, marks failures no reopen can fix. The supervisor
+	// stops on the first one and hands it to OnTerminal instead of going on the
+	// ladder.
+	Terminal   func(err error) bool
+	OnTerminal func(err error)
 	// OnBackoff reports the delay chosen before the next reopen.
 	OnBackoff func(attempt int, delay time.Duration)
 	// Backoff pins the reconnect ladder. Zero value falls back to NewBackoff().
@@ -171,6 +176,9 @@ func (s *Supervisor[M, S]) run(ctx context.Context) {
 		st, err := s.cfg.Open(streamCtx)
 		if err != nil {
 			cancelStream()
+			if s.terminal(err) {
+				return
+			}
 			s.reportError(fmt.Errorf("stream: %s: open: %w", s.cfg.Name, err))
 			if !s.wait(ctx, &attempt) {
 				return
@@ -194,6 +202,9 @@ func (s *Supervisor[M, S]) run(ctx context.Context) {
 			// unhealthy — the ladder must not carry over.
 			attempt = 0
 		case outcomeBroken:
+			if recvErr != nil && s.terminal(recvErr) {
+				return
+			}
 			if recvErr != nil && !errors.Is(recvErr, io.EOF) {
 				s.reportError(fmt.Errorf("stream: %s: recv: %w", s.cfg.Name, recvErr))
 			}
@@ -276,6 +287,19 @@ func (s *Supervisor[M, S]) wait(ctx context.Context, attempt *int) bool {
 	case <-t.C:
 		return true
 	}
+}
+
+// terminal reports err to OnTerminal and returns true when the config marks it
+// as unfixable by a reopen.
+func (s *Supervisor[M, S]) terminal(err error) bool {
+	if s.cfg.Terminal == nil || !s.cfg.Terminal(err) {
+		return false
+	}
+	s.cfg.Logger.Error("stream: terminal failure", "stream", s.cfg.Name, "err", err)
+	if s.cfg.OnTerminal != nil {
+		s.cfg.OnTerminal(err)
+	}
+	return true
 }
 
 func (s *Supervisor[M, S]) reportError(err error) {

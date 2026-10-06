@@ -7,12 +7,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sort"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/service-bridge/sdk/go/internal/outbox"
 	pb "github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1"
 	"github.com/service-bridge/sdk/go/internal/telemetry"
 )
@@ -64,86 +63,65 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// clock is a settable unix-ms source.
-type clock struct{ ms atomic.Int64 }
-
-func newClock(startMs int64) *clock {
-	c := &clock{}
-	c.ms.Store(startMs)
-	return c
-}
-
-func (c *clock) now() int64          { return c.ms.Load() }
-func (c *clock) advance(delta int64) { c.ms.Add(delta) }
-
-// recordingPublish captures every PublishRequest and answers with whatever the
-// current responder returns.
-type recordingPublish struct {
+// fakeRuntime answers Publish. verdict decides each envelope; nil accepts.
+type fakeRuntime struct {
 	mu       sync.Mutex
-	requests []*pb.PublishRequest
-	respond  func(*pb.PublishRequest) (*pb.PublishResponse, error)
-	calls    atomic.Int64
+	requests [][]*pb.EventEnvelope
+	verdict  func(call int, env *pb.EventEnvelope) (*pb.PublishStatusEntry, error)
+	gate     chan struct{} // when set, every Publish waits for it
+	calls    chan int
 }
 
-func (r *recordingPublish) publish(_ context.Context, req *pb.PublishRequest) (*pb.PublishResponse, error) {
-	r.calls.Add(1)
-	r.mu.Lock()
-	r.requests = append(r.requests, req)
-	respond := r.respond
-	r.mu.Unlock()
-	if respond == nil {
-		return acceptAll(req), nil
+func newFakeRuntime() *fakeRuntime { return &fakeRuntime{calls: make(chan int, 1024)} }
+
+func (f *fakeRuntime) publish(ctx context.Context, req *pb.PublishRequest) (*pb.PublishResponse, error) {
+	f.mu.Lock()
+	f.requests = append(f.requests, req.GetEvents())
+	n := len(f.requests)
+	verdict, gate := f.verdict, f.gate
+	f.mu.Unlock()
+	f.calls <- n
+
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
-	return respond(req)
-}
-
-func (r *recordingPublish) setResponder(fn func(*pb.PublishRequest) (*pb.PublishResponse, error)) {
-	r.mu.Lock()
-	r.respond = fn
-	r.mu.Unlock()
-}
-
-func (r *recordingPublish) lastRequest() *pb.PublishRequest {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if len(r.requests) == 0 {
-		return nil
-	}
-	return r.requests[len(r.requests)-1]
-}
-
-func acceptAll(req *pb.PublishRequest) *pb.PublishResponse {
 	resp := &pb.PublishResponse{}
-	for _, e := range req.GetEvents() {
-		resp.Results = append(resp.Results, &pb.PublishStatusEntry{
-			EventId: e.GetId(),
-			Status:  pb.PublishStatus_PUBLISH_STATUS_ACCEPTED,
-		})
+	for _, env := range req.GetEvents() {
+		entry := &pb.PublishStatusEntry{EventId: env.GetId(), Status: pb.PublishStatus_PUBLISH_STATUS_ACCEPTED}
+		if verdict != nil {
+			v, err := verdict(n, env)
+			if err != nil {
+				return nil, err
+			}
+			if v != nil {
+				entry = v
+			}
+		}
+		resp.Results = append(resp.Results, entry)
 	}
-	return resp
+	return resp, nil
 }
 
-func openStorage(t *testing.T, dir string) *outbox.Storage {
-	t.Helper()
-	st, err := outbox.Open(context.Background(), outbox.Config{Dir: dir})
-	if err != nil {
-		t.Fatalf("open outbox: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-	return st
+func (f *fakeRuntime) sent() [][]*pb.EventEnvelope {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([][]*pb.EventEnvelope(nil), f.requests...)
 }
 
-func newTestPublisher(t *testing.T, st *outbox.Storage, pub PublishFunc, opts ...func(*PublisherConfig)) *Publisher {
+func newTestPublisher(t *testing.T, rt *fakeRuntime, tweak func(*PublisherConfig)) *Publisher {
 	t.Helper()
 	cfg := PublisherConfig{
-		Storage:  st,
-		Codec:    testCodec{},
-		Publish:  pub,
-		Identity: testIdentity,
-		Logger:   discardLogger(),
+		Codec:       testCodec{},
+		Publish:     rt.publish,
+		RetryLadder: []time.Duration{time.Millisecond},
+		Logger:      discardLogger(),
 	}
-	for _, opt := range opts {
-		opt(&cfg)
+	if tweak != nil {
+		tweak(&cfg)
 	}
 	p, err := NewPublisher(cfg)
 	if err != nil {
@@ -152,431 +130,362 @@ func newTestPublisher(t *testing.T, st *outbox.Storage, pub PublishFunc, opts ..
 	return p
 }
 
-func TestPublishReturnsFast(t *testing.T) {
-	st := openStorage(t, t.TempDir())
-	// A transport that never answers: a publish that waited on it would hang.
-	blocked := func(ctx context.Context, _ *pb.PublishRequest) (*pb.PublishResponse, error) {
-		<-ctx.Done()
-		return nil, ctx.Err()
+func startPublisher(t *testing.T, p *Publisher) {
+	t.Helper()
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
 	}
-	p := newTestPublisher(t, st, blocked)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		p.Close(ctx)
+	})
+}
 
-	start := time.Now()
+func TestPublishResolvesOnTheRuntimeAcknowledgement(t *testing.T) {
+	rt := newFakeRuntime()
+	p := newTestPublisher(t, rt, nil)
+	startPublisher(t, p)
+
+	ctx := telemetry.WithTraceContext(context.Background(), telemetry.TraceContext{})
+	id, err := p.Publish(ctx, "order.created", order{ID: "o1", Total: 3},
+		WithPartitionKey("o1"), WithIdempotencyKey("k1"), WithHeaders(map[string]string{"h": "v"}), WithOccurredAt(42))
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	reqs := rt.sent()
+	if len(reqs) != 1 || len(reqs[0]) != 1 {
+		t.Fatalf("requests %v", reqs)
+	}
+	env := reqs[0][0]
+	if env.GetId() != id || env.GetName() != "order.created" || env.GetPartitionKey() != "o1" ||
+		env.GetIdempotencyKey() != "k1" || env.GetHeaders()["h"] != "v" || env.GetOccurredAtUnixMs() != 42 ||
+		env.GetContractHash() != "hash-order.created" {
+		t.Fatalf("envelope %+v", env)
+	}
+	if string(env.GetPayloadJson()) != `{"id":"o1","total":3}` {
+		t.Fatalf("payload_json %q: it must always be filled", env.GetPayloadJson())
+	}
+	if p.Pending() != 0 {
+		t.Fatalf("pending %d after the acknowledgement", p.Pending())
+	}
+}
+
+func TestEventIDsRiseInPublishOrder(t *testing.T) {
+	rt := newFakeRuntime()
+	p := newTestPublisher(t, rt, nil)
+	var ids []string
 	for i := range 50 {
-		if _, err := p.Publish(context.Background(), "order.created", order{ID: fmt.Sprint(i)}); err != nil {
-			t.Fatalf("Publish: %v", err)
+		id, err := p.Publish(context.Background(), "order.created", order{Total: i}, WithFireAndForget())
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if !sort.StringsAreSorted(ids) {
+		t.Fatalf("ids are not monotonic: %v", ids)
+	}
+}
+
+func TestFullQueueFailsAtOnce(t *testing.T) {
+	rt := newFakeRuntime()
+	p := newTestPublisher(t, rt, func(c *PublisherConfig) { c.MaxPending = 2 })
+	for range 2 {
+		if _, err := p.Publish(context.Background(), "order.created", order{}, WithFireAndForget()); err != nil {
+			t.Fatal(err)
 		}
 	}
-	elapsed := time.Since(start)
-	if elapsed > 500*time.Millisecond {
-		t.Fatalf("50 publishes took %v, want under 500ms — publish must be a local insert", elapsed)
-	}
-	if st.Rows() != 50 {
-		t.Fatalf("outbox holds %d rows, want 50", st.Rows())
+	_, err := p.Publish(context.Background(), "order.created", order{}, WithFireAndForget())
+	if !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("got %v, want ErrQueueFull", err)
 	}
 }
 
-func TestPublishedEventSurvivesRestart(t *testing.T) {
-	dir := t.TempDir()
-	ctx := context.Background()
-
-	st, err := outbox.Open(ctx, outbox.Config{Dir: dir})
-	if err != nil {
-		t.Fatalf("open outbox: %v", err)
-	}
-	p := newTestPublisher(t, st, (&recordingPublish{}).publish)
-	id, err := p.Publish(ctx, "order.created", order{ID: "o-1", Total: 42},
-		WithPartitionKey("cust-1"), WithHeaders(map[string]string{"tenant": "acme"}))
-	if err != nil {
-		t.Fatalf("Publish: %v", err)
-	}
-	if err := st.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	reopened, err := outbox.Open(ctx, outbox.Config{Dir: dir})
-	if err != nil {
-		t.Fatalf("reopen outbox: %v", err)
-	}
-	defer func() { _ = reopened.Close() }()
-
-	rec, status, err := reopened.Load(ctx, id)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if status != outbox.StatusPending {
-		t.Fatalf("status = %q after restart, want pending", status)
-	}
-	if rec.PartitionKey != "cust-1" || rec.Headers["tenant"] != "acme" {
-		t.Fatalf("record lost fields across the restart: %+v", rec)
-	}
-	var got order
-	if err := (testCodec{}).Decode("order.created", rec.Payload, &got); err != nil {
-		t.Fatalf("decode restored payload: %v", err)
-	}
-	if got.ID != "o-1" || got.Total != 42 {
-		t.Fatalf("restored payload = %+v", got)
-	}
-}
-
-func TestPublishStoresBothWireForms(t *testing.T) {
-	st := openStorage(t, t.TempDir())
-	p := newTestPublisher(t, st, (&recordingPublish{}).publish)
-	ctx := context.Background()
-
-	id, err := p.Publish(ctx, "order.created", order{ID: "o-1", Total: 7})
-	if err != nil {
-		t.Fatalf("Publish: %v", err)
-	}
-	rec, _, err := st.Load(ctx, id)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	// The runtime's ingest hook fires for every accepted event and reads the
-	// JSON mirror to evaluate workflow wait_event filters, so it can never be
-	// skipped.
-	if string(rec.PayloadJSON) != `{"id":"o-1","total":7}` {
-		t.Fatalf("payload_json = %q, want the JSON mirror of the payload", rec.PayloadJSON)
-	}
-	if string(rec.Payload) != `proto:{"id":"o-1","total":7}` {
-		t.Fatalf("payload = %q, want the canonical form", rec.Payload)
-	}
-	if rec.ContractHash != "hash-order.created" {
-		t.Fatalf("contract_hash = %q", rec.ContractHash)
-	}
-}
-
-func TestPublishRejectsMalformedName(t *testing.T) {
-	st := openStorage(t, t.TempDir())
-	p := newTestPublisher(t, st, (&recordingPublish{}).publish)
-
-	for _, name := range []string{"", "Order.Created", "order..created", ".order", "order.", "order created", "order/created"} {
-		_, err := p.Publish(context.Background(), name, order{})
-		if !errors.Is(err, ErrInvalidName) {
-			t.Fatalf("Publish(%q) error = %v, want ErrInvalidName", name, err)
+func TestTimeoutSaysWhetherTheEventWasSent(t *testing.T) {
+	t.Run("never sent", func(t *testing.T) {
+		rt := newFakeRuntime()
+		p := newTestPublisher(t, rt, func(c *PublisherConfig) { c.Timeout = 20 * time.Millisecond })
+		_, err := p.Publish(context.Background(), "order.created", order{})
+		if !errors.Is(err, ErrNotSent) {
+			t.Fatalf("got %v, want ErrNotSent", err)
 		}
-	}
-	for _, name := range []string{"order", "order.created", "order-v2.created_at", "a.b.c.d"} {
-		if !ValidEventName(name) {
-			t.Fatalf("ValidEventName(%q) = false", name)
+		if p.Pending() != 0 {
+			t.Fatal("an abandoned unsent event must leave the queue")
 		}
-	}
-	if st.Rows() != 0 {
-		t.Fatalf("a rejected name reached the outbox: %d rows", st.Rows())
-	}
-}
-
-func TestPublishRefusesWhenOutboxIsFull(t *testing.T) {
-	st := openStorage(t, t.TempDir())
-	p := newTestPublisher(t, st, (&recordingPublish{}).publish, func(c *PublisherConfig) {
-		c.MaxOutboxRows = 2
 	})
-	ctx := context.Background()
-
-	for i := range 2 {
-		if _, err := p.Publish(ctx, "order.created", order{ID: fmt.Sprint(i)}); err != nil {
-			t.Fatalf("Publish %d: %v", i, err)
+	t.Run("sent, never settled", func(t *testing.T) {
+		rt := newFakeRuntime()
+		rt.verdict = func(int, *pb.EventEnvelope) (*pb.PublishStatusEntry, error) {
+			return nil, errors.New("transport down")
 		}
-	}
-	_, err := p.Publish(ctx, "order.created", order{ID: "overflow"})
-	if !errors.Is(err, ErrOutboxFull) {
-		t.Fatalf("Publish past the cap error = %v, want ErrOutboxFull", err)
-	}
-	if !errors.Is(err, outbox.ErrFull) {
-		t.Fatalf("ErrOutboxFull must match outbox.ErrFull, got %v", err)
-	}
-}
-
-func TestPublishCarriesTheTraceFromContext(t *testing.T) {
-	st := openStorage(t, t.TempDir())
-	p := newTestPublisher(t, st, (&recordingPublish{}).publish)
-
-	tc, err := telemetry.NewRootContext()
-	if err != nil {
-		t.Fatalf("NewRootContext: %v", err)
-	}
-	ctx := telemetry.WithTraceContext(context.Background(), tc)
-
-	id, err := p.Publish(ctx, "order.created", order{ID: "o-1"})
-	if err != nil {
-		t.Fatalf("Publish: %v", err)
-	}
-	rec, _, err := st.Load(ctx, id)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if rec.Trace != telemetry.FormatHeader(tc) {
-		t.Fatalf("x_sb_trace = %q, want %q", rec.Trace, telemetry.FormatHeader(tc))
-	}
-
-	// Without a trace in ctx the field stays empty and the runtime mints a root.
-	id2, err := p.Publish(context.Background(), "order.created", order{ID: "o-2"})
-	if err != nil {
-		t.Fatalf("Publish: %v", err)
-	}
-	rec2, _, err := st.Load(context.Background(), id2)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if rec2.Trace != "" {
-		t.Fatalf("x_sb_trace = %q without a trace in ctx, want empty", rec2.Trace)
-	}
-}
-
-func TestFireAndForgetBypassesTheOutbox(t *testing.T) {
-	st := openStorage(t, t.TempDir())
-	transport := &recordingPublish{}
-	p := newTestPublisher(t, st, transport.publish)
-
-	id, err := p.Publish(context.Background(), "order.created", order{ID: "o-1"}, WithFireAndForget())
-	if err != nil {
-		t.Fatalf("Publish: %v", err)
-	}
-	if st.Rows() != 0 {
-		t.Fatalf("the no-wait path buffered %d rows, want 0", st.Rows())
-	}
-	req := transport.lastRequest()
-	if req == nil {
-		t.Fatal("the no-wait path sent nothing")
-	}
-	env := req.GetEvents()[0]
-	if env.GetId() != id {
-		t.Fatalf("envelope = %+v", env)
-	}
-	if len(env.GetPayloadJson()) == 0 {
-		t.Fatal("the no-wait path dropped the JSON mirror; the runtime hook needs it for every accepted event")
-	}
-}
-
-func TestFireAndForgetSurfacesTransportAndPolicyFailures(t *testing.T) {
-	st := openStorage(t, t.TempDir())
-	transport := &recordingPublish{}
-	p := newTestPublisher(t, st, transport.publish)
-	ctx := context.Background()
-
-	transport.setResponder(func(*pb.PublishRequest) (*pb.PublishResponse, error) {
-		return nil, errors.New("runtime unreachable")
+		p := newTestPublisher(t, rt, func(c *PublisherConfig) { c.Timeout = 50 * time.Millisecond })
+		startPublisher(t, p)
+		_, err := p.Publish(context.Background(), "order.created", order{})
+		if !errors.Is(err, ErrOutcomeUnknown) {
+			t.Fatalf("got %v, want ErrOutcomeUnknown", err)
+		}
+		waitFor(t, func() bool { return p.Pending() == 0 })
 	})
-	if _, err := p.Publish(ctx, "order.created", order{}, WithFireAndForget()); err == nil {
-		t.Fatal("the no-wait path swallowed a transport failure")
-	}
+}
 
-	transport.setResponder(func(req *pb.PublishRequest) (*pb.PublishResponse, error) {
-		return &pb.PublishResponse{Results: []*pb.PublishStatusEntry{{
-			EventId: req.GetEvents()[0].GetId(),
-			Status:  pb.PublishStatus_PUBLISH_STATUS_REJECTED_FORBIDDEN,
-			Message: "event.publish denied",
-		}}}, nil
-	})
-	_, err := p.Publish(ctx, "order.created", order{}, WithFireAndForget())
-	if !errors.Is(err, ErrRejected) {
-		t.Fatalf("policy denial error = %v, want ErrRejected", err)
+func TestCallerCancellationAbandonsTheEvent(t *testing.T) {
+	p := newTestPublisher(t, newFakeRuntime(), nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := p.Publish(ctx, "order.created", order{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v", err)
+	}
+	if p.Pending() != 0 {
+		t.Fatal("a cancelled unsent event must leave the queue")
 	}
 }
 
-func TestPublishKicksTheDrain(t *testing.T) {
-	st := openStorage(t, t.TempDir())
-	var kicks atomic.Int64
-	p := newTestPublisher(t, st, (&recordingPublish{}).publish, func(c *PublisherConfig) {
-		c.Kick = func() { kicks.Add(1) }
-	})
+// One batch in flight, at most BatchSize events, at most one per partition
+// key — and every key keeps its publish order.
+func TestBatchesKeepOneEventPerKeyAndPerKeyOrder(t *testing.T) {
+	rt := newFakeRuntime()
+	p := newTestPublisher(t, rt, func(c *PublisherConfig) { c.BatchSize = 3 })
 
-	if _, err := p.Publish(context.Background(), "order.created", order{}); err != nil {
-		t.Fatalf("Publish: %v", err)
-	}
-	if kicks.Load() != 1 {
-		t.Fatalf("kicks = %d, want 1", kicks.Load())
-	}
-	if _, err := p.Publish(context.Background(), "order.created", order{}, WithFireAndForget()); err != nil {
-		t.Fatalf("Publish: %v", err)
-	}
-	if kicks.Load() != 1 {
-		t.Fatal("the no-wait path kicked the drain although it buffered nothing")
-	}
-}
-
-func TestPublishUsesTheSuppliedOccurredAt(t *testing.T) {
-	st := openStorage(t, t.TempDir())
-	c := newClock(1_700_000_000_000)
-	p := newTestPublisher(t, st, (&recordingPublish{}).publish, func(cfg *PublisherConfig) {
-		cfg.Now = c.now
-	})
-	ctx := context.Background()
-
-	id, err := p.Publish(ctx, "order.created", order{}, WithOccurredAt(1_600_000_000_000))
-	if err != nil {
-		t.Fatalf("Publish: %v", err)
-	}
-	rec, _, err := st.Load(ctx, id)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if rec.OccurredAtMs != 1_600_000_000_000 {
-		t.Fatalf("occurred_at_ms = %d, want the supplied value", rec.OccurredAtMs)
-	}
-	if rec.EnqueuedAtMs != 1_700_000_000_000 {
-		t.Fatalf("enqueued_at_ms = %d, want the clock value", rec.EnqueuedAtMs)
-	}
-}
-
-func TestPublishReportsEncodeFailure(t *testing.T) {
-	st := openStorage(t, t.TempDir())
-	boom := errors.New("no schema registered")
-	p := newTestPublisher(t, st, (&recordingPublish{}).publish, func(c *PublisherConfig) {
-		c.Codec = testCodec{encodeErr: boom}
-	})
-	_, err := p.Publish(context.Background(), "order.created", order{})
-	if !errors.Is(err, boom) {
-		t.Fatalf("Publish error = %v, want the codec failure", err)
-	}
-	if st.Rows() != 0 {
-		t.Fatalf("an unencodable payload reached the outbox: %d rows", st.Rows())
-	}
-}
-
-func TestNewPublisherDemandsItsDependencies(t *testing.T) {
-	st := openStorage(t, t.TempDir())
-	base := PublisherConfig{
-		Storage:  st,
-		Codec:    testCodec{},
-		Publish:  (&recordingPublish{}).publish,
-		Identity: testIdentity,
-	}
-	cases := map[string]func(*PublisherConfig){
-		"storage":  func(c *PublisherConfig) { c.Storage = nil },
-		"codec":    func(c *PublisherConfig) { c.Codec = nil },
-		"publish":  func(c *PublisherConfig) { c.Publish = nil },
-		"identity": func(c *PublisherConfig) { c.Identity = nil },
-		"max rows": func(c *PublisherConfig) { c.MaxOutboxRows = -1 },
-	}
-	for name, mutate := range cases {
-		cfg := base
-		mutate(&cfg)
-		if _, err := NewPublisher(cfg); !errors.Is(err, ErrInvalidConfig) {
-			t.Fatalf("NewPublisher without %s = %v, want ErrInvalidConfig", name, err)
+	var published []string
+	keys := []string{"a", "a", "b", "", "", "a", "b", "c"}
+	for i, key := range keys {
+		id, err := p.Publish(context.Background(), "order.created", order{Total: i}, WithPartitionKey(key), WithFireAndForget())
+		if err != nil {
+			t.Fatal(err)
 		}
+		published = append(published, id)
 	}
-	if _, err := NewPublisher(base); err != nil {
-		t.Fatalf("NewPublisher with a complete config: %v", err)
-	}
-}
+	startPublisher(t, p)
+	waitFor(t, func() bool { return p.Pending() == 0 })
 
-func TestPublishOptionsReachTheStoredRecord(t *testing.T) {
-	st := openStorage(t, t.TempDir())
-	p := newTestPublisher(t, st, (&recordingPublish{}).publish)
-	ctx := context.Background()
-
-	id, err := p.Publish(ctx, "order.created", order{ID: "o-1"},
-		WithIdempotencyKey("idem-1"),
-		WithPartitionKey("cust-1"),
-		WithHeaders(map[string]string{"tenant": "acme"}),
-		WithOccurredAt(1_600_000_000_000))
-	if err != nil {
-		t.Fatalf("Publish: %v", err)
-	}
-	rec, _, err := st.Load(ctx, id)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if rec.IdempotencyKey != "idem-1" || rec.PartitionKey != "cust-1" ||
-		rec.Headers["tenant"] != "acme" || rec.OccurredAtMs != 1_600_000_000_000 {
-		t.Fatalf("options did not reach the record: %+v", rec)
-	}
-	if rec.FireAndForget {
-		t.Fatal("a buffered row must never carry the no-wait flag")
-	}
-}
-
-func TestPublishReportsAnIdentifierFailure(t *testing.T) {
-	st := openStorage(t, t.TempDir())
-	boom := errors.New("entropy source broken")
-	p := newTestPublisher(t, st, (&recordingPublish{}).publish, func(c *PublisherConfig) {
-		c.NewID = func() (string, error) { return "", boom }
-	})
-	if _, err := p.Publish(context.Background(), "order.created", order{}); !errors.Is(err, boom) {
-		t.Fatalf("Publish error = %v, want the id failure", err)
-	}
-}
-
-// A subscription may carry a wildcard where a publish may not, and the handler
-// has to be found locally too: the runtime routes the delivery, but a pattern
-// stored under itself is invisible to an exact-name lookup, so the delivery
-// would be acked with nothing run.
-func TestEventPatternsAcceptWildcardsAndMatchDeliveredNames(t *testing.T) {
-	t.Parallel()
-
-	for _, pattern := range []string{"order.created", "order.*", "order.#", "*", "#", "*.created"} {
-		if !ValidEventPattern(pattern) {
-			t.Errorf("pattern %q must be accepted for a subscription", pattern)
+	order := map[string][]string{}
+	for _, batch := range rt.sent() {
+		if len(batch) > 3 {
+			t.Fatalf("batch of %d over the cap", len(batch))
 		}
-	}
-	// A publish still refuses them: only a subscription routes on patterns.
-	for _, name := range []string{"order.*", "order.#", "*"} {
-		if ValidEventName(name) {
-			t.Errorf("name %q must be refused for a publish", name)
-		}
-	}
-	for _, bad := range []string{"", "Order.Created", "order..created", "order.*x"} {
-		if ValidEventPattern(bad) {
-			t.Errorf("pattern %q must be refused", bad)
-		}
-	}
-
-	match := []struct{ pattern, name string }{
-		{"order.created", "order.created"},
-		{"order.*", "order.created"},
-		{"*.created", "order.created"},
-		{"order.#", "order.created"},
-		{"order.#", "order.eu.created"},
-		// `#` covers zero segments too — the runtime matcher does, and a delivery
-		// it routes here must find its handler.
-		{"order.#", "order"},
-		{"#", "order"},
-		{"#", "order.eu.created"},
-		{"*", "order"},
-	}
-	for _, c := range match {
-		if !MatchEventPattern(c.pattern, c.name) {
-			t.Errorf("%q must cover %q", c.pattern, c.name)
-		}
-	}
-
-	miss := []struct{ pattern, name string }{
-		{"order.created", "order.updated"},
-		// `*` is exactly one segment, so it cannot span two.
-		{"order.*", "order.eu.created"},
-		{"*", "order.created"},
-		{"payment.*", "order.created"},
-	}
-	for _, c := range miss {
-		if MatchEventPattern(c.pattern, c.name) {
-			t.Errorf("%q must not cover %q", c.pattern, c.name)
-		}
-	}
-}
-
-func TestFireAndForgetRequiresExactPerItemAcceptance(t *testing.T) {
-	st := openStorage(t, t.TempDir())
-	for _, kind := range []string{"missing", "wrong-id", "unspecified", "transient"} {
-		t.Run(kind, func(t *testing.T) {
-			publish := func(_ context.Context, req *pb.PublishRequest) (*pb.PublishResponse, error) {
-				entry := &pb.PublishStatusEntry{EventId: req.Events[0].Id, Status: pb.PublishStatus_PUBLISH_STATUS_ACCEPTED}
-				switch kind {
-				case "missing":
-					return &pb.PublishResponse{}, nil
-				case "wrong-id":
-					entry.EventId = "unrelated"
-				case "unspecified":
-					entry.Status = pb.PublishStatus_PUBLISH_STATUS_UNSPECIFIED
-				case "transient":
-					entry.Status = pb.PublishStatus(99)
-				}
-				return &pb.PublishResponse{Results: []*pb.PublishStatusEntry{entry}}, nil
+		seen := map[string]bool{}
+		for _, env := range batch {
+			key := env.GetPartitionKey()
+			if key != "" && seen[key] {
+				t.Fatalf("key %q twice in one batch", key)
 			}
-			p := newTestPublisher(t, st, publish)
-			if _, err := p.Publish(context.Background(), "order.created", order{}, WithFireAndForget()); !errors.Is(err, ErrRejected) {
-				t.Fatalf("unaccepted item reported success: %v", err)
+			seen[key] = true
+			order[key] = append(order[key], env.GetId())
+		}
+	}
+	for key, ids := range order {
+		if key != "" && !sort.StringsAreSorted(ids) {
+			t.Fatalf("key %q went out of order: %v", key, ids)
+		}
+	}
+	if total := len(order["a"]) + len(order["b"]) + len(order["c"]) + len(order[""]); total != len(published) {
+		t.Fatalf("sent %d events, want %d", total, len(published))
+	}
+}
+
+func TestVerdictsMapToResults(t *testing.T) {
+	rt := newFakeRuntime()
+	rt.verdict = func(_ int, env *pb.EventEnvelope) (*pb.PublishStatusEntry, error) {
+		switch env.GetName() {
+		case "dup.event":
+			return &pb.PublishStatusEntry{EventId: "original-id", Status: pb.PublishStatus_PUBLISH_STATUS_REJECTED_DUPLICATE}, nil
+		case "conflict.event":
+			return &pb.PublishStatusEntry{Status: pb.PublishStatus_PUBLISH_STATUS_REJECTED_CONFLICT}, nil
+		case "bad.event":
+			return &pb.PublishStatusEntry{Status: pb.PublishStatus_PUBLISH_STATUS_REJECTED_INVALID_NAME}, nil
+		case "secret.event":
+			return &pb.PublishStatusEntry{Status: pb.PublishStatus_PUBLISH_STATUS_REJECTED_FORBIDDEN, Message: "no rule"}, nil
+		}
+		return nil, nil
+	}
+	var violations []PolicyViolation
+	var mu sync.Mutex
+	p := newTestPublisher(t, rt, func(c *PublisherConfig) {
+		c.OnPolicyViolation = func(v PolicyViolation) {
+			mu.Lock()
+			violations = append(violations, v)
+			mu.Unlock()
+		}
+	})
+	startPublisher(t, p)
+
+	if id, err := p.Publish(context.Background(), "dup.event", order{}); err != nil || id != "original-id" {
+		t.Fatalf("duplicate: id %q err %v, want the original id", id, err)
+	}
+	if _, err := p.Publish(context.Background(), "conflict.event", order{}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("conflict: %v", err)
+	}
+	if _, err := p.Publish(context.Background(), "bad.event", order{}); !errors.Is(err, ErrInvalidName) {
+		t.Fatalf("invalid name: %v", err)
+	}
+	if _, err := p.Publish(context.Background(), "secret.event", order{}); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("forbidden: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(violations) != 1 || violations[0].EventName != "secret.event" || violations[0].Reason != "no rule" {
+		t.Fatalf("violations %+v", violations)
+	}
+}
+
+// UNSPECIFIED and transport failures retry the same envelope — same id — so
+// the runtime deduplicates the retry.
+func TestUnsettledEventsAreRetriedWithTheSameID(t *testing.T) {
+	rt := newFakeRuntime()
+	rt.verdict = func(call int, _ *pb.EventEnvelope) (*pb.PublishStatusEntry, error) {
+		switch call {
+		case 1:
+			return nil, errors.New("transport down")
+		case 2:
+			return &pb.PublishStatusEntry{Status: pb.PublishStatus_PUBLISH_STATUS_UNSPECIFIED, Message: "publish rate limit exceeded"}, nil
+		}
+		return nil, nil
+	}
+	p := newTestPublisher(t, rt, nil)
+	startPublisher(t, p)
+
+	id, err := p.Publish(context.Background(), "order.created", order{})
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	reqs := rt.sent()
+	if len(reqs) != 3 {
+		t.Fatalf("%d requests, want 3", len(reqs))
+	}
+	for _, r := range reqs {
+		if r[0].GetId() != id {
+			t.Fatalf("a retry minted a new id: %s vs %s", r[0].GetId(), id)
+		}
+	}
+}
+
+// A sender waiting out a long rung retries at once on Kick — the client kicks
+// it on every reconnect.
+func TestKickCutsTheRetryWaitShort(t *testing.T) {
+	rt := newFakeRuntime()
+	rt.verdict = func(call int, _ *pb.EventEnvelope) (*pb.PublishStatusEntry, error) {
+		if call == 1 {
+			return nil, errors.New("transport down")
+		}
+		return nil, nil
+	}
+	p := newTestPublisher(t, rt, func(c *PublisherConfig) { c.RetryLadder = []time.Duration{time.Hour} })
+	startPublisher(t, p)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Publish(context.Background(), "order.created", order{})
+		done <- err
+	}()
+	<-rt.calls
+	time.Sleep(10 * time.Millisecond)
+	p.Kick()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Kick did not cut the retry wait")
+	}
+}
+
+func TestFireAndForgetReturnsBeforeTheAcknowledgement(t *testing.T) {
+	rt := newFakeRuntime()
+	rt.gate = make(chan struct{})
+	p := newTestPublisher(t, rt, nil)
+	startPublisher(t, p)
+
+	id, err := p.Publish(context.Background(), "order.created", order{}, WithFireAndForget())
+	if err != nil || id == "" {
+		t.Fatalf("fire and forget: %q %v", id, err)
+	}
+	close(rt.gate)
+	waitFor(t, func() bool { return p.Pending() == 0 })
+}
+
+func TestCloseFlushesThenFailsTheRest(t *testing.T) {
+	t.Run("flushes within the deadline", func(t *testing.T) {
+		rt := newFakeRuntime()
+		p := newTestPublisher(t, rt, nil)
+		for range 3 {
+			if _, err := p.Publish(context.Background(), "order.created", order{}, WithFireAndForget()); err != nil {
+				t.Fatal(err)
 			}
-		})
+		}
+		if err := p.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		p.Close(ctx)
+		if p.Pending() != 0 || len(rt.sent()) == 0 {
+			t.Fatalf("pending %d after a flush, %d requests", p.Pending(), len(rt.sent()))
+		}
+		if _, err := p.Publish(context.Background(), "order.created", order{}); !errors.Is(err, ErrStopped) {
+			t.Fatalf("publish after close: %v", err)
+		}
+	})
+	t.Run("rejects leftovers", func(t *testing.T) {
+		p := newTestPublisher(t, newFakeRuntime(), nil)
+		done := make(chan error, 1)
+		go func() {
+			_, err := p.Publish(context.Background(), "order.created", order{})
+			done <- err
+		}()
+		waitFor(t, func() bool { return p.Pending() == 1 })
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		p.Close(ctx)
+		if err := <-done; !errors.Is(err, ErrStopped) {
+			t.Fatalf("leftover: %v, want ErrStopped", err)
+		}
+	})
+}
+
+func TestPublishRefusesBadInput(t *testing.T) {
+	p := newTestPublisher(t, newFakeRuntime(), nil)
+	if _, err := p.Publish(context.Background(), "Bad Name", order{}); !errors.Is(err, ErrInvalidName) {
+		t.Fatalf("invalid name: %v", err)
+	}
+	bad := newTestPublisher(t, newFakeRuntime(), func(c *PublisherConfig) { c.Codec = testCodec{encodeErr: errors.New("nope")} })
+	if _, err := bad.Publish(context.Background(), "order.created", order{}); err == nil {
+		t.Fatal("encode failure must surface")
+	}
+	if _, err := NewPublisher(PublisherConfig{Publish: newFakeRuntime().publish}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("missing codec: %v", err)
+	}
+	if _, err := NewPublisher(PublisherConfig{Codec: testCodec{}}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("missing publish: %v", err)
+	}
+	if _, err := NewPublisher(PublisherConfig{Codec: testCodec{}, Publish: newFakeRuntime().publish, MaxPending: -1}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("negative bound: %v", err)
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background()); !errors.Is(err, ErrAlreadyStarted) {
+		t.Fatalf("second start: %v", err)
+	}
+	p.Close(context.Background())
+}
+
+func TestValidEventNameAndPattern(t *testing.T) {
+	if !ValidEventName("order.created") || ValidEventName("order.*") || ValidEventName("") {
+		t.Fatal("event name grammar")
+	}
+	if !ValidEventPattern("order.*") || !ValidEventPattern("#") || ValidEventPattern("Order") {
+		t.Fatal("pattern grammar")
+	}
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition never held")
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }

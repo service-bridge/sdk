@@ -6,6 +6,8 @@ import (
 	"fmt"
 
 	pb "github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
 
 // ErrInvalidConfig means a required dependency is missing.
@@ -55,9 +57,10 @@ func (p *Proxy) Unary(ctx context.Context, req *pb.InvokeRequest) ([]byte, error
 	if err != nil {
 		return nil, fmt.Errorf("rpc: proxy unary %s: %w", req.GetMethod(), err)
 	}
-	resp, err := client.Unary(ctx, req)
+	var trailer metadata.MD
+	resp, err := client.Unary(ctx, req, grpc.Trailer(&trailer))
 	if err != nil {
-		return nil, fmt.Errorf("rpc: proxy unary %s: %w", req.GetMethod(), err)
+		return nil, fmt.Errorf("rpc: proxy unary %s: %w", req.GetMethod(), markNotDispatched(err, trailer, false))
 	}
 	if resp.GetErrorCode() != "" {
 		return nil, handlerError(resp.GetErrorCode(), resp.GetErrorMessage())
@@ -79,7 +82,7 @@ func (p *Proxy) Stream(ctx context.Context, req *pb.InvokeRequest) (*Stream, err
 		return nil, fmt.Errorf("rpc: proxy stream %s: %w", req.GetMethod(), err)
 	}
 
-	return newStream(
+	return NewStream(
 		func() ([]byte, error) {
 			chunk, rerr := cs.Recv()
 			if rerr != nil {

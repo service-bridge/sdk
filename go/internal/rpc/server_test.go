@@ -31,9 +31,17 @@ const (
 )
 
 // stubAcceptance stands in for the registry cache.
-type stubAcceptance struct{ eval *pb.PolicyEvaluation }
+type stubAcceptance struct {
+	eval     *pb.PolicyEvaluation
+	notReady bool
+	revoked  map[string]bool
+}
 
 func (s stubAcceptance) Policy() *pb.PolicyEvaluation { return s.eval }
+func (s stubAcceptance) Ready() bool                  { return !s.notReady }
+func (s stubAcceptance) Revoked(serviceID, instanceID string) bool {
+	return s.revoked[serviceID] || s.revoked[instanceID]
+}
 
 type inboundFixture struct {
 	ca       *inboundCA
@@ -42,15 +50,18 @@ type inboundFixture struct {
 	instance string
 }
 
-func newInboundFixture(t *testing.T, d *Dispatcher, limits ServerLimits, policies AcceptancePolicySource) *inboundFixture {
+func newInboundFixture(t *testing.T, d *Dispatcher, limits ServerLimits, admission AdmissionSource) *inboundFixture {
 	t.Helper()
 
+	if admission == nil {
+		admission = stubAcceptance{}
+	}
 	ca := newInboundCA(t)
 	srv, err := NewServer(ServerConfig{
 		Host:       "127.0.0.1",
 		Limits:     limits,
 		Dispatcher: d,
-		Policies:   policies,
+		Admission:  admission,
 		Logger:     inboundTestLogger(),
 	})
 	if err != nil {
@@ -120,15 +131,15 @@ func TestNewServerRejectsInvalidConfig(t *testing.T) {
 		name string
 		cfg  ServerConfig
 	}{
-		{"no host", ServerConfig{Limits: DefaultServerLimits(), Dispatcher: d}},
-		{"negative port", ServerConfig{Host: "127.0.0.1", Port: -1, Limits: DefaultServerLimits(), Dispatcher: d}},
-		{"port above range", ServerConfig{Host: "127.0.0.1", Port: 70000, Limits: DefaultServerLimits(), Dispatcher: d}},
-		{"no dispatcher", ServerConfig{Host: "127.0.0.1", Limits: DefaultServerLimits()}},
-		{"zero call limit", ServerConfig{Host: "127.0.0.1", Dispatcher: d, Limits: ServerLimits{MaxConcurrentCalls: 0, MaxConcurrentStreams: 8}}},
-		{"negative call limit", ServerConfig{Host: "127.0.0.1", Dispatcher: d, Limits: ServerLimits{MaxConcurrentCalls: -1, MaxConcurrentStreams: 8}}},
-		{"zero stream limit", ServerConfig{Host: "127.0.0.1", Dispatcher: d, Limits: ServerLimits{MaxConcurrentCalls: 8, MaxConcurrentStreams: 0}}},
-		{"negative stream limit", ServerConfig{Host: "127.0.0.1", Dispatcher: d, Limits: ServerLimits{MaxConcurrentCalls: 8, MaxConcurrentStreams: -3}}},
-		{"stream limit beyond uint32", ServerConfig{Host: "127.0.0.1", Dispatcher: d, Limits: ServerLimits{MaxConcurrentCalls: 8, MaxConcurrentStreams: math.MaxUint32 + 1}}},
+		{"no host", ServerConfig{Limits: DefaultServerLimits(), Dispatcher: d, Admission: stubAcceptance{}}},
+		{"negative port", ServerConfig{Host: "127.0.0.1", Port: -1, Limits: DefaultServerLimits(), Dispatcher: d, Admission: stubAcceptance{}}},
+		{"port above range", ServerConfig{Host: "127.0.0.1", Port: 70000, Limits: DefaultServerLimits(), Dispatcher: d, Admission: stubAcceptance{}}},
+		{"no dispatcher", ServerConfig{Host: "127.0.0.1", Limits: DefaultServerLimits(), Admission: stubAcceptance{}}},
+		{"no admission", ServerConfig{Host: "127.0.0.1", Limits: DefaultServerLimits(), Dispatcher: d}},
+		{"zero call limit", ServerConfig{Host: "127.0.0.1", Dispatcher: d, Admission: stubAcceptance{}, Limits: ServerLimits{MaxConcurrentCalls: 0, MaxQueuedCalls: 8}}},
+		{"negative call limit", ServerConfig{Host: "127.0.0.1", Dispatcher: d, Admission: stubAcceptance{}, Limits: ServerLimits{MaxConcurrentCalls: -1, MaxQueuedCalls: 8}}},
+		{"negative queue limit", ServerConfig{Host: "127.0.0.1", Dispatcher: d, Admission: stubAcceptance{}, Limits: ServerLimits{MaxConcurrentCalls: 8, MaxQueuedCalls: -3}}},
+		{"limits beyond uint32", ServerConfig{Host: "127.0.0.1", Dispatcher: d, Admission: stubAcceptance{}, Limits: ServerLimits{MaxConcurrentCalls: 8, MaxQueuedCalls: math.MaxUint32}}},
 	}
 
 	for _, tc := range tests {
@@ -183,7 +194,7 @@ func TestStartAdvertisesTheBoundPort(t *testing.T) {
 
 func TestEndpointBeforeStart(t *testing.T) {
 	d := NewDispatcher(inboundTestLogger())
-	srv, err := NewServer(ServerConfig{Host: "127.0.0.1", Limits: DefaultServerLimits(), Dispatcher: d, Logger: inboundTestLogger()})
+	srv, err := NewServer(ServerConfig{Host: "127.0.0.1", Limits: DefaultServerLimits(), Dispatcher: d, Admission: stubAcceptance{}, Logger: inboundTestLogger()})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -211,7 +222,7 @@ func TestHandshakeBeforeCredentialsIsRefused(t *testing.T) {
 	d := NewDispatcher(inboundTestLogger())
 	mustAddUnary(t, d, "echo", echoUnaryHandler)
 
-	srv, err := NewServer(ServerConfig{Host: "127.0.0.1", Limits: DefaultServerLimits(), Dispatcher: d, Logger: inboundTestLogger()})
+	srv, err := NewServer(ServerConfig{Host: "127.0.0.1", Limits: DefaultServerLimits(), Dispatcher: d, Admission: stubAcceptance{}, Logger: inboundTestLogger()})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -424,8 +435,8 @@ func TestInboundTraceSources(t *testing.T) {
 	})
 }
 
-func TestOverloadShedsWithResourceExhausted(t *testing.T) {
-	entered := make(chan struct{}, 1)
+func TestOverloadQueuesThenShedsWithResourceExhausted(t *testing.T) {
+	entered := make(chan struct{}, 4)
 	release := make(chan struct{})
 
 	d := NewDispatcher(inboundTestLogger())
@@ -438,37 +449,152 @@ func TestOverloadShedsWithResourceExhausted(t *testing.T) {
 		return nil, nil
 	})
 
-	// One handler slot, plenty of HTTP/2 streams: the shed must come from the
-	// server's own bound, not from transport-level flow control.
-	f := newInboundFixture(t, d, ServerLimits{MaxConcurrentCalls: 1, MaxConcurrentStreams: 64}, nil)
-	client := f.serviceClient(t, inboundCallerID)
+	// One slot, one queue place. Every call rides its own connection, so the
+	// per-connection HTTP/2 stream bound never gets in the way.
+	f := newInboundFixture(t, d, ServerLimits{MaxConcurrentCalls: 1, MaxQueuedCalls: 1}, nil)
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if _, err := client.Unary(inboundCallCtx(t), &pb.CallRequest{Method: "block"}); err != nil {
-			t.Errorf("the admitted call failed: %v", err)
-		}
-	}()
-	defer func() {
-		close(release)
-		wg.Wait()
-	}()
+	errs := make(chan error, 2)
+	for range 2 {
+		client := f.serviceClient(t, inboundCallerID)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := client.Unary(inboundCallCtx(t), &pb.CallRequest{Method: "block"})
+			errs <- err
+		}()
+	}
 
 	select {
 	case <-entered:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the first call never reached its handler")
 	}
+	waitUntil(t, func() bool { return f.srv.admitted.Load() == 2 })
 
-	// A short deadline is the discriminator: shedding answers now,
-	// queueing answers with DeadlineExceeded once the slot frees.
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	_, err := client.Unary(ctx, &pb.CallRequest{Method: "block"})
+	var trailer metadata.MD
+	_, err := f.serviceClient(t, inboundCallerID).Unary(inboundCallCtx(t), &pb.CallRequest{Method: "block"}, grpc.Trailer(&trailer))
 	if got := status.Code(err); got != codes.ResourceExhausted {
 		t.Fatalf("code = %v, want ResourceExhausted (err %v)", got, err)
+	}
+	if v := trailer.Get(NotDispatchedKey); len(v) != 1 || v[0] != "1" {
+		t.Fatalf("an overload refusal must carry the not-dispatched trailer, got %v", trailer)
+	}
+
+	close(release)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("the running and the queued call must both succeed: %v", err)
+		}
+	}
+}
+
+func waitUntil(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition never held")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestNotReadyAndDrainingRefuseWithTheTrailer(t *testing.T) {
+	d := NewDispatcher(inboundTestLogger())
+	mustAddUnary(t, d, "echo", echoUnaryHandler)
+
+	t.Run("before the first snapshot", func(t *testing.T) {
+		f := newInboundFixture(t, d, DefaultServerLimits(), stubAcceptance{notReady: true})
+		var trailer metadata.MD
+		_, err := f.serviceClient(t, inboundCallerID).Unary(inboundCallCtx(t), &pb.CallRequest{Method: "echo"}, grpc.Trailer(&trailer))
+		if status.Code(err) != codes.Unavailable || trailer.Get(NotDispatchedKey) == nil {
+			t.Fatalf("got %v trailer %v, want UNAVAILABLE with the trailer", err, trailer)
+		}
+	})
+	t.Run("draining", func(t *testing.T) {
+		f := newInboundFixture(t, d, DefaultServerLimits(), nil)
+		f.srv.Drain()
+		var trailer metadata.MD
+		_, err := f.serviceClient(t, inboundCallerID).Unary(inboundCallCtx(t), &pb.CallRequest{Method: "echo"}, grpc.Trailer(&trailer))
+		if status.Code(err) != codes.Unavailable || trailer.Get(NotDispatchedKey) == nil {
+			t.Fatalf("got %v trailer %v, want UNAVAILABLE with the trailer", err, trailer)
+		}
+		if err := f.srv.Wait(inboundCallCtx(t)); err != nil {
+			t.Fatalf("Wait with nothing in flight: %v", err)
+		}
+	})
+}
+
+// Permanent refusals carry no trailer: another instance would answer them the
+// same, so a retry would only repeat the refusal.
+func TestPermanentRefusalsCarryNoTrailer(t *testing.T) {
+	d := NewDispatcher(inboundTestLogger())
+	mustAddUnary(t, d, "echo", echoUnaryHandler)
+	f := newInboundFixture(t, d, DefaultServerLimits(), stubAcceptance{revoked: map[string]bool{"svc-revoked": true}})
+
+	var trailer metadata.MD
+	_, err := f.serviceClient(t, "svc-revoked").Unary(inboundCallCtx(t), &pb.CallRequest{Method: "echo"}, grpc.Trailer(&trailer))
+	if status.Code(err) != codes.PermissionDenied || trailer.Get(NotDispatchedKey) != nil {
+		t.Fatalf("revoked caller: got %v trailer %v, want PERMISSION_DENIED without trailer", err, trailer)
+	}
+
+	trailer = nil
+	_, err = f.serviceClient(t, inboundCallerID).Unary(inboundCallCtx(t), &pb.CallRequest{Method: "missing"}, grpc.Trailer(&trailer))
+	if status.Code(err) != codes.NotFound || trailer.Get(NotDispatchedKey) != nil {
+		t.Fatalf("unknown method: got %v trailer %v, want NOT_FOUND without trailer", err, trailer)
+	}
+}
+
+// A revoked service is refused on the proxy path too: the runtime names the
+// originating service in caller_service.
+func TestRevokedServiceIsRefusedThroughTheProxy(t *testing.T) {
+	d := NewDispatcher(inboundTestLogger())
+	mustAddUnary(t, d, "echo", echoUnaryHandler)
+	f := newInboundFixture(t, d, DefaultServerLimits(), stubAcceptance{revoked: map[string]bool{"svc-revoked": true}})
+	client := f.client(t, f.ca.runtimeLeaf(t))
+
+	_, err := client.Unary(inboundCallCtx(t), &pb.CallRequest{Method: "echo", CallerService: "svc-revoked"})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("got %v, want PERMISSION_DENIED", err)
+	}
+	if _, err := client.Unary(inboundCallCtx(t), &pb.CallRequest{Method: "echo", CallerService: "svc-fine"}); err != nil {
+		t.Fatalf("a non-revoked proxied caller was refused: %v", err)
+	}
+}
+
+func TestHandlerSeesTheCallInfo(t *testing.T) {
+	got := make(chan CallInfo, 2)
+	d := NewDispatcher(inboundTestLogger())
+	mustAddUnary(t, d, "who", func(ctx context.Context, _ []byte) ([]byte, error) {
+		info, ok := CallInfoFromContext(ctx)
+		if !ok {
+			return nil, errors.New("no call info")
+		}
+		got <- info
+		return nil, nil
+	})
+	f := newInboundFixture(t, d, DefaultServerLimits(), nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+	defer cancel()
+	if _, err := f.serviceClient(t, inboundCallerID).Unary(ctx, &pb.CallRequest{Method: "who", RequestId: "req-1", IdempotencyKey: "idem-1"}); err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	info := <-got
+	if info.RequestID != "req-1" || info.IdempotencyKey != "idem-1" ||
+		info.CallerServiceID != inboundCallerID || info.CallerInstanceID != inboundCallerID+"-inst" || info.Deadline.IsZero() {
+		t.Fatalf("call info = %+v", info)
+	}
+
+	proxied := f.client(t, f.ca.runtimeLeaf(t))
+	if _, err := proxied.Unary(inboundCallCtx(t), &pb.CallRequest{Method: "who", CallerService: "svc-origin"}); err != nil {
+		t.Fatalf("proxied call: %v", err)
+	}
+	if info := <-got; info.CallerServiceID != "svc-origin" || info.CallerInstanceID != "" {
+		t.Fatalf("proxied call info = %+v", info)
 	}
 }
 
@@ -489,7 +615,7 @@ func TestAcceptanceRunsBeforeTheSlotIsTaken(t *testing.T) {
 	policy := stubAcceptance{eval: &pb.PolicyEvaluation{
 		Acceptance: []*pb.PolicyRule{{Action: actionRPCHandle, PeerServiceId: inboundCallerID, TargetName: wildcardTarget}},
 	}}
-	f := newInboundFixture(t, d, ServerLimits{MaxConcurrentCalls: 1, MaxConcurrentStreams: 64}, policy)
+	f := newInboundFixture(t, d, ServerLimits{MaxConcurrentCalls: 1}, policy)
 
 	admitted := f.serviceClient(t, inboundCallerID)
 	denied := f.serviceClient(t, "svc-intruder")
@@ -753,7 +879,7 @@ func TestCredentialsRotateUnderALiveListener(t *testing.T) {
 
 func TestUseCredentialsRejectsAnEmptyLease(t *testing.T) {
 	d := NewDispatcher(inboundTestLogger())
-	srv, err := NewServer(ServerConfig{Host: "127.0.0.1", Limits: DefaultServerLimits(), Dispatcher: d, Logger: inboundTestLogger()})
+	srv, err := NewServer(ServerConfig{Host: "127.0.0.1", Limits: DefaultServerLimits(), Dispatcher: d, Admission: stubAcceptance{}, Logger: inboundTestLogger()})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -779,7 +905,7 @@ func TestServerLeavesNoGoroutinesBehind(t *testing.T) {
 		d := NewDispatcher(inboundTestLogger())
 		mustAddUnary(t, d, "echo", echoUnaryHandler)
 
-		srv, err := NewServer(ServerConfig{Host: "127.0.0.1", Limits: DefaultServerLimits(), Dispatcher: d, Logger: inboundTestLogger()})
+		srv, err := NewServer(ServerConfig{Host: "127.0.0.1", Limits: DefaultServerLimits(), Dispatcher: d, Admission: stubAcceptance{}, Logger: inboundTestLogger()})
 		if err != nil {
 			t.Fatalf("NewServer: %v", err)
 		}

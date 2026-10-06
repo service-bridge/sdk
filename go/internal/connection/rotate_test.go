@@ -2,39 +2,41 @@ package connection_test
 
 import (
 	"crypto/ecdsa"
+	"crypto/tls"
 	"crypto/x509"
-	"errors"
-	"fmt"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/service-bridge/sdk/go/internal/connection"
 	pb "github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1"
-	"github.com/service-bridge/sdk/go/internal/stream"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/status"
 )
 
 // ── fake Control.RefreshCert ──────────────────────────────────────────────────
 
-// refreshRuntime issues renewed leaves the way the runtime does: same serviceID,
-// a brand-new instanceID, expiry in SECONDS.
+// refreshRuntime issues renewed leaves the way the runtime does: same service,
+// same instance, a new key and a new expiry.
 type refreshRuntime struct {
 	t  *testing.T
 	ca *testCA
 
-	mu           sync.Mutex
-	notAfter     time.Time
-	err          error
-	sameInstance string
-	issued       []string
+	mu       sync.Mutex
+	notAfter time.Time
+	err      error
+	// errOnce fails exactly the next refresh, then clears itself.
+	errOnce  error
+	instance string
+	issued   []string
 }
 
-func (r *refreshRuntime) handle(n int, req *pb.RefreshCertRequest) (*pb.RefreshCertResponse, error) {
+func (r *refreshRuntime) handle(_ int, req *pb.RefreshCertRequest) (*pb.RefreshCertResponse, error) {
 	r.mu.Lock()
-	notAfter, failWith, same := r.notAfter, r.err, r.sameInstance
+	notAfter, failWith, instanceID := r.notAfter, r.err, r.instance
+	if r.errOnce != nil {
+		failWith, r.errOnce = r.errOnce, nil
+	}
 	r.mu.Unlock()
 
 	if failWith != nil {
@@ -52,10 +54,8 @@ func (r *refreshRuntime) handle(n int, req *pb.RefreshCertRequest) (*pb.RefreshC
 	if !ok {
 		return nil, status.Errorf(codes.InvalidArgument, "csr key is %T, want ECDSA", csr.PublicKey)
 	}
-
-	instanceID := same
 	if instanceID == "" {
-		instanceID = fmt.Sprintf("rotated-%d", n)
+		instanceID = "provisioned-1"
 	}
 	der := r.ca.issueLeaf(r.t, pub, connection.Identity{ServiceID: testServiceID, InstanceID: instanceID})
 
@@ -64,9 +64,9 @@ func (r *refreshRuntime) handle(n int, req *pb.RefreshCertRequest) (*pb.RefreshC
 	r.mu.Unlock()
 
 	return &pb.RefreshCertResponse{
-		CertDer:    der,
-		CaChainDer: r.ca.der,
-		InstanceId: instanceID,
+		CertDer:        der,
+		CaChainDer:     r.ca.der,
+		InstanceId:     instanceID,
 		NotAfterUnixMs: notAfter.UnixMilli(),
 	}, nil
 }
@@ -100,100 +100,75 @@ func instanceOf(t *testing.T, leaf *x509.Certificate) string {
 	return id.InstanceID
 }
 
+// presented reads the leaf a TLS configuration hands out on its next handshake.
+func presented(t *testing.T, creds connection.Credentials) *x509.Certificate {
+	t.Helper()
+	cert, err := creds.TLS.GetClientCertificate(&tls.CertificateRequestInfo{})
+	if err != nil {
+		t.Fatalf("client certificate: %v", err)
+	}
+	return cert.Leaf
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
-func TestRotationSwapsTheSessionOnlyAfterWelcome(t *testing.T) {
+// A renewal swaps the TLS material and nothing else: the control session, its
+// channel and the identity stay. The runtime treats a second Control.Open of
+// the same instance as a replacement and aborts the first one, so reopening
+// would cut the very session the renewal was meant to keep alive.
+func TestRotationKeepsTheSessionAndOnlySwapsTheLeaf(t *testing.T) {
 	t.Parallel()
-	h := newHarness(t, func(cfg *connection.LifecycleConfig) {
-		cfg.WelcomeTimeout = 10 * time.Second
-	})
-	h.withRefresh(time.Now().Add(24 * time.Hour))
-	gate := h.control.holdWelcome(2)
+	notAfter := time.Now().Add(24 * time.Hour)
+	h := newHarness(t, nil)
+	h.withRefresh(notAfter)
 	h.start()
 
 	first := h.control.awaitOpen(t)
 	oldConn := mustConn(t, h.life)
+	_, dialed := h.dialer.dialed()
+	before := presented(t, dialed[0])
 
 	h.life.Rotate()
-	h.control.awaitOpen(t) // the renewed session is dialled and parked
+	waitFor(t, "the renewal", func() bool { return h.consumers["call-server"].count() == 2 })
 
-	// While the new session is unproven the old one keeps serving: no swap, no
-	// credential update, no teardown.
-	time.Sleep(100 * time.Millisecond)
-	if got := h.life.Identity().InstanceID; got != "provisioned-1" {
-		t.Errorf("identity swapped before Welcome: %q", got)
+	if got := h.control.openCount(); got != 1 {
+		t.Errorf("Control.Open called %d times, want 1: a renewal must not reopen the session", got)
 	}
 	if current, err := h.life.Conn(); err != nil || current != oldConn {
-		t.Errorf("channel swapped before Welcome (err %v)", err)
-	}
-	for _, name := range consumerNames {
-		if got := h.consumers[name].count(); got != 1 {
-			t.Errorf("consumer %s got %d credential updates before Welcome, want 1", name, got)
-		}
+		t.Errorf("the session channel was replaced by a renewal (err %v)", err)
 	}
 	select {
 	case <-first.ended:
-		t.Fatal("the old stream was closed before the new session was welcomed")
+		t.Fatal("the control stream was closed by a renewal")
 	default:
 	}
-
-	close(gate)
-
-	waitFor(t, "the renewed session", func() bool { return len(h.observer.connectedIDs()) == 2 })
-	if got := h.life.Identity().InstanceID; got != "rotated-1" {
-		t.Errorf("identity after rotation: %q want rotated-1", got)
+	assertLive(t, oldConn, "the session channel")
+	if got := h.life.Identity().InstanceID; got != "provisioned-1" {
+		t.Errorf("instance after renewal: %q want provisioned-1", got)
 	}
-	select {
-	case <-first.ended:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the old stream outlived the accepted rotation")
+	// The configuration the session was dialled with now presents the renewed
+	// leaf: the next handshake of every channel picks it up.
+	after := presented(t, dialed[0])
+	if after.Equal(before) {
+		t.Fatal("the dialled TLS configuration still presents the pre-renewal leaf")
 	}
-	assertClosed(t, oldConn, "the channel of the replaced session")
-}
-
-// The regression the whole design exists for: after a successful rotation the
-// new session must be supervised exactly like the first one. In the Node SDK the
-// rotated session was watched by a callback that had already been resolved, so
-// its death was silent and the service lost its control plane for good.
-func TestStreamDeathAfterRotationReconnects(t *testing.T) {
-	t.Parallel()
-	h := newHarness(t, nil)
-	h.withRefresh(time.Now().Add(24 * time.Hour))
-	h.start()
-
-	h.control.awaitOpen(t)
-	h.life.Rotate()
-	waitFor(t, "the renewed session", func() bool { return len(h.observer.connectedIDs()) == 2 })
-
-	rotated := h.control.awaitOpen(t)
-	if rotated.n != 2 {
-		t.Fatalf("expected the rotated session to be Control.Open #2, got #%d", rotated.n)
+	if want := notAfter.Truncate(time.Second); !after.NotAfter.Equal(want.UTC()) && after.NotAfter.Before(before.NotAfter) {
+		t.Errorf("presented leaf expires %s, want the renewed one", after.NotAfter)
 	}
-	rotated.die(t, status.Error(codes.Unavailable, "runtime restarted"))
-
-	waitFor(t, "a session after the rotated one died", func() bool {
-		return len(h.observer.connectedIDs()) == 3
-	})
-	if h.observer.reconnectCount() == 0 {
-		t.Error("the death of a rotated session did not report a reconnect")
-	}
-	if got := h.control.openCount(); got != 3 {
-		t.Errorf("Control.Open called %d times, want 3", got)
+	if len(h.observer.connectedIDs()) != 1 {
+		t.Errorf("a renewal reported a new connection")
 	}
 }
 
-// Regression on the second Node bug: only two of eight credential holders were
-// switched, so RPC, events, workflow checkpoints, job results and telemetry all
-// broke together the moment the first certificate expired.
 func TestRotationUpdatesEveryCredentialConsumer(t *testing.T) {
 	t.Parallel()
-	notAfter := time.Now().Add(12 * time.Hour)
+	notAfter := time.Now().Add(12 * time.Hour).Truncate(time.Second)
 	h := newHarness(t, nil)
 	h.withRefresh(notAfter)
 	h.start()
 
 	h.life.Rotate()
-	waitFor(t, "the renewed session", func() bool { return len(h.observer.connectedIDs()) == 2 })
+	waitFor(t, "the renewal", func() bool { return h.consumers["call-server"].count() == 2 })
 
 	for _, name := range consumerNames {
 		consumer := h.consumers[name]
@@ -201,142 +176,56 @@ func TestRotationUpdatesEveryCredentialConsumer(t *testing.T) {
 			t.Errorf("consumer %s got %d credential updates, want 2", name, got)
 			continue
 		}
-		if got := instanceOf(t, leafOf(t, consumer)); got != "rotated-1" {
-			t.Errorf("consumer %s still holds the certificate of instance %q", name, got)
-		}
 		creds, _ := consumer.last()
-		if want := notAfter.Truncate(time.Second).UTC(); !creds.Lease.NotAfter.Equal(want) {
-			t.Errorf("consumer %s got expiry %s, want the leaf's %s",
-				name, creds.Lease.NotAfter, want)
+		if creds.Lease.NotAfterUnixMs != notAfter.UnixMilli() {
+			t.Errorf("consumer %s got expiry %d, want %d", name, creds.Lease.NotAfterUnixMs, notAfter.UnixMilli())
+		}
+		if got := instanceOf(t, creds.Lease.TLSCert.Leaf); got != "provisioned-1" {
+			t.Errorf("consumer %s holds a leaf of instance %q", name, got)
 		}
 	}
 
-	// A consumer registered after the rotation must not start out holding nothing.
 	late := &recordConsumer{name: "late"}
 	if err := h.creds.Register(t.Context(), "late", late); err != nil {
 		t.Fatalf("Register after a rotation: %v", err)
 	}
-	if got := instanceOf(t, leafOf(t, late)); got != "rotated-1" {
-		t.Errorf("late consumer got the certificate of instance %q", got)
+	if creds, _ := late.last(); creds.Lease.NotAfterUnixMs != notAfter.UnixMilli() {
+		t.Errorf("late consumer got expiry %d", creds.Lease.NotAfterUnixMs)
 	}
 }
 
-// Regression on the third Node bug: the certificate cache kept the pre-rotation
-// leaf, so every later reconnect re-ran the 64 MiB argon2id hash on the runtime.
-func TestRotationRefreshesTheLeafCache(t *testing.T) {
+// The renewed leaf is the cached one: a later reconnect reuses it instead of
+// re-running the argon2id provisioning on the runtime.
+func TestReconnectAfterRotationReusesTheRenewedLeaf(t *testing.T) {
 	t.Parallel()
+	notAfter := time.Now().Add(24 * time.Hour).Truncate(time.Second)
 	h := newHarness(t, nil)
-	h.withRefresh(time.Now().Add(24 * time.Hour))
+	h.withRefresh(notAfter)
 	h.start()
 
-	h.control.awaitOpen(t)
+	first := h.control.awaitOpen(t)
 	h.life.Rotate()
-	waitFor(t, "the renewed session", func() bool { return len(h.observer.connectedIDs()) == 2 })
+	waitFor(t, "the renewal", func() bool { return h.consumers["call-server"].count() == 2 })
 
-	rotated := h.control.awaitOpen(t)
-	rotated.die(t, status.Error(codes.Unavailable, "transport closing"))
-	waitFor(t, "the reconnected session", func() bool { return len(h.observer.connectedIDs()) == 3 })
+	first.die(t, status.Error(codes.Unavailable, "transport closing"))
+	waitFor(t, "the reconnected session", func() bool { return len(h.observer.connectedIDs()) == 2 })
 
 	if got := h.prov.count(); got != 1 {
-		t.Errorf("Provision called %d times, want 1: the reconnect must reuse the rotated leaf", got)
+		t.Errorf("Provision called %d times, want 1", got)
 	}
 	_, creds := h.dialer.dialed()
 	last := creds[len(creds)-1]
-	if got := instanceOf(t, last.Lease.TLSCert.Leaf); got != "rotated-1" {
-		t.Errorf("the reconnect dialled with the certificate of instance %q, want rotated-1", got)
-	}
-	if got := h.life.Identity().InstanceID; got != "rotated-1" {
-		t.Errorf("identity after the reconnect: %q", got)
+	if last.Lease.NotAfterUnixMs != notAfter.UnixMilli() {
+		t.Errorf("the reconnect dialled with expiry %d, want the renewed %d", last.Lease.NotAfterUnixMs, notAfter.UnixMilli())
 	}
 }
 
-func TestRotationRollsBackWhenTheNewSessionIsNeverWelcomed(t *testing.T) {
-	t.Parallel()
-	h := newHarness(t, func(cfg *connection.LifecycleConfig) {
-		// One rotation attempt: the retry rung is longer than the test.
-		cfg.Backoff = stream.NewBackoff(stream.WithLadder(30*time.Second), stream.WithJitterRatio(0))
-	})
-	h.withRefresh(time.Now().Add(24 * time.Hour))
-	h.control.holdWelcome(2) // never released
-	h.start()
-
-	first := h.control.awaitOpen(t)
-	oldConn := mustConn(t, h.life)
-
-	h.life.Rotate()
-	h.control.awaitOpen(t)
-
-	// The rotation fails on the Welcome timeout. Its channel goes with it and
-	// the old session keeps serving.
-	waitFor(t, "the rejected rotation channel to close", func() bool {
-		conns, _ := h.dialer.dialed()
-		return len(conns) == 2 && conns[1].GetState() == connectivity.Shutdown
-	})
-
-	if got := h.life.Identity().InstanceID; got != "provisioned-1" {
-		t.Errorf("identity after a failed rotation: %q want the pre-rotation one", got)
-	}
-	if current, err := h.life.Conn(); err != nil || current != oldConn {
-		t.Errorf("the old session did not survive a failed rotation (err %v)", err)
-	}
-	select {
-	case <-first.ended:
-		t.Fatal("the old stream was torn down by a failed rotation")
-	default:
-	}
-	assertLive(t, oldConn, "the channel of the surviving session")
-	for _, name := range consumerNames {
-		if got := h.consumers[name].count(); got != 1 {
-			t.Errorf("consumer %s was handed the credentials of an unproven session (%d updates)", name, got)
-		}
-	}
-}
-
-func TestRotationRollsBackWhenAConsumerRejectsTheCredentials(t *testing.T) {
-	t.Parallel()
-	h := newHarness(t, func(cfg *connection.LifecycleConfig) {
-		cfg.Backoff = stream.NewBackoff(stream.WithLadder(30*time.Second), stream.WithJitterRatio(0))
-	})
-	h.withRefresh(time.Now().Add(24 * time.Hour))
-	h.start()
-
-	first := h.control.awaitOpen(t)
-	oldConn := mustConn(t, h.life)
-	h.consumers["telemetry"].setFail(errors.New("telemetry client is closed"))
-
-	h.life.Rotate()
-
-	// Half the consumers on the new certificate and half on the old one is the
-	// state the registry exists to prevent: the whole swap is undone.
-	waitFor(t, "the rejected rotation channel to close", func() bool {
-		conns, _ := h.dialer.dialed()
-		return len(conns) == 2 && conns[1].GetState() == connectivity.Shutdown
-	})
-
-	if got := h.life.Identity().InstanceID; got != "provisioned-1" {
-		t.Errorf("identity after a rejected credential update: %q", got)
-	}
-	if current, err := h.life.Conn(); err != nil || current != oldConn {
-		t.Errorf("the old session did not survive a rejected credential update (err %v)", err)
-	}
-	select {
-	case <-first.ended:
-		t.Fatal("the old stream was torn down after a rejected credential update")
-	default:
-	}
-	if got := h.consumers["call-server"].count(); got != 2 {
-		t.Errorf("the healthy consumers were not attempted: %d updates", got)
-	}
-}
-
-func TestRotationRejectsAReusedInstanceID(t *testing.T) {
+func TestRotationRejectsALeafForAnotherInstance(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t, nil)
 	rr := h.withRefresh(time.Now().Add(24 * time.Hour))
 	rr.mu.Lock()
-	// A runtime that reissues the same instanceID makes the overlapping sessions
-	// indistinguishable: closing the old one would mark the new one disconnected.
-	rr.sameInstance = "provisioned-1"
+	rr.instance = "someone-else"
 	rr.mu.Unlock()
 	h.start()
 
@@ -344,11 +233,36 @@ func TestRotationRejectsAReusedInstanceID(t *testing.T) {
 	waitFor(t, "the rejected renewal", func() bool { return h.control.refreshCount() >= 1 })
 
 	time.Sleep(100 * time.Millisecond)
-	if got := h.control.openCount(); got != 1 {
-		t.Errorf("a leaf with a reused instanceID opened %d sessions, want 1", got)
+	for _, name := range consumerNames {
+		if got := h.consumers[name].count(); got != 1 {
+			t.Errorf("consumer %s adopted a leaf for another instance (%d updates)", name, got)
+		}
 	}
 	if got := h.life.Identity().InstanceID; got != "provisioned-1" {
 		t.Errorf("identity: %q", got)
+	}
+}
+
+// RefreshCert is rate limited on the runtime. ResourceExhausted is not a
+// reason to give up: the renewal is retried after the retry interval.
+func TestRateLimitedRefreshIsRetried(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, func(cfg *connection.LifecycleConfig) {
+		cfg.RotateRetry = 50 * time.Millisecond
+	})
+	rr := h.withRefresh(time.Now().Add(24 * time.Hour))
+	rr.mu.Lock()
+	rr.errOnce = status.Error(codes.ResourceExhausted, "refresh rate limited")
+	rr.mu.Unlock()
+	h.start()
+
+	h.life.Rotate()
+	waitFor(t, "the retried renewal", func() bool { return h.consumers["call-server"].count() == 2 })
+	if got := h.control.refreshCount(); got != 2 {
+		t.Errorf("RefreshCert called %d times, want 2", got)
+	}
+	if len(h.observer.disconnects()) != 0 {
+		t.Error("a rate-limited renewal stopped the lifecycle")
 	}
 }
 
@@ -372,20 +286,16 @@ func TestNonRetryableRefreshCodeStopsTheLifecycle(t *testing.T) {
 func TestRenewalIsScheduledAheadOfExpiry(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t, func(cfg *connection.LifecycleConfig) {
-		// The provisioned leaf lives an hour; renewal is due 100ms in.
 		cfg.RotateLead = time.Hour - 100*time.Millisecond
 		cfg.MinRotateDelay = time.Millisecond
 	})
 	h.prov.setNotAfter(time.Now().Add(time.Hour))
-	// The renewed leaf lives long enough that the next renewal is a day away.
 	h.withRefresh(time.Now().Add(24 * time.Hour))
 	h.start()
 
-	waitFor(t, "the scheduled renewal", func() bool { return len(h.observer.connectedIDs()) == 2 })
-	if got := h.control.refreshCount(); got != 1 {
-		t.Errorf("RefreshCert called %d times, want 1", got)
-	}
-	if got := h.life.Identity().InstanceID; got != "rotated-1" {
-		t.Errorf("identity after the scheduled renewal: %q", got)
+	waitFor(t, "the scheduled renewal", func() bool { return h.control.refreshCount() == 1 })
+	waitFor(t, "the renewed leaf", func() bool { return h.consumers["call-server"].count() == 2 })
+	if got := h.control.openCount(); got != 1 {
+		t.Errorf("Control.Open called %d times, want 1", got)
 	}
 }

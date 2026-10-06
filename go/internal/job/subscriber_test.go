@@ -1144,3 +1144,32 @@ func TestHeartbeatNegotiatesBeforeDefaultPeriod(t *testing.T) {
 		}
 	}
 }
+
+// The runtime is the authority in both directions: a cadence longer than the
+// local default is adopted too, not clamped to it.
+func TestHeartbeatAdoptsALongerRuntimeCadence(t *testing.T) {
+	t.Parallel()
+	srv, client := startJobs(t)
+	srv.heartbeatInterval.Store(1000)
+	sub, err := job.NewSubscriber(job.SubscriberConfig{
+		Clients: &staticClients{client: client}, Identity: func() job.Identity { return job.Identity{ServiceID: "s", InstanceID: "i"} },
+		Jobs: job.NewDeclarations(), Logger: slog.New(&logSink{}), HeartbeatInterval: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = sub.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Stop()
+	<-srv.heartbeats
+	start := time.Now()
+	select {
+	case <-srv.heartbeats:
+		if gap := time.Since(start); gap < 800*time.Millisecond {
+			t.Fatalf("next beat after %v, want the runtime's 1s", gap)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no second beat")
+	}
+}

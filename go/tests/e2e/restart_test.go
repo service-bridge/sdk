@@ -48,7 +48,6 @@ func TestClientReconnectsAfterRuntimeRestart(t *testing.T) {
 	disconnected := make(chan error, 8)
 
 	c, err := servicebridge.New(rt.URL, key,
-		servicebridge.WithDataDir(t.TempDir()),
 		servicebridge.WithLogger(logger(t)),
 		servicebridge.WithReconnectAttempts(30),
 		servicebridge.WithReconnectLadder(500*time.Millisecond),
@@ -126,7 +125,6 @@ func TestClientReconnectsAfterRuntimeRestart(t *testing.T) {
 	// runtime has to discover the handler and reach it, proving the client's
 	// registration survived the round trip, not just its control stream.
 	caller, err := servicebridge.New(rt.URL, key,
-		servicebridge.WithDataDir(t.TempDir()),
 		servicebridge.WithLogger(logger(t)),
 		servicebridge.WithReconnectAttempts(3),
 		servicebridge.WithAdvertise("127.0.0.1", 0),

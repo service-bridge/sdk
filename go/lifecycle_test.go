@@ -19,7 +19,6 @@ import (
 
 	sb "github.com/service-bridge/sdk/go"
 	internaljob "github.com/service-bridge/sdk/go/internal/job"
-	"github.com/service-bridge/sdk/go/internal/outbox"
 	pb "github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1"
 	"github.com/service-bridge/sdk/go/job"
 	"google.golang.org/grpc"
@@ -30,7 +29,7 @@ import (
 )
 
 // A real TLS runtime fixture exercises public construction/start/stop, including
-// bootstrap, mTLS data-plane streams, SQLite ownership and a running job.
+// bootstrap, mTLS data-plane streams and a running job.
 type lifecycleRuntime struct {
 	pb.UnimplementedBootstrapServer
 	pb.UnimplementedControlServer
@@ -45,6 +44,7 @@ type lifecycleRuntime struct {
 	rejectProvision    bool
 	jobs               chan *pb.JobExecution
 	staleResults       atomic.Int64
+	protocol           uint32
 }
 
 func (f *lifecycleRuntime) Provision(ctx context.Context, req *pb.ProvisionRequest) (*pb.ProvisionResponse, error) {
@@ -75,7 +75,7 @@ func (f *lifecycleRuntime) Provision(ctx context.Context, req *pb.ProvisionReque
 	return &pb.ProvisionResponse{CertDer: der, CaChainDer: f.ca.Raw, ServiceId: "service", ServiceName: "test", InstanceId: "instance", NotAfterUnixMs: leaf.NotAfter.UnixMilli()}, nil
 }
 func (f *lifecycleRuntime) Open(_ *pb.OpenRequest, st pb.Control_OpenServer) error {
-	if err := st.Send(&pb.ServerControl{Kind: &pb.ServerControl_Welcome{Welcome: &pb.Welcome{ServiceId: "service", ServiceName: "test", SessionId: "session"}}}); err != nil {
+	if err := st.Send(&pb.ServerControl{Kind: &pb.ServerControl_Welcome{Welcome: &pb.Welcome{ServiceId: "service", ServiceName: "test", SessionId: "session", ProtocolVersion: f.protocol}}}); err != nil {
 		return err
 	}
 	<-st.Context().Done()
@@ -161,7 +161,7 @@ func startLifecycleRuntime(t *testing.T) (*lifecycleRuntime, string, string) {
 func TestPublicStartRollsBackFailedProvision(t *testing.T) {
 	f, addr, key := startLifecycleRuntime(t)
 	f.rejectProvision = true
-	c, err := sb.New(addr, key, sb.WithCallerOnly(), sb.WithDataDir(t.TempDir()))
+	c, err := sb.New(addr, key, sb.WithCallerOnly())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,8 +170,8 @@ func TestPublicStartRollsBackFailedProvision(t *testing.T) {
 	if err = c.Start(ctx); err == nil {
 		t.Fatal("revoked bootstrap unexpectedly started")
 	}
-	if _, err = c.FailedOutboxEvents(context.Background(), 1, ""); !errors.Is(err, outbox.ErrClosed) {
-		t.Fatalf("failed startup must close SQLite: %v", err)
+	if err = c.Ready(ctx); !errors.Is(err, sb.ErrState) {
+		t.Fatalf("Ready on a client whose start failed: %v", err)
 	}
 	if err = c.Start(ctx); err == nil {
 		t.Fatal("terminal failed client restarted")
@@ -184,7 +184,7 @@ func TestPublicStartRollsBackFailedProvision(t *testing.T) {
 func TestPublicStopInterruptsInitialProvision(t *testing.T) {
 	f, addr, key := startLifecycleRuntime(t)
 	f.blockProvision = true
-	c, err := sb.New(addr, key, sb.WithCallerOnly(), sb.WithDataDir(t.TempDir()))
+	c, err := sb.New(addr, key, sb.WithCallerOnly())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +217,7 @@ func TestPublicStopInterruptsInitialProvision(t *testing.T) {
 
 func TestPublicStopCancelsAndBoundsUncooperativeJob(t *testing.T) {
 	f, addr, key := startLifecycleRuntime(t)
-	c, err := sb.New(addr, key, sb.WithCallerOnly(), sb.WithDataDir(t.TempDir()))
+	c, err := sb.New(addr, key, sb.WithCallerOnly())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,13 +261,75 @@ func TestPublicStopCancelsAndBoundsUncooperativeJob(t *testing.T) {
 	}
 	select {
 	case <-cancelled:
-	default:
-		t.Fatal("Stop did not cancel active execution before waiting")
-	}
-	if _, err = c.FailedOutboxEvents(context.Background(), 1, ""); !errors.Is(err, outbox.ErrClosed) {
-		t.Fatalf("bounded Stop must close owned SQLite before waiting on handler: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not cancel the execution once its deadline passed")
 	}
 	if f.staleResults.Load() != 0 {
 		t.Fatal("cancelled execution reported stale success")
+	}
+}
+
+// Stop drains: a job handler that finishes within the deadline completes and
+// reports its result before the client goes away.
+func TestPublicStopWaitsForInFlightWork(t *testing.T) {
+	f, addr, key := startLifecycleRuntime(t)
+	c, err := sb.New(addr, key, sb.WithCallerOnly())
+	if err != nil {
+		t.Fatal(err)
+	}
+	trigger, err := job.Interval(time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := job.NewSpec(trigger, job.WithVersion("v1"))
+	entered := make(chan struct{})
+	if err = c.Job.Handle("short", spec, func(ctx context.Context, _ job.Execution) error {
+		close(entered)
+		select {
+		case <-time.After(100 * time.Millisecond):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err = c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = c.Ready(ctx); err != nil {
+		t.Fatalf("Ready after Start: %v", err)
+	}
+	raw, err := spec.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.jobs <- &pb.JobExecution{JobName: "short", ExecutionId: "execution", Fingerprint: internaljob.ContractHash(raw), LeaseEpoch: 1}
+	<-entered
+	if err = c.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if f.staleResults.Load() != 1 {
+		t.Fatalf("the in-flight execution reported %d results, want 1", f.staleResults.Load())
+	}
+	if _, err := sb.PublishEvent(ctx, c, "order.created", &pb.Ack{}); !errors.Is(err, sb.ErrState) {
+		t.Fatalf("publish after Stop: %v", err)
+	}
+}
+
+// A runtime speaking another wire revision fails Start terminally.
+func TestPublicStartRefusesAnUnsupportedProtocol(t *testing.T) {
+	f, addr, key := startLifecycleRuntime(t)
+	f.protocol = 99
+	c, err := sb.New(addr, key, sb.WithCallerOnly())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err = c.Start(ctx); !errors.Is(err, sb.ErrConfig) {
+		t.Fatalf("Start against protocol 99: %v, want CONFIG", err)
 	}
 }

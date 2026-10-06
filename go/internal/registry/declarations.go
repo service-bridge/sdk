@@ -128,21 +128,23 @@ func (d *Declarations) PublishEvent(name string, schemaJSON []byte, contractHash
 	return nil
 }
 
-// SubscribeEvent declares an event subscription. Duplicate patterns collapse
-// into one row: event_subscriptions has PRIMARY KEY (subscriber_id, pattern),
-// so a duplicate rolls the whole registration back. In-process fan-out across
-// several handlers for the same pattern is the SDK's own business.
-func (d *Declarations) SubscribeEvent(pattern string) error {
+// ErrDuplicateSubscription marks a pattern declared twice. The runtime refuses
+// such a registration with INVALID_ARGUMENT, so it is caught here.
+var ErrDuplicateSubscription = errors.New("event pattern is already subscribed")
+
+// SubscribeEvent declares an event subscription with its filter expression
+// (JSON, empty for none). One pattern is declared once.
+func (d *Declarations) SubscribeEvent(pattern, filter string) error {
 	if pattern == "" {
 		return fmt.Errorf("registry: subscribe event: %w", ErrEmptyName)
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if _, seen := d.subsSeen[pattern]; seen {
-		return nil
+		return fmt.Errorf("registry: subscribe event %q: %w", pattern, ErrDuplicateSubscription)
 	}
 	d.subsSeen[pattern] = struct{}{}
-	d.subs = append(d.subs, &pb.EventSubscription{Pattern: pattern})
+	d.subs = append(d.subs, &pb.EventSubscription{Pattern: pattern, Filter: filter})
 	return nil
 }
 

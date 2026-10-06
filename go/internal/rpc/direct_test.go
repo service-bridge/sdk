@@ -287,7 +287,6 @@ func directUnderTest(t *testing.T, ca *outboundCA, clk *stepClock, dialer PeerDi
 
 	d := NewDirect(DirectConfig{Dialer: dialer, Now: clk.now, Logger: outboundTestLogger()})
 	creds := ca.credentials(t, ca.serviceLeaf(t, "svc-caller", "inst-caller"), "svc-caller", "inst-caller")
-	creds.Lease.NotAfter = time.UnixMilli(clk.now()).Add(24 * time.Hour)
 	if err := d.UseCredentials(context.Background(), creds); err != nil {
 		t.Fatalf("publish credentials: %v", err)
 	}
@@ -348,7 +347,37 @@ func TestChannelIsReusedForTheSameTarget(t *testing.T) {
 	}
 }
 
-func TestCredentialRotationDropsEveryCachedChannel(t *testing.T) {
+// A renewal of the same instance swaps only the TLS material: cached channels
+// stay, and their next handshake presents the renewed leaf.
+func TestRenewalOfTheSameInstanceKeepsCachedChannels(t *testing.T) {
+	ca := newOutboundCA(t)
+	clk := newStepClock(1_700_000_000_000)
+	dialer := &countingDialer{}
+	d := directUnderTest(t, ca, clk, dialer)
+
+	target := peerTarget("svc-a", "inst-1", "10.0.0.7:14446")
+	l, err := d.lease(context.Background(), target)
+	if err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+	l.release()
+
+	renewed := ca.credentials(t, ca.serviceLeaf(t, "svc-caller", "inst-caller"), "svc-caller", "inst-caller")
+	if err := d.UseCredentials(context.Background(), renewed); err != nil {
+		t.Fatalf("renew: %v", err)
+	}
+	if d.Cached() != 1 {
+		t.Fatalf("a renewal dropped the cached channel (cached %d)", d.Cached())
+	}
+	if _, err := d.lease(context.Background(), target); err != nil {
+		t.Fatalf("lease after renewal: %v", err)
+	}
+	if len(dialer.dials) != 1 {
+		t.Fatalf("dialled %d times, want the channel reused", len(dialer.dials))
+	}
+}
+
+func TestReprovisionedInstanceDropsEveryCachedChannel(t *testing.T) {
 	ca := newOutboundCA(t)
 	clk := newStepClock(1_700_000_000_000)
 	dialer := &countingDialer{}
@@ -362,7 +391,6 @@ func TestCredentialRotationDropsEveryCachedChannel(t *testing.T) {
 	l.release()
 
 	rotated := ca.credentials(t, ca.serviceLeaf(t, "svc-caller", "inst-caller-2"), "svc-caller", "inst-caller-2")
-	rotated.Lease.NotAfter = time.UnixMilli(clk.now()).Add(24 * time.Hour)
 	if err := d.UseCredentials(context.Background(), rotated); err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
@@ -400,49 +428,6 @@ func TestRetainInstancesClosesDepartedPeers(t *testing.T) {
 
 	if d.Cached() != 1 {
 		t.Fatalf("cached %d channels after the departure, want 1", d.Cached())
-	}
-}
-
-func TestExpiredChannelIsRedialled(t *testing.T) {
-	ca := newOutboundCA(t)
-	clk := newStepClock(1_700_000_000_000)
-	dialer := &countingDialer{}
-
-	d := NewDirect(DirectConfig{Dialer: dialer, Now: clk.now, Logger: outboundTestLogger()})
-	t.Cleanup(func() { _ = d.Close() })
-
-	creds := ca.credentials(t, ca.serviceLeaf(t, "svc-caller", "inst-caller"), "svc-caller", "inst-caller")
-	// A certificate expiring in 10 minutes: TTL is 10min − 5min lead = 5min.
-	creds.Lease.NotAfter = time.UnixMilli(clk.now()).Add(10 * time.Minute)
-	if err := d.UseCredentials(context.Background(), creds); err != nil {
-		t.Fatalf("publish credentials: %v", err)
-	}
-
-	target := peerTarget("svc-a", "inst-1", "10.0.0.7:14446")
-	l, err := d.lease(context.Background(), target)
-	if err != nil {
-		t.Fatalf("lease: %v", err)
-	}
-	l.release()
-
-	clk.advance(5*60*1000 - 1)
-	l, err = d.lease(context.Background(), target)
-	if err != nil {
-		t.Fatalf("lease before expiry: %v", err)
-	}
-	l.release()
-	if len(dialer.dials) != 1 {
-		t.Fatalf("dialled %d times before the TTL elapsed, want 1", len(dialer.dials))
-	}
-
-	clk.advance(1)
-	l, err = d.lease(context.Background(), target)
-	if err != nil {
-		t.Fatalf("lease after expiry: %v", err)
-	}
-	l.release()
-	if len(dialer.dials) != 2 {
-		t.Fatalf("dialled %d times after the TTL elapsed, want a redial", len(dialer.dials))
 	}
 }
 
@@ -567,6 +552,9 @@ func TestDirectUnaryFailsAgainstAnImpersonatingPeer(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "peer SPIFFE identity mismatch") {
 		t.Fatalf("the failure must name the identity pin, got %v", err)
+	}
+	if !PreDispatch(err) || !directPreDispatch(err) {
+		t.Fatalf("a failed handshake never wrote the request: %v", err)
 	}
 	if d.Cached() != 0 {
 		t.Fatal("a channel that failed its handshake must be evicted, not kept")

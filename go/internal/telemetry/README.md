@@ -91,6 +91,9 @@
 | `TransportConfig.FlushInterval` · `.MaxBatchItems` | `time.Duration` · `int` | `250ms` · `256` | Темп и размер пачки. |
 | `NewTransport(cfg) (*Transport, error)` | функция | — | |
 | `Transport.Start(ctx) error` · `Stop()` | методы | — | Жизненный цикл поверх `stream.Supervisor` — второго автомата переподключения в SDK нет. |
+| `Transport.Close(ctx)` | метод | — | Финальный flush: дописать буфер, дождаться подтверждения последней пачки (клиент даёт не больше 2 с), закрыть отправку, остановиться. |
+| `TransportConfig.OnDrop` | `func(DropInfo)` | `nil` | Потери с прошлого отчёта: `ServerDropped`, `BufferDropped` (дельты), `BackpressureLevel`. |
+| `TransportConfig.InstanceID` | `func() string` | `nil` | Инстанс, от имени которого потери уходят в рантайм счётчиком `sb_sdk_telemetry_dropped_total{source="ring"\|"server"}` (`DroppedMetric`). |
 | `Transport.BackpressureLevel() uint32` | метод | — | Последний уровень затора от рантайма. Только наблюдение, см. решения ниже. |
 | `NewMetrics(sink MetricSink) *Metrics` | функция | — | Агрегатор по серии `(вид, имя, instance_id, метки)`. |
 | `Metrics.Counter(name, labels) *Counter` · `.Gauge(...)` · `.Histogram(name, unit, labels, bounds)` | методы | границы — лесенка латентности в секундах | Хендл держит ссылку на серию: `Inc` — сложение, без аллокаций и поиска. |

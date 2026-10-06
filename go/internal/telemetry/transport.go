@@ -44,13 +44,17 @@ const DefaultFlushInterval = 250 * time.Millisecond
 // one flush cycle writes as many batches as the buffer holds.
 const DefaultMaxBatchItems = 256
 
-// DropInfo reports telemetry that was lost, either by the runtime shedding load
-// or by the local buffer overflowing.
+// DropInfo reports telemetry lost since the previous report, either by the
+// runtime shedding load or by the local buffer overflowing.
 type DropInfo struct {
 	ServerDropped     uint64
 	BufferDropped     uint64
 	BackpressureLevel uint32
 }
+
+// DroppedMetric is the counter the drops are reported to the runtime under,
+// labelled source="ring" or source="server".
+const DroppedMetric = "sb_sdk_telemetry_dropped_total"
 
 // TransportConfig wires the Telemetry.Report client. See ./README.md.
 type TransportConfig struct {
@@ -67,8 +71,11 @@ type TransportConfig struct {
 	MaxBatchItems int
 	// MaxInflightItems bounds all unacknowledged kinds together; default 1024.
 	MaxInflightItems int
-	// OnDrop fires when a drop counter rises on either side.
+	// OnDrop fires when a drop counter rises on either side, with the deltas.
 	OnDrop func(DropInfo)
+	// InstanceID names the live instance the drop counter is reported under.
+	// Without it the counter is not reported.
+	InstanceID func() string
 	// OnDrain fires once per stream when the runtime asks the SDK to close. The
 	// transport stops sending new batches before it runs.
 	OnDrain func(reason string)
@@ -101,6 +108,8 @@ type Transport struct {
 	cur           *session
 	inflight      inflightSet
 	sequence      uint64
+	acked         uint64
+	ackNotify     chan struct{}
 	draining      bool
 	backpressure  uint32
 	serverDropped uint64
@@ -131,7 +140,7 @@ func NewTransport(cfg TransportConfig) (*Transport, error) {
 		cfg.Logger = slog.Default()
 	}
 
-	t := &Transport{cfg: cfg}
+	t := &Transport{cfg: cfg, ackNotify: make(chan struct{})}
 	t.inflight.reset()
 
 	sup, err := stream.NewSupervisor(stream.Config[*pb.TelemetryAck, *session]{
@@ -256,6 +265,7 @@ func (t *Transport) open(ctx context.Context) (*session, error) {
 	t.cur = sess
 	t.inflight.reset()
 	t.sequence = 0
+	t.acked = 0
 	t.draining = false
 	t.mu.Unlock()
 
@@ -271,6 +281,9 @@ func (t *Transport) onData(_ context.Context, ack *pb.TelemetryAck, sess *sessio
 	confirmed := Batch{}
 	if seq := ack.GetAcknowledgedSequence(); seq > 0 && seq <= t.sequence {
 		confirmed = t.inflight.release(seq)
+		t.acked = max(t.acked, seq)
+		close(t.ackNotify)
+		t.ackNotify = make(chan struct{})
 	}
 	if !confirmed.Empty() {
 		t.cfg.Ring.Commit(confirmed)
@@ -284,8 +297,8 @@ func (t *Transport) onData(_ context.Context, ack *pb.TelemetryAck, sess *sessio
 	}
 	t.mu.Unlock()
 
-	if rose && t.cfg.OnDrop != nil {
-		t.cfg.OnDrop(drop)
+	if rose {
+		t.reportDrops(drop)
 	}
 
 	if drainReason == "" {
@@ -303,19 +316,76 @@ func (t *Transport) onData(_ context.Context, ack *pb.TelemetryAck, sess *sessio
 	}
 }
 
-// dropInfoLocked reports the current loss counters and whether either of them
-// rose since the last report.
+// dropInfoLocked reports the loss since the last report and whether there was
+// any. The runtime's counter is per stream, so a value below the last one is a
+// new stream starting over, and counts from zero.
 func (t *Transport) dropInfoLocked(ack *pb.TelemetryAck) (DropInfo, bool) {
 	serverDropped := ack.GetDropCountServerSide()
 	bufferDropped := t.cfg.Ring.TotalDropped()
-	rose := serverDropped > t.serverDropped || bufferDropped > t.bufferDropped
+	var serverDelta, bufferDelta uint64
+	if serverDropped >= t.serverDropped {
+		serverDelta = serverDropped - t.serverDropped
+	} else {
+		serverDelta = serverDropped
+	}
+	if bufferDropped >= t.bufferDropped {
+		bufferDelta = bufferDropped - t.bufferDropped
+	}
 	t.serverDropped = serverDropped
 	t.bufferDropped = bufferDropped
 	return DropInfo{
-		ServerDropped:     serverDropped,
-		BufferDropped:     bufferDropped,
+		ServerDropped:     serverDelta,
+		BufferDropped:     bufferDelta,
 		BackpressureLevel: ack.GetBackpressureLevel(),
-	}, rose
+	}, serverDelta > 0 || bufferDelta > 0
+}
+
+// reportDrops hands the loss to the owner and to the runtime, as the
+// sb_sdk_telemetry_dropped_total counter.
+func (t *Transport) reportDrops(drop DropInfo) {
+	if t.cfg.InstanceID != nil {
+		instance := t.cfg.InstanceID()
+		for source, n := range map[string]uint64{"ring": drop.BufferDropped, "server": drop.ServerDropped} {
+			if n == 0 {
+				continue
+			}
+			c, err := t.cfg.Metrics.Counter(instance, DroppedMetric, Labels{"source": source})
+			if err != nil {
+				t.cfg.Logger.Warn("telemetry: drop counter", "err", err)
+				continue
+			}
+			c.Add(float64(n))
+		}
+	}
+	if t.cfg.OnDrop != nil {
+		t.cfg.OnDrop(drop)
+	}
+}
+
+// Close is the final flush: everything buffered is written, the transport
+// waits for the runtime to acknowledge the last batch or for ctx to end, and
+// then stops. What is still unacknowledged at that point is lost.
+func (t *Transport) Close(ctx context.Context) {
+	t.Flush()
+	for {
+		t.mu.Lock()
+		done := t.cur == nil || t.acked >= t.sequence
+		ch := t.ackNotify
+		t.mu.Unlock()
+		if done {
+			break
+		}
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			t.Stop()
+			return
+		}
+	}
+	if sess, ok := t.sup.Current(); ok {
+		_ = sess.stream.CloseSend()
+	}
+	t.Stop()
 }
 
 // writeOnceLocked writes the next unsent slice of the buffer and records it as

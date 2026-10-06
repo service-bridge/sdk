@@ -244,13 +244,10 @@ func (w testWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// newClient builds an unstarted client on a domain identity. Its outbox lives
-// in a per-test temporary directory, so no run inherits another run's buffered
-// events.
+// newClient builds an unstarted client on a domain identity.
 func newClient(t *testing.T, domain string, index int, opts ...servicebridge.Option) *servicebridge.Client {
 	t.Helper()
 	base := []servicebridge.Option{
-		servicebridge.WithDataDir(t.TempDir()),
 		servicebridge.WithLogger(logger(t)),
 		// Bounded so a runtime that went away fails the test instead of holding
 		// it until the go test timeout.

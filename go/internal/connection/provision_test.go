@@ -185,8 +185,8 @@ func TestProvisionSuccess(t *testing.T) {
 	if res.ServiceName != fake.svcName {
 		t.Errorf("ServiceName: got %q want %q", res.ServiceName, fake.svcName)
 	}
-	if !res.NotAfter.Equal(fake.notAfter.UTC()) {
-		t.Errorf("NotAfter: got %s want %s (seconds, not milliseconds)", res.NotAfter, fake.notAfter.UTC())
+	if res.NotAfterUnixMs != fake.notAfter.UnixMilli() {
+		t.Errorf("NotAfterUnixMs: got %d want %d", res.NotAfterUnixMs, fake.notAfter.UnixMilli())
 	}
 
 	req := fake.request()

@@ -11,31 +11,39 @@ import (
 type Transport uint8
 
 const (
-	// TransportDirect dials the callee instance over mTLS. The SDK picks the
-	// instance, so load balancing and the circuit breaker apply.
-	TransportDirect Transport = iota
-	// TransportProxy goes through the runtime, which resolves the instance
-	// itself and owns the idempotency claim.
+	// TransportAuto dials the picked instance directly and falls back to the
+	// runtime proxy for the next attempt when the direct path fails before
+	// the request was sent. It is the default.
+	TransportAuto Transport = iota
+	// TransportDirect dials the callee instance over mTLS and never proxies.
+	TransportDirect
+	// TransportProxy always goes through the runtime, which resolves the
+	// instance itself.
 	TransportProxy
 )
 
 func (t Transport) internal() rpc.Transport {
-	if t == TransportProxy {
+	switch t {
+	case TransportDirect:
+		return rpc.TransportDirect
+	case TransportProxy:
 		return rpc.TransportProxy
+	default:
+		return rpc.TransportAuto
 	}
-	return rpc.TransportDirect
 }
 
 // Defaults applied when the caller states no preference. They are named so a
-// reader can see what a bare New gives them.
+// reader can see what a bare New gives them, and they match the other SDKs.
 const (
-	DefaultDataDir              = "./.servicebridge"
-	DefaultMaxOutboxRows        = 10_000
-	DefaultDrainBatchSize       = 100
-	DefaultMaxInFlightEvents    = 32
-	DefaultMaxConcurrentCalls   = 512
-	DefaultMaxConcurrentStreams = 512
-	DefaultCallAttempts         = 3
+	DefaultCallTimeout         = 30 * time.Second
+	DefaultCallAttempts        = 3
+	DefaultMaxPendingPublishes = 10_000
+	DefaultPublishTimeout      = 30 * time.Second
+	DefaultMaxInFlightEvents   = 32
+	DefaultMaxConcurrentCalls  = 256
+	DefaultMaxQueuedCalls      = 256
+	DefaultStopTimeout         = 10 * time.Second
 	// DefaultAdvertiseHost keeps a bare New usable on a laptop. It is announced
 	// to the mesh as-is, so a cross-host deployment must pass WithAdvertise:
 	// guessing an address from the environment is wrong more often than it is
@@ -58,31 +66,32 @@ type config struct {
 	callAttempts          int
 	failOnPolicyViolation bool
 
-	dataDir           string
-	maxOutboxRows     int
-	drainBatchSize    int
-	maxInFlightEvents int
+	maxPendingPublishes int
+	publishTimeout      time.Duration
+	maxInFlightEvents   int
 
-	maxConcurrentCalls   int
-	maxConcurrentStreams int
+	maxConcurrentCalls int
+	maxQueuedCalls     int
 
 	reconnectAttempts int
 	reconnectLadder   []time.Duration
+
+	onTelemetryDrop func(TelemetryDrop)
 
 	logger *slog.Logger
 }
 
 func defaultConfig() config {
 	return config{
-		advertiseHost:        DefaultAdvertiseHost,
-		dataDir:              DefaultDataDir,
-		maxOutboxRows:        DefaultMaxOutboxRows,
-		drainBatchSize:       DefaultDrainBatchSize,
-		maxInFlightEvents:    DefaultMaxInFlightEvents,
-		maxConcurrentCalls:   DefaultMaxConcurrentCalls,
-		maxConcurrentStreams: DefaultMaxConcurrentStreams,
-		callAttempts:         DefaultCallAttempts,
-		logger:               slog.Default(),
+		advertiseHost:       DefaultAdvertiseHost,
+		callDefaults:        callOptions{timeout: DefaultCallTimeout, transport: TransportAuto},
+		callAttempts:        DefaultCallAttempts,
+		maxPendingPublishes: DefaultMaxPendingPublishes,
+		publishTimeout:      DefaultPublishTimeout,
+		maxInFlightEvents:   DefaultMaxInFlightEvents,
+		maxConcurrentCalls:  DefaultMaxConcurrentCalls,
+		maxQueuedCalls:      DefaultMaxQueuedCalls,
+		logger:              slog.Default(),
 	}
 }
 
@@ -99,24 +108,24 @@ func (c *config) validate() error {
 		return configError(op, "advertise host must not be empty")
 	case c.advertisePort < 0 || c.advertisePort > maxPort:
 		return configError(op, "advertise port must be within 0..65535")
-	case c.dataDir == "":
-		return configError(op, "data directory must not be empty")
-	case c.maxOutboxRows < 0:
-		return configError(op, "outbox row cap must not be negative")
-	case c.drainBatchSize <= 0:
-		return configError(op, "drain batch size must be positive")
+	case c.maxPendingPublishes <= 0:
+		return configError(op, "pending publish cap must be positive")
+	case c.publishTimeout <= 0:
+		return configError(op, "publish timeout must be positive")
 	case c.maxInFlightEvents <= 0:
 		return configError(op, "in-flight event limit must be positive")
 	case c.maxConcurrentCalls <= 0:
 		return configError(op, "inbound call limit must be positive")
-	case c.maxConcurrentStreams <= 0:
-		return configError(op, "inbound stream limit must be positive")
+	case c.maxQueuedCalls < 0:
+		return configError(op, "inbound queue limit must not be negative")
 	case c.callAttempts <= 0:
 		return configError(op, "call attempt budget must be at least one")
 	case c.reconnectAttempts < 0:
 		return configError(op, "reconnect attempt cap must not be negative")
-	case c.callDefaults.timeout < 0:
-		return configError(op, "call timeout must not be negative")
+	case c.callDefaults.timeout <= 0:
+		return configError(op, "call timeout must be positive")
+	case c.callDefaults.transport > TransportProxy:
+		return configError(op, "unknown call transport")
 	case c.logger == nil:
 		return configError(op, "logger must not be nil")
 	}
@@ -169,20 +178,17 @@ func WithFailOnPolicyViolation() Option {
 	return func(c *config) { c.failOnPolicyViolation = true }
 }
 
-// WithDataDir sets the directory holding the local outbox database.
-func WithDataDir(dir string) Option {
-	return func(c *config) { c.dataDir = dir }
+// WithMaxPendingPublishes caps the in-memory publish queue. At the cap a
+// publish fails at once with CodeQueueFull.
+func WithMaxPendingPublishes(n int) Option {
+	return func(c *config) { c.maxPendingPublishes = n }
 }
 
-// WithMaxOutboxRows caps the local event buffer. Zero lifts the cap; an
-// uncapped buffer turns a long outage into a full disk.
-func WithMaxOutboxRows(n int) Option {
-	return func(c *config) { c.maxOutboxRows = n }
-}
-
-// WithDrainBatchSize sets how many buffered events one drain iteration claims.
-func WithDrainBatchSize(n int) Option {
-	return func(c *config) { c.drainBatchSize = n }
+// WithPublishTimeout bounds one publication from enqueue to the runtime's
+// acknowledgement. Past it the publish fails with CodeTimeout, saying whether
+// the event was ever sent.
+func WithPublishTimeout(d time.Duration) Option {
+	return func(c *config) { c.publishTimeout = d }
 }
 
 // WithMaxInFlightEvents caps concurrently processed inbound deliveries. At the
@@ -193,13 +199,28 @@ func WithMaxInFlightEvents(n int) Option {
 }
 
 // WithInboundLimits bounds inbound RPC: handlers running at once across every
-// connection, and HTTP/2 streams per connection. Past the first bound a caller
-// gets ResourceExhausted — load is shed, not queued.
-func WithInboundLimits(maxCalls, maxStreams int) Option {
+// connection, and calls waiting for a free handler. Past both bounds a caller
+// gets RESOURCE_EXHAUSTED with the not-dispatched proof, so it retries on
+// another instance. HTTP/2 streams per connection are capped at the sum.
+func WithInboundLimits(maxCalls, maxQueued int) Option {
 	return func(c *config) {
 		c.maxConcurrentCalls = maxCalls
-		c.maxConcurrentStreams = maxStreams
+		c.maxQueuedCalls = maxQueued
 	}
+}
+
+// TelemetryDrop reports telemetry lost since the previous report: dropped by
+// the runtime under load, or evicted from the local buffer.
+type TelemetryDrop struct {
+	ServerDrops       uint64
+	RingDrops         uint64
+	BackpressureLevel uint32
+}
+
+// WithTelemetryDropHandler is called whenever telemetry was lost. The same
+// counts reach the runtime as the metric sb_sdk_telemetry_dropped_total.
+func WithTelemetryDropHandler(fn func(TelemetryDrop)) Option {
+	return func(c *config) { c.onTelemetryDrop = fn }
 }
 
 // WithReconnectAttempts caps consecutive reconnect attempts. Zero, the default,
@@ -231,7 +252,8 @@ type callOptions struct {
 	businessKey    string
 }
 
-// WithTimeout bounds one call. Zero leaves the deadline to the caller's ctx.
+// WithTimeout bounds one call. The default is DefaultCallTimeout; the caller's
+// ctx deadline still applies when it is earlier.
 func WithTimeout(d time.Duration) CallOption {
 	return func(o *callOptions) { o.timeout = d }
 }
@@ -241,9 +263,9 @@ func WithTransport(t Transport) CallOption {
 	return func(o *callOptions) { o.transport = t }
 }
 
-// WithIdempotencyKey supplies the caller's own deduplication key. Its presence
-// is what unlocks retrying the codes that leave the callee's state unknown, so
-// the SDK never invents one.
+// WithIdempotencyKey supplies the caller's own deduplication key; the callee
+// reads it from CallInfo. It does not widen what the SDK retries — only a
+// proven pre-dispatch failure is retried — and the SDK never invents one.
 func WithIdempotencyKey(key string) CallOption {
 	return func(o *callOptions) { o.idempotencyKey = key }
 }

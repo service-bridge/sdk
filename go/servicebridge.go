@@ -23,7 +23,6 @@ import (
 	"github.com/service-bridge/sdk/go/internal/connection"
 	"github.com/service-bridge/sdk/go/internal/events"
 	jobi "github.com/service-bridge/sdk/go/internal/job"
-	"github.com/service-bridge/sdk/go/internal/outbox"
 	pb "github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1"
 	"github.com/service-bridge/sdk/go/internal/registry"
 	"github.com/service-bridge/sdk/go/internal/rpc"
@@ -35,8 +34,8 @@ import (
 )
 
 // Client owns every resource the SDK holds: the control-plane session, the
-// inbound Call server, one mTLS channel per data-plane domain and the local
-// outbox. Stop releases them all.
+// inbound Call server, one mTLS channel per data-plane domain and the publish
+// queue. Stop releases them all.
 type Client struct {
 	cfg config
 	log *slog.Logger
@@ -77,9 +76,8 @@ type Client struct {
 	session      atomic.Value
 	watchStarted atomic.Bool
 
-	// One mTLS channel per data-plane domain. Each is a credential consumer:
-	// a rotation that reached only some of them leaves the rest talking over a
-	// certificate about to expire.
+	// One mTLS channel per data-plane domain. Each is built once, from the
+	// rotating TLS configuration: a renewed leaf reaches its next handshake.
 	eventsCh   *channel
 	jobsCh     *channel
 	workflowCh *channel
@@ -92,12 +90,10 @@ type Client struct {
 	proxy    *rpc.Proxy
 	balancer *rpc.Balancer
 	breaker  *rpc.Breaker
-	callers  map[Transport]*rpc.Client
+	caller   outbound
 
 	// Events.
-	buffer    *outbox.Storage
 	publisher *events.Publisher
-	drainer   *events.Drainer
 	eventSub  *events.Subscriber
 
 	// Jobs and workflows.
@@ -159,7 +155,6 @@ func New(url, key string, opts ...Option) (*Client, error) {
 		callSchemas: registry.NewCallSchemas(),
 		graphs:      map[string][]wf.Step{},
 		creds:       connection.NewCredentialRegistry(),
-		callers:     map[Transport]*rpc.Client{},
 	}
 
 	c.buildTelemetry()
@@ -211,6 +206,7 @@ func (c *Client) buildConnection(addr string) error {
 		OnChange:         c.onRegistryChange,
 		OnPolicyWarnings: c.onPolicyWarnings,
 		OnError:          func(err error) { c.log.Warn("registry stream failed", "error", err) },
+		OnTerminal:       c.onRegistryTerminal,
 		Backoff:          c.backoff(),
 		Logger:           c.log,
 	})
@@ -224,11 +220,11 @@ func (c *Client) buildConnection(addr string) error {
 			Host: c.cfg.advertiseHost,
 			Port: c.cfg.advertisePort,
 			Limits: rpc.ServerLimits{
-				MaxConcurrentCalls:   c.cfg.maxConcurrentCalls,
-				MaxConcurrentStreams: c.cfg.maxConcurrentStreams,
+				MaxConcurrentCalls: c.cfg.maxConcurrentCalls,
+				MaxQueuedCalls:     c.cfg.maxQueuedCalls,
 			},
 			Dispatcher: c.dispatch,
-			Policies:   watch.Cache(),
+			Admission:  watch.Cache(),
 			Logger:     c.log,
 		})
 		if err != nil {
@@ -279,24 +275,28 @@ func (c *Client) buildRPC() error {
 
 	retry := rpc.DefaultRetryPolicy()
 	retry.MaxAttempts = c.cfg.callAttempts
-	for _, t := range []Transport{TransportDirect, TransportProxy} {
-		caller, err := rpc.NewClient(rpc.ClientConfig{
-			Registry:  c.watch.Cache(),
-			Direct:    c.direct,
-			Proxy:     c.proxy,
-			Balancer:  c.balancer,
-			Breaker:   c.breaker,
-			Recorder:  c.recorder,
-			Retry:     retry,
-			Transport: t.internal(),
-			Logger:    c.log,
-		})
-		if err != nil {
-			return err
-		}
-		c.callers[t] = caller
+	caller, err := rpc.NewClient(rpc.ClientConfig{
+		Registry: c.watch.Cache(),
+		Direct:   c.direct,
+		Proxy:    c.proxy,
+		Balancer: c.balancer,
+		Breaker:  c.breaker,
+		Recorder: c.recorder,
+		Retry:    retry,
+		Logger:   c.log,
+	})
+	if err != nil {
+		return err
 	}
+	c.caller = caller
 	return nil
+}
+
+// outbound is the call path the typed operations use. The live client's is the
+// rpc package's; the test harness installs an in-memory one.
+type outbound interface {
+	Unary(ctx context.Context, req rpc.Request) ([]byte, error)
+	Stream(ctx context.Context, req rpc.Request) (*rpc.Stream, error)
 }
 
 func (c *Client) buildDomains() error {
@@ -313,6 +313,19 @@ func (c *Client) buildDomains() error {
 		return err
 	}
 	c.eventSub = sub
+
+	publisher, err := events.NewPublisher(events.PublisherConfig{
+		Codec:             codec{},
+		Publish:           c.publishEnvelope,
+		MaxPending:        c.cfg.maxPendingPublishes,
+		Timeout:           c.cfg.publishTimeout,
+		OnPolicyViolation: c.onPublishViolation,
+		Logger:            c.log,
+	})
+	if err != nil {
+		return err
+	}
+	c.publisher = publisher
 
 	jobSub, err := jobi.NewSubscriber(jobi.SubscriberConfig{
 		Clients:  c.jobsCh,
@@ -365,12 +378,14 @@ func (c *Client) buildDomains() error {
 	c.wfSub = wfSub
 
 	tport, err := telemetry.NewTransport(telemetry.TransportConfig{
-		Open:    c.openTelemetryStream,
-		Ring:    c.ring,
-		Metrics: c.metrics,
-		Backoff: c.backoff(),
-		OnError: func(err error) { c.log.Warn("telemetry stream failed", "error", err) },
-		Logger:  c.log,
+		Open:       c.openTelemetryStream,
+		Ring:       c.ring,
+		Metrics:    c.metrics,
+		OnDrop:     c.onTelemetryDrop,
+		InstanceID: c.instanceID,
+		Backoff:    c.backoff(),
+		OnError:    func(err error) { c.log.Warn("telemetry stream failed", "error", err) },
+		Logger:     c.log,
 	})
 	if err != nil {
 		return err
@@ -398,7 +413,7 @@ func (c *Client) buildDomains() error {
 //  0. check that every workflow call step names a declared dependency, while
 //     the declarations are still the reader's to fix
 //  1. seal the declarations — after this the mesh has been told what exists
-//  2. open the local outbox, so a publish has somewhere durable to land
+//  2. declare the event subscriptions, with their filters
 //  3. register every credential consumer, so the first lease reaches all of them
 //  4. hand the lifecycle control: it provisions (or reuses the cached lease),
 //     binds the inbound Call server, opens Control.Open and only then starts
@@ -444,9 +459,6 @@ func (c *Client) Start(ctx context.Context) (result error) {
 	ctx = startCtx
 
 	c.dispatch.Seal()
-	if err := c.openOutbox(ctx); err != nil {
-		return wrap(op, err)
-	}
 	if err := c.registerConsumers(ctx); err != nil {
 		return wrap(op, err)
 	}
@@ -460,43 +472,6 @@ func (c *Client) Start(ctx context.Context) (result error) {
 	c.ready = !c.stopped
 	c.lifeMu.Unlock()
 	return wrap(op, c.startSubscriptions())
-}
-
-func (c *Client) openOutbox(ctx context.Context) error {
-	storage, err := outbox.Open(ctx, outbox.Config{Dir: c.cfg.dataDir})
-	if err != nil {
-		return err
-	}
-	c.buffer = storage
-
-	drainer, err := events.NewDrainer(events.DrainerConfig{
-		Storage:           storage,
-		Publish:           c.publishEnvelope,
-		Identity:          c.eventsIdentity,
-		BatchSize:         c.cfg.drainBatchSize,
-		OnPolicyViolation: c.onDrainViolation,
-		OnError:           func(err error) { c.log.Warn("event drain failed", "error", err) },
-		Logger:            c.log,
-	})
-	if err != nil {
-		return err
-	}
-	c.drainer = drainer
-
-	publisher, err := events.NewPublisher(events.PublisherConfig{
-		Storage:       storage,
-		Codec:         codec{},
-		Publish:       c.publishEnvelope,
-		Identity:      c.eventsIdentity,
-		Kick:          drainer.Kick,
-		MaxOutboxRows: c.cfg.maxOutboxRows,
-		Logger:        c.log,
-	})
-	if err != nil {
-		return err
-	}
-	c.publisher = publisher
-	return nil
 }
 
 // registerConsumers wires every holder of mTLS material into the credential
@@ -522,7 +497,7 @@ func (c *Client) registerConsumers(ctx context.Context) error {
 }
 
 func (c *Client) startSubscriptions() error {
-	if err := c.drainer.Start(c.runCtx); err != nil {
+	if err := c.publisher.Start(c.runCtx); err != nil {
 		return err
 	}
 	if err := c.tport.Start(c.runCtx); err != nil {
@@ -531,7 +506,7 @@ func (c *Client) startSubscriptions() error {
 	if err := c.sampler.Start(c.runCtx); err != nil {
 		return err
 	}
-	if len(c.eventSub.Names()) > 0 {
+	if len(c.eventSub.Subscriptions()) > 0 {
 		if err := c.eventSub.Start(c.runCtx); err != nil {
 			return err
 		}
@@ -549,10 +524,32 @@ func (c *Client) startSubscriptions() error {
 	return nil
 }
 
-// Stop releases every resource the client owns, in the reverse order of Start.
-// It is idempotent and reports the first failure without skipping the rest:
-// a channel left open holds its own reconnect goroutines until the process
-// dies.
+// Ready blocks until the current session is live and has applied a registry
+// snapshot. After Start it returns at once unless the client is reconnecting.
+func (c *Client) Ready(ctx context.Context) error {
+	const op = "Client.Ready"
+	c.lifeMu.Lock()
+	started, stopped := c.started, c.stopped
+	c.lifeMu.Unlock()
+	if stopped || !started {
+		return newError(CodeState, op, "client is not running", nil)
+	}
+	return wrap(op, c.watch.Ready(ctx))
+}
+
+// Stop shuts the client down in the order that loses nothing it can keep:
+//
+//  1. drain — the inbound server refuses new calls with UNAVAILABLE and the
+//     not-dispatched proof, the instance re-registers with no call endpoint so
+//     peers stop routing to it, and the subscribers stop taking new work
+//  2. wait for in-flight calls, event and job handlers
+//  3. flush the publish queue; what is left fails with CONNECTION
+//  4. flush telemetry and wait for its last acknowledgement (at most 2 s)
+//  5. close the control session, the registry stream, the data channels and
+//     the Call server
+//
+// Steps 2 and 3 share ctx's deadline, DefaultStopTimeout when ctx has none. It
+// is idempotent and reports every failure without skipping the rest.
 func (c *Client) Stop(ctx context.Context) error {
 	const op = "Client.Stop"
 	c.lifeMu.Lock()
@@ -566,15 +563,20 @@ func (c *Client) Stop(ctx context.Context) error {
 		return nil
 	}
 	c.stopped = true
+	wasReady := c.ready
+	c.ready = false
 	startDone := c.startDone
 	c.lifeMu.Unlock()
 
-	if c.cancel != nil {
+	if !wasReady && c.cancel != nil {
+		// Start is still running: there is nothing to drain, and cancelling is
+		// what makes it return.
 		c.cancel()
 	}
+
 	if _, bounded := ctx.Deadline(); !bounded {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, 5*time.Second)
+		ctx, cancel = context.WithTimeout(ctx, DefaultStopTimeout)
 		defer cancel()
 	}
 	done := make(chan error, 1)
@@ -582,51 +584,73 @@ func (c *Client) Stop(ctx context.Context) error {
 		if startDone != nil {
 			<-startDone
 		}
-		var errs []error
-		errs = append(errs, c.direct.Close())
-		for _, ch := range []*channel{c.invokeCh, c.eventsCh, c.jobsCh, c.workflowCh, c.telemCh} {
-			if ch != nil {
-				errs = append(errs, ch.Close())
-			}
-		}
-		if c.server != nil {
-			errs = append(errs, c.server.Close(ctx))
-		}
-		if c.sampler != nil {
-			c.sampler.Stop()
-		}
-		if c.drainer != nil {
-			c.drainer.Stop()
-		}
-		if c.tport != nil {
-			c.tport.Stop()
-		}
-		if c.watch != nil {
-			c.watch.Stop()
-		}
-		if c.buffer != nil {
-			errs = append(errs, c.buffer.Close())
-		}
-		// User handlers can ignore cancellation. All owned network/storage
-		// resources are closed before waiting for those goroutines to return.
-		if c.wfSub != nil {
-			c.wfSub.Stop()
-		}
-		if c.jobSub != nil {
-			c.jobSub.Stop()
-		}
-		if c.eventSub != nil {
-			c.eventSub.Stop()
-		}
-		errs = append(errs, c.life.Stop(ctx))
-		done <- errors.Join(errs...)
+		done <- c.shutdown(ctx, wasReady)
 	}()
 	select {
 	case err := <-done:
 		return wrap(op, err)
 	case <-ctx.Done():
+		if c.cancel != nil {
+			c.cancel()
+		}
 		return wrap(op, ctx.Err())
 	}
+}
+
+func (c *Client) shutdown(ctx context.Context, wasReady bool) error {
+	var errs []error
+
+	// 1. Drain.
+	if c.server != nil {
+		c.server.Drain()
+	}
+	c.eventSub.Drain()
+	c.jobSub.Drain()
+	if wasReady && c.server != nil {
+		c.decls.SetCallEndpoint("")
+		reregCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		if err := c.watch.Reregister(reregCtx); err != nil {
+			c.log.Info("stop: withdrawing the call endpoint", "error", err)
+		}
+		cancel()
+	}
+
+	// 2. In-flight work.
+	if c.server != nil {
+		errs = append(errs, c.server.Wait(ctx))
+	}
+	errs = append(errs, c.eventSub.Wait(ctx), c.jobSub.Wait(ctx))
+
+	// 3. The publish queue.
+	c.publisher.Close(ctx)
+
+	// 4. Telemetry.
+	telemetryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	if wasReady {
+		c.tport.Close(telemetryCtx)
+	} else {
+		c.tport.Stop()
+	}
+	cancel()
+
+	// 5. Everything else.
+	if c.cancel != nil {
+		c.cancel()
+	}
+	c.sampler.Stop()
+	c.wfSub.Stop()
+	c.jobSub.Stop()
+	c.eventSub.Stop()
+	errs = append(errs, c.life.Stop(ctx))
+	c.watch.Stop()
+	for _, ch := range []*channel{c.invokeCh, c.eventsCh, c.jobsCh, c.workflowCh, c.telemCh} {
+		errs = append(errs, ch.Close())
+	}
+	errs = append(errs, c.direct.Close())
+	if c.server != nil {
+		errs = append(errs, c.server.Close(ctx))
+	}
+	return errors.Join(errs...)
 }
 
 // Recorder, Declarations and RestartRegistry are what the HTTP integrations
@@ -671,8 +695,8 @@ type ServiceDeps struct {
 	HTTP      []string
 }
 
-// Identity reports the live session. It is read per use, never cached: every
-// certificate rotation mints a fresh InstanceID for the same ServiceID.
+// Identity reports the live session. The instance is stable across certificate
+// renewals; it changes only if the lease expired and was provisioned again.
 func (c *Client) Identity() Identity {
 	id := c.life.Identity()
 	return Identity{
@@ -790,7 +814,7 @@ func violationOf(v *pb.PolicyViolation) PolicyViolation {
 
 // OnConnected registers a callback fired once per live session, after the
 // runtime's Welcome. Callbacks run on the lifecycle's goroutines and must not
-// block.
+// block; a panic in one is recovered and logged.
 func (c *Client) OnConnected(fn func(Identity)) {
 	c.obsMu.Lock()
 	defer c.obsMu.Unlock()
@@ -804,7 +828,8 @@ func (c *Client) OnReconnecting(fn func(attempt int, cause error)) {
 	c.onReconnect = append(c.onReconnect, fn)
 }
 
-// OnDraining fires when the runtime announces it is shutting down.
+// OnDraining fires when the runtime announces it is shutting down. The client
+// reconnects on its own once the runtime closes the session.
 func (c *Client) OnDraining(fn func(reason string)) {
 	c.obsMu.Lock()
 	defer c.obsMu.Unlock()
@@ -826,6 +851,28 @@ func (c *Client) OnPolicyViolation(fn func(PolicyViolation)) {
 	c.onViolation = append(c.onViolation, fn)
 }
 
+// notify runs every listener with the lock released between registration and
+// the call, and isolates each one: a panicking listener is logged, and the
+// rest still run.
+func notify[T any](c *Client, event string, fns []T, call func(T)) {
+	for _, fn := range fns {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					c.log.Error("listener panicked", "event", event, "panic", fmt.Sprint(r))
+				}
+			}()
+			call(fn)
+		}()
+	}
+}
+
+func listeners[T any](c *Client, list *[]T) []T {
+	c.obsMu.RLock()
+	defer c.obsMu.RUnlock()
+	return append([]T(nil), (*list)...)
+}
+
 // observer keeps the four lifecycle callbacks off the Client's own method set:
 // Connected, Reconnecting, Draining and Disconnected are names an application
 // would otherwise find on its client and try to call.
@@ -835,59 +882,52 @@ func (o *observer) Connected(id connection.SessionIdentity) {
 	c := (*Client)(o)
 	c.metrics.RetireExcept(id.InstanceID)
 	c.log.Info("connected", "service", id.ServiceName, "instance", id.InstanceID)
+	// Whatever the publisher was waiting out was the connection that is back.
+	c.publisher.Kick()
 	identity := Identity{
 		SessionID:   id.SessionID,
 		ServiceID:   id.ServiceID,
 		ServiceName: id.ServiceName,
 		InstanceID:  id.InstanceID,
 	}
-	c.obsMu.RLock()
-	defer c.obsMu.RUnlock()
-	for _, fn := range c.onConnected {
-		fn(identity)
-	}
+	notify(c, "connected", listeners(c, &c.onConnected), func(fn func(Identity)) { fn(identity) })
 }
 
 func (o *observer) Reconnecting(attempt int, cause error) {
 	c := (*Client)(o)
-	c.log.Warn("reconnecting", "attempt", attempt, "error", cause)
-	c.obsMu.RLock()
-	defer c.obsMu.RUnlock()
-	for _, fn := range c.onReconnect {
-		fn(attempt, cause)
+	if errors.Is(cause, connection.ErrDrained) {
+		c.log.Info("reconnecting after a runtime drain", "attempt", attempt)
+	} else {
+		c.log.Warn("reconnecting", "attempt", attempt, "error", cause)
 	}
+	notify(c, "reconnecting", listeners(c, &c.onReconnect), func(fn func(int, error)) { fn(attempt, cause) })
 }
 
 func (o *observer) Draining(reason string) {
 	c := (*Client)(o)
-	c.log.Warn("runtime is draining", "reason", reason)
-	c.obsMu.RLock()
-	defer c.obsMu.RUnlock()
-	for _, fn := range c.onDrain {
-		fn(reason)
-	}
+	c.log.Info("runtime is draining", "reason", reason)
+	notify(c, "draining", listeners(c, &c.onDrain), func(fn func(string)) { fn(reason) })
 }
 
 func (o *observer) Disconnected(cause error) {
 	c := (*Client)(o)
 	if cause != nil {
-		if c.cancel != nil {
-			c.cancel()
-		}
+		c.log.Error("disconnected", "error", cause)
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), DefaultStopTimeout)
 			defer cancel()
 			if err := c.Stop(ctx); err != nil {
 				c.log.Warn("terminal connection cleanup", "error", err)
 			}
 		}()
 	}
-	c.log.Error("disconnected", "error", cause)
-	c.obsMu.RLock()
-	defer c.obsMu.RUnlock()
-	for _, fn := range c.onDisconn {
-		fn(cause)
-	}
+	notify(c, "disconnected", listeners(c, &c.onDisconn), func(fn func(error)) { fn(cause) })
+}
+
+// onRegistryTerminal ends the client when the runtime refuses the
+// registration itself: reconnecting would send the same request again.
+func (c *Client) onRegistryTerminal(err error) {
+	(*observer)(c).Disconnected(newError(CodeValidation, "registry", "the runtime refused the registration", err))
 }
 
 // NewRegistrar builds the registry stream owner for one session. The stream
@@ -947,6 +987,9 @@ func (c *Client) onRegistryChange(ch registry.Change) {
 	if ch.Snapshot || len(ch.RemovedInstances) > 0 || len(ch.RemovedPeers) > 0 {
 		c.retainLive()
 	}
+	if len(ch.RevokedServices) > 0 || len(ch.RevokedInstances) > 0 {
+		c.direct.DropRevoked(c.watch.Cache().RevokedSets())
+	}
 }
 
 // retainLive evicts the per-instance state of instances that left the mesh. The
@@ -984,7 +1027,25 @@ func (c *Client) onPolicyWarnings(warnings []*pb.PolicyViolation) {
 	}
 }
 
-func (c *Client) onDrainViolation(v events.PolicyViolation) {
+func (c *Client) onTelemetryDrop(d telemetry.DropInfo) {
+	if c.cfg.onTelemetryDrop == nil {
+		return
+	}
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				c.log.Error("listener panicked", "event", "telemetry_drop", "panic", fmt.Sprint(r))
+			}
+		}()
+		c.cfg.onTelemetryDrop(TelemetryDrop{
+			ServerDrops:       d.ServerDropped,
+			RingDrops:         d.BufferDropped,
+			BackpressureLevel: d.BackpressureLevel,
+		})
+	}()
+}
+
+func (c *Client) onPublishViolation(v events.PolicyViolation) {
 	c.emitViolation(PolicyViolation{
 		Declaration: "event.publish",
 		Value:       v.EventName,
@@ -994,11 +1055,7 @@ func (c *Client) onDrainViolation(v events.PolicyViolation) {
 }
 
 func (c *Client) emitViolation(v PolicyViolation) {
-	c.obsMu.RLock()
-	defer c.obsMu.RUnlock()
-	for _, fn := range c.onViolation {
-		fn(v)
-	}
+	notify(c, "policy_violation", listeners(c, &c.onViolation), func(fn func(PolicyViolation)) { fn(v) })
 }
 
 func (c *Client) isStarted() bool {
@@ -1094,20 +1151,31 @@ func (c *Client) checkCallDependencies() error {
 	return nil
 }
 
-// channel owns the one mTLS channel a data-plane domain talks over and rebuilds
-// it on every rotation. It is a credential consumer rather than a borrower of
-// the control session's channel so that a domain's streams break — and reopen —
-// exactly when its certificate is replaced.
+// channel owns the one mTLS channel a data-plane domain talks over. It is
+// built from the rotating TLS configuration, so a renewed leaf needs nothing
+// from it: the next handshake presents the new certificate and the streams on
+// it keep running. Only a lease for another instance — a re-provision after
+// the old leaf expired — rebuilds it, because its live connections still
+// authenticate as the instance that is gone.
 type channel struct {
 	name string
 
-	mu sync.Mutex
-	cc *grpc.ClientConn
+	mu       sync.Mutex
+	cc       *grpc.ClientConn
+	instance string
 }
 
 func newChannel(name string) *channel { return &channel{name: name} }
 
 func (ch *channel) UseCredentials(ctx context.Context, creds connection.Credentials) error {
+	instance := creds.Lease.Identity.InstanceID
+	ch.mu.Lock()
+	if ch.cc != nil && ch.instance == instance {
+		ch.mu.Unlock()
+		return nil
+	}
+	ch.mu.Unlock()
+
 	next, err := connection.MTLSDialer{}.Dial(ctx, creds)
 	if err != nil {
 		return fmt.Errorf("servicebridge: dial %s channel: %w", ch.name, err)
@@ -1115,10 +1183,11 @@ func (ch *channel) UseCredentials(ctx context.Context, creds connection.Credenti
 	ch.mu.Lock()
 	prev := ch.cc
 	ch.cc = next
+	ch.instance = instance
 	ch.mu.Unlock()
 	if prev != nil {
-		// The old channel carries the retiring leaf. Closing it breaks this
-		// domain's streams, which is the point: they reopen on the new one.
+		// The old channel speaks for an instance that no longer exists.
+		// Closing it breaks this domain's streams, which reopen on the new one.
 		_ = prev.Close()
 	}
 	return nil

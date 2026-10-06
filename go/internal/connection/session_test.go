@@ -5,7 +5,6 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -55,6 +54,7 @@ type fakeControl struct {
 	openErr  func(n int) error
 	refresh  func(n int, req *pb.RefreshCertRequest) (*pb.RefreshCertResponse, error)
 	refreshN int
+	protocol uint32
 }
 
 func newFakeControl() *fakeControl {
@@ -63,17 +63,6 @@ func newFakeControl() *fakeControl {
 		welcomes: 1,
 		holds:    make(map[int]chan struct{}),
 	}
-}
-
-// holdWelcome withholds the Welcome of the n-th Control.Open until the returned
-// channel is closed. It is how a test parks a rotation exactly at the moment
-// the new session is dialled but not yet proven.
-func (f *fakeControl) holdWelcome(n int) chan struct{} {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	gate := make(chan struct{})
-	f.holds[n] = gate
-	return gate
 }
 
 func (f *fakeControl) Open(_ *pb.OpenRequest, srv grpc.ServerStreamingServer[pb.ServerControl]) error {
@@ -86,7 +75,7 @@ func (f *fakeControl) Open(_ *pb.OpenRequest, srv grpc.ServerStreamingServer[pb.
 		ended: make(chan struct{}),
 	}
 	f.calls = append(f.calls, call)
-	welcomes, openErr, gate := f.welcomes, f.openErr, f.holds[call.n]
+	welcomes, openErr, gate, protocol := f.welcomes, f.openErr, f.holds[call.n], f.protocol
 	f.mu.Unlock()
 
 	defer close(call.ended)
@@ -106,9 +95,10 @@ func (f *fakeControl) Open(_ *pb.OpenRequest, srv grpc.ServerStreamingServer[pb.
 	}
 	for i := 0; i < welcomes; i++ {
 		msg := &pb.ServerControl{Kind: &pb.ServerControl_Welcome{Welcome: &pb.Welcome{
-			SessionId:   "session-" + strconv.Itoa(call.n),
-			ServiceId:   testServiceID,
-			ServiceName: testServiceName,
+			SessionId:       "session-" + strconv.Itoa(call.n),
+			ServiceId:       testServiceID,
+			ServiceName:     testServiceName,
+			ProtocolVersion: protocol,
 		}}}
 		if err := srv.Send(msg); err != nil {
 			return err
@@ -274,13 +264,13 @@ func newLease(t *testing.T, ca *testCA, instanceID string, notAfter time.Time) c
 		t.Fatalf("NewTLSCertificate: %v", err)
 	}
 	return connection.Lease{
-		Identity:    id,
-		ServiceName: testServiceName,
-		CertDER:     der,
-		CAChainDER:  ca.der,
-		PrivateKey:  key,
-		TLSCert:     cert,
-		NotAfter:    notAfter,
+		Identity:       id,
+		ServiceName:    testServiceName,
+		CertDER:        der,
+		CAChainDER:     ca.der,
+		PrivateKey:     key,
+		TLSCert:        cert,
+		NotAfterUnixMs: notAfter.UnixMilli(),
 	}
 }
 
@@ -373,6 +363,7 @@ type recordObserver struct {
 	mu           sync.Mutex
 	connected    []connection.SessionIdentity
 	reconnects   []int
+	causes       []error
 	drains       []string
 	disconnected []error
 	done         bool
@@ -384,10 +375,17 @@ func (o *recordObserver) Connected(id connection.SessionIdentity) {
 	o.connected = append(o.connected, id)
 }
 
-func (o *recordObserver) Reconnecting(attempt int, _ error) {
+func (o *recordObserver) Reconnecting(attempt int, cause error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.reconnects = append(o.reconnects, attempt)
+	o.causes = append(o.causes, cause)
+}
+
+func (o *recordObserver) reconnectCauses() []error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]error(nil), o.causes...)
 }
 
 func (o *recordObserver) Draining(reason string) {
@@ -628,23 +626,6 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
-// leafOf returns the leaf certificate a consumer was last handed.
-func leafOf(t *testing.T, c *recordConsumer) *x509.Certificate {
-	t.Helper()
-	creds, ok := c.last()
-	if !ok {
-		t.Fatalf("consumer %s never received credentials", c.name)
-	}
-	if creds.TLS == nil || len(creds.TLS.Certificates) != 1 {
-		t.Fatalf("consumer %s got a TLS config without exactly one client certificate", c.name)
-	}
-	leaf := creds.TLS.Certificates[0].Leaf
-	if leaf == nil {
-		t.Fatalf("consumer %s got a certificate without a parsed leaf", c.name)
-	}
-	return leaf
-}
-
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 func TestSessionWelcomeBringsTheClientUp(t *testing.T) {
@@ -791,5 +772,60 @@ func TestStopClosesEverythingTheSessionOwns(t *testing.T) {
 	}
 	if err := h.life.Stop(ctx); err != nil {
 		t.Errorf("second Stop: %v", err)
+	}
+}
+
+// A runtime that speaks another wire revision cannot be fixed by reconnecting:
+// the first connect fails terminally.
+func TestUnsupportedProtocolVersionIsTerminal(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	h.control.mu.Lock()
+	h.control.protocol = connection.ProtocolVersion + 1
+	h.control.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := h.life.Start(ctx)
+	if !errors.Is(err, connection.ErrProtocol) || !connection.IsTerminal(err) {
+		t.Fatalf("Start: got %v, want a terminal protocol error", err)
+	}
+}
+
+func TestFailedPreconditionFromTheRuntimeIsTerminal(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	h.start()
+
+	call := h.control.awaitOpen(t)
+	h.control.mu.Lock()
+	h.control.openErr = func(int) error {
+		return status.Error(codes.FailedPrecondition, "protocol version 9 is not supported")
+	}
+	h.control.mu.Unlock()
+	call.kill <- status.Error(codes.FailedPrecondition, "protocol version 9 is not supported")
+
+	waitFor(t, "Disconnected", func() bool { return len(h.observer.disconnects()) == 1 })
+	if h.control.openCount() != 1 {
+		t.Errorf("a terminal code was retried: %d opens", h.control.openCount())
+	}
+}
+
+// A drained session ends routinely: the reconnect that follows carries
+// ErrDrained as its cause, which is what keeps it out of the error logs.
+func TestDrainedSessionReconnectsWithADrainCause(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	h.start()
+
+	call := h.control.awaitOpen(t)
+	call.drain <- "runtime shutting down"
+	waitFor(t, "Draining", func() bool { return len(h.observer.drainReasons()) == 1 })
+	call.kill <- status.Error(codes.Unavailable, "server shutting down")
+
+	waitFor(t, "the reconnect", func() bool { return len(h.observer.connectedIDs()) == 2 })
+	causes := h.observer.reconnectCauses()
+	if len(causes) == 0 || !errors.Is(causes[0], connection.ErrDrained) {
+		t.Fatalf("reconnect cause: %v, want ErrDrained", causes)
 	}
 }

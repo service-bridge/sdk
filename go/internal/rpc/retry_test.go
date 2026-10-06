@@ -8,85 +8,71 @@ import (
 	"time"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
-// An ambiguous status can follow a committed effect and a lost response.
-func TestDispatchedErrorsNeverRetryEvenWithKey(t *testing.T) {
-	for _, code := range []codes.Code{codes.DeadlineExceeded, codes.Unavailable, codes.ResourceExhausted, codes.Internal, codes.Aborted, codes.Unknown} {
-		for _, keyed := range []bool{false, true} {
-			err := status.Error(code, "effect may already have committed")
-			if Classify(err) != RetryNever || Retryable(err, keyed) {
-				t.Fatalf("unsafe replay for %v keyed=%v", code, keyed)
-			}
+// An ambiguous status can follow a committed effect and a lost response: no
+// status without the not-dispatched trailer authorizes a replay, key or not.
+func TestDispatchedErrorsAreNeverPreDispatch(t *testing.T) {
+	for _, code := range []codes.Code{
+		codes.DeadlineExceeded, codes.Unavailable, codes.ResourceExhausted, codes.Internal,
+		codes.Aborted, codes.Unknown, codes.InvalidArgument, codes.NotFound, codes.PermissionDenied,
+		codes.FailedPrecondition, codes.Canceled,
+	} {
+		if PreDispatch(status.Error(code, "effect may already have committed")) {
+			t.Fatalf("unsafe replay for %v", code)
 		}
 	}
 }
 
-func TestOnlyLocalSelectionProofRetries(t *testing.T) {
-	err := fmt.Errorf("selection: %w", &SelectionError{Reason: status.Error(codes.Unavailable, "no candidates")})
-	if Classify(err) != RetryAlways || !Retryable(err, false) {
-		t.Fatalf("proven pre-dispatch failure should retry: %v", err)
+func TestSelectionFailureIsPreDispatch(t *testing.T) {
+	err := fmt.Errorf("selection: %w", &SelectionError{Reason: ErrNoCandidates})
+	if !PreDispatch(err) {
+		t.Fatalf("a selection failure is proven pre-dispatch: %v", err)
 	}
 }
 
-func TestBusinessCodesAreNeverRetried(t *testing.T) {
-	business := []codes.Code{
-		codes.InvalidArgument, codes.NotFound, codes.AlreadyExists,
-		codes.PermissionDenied, codes.Unauthenticated, codes.FailedPrecondition,
-		codes.OutOfRange, codes.Unimplemented, codes.Canceled,
+func TestNotDispatchedTrailerIsPreDispatchProof(t *testing.T) {
+	trailer := metadata.Pairs(NotDispatchedKey, "1")
+	err := markNotDispatched(status.Error(codes.Unavailable, "draining"), trailer, true)
+	if !PreDispatch(err) || !directPreDispatch(err) {
+		t.Fatalf("a status with the trailer is pre-dispatch proof: %v", err)
 	}
-	for _, code := range business {
-		t.Run(code.String(), func(t *testing.T) {
-			err := status.Error(code, "decided")
-			if got := Classify(err); got != RetryNever {
-				t.Fatalf("Classify(%v) = %v, want %v", code, got, RetryNever)
-			}
-			if Retryable(err, true) {
-				t.Fatalf("%v must not be retried even with an idempotency key", code)
-			}
-		})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("the status must survive the marker, got %v", status.Code(err))
+	}
+	viaProxy := markNotDispatched(status.Error(codes.ResourceExhausted, "busy"), trailer, false)
+	if !PreDispatch(viaProxy) || directPreDispatch(viaProxy) {
+		t.Fatal("a proxied proof must not switch transports")
+	}
+	if PreDispatch(markNotDispatched(status.Error(codes.Unavailable, "x"), metadata.MD{}, true)) {
+		t.Fatal("no trailer, no proof")
+	}
+	if markNotDispatched(nil, trailer, true) != nil {
+		t.Fatal("nil stays nil")
 	}
 }
 
-// TestHandlerErrorIsNeverRetried: the handler ran and decided. It carries no
-// wire code, and a code-less error must not fall through to the UNKNOWN branch.
-func TestHandlerErrorIsNeverRetried(t *testing.T) {
+func TestHandlerErrorIsNeverPreDispatch(t *testing.T) {
 	err := handlerError("VALIDATION", "amount must be positive")
-
-	if got := Classify(err); got != RetryNever {
-		t.Fatalf("Classify(handler error) = %v, want %v", got, RetryNever)
-	}
-	if Retryable(err, true) {
-		t.Fatal("a handler business error must not be retried, key or not")
+	if PreDispatch(err) {
+		t.Fatal("a handler business error must not be retried")
 	}
 	var he *HandlerError
 	if !errors.As(err, &he) || he.Code != "VALIDATION" {
 		t.Fatalf("handler error must stay inspectable, got %#v", err)
 	}
+	if he.Error() != "VALIDATION: amount must be positive" || (&HandlerError{Code: "X"}).Error() != "X" {
+		t.Fatalf("handler error text: %q", he.Error())
+	}
 }
 
-func TestLocalErrorsWithoutAWireCodeAreNeverRetried(t *testing.T) {
-	for _, err := range []error{ErrNoLease, ErrDirectClosed, errors.New("boom")} {
-		if got := Classify(err); got != RetryNever {
-			t.Fatalf("Classify(%v) = %v, want %v", err, got, RetryNever)
+func TestLocalErrorsAreNotPreDispatch(t *testing.T) {
+	for _, err := range []error{ErrNoLease, ErrDirectClosed, errors.New("boom"), context.DeadlineExceeded, context.Canceled} {
+		if PreDispatch(err) {
+			t.Fatalf("PreDispatch(%v) = true", err)
 		}
-	}
-}
-
-func TestWrappedStatusKeepsItsClass(t *testing.T) {
-	err := fmt.Errorf("rpc: direct unary Ping to 10.0.0.1:14446: %w", status.Error(codes.Unavailable, "conn refused"))
-	if got := Classify(err); got != RetryNever {
-		t.Fatalf("wrapping cannot create pre-dispatch proof: got %v", got)
-	}
-}
-
-func TestContextDeadlineIsTreatedAsTheWireDeadline(t *testing.T) {
-	if got := Classify(context.DeadlineExceeded); got != RetryNever {
-		t.Fatalf("Classify(context.DeadlineExceeded) = %v, want %v", got, RetryNever)
-	}
-	if got := Classify(context.Canceled); got != RetryNever {
-		t.Fatalf("Classify(context.Canceled) = %v, want %v", got, RetryNever)
 	}
 }
 
@@ -161,18 +147,6 @@ func TestSleepMsChecksTheContextEvenAtZeroDelay(t *testing.T) {
 	}
 	if err := sleepMs(context.Background(), 0); err != nil {
 		t.Fatalf("a zero delay on a live context must not fail: %v", err)
-	}
-}
-
-func TestRetryClassNamesItself(t *testing.T) {
-	cases := map[RetryClass]string{
-		RetryNever:  "never",
-		RetryAlways: "always",
-	}
-	for class, want := range cases {
-		if got := class.String(); got != want {
-			t.Fatalf("RetryClass(%d).String() = %q, want %q", class, got, want)
-		}
 	}
 }
 

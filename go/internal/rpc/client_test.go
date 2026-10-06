@@ -13,6 +13,7 @@ import (
 	pb "github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1"
 	"github.com/service-bridge/sdk/go/internal/telemetry"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -28,6 +29,11 @@ const (
 type stubRegistry struct {
 	methods   map[string][]*pb.MethodDescriptor
 	instances map[string]*pb.ServiceInstanceInfo
+	revoked   map[string]bool
+}
+
+func (r *stubRegistry) Revoked(serviceID, instanceID string) bool {
+	return r.revoked[serviceID] || r.revoked[instanceID]
 }
 
 func (r *stubRegistry) Candidates(service, method, contractHash string) []*pb.MethodDescriptor {
@@ -97,13 +103,12 @@ func proxyClient(t *testing.T, reg CandidateSource, stub pb.InvokeClient, ring *
 		*ring = r
 	}
 	c, err := NewClient(ClientConfig{
-		Registry:      reg,
-		Proxy:         proxyOver(t, stub),
-		Recorder:      rec,
-		Retry:         fastRetry(),
-		Transport:     TransportProxy,
-		CallerService: "checkout",
-		Logger:        outboundTestLogger(),
+		Registry: reg,
+		Direct:   NewDirect(DirectConfig{}),
+		Proxy:    proxyOver(t, stub),
+		Recorder: rec,
+		Retry:    fastRetry(),
+		Logger:   outboundTestLogger(),
 	})
 	if err != nil {
 		t.Fatalf("new client: %v", err)
@@ -117,7 +122,14 @@ func testRequest() Request {
 		Method:       testMethod,
 		Payload:      []byte("body"),
 		ContractHash: testHash,
+		Transport:    TransportProxy,
 	}
+}
+
+func directRequest() Request {
+	req := testRequest()
+	req.Transport = TransportDirect
+	return req
 }
 
 // TestSelectionFailuresAreDistinguishable is the operator-facing invariant: the
@@ -142,18 +154,6 @@ func TestSelectionFailuresAreDistinguishable(t *testing.T) {
 			want:     ErrNoEndpoint,
 			mentions: "addressed=0",
 		},
-		{
-			name: "everything is shed",
-			registry: func() *stubRegistry {
-				a := instanceInfo("inst-1", "10.0.0.1:14446")
-				a.IsUnhealthySinceUnixMs = time.Now().UnixMilli()
-				b := instanceInfo("inst-2", "10.0.0.2:14446")
-				b.IsUnhealthySinceUnixMs = time.Now().UnixMilli()
-				return registryWith(a, b)
-			}(),
-			want:     ErrAllUnavailable,
-			mentions: "eligible=0",
-		},
 	}
 
 	seen := map[string]string{}
@@ -176,9 +176,8 @@ func TestSelectionFailuresAreDistinguishable(t *testing.T) {
 			if !strings.Contains(err.Error(), tc.mentions) {
 				t.Fatalf("message %q must carry the evidence %q", err.Error(), tc.mentions)
 			}
-			// A selection failure is Unavailable so a callee redeploy heals it.
-			if code, ok := callCode(err); !ok || code != codes.Unavailable {
-				t.Fatalf("selection failure must report Unavailable, got %v (ok=%v)", code, ok)
+			if !PreDispatch(err) {
+				t.Fatal("a selection failure is pre-dispatch proof, so a callee redeploy heals it")
 			}
 
 			for other, msg := range seen {
@@ -190,8 +189,8 @@ func TestSelectionFailuresAreDistinguishable(t *testing.T) {
 		})
 	}
 
-	if len(seen) != 3 {
-		t.Fatalf("expected three distinct failure messages, got %d", len(seen))
+	if len(seen) != 2 {
+		t.Fatalf("expected two distinct failure messages, got %d", len(seen))
 	}
 }
 
@@ -529,11 +528,10 @@ func TestNewClientRequiresItsDependencies(t *testing.T) {
 		name string
 		cfg  ClientConfig
 	}{
-		{"no registry", ClientConfig{Recorder: rec, Direct: NewDirect(DirectConfig{})}},
-		{"no recorder", ClientConfig{Registry: reg, Direct: NewDirect(DirectConfig{})}},
-		{"direct selected but absent", ClientConfig{Registry: reg, Recorder: rec, Transport: TransportDirect}},
-		{"proxy selected but absent", ClientConfig{Registry: reg, Recorder: rec, Transport: TransportProxy}},
-		{"unknown transport", ClientConfig{Registry: reg, Recorder: rec, Transport: Transport(9)}},
+		{"no registry", ClientConfig{Recorder: rec, Direct: NewDirect(DirectConfig{}), Proxy: proxyOver(t, &stubInvoke{})}},
+		{"no recorder", ClientConfig{Registry: reg, Direct: NewDirect(DirectConfig{}), Proxy: proxyOver(t, &stubInvoke{})}},
+		{"direct absent", ClientConfig{Registry: reg, Recorder: rec, Proxy: proxyOver(t, &stubInvoke{})}},
+		{"proxy absent", ClientConfig{Registry: reg, Recorder: rec, Direct: NewDirect(DirectConfig{})}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -558,16 +556,15 @@ func TestDirectPathCallsThePinnedPeer(t *testing.T) {
 	balancer := NewBalancer()
 
 	c, err := NewClient(ClientConfig{
-		Registry:      registryWith(instanceInfo("inst-1", addr)),
-		Direct:        direct,
-		Balancer:      balancer,
-		Breaker:       breaker,
-		Recorder:      rec,
-		Retry:         fastRetry(),
-		Transport:     TransportDirect,
-		CallerService: "checkout",
-		Now:           clk.now,
-		Logger:        outboundTestLogger(),
+		Registry: registryWith(instanceInfo("inst-1", addr)),
+		Direct:   direct,
+		Proxy:    proxyOver(t, &stubInvoke{}),
+		Balancer: balancer,
+		Breaker:  breaker,
+		Recorder: rec,
+		Retry:    fastRetry(),
+		Now:      clk.now,
+		Logger:   outboundTestLogger(),
 	})
 	if err != nil {
 		t.Fatalf("new client: %v", err)
@@ -576,15 +573,12 @@ func TestDirectPathCallsThePinnedPeer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	got, err := c.Unary(ctx, testRequest())
+	got, err := c.Unary(ctx, directRequest())
 	if err != nil {
 		t.Fatalf("direct call: %v", err)
 	}
 	if string(got) != "body" {
 		t.Fatalf("payload = %q, want body", got)
-	}
-	if peer.lastReq.GetCallerService() != "checkout" {
-		t.Fatalf("caller_service = %q, want checkout", peer.lastReq.GetCallerService())
 	}
 	if peer.lastReq.GetXSbTrace() == "" {
 		t.Fatal("the direct path must carry the trace in the body: that is where the callee reads it")
@@ -617,15 +611,15 @@ func TestDirectPathReleasesItsReservationsOnFailure(t *testing.T) {
 	balancer := NewBalancer()
 
 	c, err := NewClient(ClientConfig{
-		Registry:  registryWith(instanceInfo("inst-1", "127.0.0.1:1")),
-		Direct:    direct,
-		Balancer:  balancer,
-		Breaker:   breakerUnderTest(clk),
-		Recorder:  rec,
-		Retry:     RetryPolicy{MaxAttempts: 2, BaseMs: 1, MaxMs: 1, Multiplier: 1, JitterRatio: 0},
-		Transport: TransportDirect,
-		Now:       clk.now,
-		Logger:    outboundTestLogger(),
+		Registry: registryWith(instanceInfo("inst-1", "127.0.0.1:1")),
+		Direct:   direct,
+		Proxy:    proxyOver(t, &stubInvoke{}),
+		Balancer: balancer,
+		Breaker:  breakerUnderTest(clk),
+		Recorder: rec,
+		Retry:    RetryPolicy{MaxAttempts: 2, BaseMs: 1, MaxMs: 1, Multiplier: 1, JitterRatio: 0},
+		Now:      clk.now,
+		Logger:   outboundTestLogger(),
 	})
 	if err != nil {
 		t.Fatalf("new client: %v", err)
@@ -633,7 +627,7 @@ func TestDirectPathReleasesItsReservationsOnFailure(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if _, err := c.Unary(ctx, testRequest()); err == nil {
+	if _, err := c.Unary(ctx, directRequest()); err == nil {
 		t.Fatal("expected the call to fail against a dead endpoint")
 	}
 	if got := balancer.Tracked(); got != 0 {
@@ -702,12 +696,12 @@ func TestBackoffStopsWhenTheCallerContextExpires(t *testing.T) {
 	stub := &stubInvoke{err: status.Error(codes.Unavailable, "conn refused")}
 	rec, _ := recorderUnderTest()
 	c, err := NewClient(ClientConfig{
-		Registry:  registryWith(instanceInfo("inst-1", "10.0.0.1:14446")),
-		Proxy:     proxyOver(t, stub),
-		Recorder:  rec,
-		Retry:     RetryPolicy{MaxAttempts: 3, BaseMs: 30_000, MaxMs: 30_000, Multiplier: 1, JitterRatio: 0},
-		Transport: TransportProxy,
-		Logger:    outboundTestLogger(),
+		Registry: registryWith(instanceInfo("inst-1", "10.0.0.1:14446")),
+		Direct:   NewDirect(DirectConfig{}),
+		Proxy:    proxyOver(t, stub),
+		Recorder: rec,
+		Retry:    RetryPolicy{MaxAttempts: 3, BaseMs: 30_000, MaxMs: 30_000, Multiplier: 1, JitterRatio: 0},
+		Logger:   outboundTestLogger(),
 	})
 	if err != nil {
 		t.Fatalf("new client: %v", err)
@@ -740,4 +734,114 @@ func (r *lateCandidates) Candidates(service, method, hash string) []*pb.MethodDe
 		return nil
 	}
 	return r.stubRegistry.Candidates(service, method, hash)
+}
+
+func TestNotDispatchedFailureIsRetried(t *testing.T) {
+	stub := &stubInvoke{
+		err:      status.Error(codes.Unavailable, "draining"),
+		errUntil: 1,
+		trailer:  metadata.Pairs(NotDispatchedKey, "1"),
+	}
+	c := proxyClient(t, registryWith(instanceInfo("inst-1", "10.0.0.1:14446")), stub, nil)
+
+	got, err := c.Unary(context.Background(), testRequest())
+	if err != nil {
+		t.Fatalf("a not-dispatched refusal must be retried: %v", err)
+	}
+	if string(got) != "body" || stub.calls != 2 {
+		t.Fatalf("payload %q after %d calls, want body after 2", got, stub.calls)
+	}
+}
+
+func directAndProxyClient(t *testing.T, reg CandidateSource, stub pb.InvokeClient) *Client {
+	t.Helper()
+	ca := newOutboundCA(t)
+	clk := newStepClock(time.Now().UnixMilli())
+	rec, _ := recorderUnderTest()
+	c, err := NewClient(ClientConfig{
+		Registry: reg,
+		Direct:   directUnderTest(t, ca, clk, GRPCPeerDialer{}),
+		Proxy:    proxyOver(t, stub),
+		Breaker:  breakerUnderTest(clk),
+		Recorder: rec,
+		Retry:    fastRetry(),
+		Now:      clk.now,
+		Logger:   outboundTestLogger(),
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	return c
+}
+
+// Transport auto: the direct path fails before dispatch (nothing listens), so
+// the next attempt goes through the runtime — and succeeds there.
+func TestAutoFallsBackToTheProxyAfterADirectPreDispatchFailure(t *testing.T) {
+	stub := &stubInvoke{}
+	c := directAndProxyClient(t, registryWith(instanceInfo("inst-1", "127.0.0.1:1")), stub)
+
+	req := testRequest()
+	req.Transport = TransportAuto
+	got, err := c.Unary(inboundCallCtx(t), req)
+	if err != nil {
+		t.Fatalf("auto call: %v", err)
+	}
+	if string(got) != "body" || stub.calls != 1 {
+		t.Fatalf("payload %q, proxy calls %d; want the proxy to answer once", got, stub.calls)
+	}
+}
+
+func TestDirectTransportNeverFallsBack(t *testing.T) {
+	stub := &stubInvoke{}
+	c := directAndProxyClient(t, registryWith(instanceInfo("inst-1", "127.0.0.1:1")), stub)
+
+	_, err := c.Unary(inboundCallCtx(t), directRequest())
+	if !errors.Is(err, ErrPeerUnreachable) {
+		t.Fatalf("got %v, want the unreachable peer", err)
+	}
+	if stub.calls != 0 {
+		t.Fatalf("transport direct reached the proxy %d times", stub.calls)
+	}
+}
+
+// The health hint never empties the candidate set on its own: with every
+// instance flagged unhealthy, the call still goes to one of them.
+func TestHealthHintFailsOpen(t *testing.T) {
+	ca := newOutboundCA(t)
+	addr := startPeer(t, ca, ca.serviceLeaf(t, "svc-uuid", "inst-1"), &echoPeer{})
+	sick := instanceInfo("inst-1", addr)
+	sick.IsUnhealthySinceUnixMs = time.Now().UnixMilli()
+
+	rec, _ := recorderUnderTest()
+	clk := newStepClock(time.Now().UnixMilli())
+	direct := NewDirect(DirectConfig{Now: clk.now, Logger: outboundTestLogger()})
+	t.Cleanup(func() { _ = direct.Close() })
+	if err := direct.UseCredentials(context.Background(), ca.credentials(t, ca.serviceLeaf(t, "svc-caller", "inst-caller"), "svc-caller", "inst-caller")); err != nil {
+		t.Fatalf("credentials: %v", err)
+	}
+	c, err := NewClient(ClientConfig{
+		Registry: registryWith(sick), Direct: direct, Proxy: proxyOver(t, &stubInvoke{}),
+		Recorder: rec, Retry: fastRetry(), Now: clk.now, Logger: outboundTestLogger(),
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	if _, err := c.Unary(inboundCallCtx(t), directRequest()); err != nil {
+		t.Fatalf("an all-unhealthy fleet must still be called: %v", err)
+	}
+
+	stub := &stubInvoke{}
+	if _, err := proxyClient(t, registryWith(sick), stub, nil).Unary(context.Background(), testRequest()); err != nil || stub.calls != 1 {
+		t.Fatalf("proxy path must fail open too: %v (calls %d)", err, stub.calls)
+	}
+}
+
+func TestRevokedCandidatesAreNeverPicked(t *testing.T) {
+	reg := registryWith(instanceInfo("inst-1", "10.0.0.1:14446"))
+	reg.revoked = map[string]bool{"inst-1": true}
+	stub := &stubInvoke{}
+	_, err := proxyClient(t, reg, stub, nil).Unary(context.Background(), testRequest())
+	if !errors.Is(err, ErrNoCandidates) || stub.calls != 0 {
+		t.Fatalf("got %v after %d calls, want no candidate and nothing sent", err, stub.calls)
+	}
 }

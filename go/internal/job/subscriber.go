@@ -13,12 +13,17 @@ import (
 	"github.com/service-bridge/sdk/go/internal/telemetry"
 )
 
-// Defaults of the subscriber. A runtime heartbeat hint can shorten the period;
-// the threshold gives the stream two missed beats before it is reopened.
+// Defaults of the subscriber. The heartbeat period is the runtime's answer;
+// the default applies only until the first one. The threshold gives the stream
+// two missed beats before it is reopened.
 const (
 	DefaultHeartbeatInterval  = 5 * time.Second
 	DefaultHeartbeatThreshold = 3
 	DefaultResultTimeout      = 10 * time.Second
+
+	// minHeartbeatInterval floors the runtime's hint so a misconfigured
+	// runtime cannot put the subscriber into a hot loop.
+	minHeartbeatInterval = 100 * time.Millisecond
 )
 
 // ErrInvalidConfig is returned by NewSubscriber when a required dependency is
@@ -69,21 +74,24 @@ type SubscriberConfig struct {
 	Logger *slog.Logger
 }
 
-// Subscriber owns the Jobs execution stream, the heartbeat that keeps this
-// instance's leases alive and every goroutine running a handler.
+// Subscriber owns the Jobs execution stream, the heartbeat and every goroutine
+// running a handler. The heartbeat runs for as long as the subscriber does: each
+// beat extends the lease of every execution this instance holds, so a long
+// handler keeps its lease without any per-execution renewal.
 type Subscriber struct {
 	cfg    SubscriberConfig
 	logger *slog.Logger
 	sup    *stream.Supervisor[*pb.JobExecution, pb.Jobs_SubscribeClient]
 
-	mu      sync.Mutex
-	started bool
-	stopped bool
-	runCtx  context.Context
-	cancel  context.CancelFunc
-	slots   map[string]chan struct{}
-	pending chan struct{}
-	active  map[string]activeExecution
+	mu       sync.Mutex
+	started  bool
+	stopped  bool
+	runCtx   context.Context
+	cancel   context.CancelFunc
+	slots    map[string]chan struct{}
+	pending  chan struct{}
+	active   map[string]activeExecution
+	draining bool
 
 	wg sync.WaitGroup
 
@@ -176,6 +184,30 @@ func (s *Subscriber) Stop() {
 	s.wg.Wait()
 }
 
+// Drain stops taking new executions. Running handlers finish.
+func (s *Subscriber) Drain() {
+	s.mu.Lock()
+	s.draining = true
+	s.mu.Unlock()
+}
+
+// Wait blocks until no execution is running or ctx ends.
+func (s *Subscriber) Wait(ctx context.Context) error {
+	for {
+		s.mu.Lock()
+		n := len(s.active)
+		s.mu.Unlock()
+		if n == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("job: wait for executions: %w", ctx.Err())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
 func (s *Subscriber) open(ctx context.Context) (pb.Jobs_SubscribeClient, error) {
 	id := s.cfg.Identity()
 	if id.ServiceID == "" || id.InstanceID == "" {
@@ -215,7 +247,9 @@ func (s *Subscriber) onData(streamCtx context.Context, msg *pb.JobExecution, _ p
 	}
 
 	s.mu.Lock()
-	if s.stopped || s.runCtx == nil {
+	if s.stopped || s.draining || s.runCtx == nil {
+		// A draining instance takes no new work; the runtime reclaims the
+		// lease once the stream is gone and hands the execution to another.
 		s.mu.Unlock()
 		<-s.pending
 		return
@@ -346,8 +380,9 @@ func (s *Subscriber) sendResult(ctx context.Context, msg *pb.JobExecution, runEr
 	}
 }
 
-// heartbeat renews this instance's liveness. Owned by Start, stopped by the
-// context Stop cancels.
+// heartbeat keeps this instance alive for the runtime and extends the lease of
+// every execution it holds. Owned by Start, stopped by the context Stop
+// cancels.
 func (s *Subscriber) heartbeat(ctx context.Context) {
 	defer s.wg.Done()
 
@@ -387,8 +422,10 @@ func (s *Subscriber) beat(ctx context.Context, interval time.Duration) time.Dura
 		return interval
 	}
 	s.hbFailures = 0
-	if hint := resp.GetHeartbeatIntervalMs(); hint > 0 && hint <= s.cfg.HeartbeatInterval.Milliseconds() {
-		return time.Duration(hint) * time.Millisecond
+	// The runtime derives the cadence from its lease and instance timeouts; it
+	// is the authority in both directions.
+	if hint := resp.GetHeartbeatIntervalMs(); hint > 0 {
+		return max(time.Duration(hint)*time.Millisecond, minHeartbeatInterval)
 	}
 	return interval
 }

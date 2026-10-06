@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -22,40 +23,48 @@ const (
 	DefaultJitterRatio = 0.3
 )
 
-// RetryClass is how far an error may be retried.
-type RetryClass uint8
+// NotDispatchedKey is the trailer a callee sets on every rejection it makes
+// before the handler runs. A status carrying it is proof the call never
+// executed, which is the only thing that makes a retry on another instance safe.
+const NotDispatchedKey = "x-sb-not-dispatched"
 
-const (
-	// RetryNever covers dispatched or ambiguous outcomes. Execution may have
-	// committed an effect, so transport status cannot authorize replay.
-	RetryNever RetryClass = iota
-	// RetryAlways covers proven local pre-dispatch selection failures.
-	RetryAlways
-)
+// ErrPeerUnreachable means the channel to the picked callee did not become
+// ready before the request could be written: nothing reached the handler.
+var ErrPeerUnreachable = errors.New("rpc: callee channel is not ready")
 
-func (c RetryClass) String() string {
-	switch c {
-	case RetryAlways:
-		return "always"
-	default:
-		return "never"
-	}
+// NotDispatchedError marks a failure proven to have happened before the
+// callee's handler ran: the channel never became ready, or the callee answered
+// with the not-dispatched trailer. Direct reports that the proof came from the
+// direct path, which is what lets transport auto fall back to the proxy.
+type NotDispatchedError struct {
+	Err    error
+	Direct bool
 }
 
-// Classify allows automatic retry only for a locally proven pre-dispatch
-// rejection. A gRPC status, or the presence of a business key, cannot prove that
-// the remote handler did not execute.
-func Classify(err error) RetryClass {
+func (e *NotDispatchedError) Error() string { return e.Err.Error() }
+
+func (e *NotDispatchedError) Unwrap() error { return e.Err }
+
+// PreDispatch reports whether err proves the call never reached a handler:
+// no candidate was selectable, the callee channel was not ready, or the callee
+// rejected the call with the not-dispatched trailer. Everything else — a gRPC
+// status without the trailer, a deadline, a handler answer — may follow a
+// committed effect, so it is never retried.
+func PreDispatch(err error) bool {
 	var selection *SelectionError
 	if errors.As(err, &selection) {
-		return RetryAlways
+		return true
 	}
-	return RetryNever
+	var nd *NotDispatchedError
+	return errors.As(err, &nd)
 }
 
-// Retryable ignores the correlation key: it does not guarantee atomic dedup of
-// remote business effects. Selection failures are safe to retry.
-func Retryable(err error, _ bool) bool { return Classify(err) == RetryAlways }
+// directPreDispatch reports whether err is a pre-dispatch failure of the direct
+// path, the one condition under which transport auto switches to the proxy.
+func directPreDispatch(err error) bool {
+	var nd *NotDispatchedError
+	return errors.As(err, &nd) && nd.Direct
+}
 
 // callCode extracts the gRPC code an error carries. The second result is false
 // when the error carries none, which is what separates the wire code UNKNOWN —
@@ -174,4 +183,17 @@ func sleepMs(ctx context.Context, ms int64) error {
 	case <-ctx.Done():
 		return fmt.Errorf("rpc: backoff: %w", ctx.Err())
 	}
+}
+
+// markNotDispatched wraps a status error whose trailer carries the
+// not-dispatched proof. Without the trailer the error is returned as is: a bare
+// status may follow a committed effect.
+func markNotDispatched(err error, trailer metadata.MD, direct bool) error {
+	if err == nil {
+		return nil
+	}
+	if vals := trailer.Get(NotDispatchedKey); len(vals) > 0 && vals[0] == "1" {
+		return &NotDispatchedError{Err: err, Direct: direct}
+	}
+	return err
 }

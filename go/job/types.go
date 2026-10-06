@@ -21,10 +21,6 @@ type Execution = internaljob.Execution
 // Jobs carry no input and no output — the only outcome is an error or nil.
 type Handler = internaljob.Handler
 
-// ErrPermanent marks a failure the runtime must not retry. Wrap it to report a
-// poisoned input instead of burning every remaining attempt on it.
-var ErrPermanent = internaljob.ErrPermanent
-
 // The reasons a declaration is refused. Every one of them is checked before the
 // job reaches the runtime, so they surface at the declaration, not at the first
 // fire. Match them with errors.Is.
