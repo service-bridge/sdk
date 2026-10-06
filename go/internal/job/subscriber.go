@@ -292,11 +292,12 @@ func (s *Subscriber) dispatch(ctx context.Context, decl Declaration, msg *pb.Job
 // counts this instance as its owner. Shedding it would not reject a request, it
 // would abandon work the runtime believes is being done.
 func (s *Subscriber) acquire(ctx context.Context, decl Declaration) (func(), bool) {
-	limit := decl.Spec.MaxConcurrent
+	limit := 32
+	if decl.Spec.MaxConcurrent != nil && *decl.Spec.MaxConcurrent > 0 {
+		limit = *decl.Spec.MaxConcurrent
+	}
 	if decl.Spec.Overlap == "" || decl.Spec.Overlap == OverlapSkip {
 		limit = 1
-	} else if limit <= 0 {
-		limit = 32
 	}
 
 	s.mu.Lock()

@@ -3,6 +3,7 @@
 package job
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -147,60 +148,21 @@ func NewAtTrigger(t time.Time) (Trigger, error) {
 	return Trigger{kind: triggerDelayed, runAtUnixMs: t.UnixMilli()}, nil
 }
 
-// Spec is everything a job declares. Every zero field is left out of the
-// canonical JSON: the runtime owns the defaults, and repeating them here would
-// make the SDK a second source of truth that drifts on the first settings
-// change.
+// Spec is everything a job declares. A field left unset is left out of the
+// canonical JSON — the runtime owns the defaults. A limit that is set is
+// written even when it is zero: the canonical bytes must be the ones the Node
+// SDK produces for the same declaration, and it writes every field that was
+// given.
 type Spec struct {
 	Version       string
 	Trigger       Trigger
 	Catchup       CatchupPolicy
 	Overlap       OverlapPolicy
 	Deps          []Dep
-	MaxAttempts   int
-	LeaseTTLMs    int64
-	MaxConcurrent int
+	MaxAttempts   *int
+	LeaseTTLMs    *int64
+	MaxConcurrent *int
 	Retry         *RetryPolicy
-}
-
-// canonicalSpec is the exact shape the runtime decodes out of
-// IncomingMethod.input_schema_json (runtime/internal/jobs/canonical.go,
-// CanonicalJobSpec). Field order here is key order in the encoded JSON, so this
-// struct mirrors the runtime declaration line for line.
-type canonicalSpec struct {
-	Version       string           `json:"version"`
-	Trigger       canonicalTrigger `json:"trigger"`
-	Catchup       string           `json:"catchup,omitempty"`
-	Overlap       string           `json:"overlap,omitempty"`
-	Deps          []canonicalDep   `json:"deps,omitempty"`
-	MaxAttempts   int              `json:"maxAttempts,omitempty"`
-	LeaseTTLMs    int64            `json:"leaseTtlMs,omitempty"`
-	MaxConcurrent int              `json:"maxConcurrent,omitempty"`
-	Retry         *RetryPolicy     `json:"retry,omitempty"`
-}
-
-type canonicalTrigger struct {
-	Cron     *canonicalCron     `json:"cron,omitempty"`
-	Delayed  *canonicalDelayed  `json:"delayed,omitempty"`
-	Interval *canonicalInterval `json:"interval,omitempty"`
-}
-
-type canonicalCron struct {
-	Expr string `json:"expr"`
-	TZ   string `json:"tz,omitempty"`
-}
-
-type canonicalDelayed struct {
-	RunAtUnixMs int64 `json:"runAtUnixMs"`
-}
-
-type canonicalInterval struct {
-	EveryMs int64 `json:"everyMs"`
-}
-
-type canonicalDep struct {
-	Kind   string `json:"kind"`
-	Target string `json:"target"`
 }
 
 // Validate rejects the shapes the runtime answers with InvalidArgument, plus the
@@ -231,11 +193,11 @@ func (s Spec) Validate() error {
 			return fmt.Errorf("job: validate spec: %w: kind %q", ErrDepTarget, d.Kind)
 		}
 	}
-	if s.MaxAttempts < 0 || s.LeaseTTLMs < 0 || s.MaxConcurrent < 0 {
+	if negative(s.MaxAttempts) || (s.LeaseTTLMs != nil && *s.LeaseTTLMs < 0) || negative(s.MaxConcurrent) {
 		return fmt.Errorf("job: validate spec: %w", ErrNegativeLimit)
 	}
-	if s.MaxConcurrent > 1024 {
-		return fmt.Errorf("job: maxConcurrent exceeds 1024")
+	if s.MaxConcurrent != nil && *s.MaxConcurrent > 1024 {
+		return fmt.Errorf("job: validate spec: %w: maxConcurrent exceeds 1024", ErrNegativeLimit)
 	}
 	if s.Retry != nil && s.Retry.InitialMs <= 0 {
 		return fmt.Errorf("job: validate spec: %w", ErrRetryInitial)
@@ -243,10 +205,18 @@ func (s Spec) Validate() error {
 	return nil
 }
 
+func negative(n *int) bool { return n != nil && *n < 0 }
+
 // CanonicalJSON renders the spec exactly as the runtime expects to read it back
-// out of input_schema_json. Any drift in a key name, in field order or in what
-// is omitted changes the contract hash on one side only, and the job then fails
-// to register with an error that points nowhere near the cause.
+// out of input_schema_json, byte for byte what the Node SDK's JSON.stringify
+// produces for the same declaration (sdk/job-canonical-vectors.json pins it).
+// Any drift in a key, in key order, in what is omitted or in how a string is
+// escaped changes the contract hash on one side only.
+//
+// Key order mirrors runtime/internal/jobs/canonical.go (CanonicalJobSpec):
+// version, trigger, catchup, overlap, deps, maxAttempts, leaseTtlMs,
+// maxConcurrent, retry; the retry block is snake_case because the runtime
+// decodes it into the persisted retry_policy column.
 func (s Spec) CanonicalJSON() ([]byte, error) {
 	if err := s.Validate(); err != nil {
 		return nil, err
@@ -254,39 +224,170 @@ func (s Spec) CanonicalJSON() ([]byte, error) {
 	if strings.TrimSpace(s.Version) == "" {
 		return nil, ErrVersion
 	}
-	c := canonicalSpec{
-		Version:       s.Version,
-		Trigger:       s.Trigger.canonical(),
-		Catchup:       string(s.Catchup),
-		Overlap:       string(s.Overlap),
-		MaxAttempts:   s.MaxAttempts,
-		LeaseTTLMs:    s.LeaseTTLMs,
-		MaxConcurrent: s.MaxConcurrent,
-		Retry:         s.Retry,
+	var w canonicalWriter
+	w.open()
+	w.str("version", s.Version)
+	w.key("trigger")
+	s.Trigger.write(&w)
+	if s.Catchup != "" {
+		w.str("catchup", string(s.Catchup))
 	}
-	for _, d := range s.Deps {
-		c.Deps = append(c.Deps, canonicalDep(d))
+	if s.Overlap != "" {
+		w.str("overlap", string(s.Overlap))
 	}
-	out, err := json.Marshal(c)
-	if err != nil {
-		return nil, fmt.Errorf("job: encode canonical spec: %w", err)
+	if len(s.Deps) > 0 {
+		w.key("deps")
+		w.buf.WriteByte('[')
+		for i, d := range s.Deps {
+			if i > 0 {
+				w.buf.WriteByte(',')
+			}
+			var dep canonicalWriter
+			dep.open()
+			dep.str("kind", d.Kind)
+			dep.str("target", d.Target)
+			dep.close()
+			w.buf.Write(dep.buf.Bytes())
+		}
+		w.buf.WriteByte(']')
 	}
-	return out, nil
+	if s.MaxAttempts != nil {
+		w.num("maxAttempts", float64(*s.MaxAttempts))
+	}
+	if s.LeaseTTLMs != nil {
+		w.num("leaseTtlMs", float64(*s.LeaseTTLMs))
+	}
+	if s.MaxConcurrent != nil {
+		w.num("maxConcurrent", float64(*s.MaxConcurrent))
+	}
+	if s.Retry != nil {
+		w.key("retry")
+		var r canonicalWriter
+		r.open()
+		r.num("initial_ms", float64(s.Retry.InitialMs))
+		r.num("max_ms", float64(s.Retry.MaxMs))
+		r.num("multiplier", s.Retry.Multiplier)
+		r.num("jitter", s.Retry.Jitter)
+		r.close()
+		w.buf.Write(r.buf.Bytes())
+	}
+	w.close()
+	if w.err != nil {
+		return nil, fmt.Errorf("job: encode canonical spec: %w", w.err)
+	}
+	return w.buf.Bytes(), nil
 }
 
-func (t Trigger) canonical() canonicalTrigger {
+func (t Trigger) write(w *canonicalWriter) {
+	var inner canonicalWriter
+	inner.open()
 	switch t.kind {
 	case triggerCron:
-		return canonicalTrigger{Cron: &canonicalCron{Expr: t.cronExpr, TZ: t.cronTZ}}
+		inner.key("cron")
+		var c canonicalWriter
+		c.open()
+		c.str("expr", t.cronExpr)
+		if t.cronTZ != "" {
+			c.str("tz", t.cronTZ)
+		}
+		c.close()
+		inner.buf.Write(c.buf.Bytes())
 	case triggerDelayed:
-		return canonicalTrigger{Delayed: &canonicalDelayed{RunAtUnixMs: t.runAtUnixMs}}
+		inner.key("delayed")
+		var c canonicalWriter
+		c.open()
+		c.num("runAtUnixMs", float64(t.runAtUnixMs))
+		c.close()
+		inner.buf.Write(c.buf.Bytes())
 	case triggerInterval:
-		return canonicalTrigger{Interval: &canonicalInterval{EveryMs: t.everyMs}}
+		inner.key("interval")
+		var c canonicalWriter
+		c.open()
+		c.num("everyMs", float64(t.everyMs))
+		c.close()
+		inner.buf.Write(c.buf.Bytes())
 	default:
 		// Unreachable: Validate rejects a spec without a trigger before any
 		// caller reaches the encoder.
 		panic("job: canonical trigger: no trigger kind")
 	}
+	inner.close()
+	w.buf.Write(inner.buf.Bytes())
+}
+
+// canonicalWriter writes one JSON object the way JavaScript's JSON.stringify
+// does. encoding/json differs in exactly two respects — it escapes <, > and &
+// and the line separators U+2028/U+2029 — and either one would change the hash
+// of a spec carrying them. Numbers go through encoding/json, whose float format
+// is the ECMAScript one.
+type canonicalWriter struct {
+	buf   bytes.Buffer
+	first bool
+	err   error
+}
+
+func (w *canonicalWriter) open() {
+	w.buf.WriteByte('{')
+	w.first = true
+}
+
+func (w *canonicalWriter) close() { w.buf.WriteByte('}') }
+
+func (w *canonicalWriter) key(k string) {
+	if !w.first {
+		w.buf.WriteByte(',')
+	}
+	w.first = false
+	writeJSString(&w.buf, k)
+	w.buf.WriteByte(':')
+}
+
+func (w *canonicalWriter) str(k, v string) {
+	w.key(k)
+	writeJSString(&w.buf, v)
+}
+
+func (w *canonicalWriter) num(k string, v float64) {
+	w.key(k)
+	raw, err := json.Marshal(v)
+	if err != nil && w.err == nil {
+		w.err = err
+	}
+	w.buf.Write(raw)
+}
+
+// writeJSString quotes s like JSON.stringify: '"' and '\' escaped, control
+// characters below U+0020 as \b \f \n \r \t or \u00xx, everything else —
+// including <, >, &, U+2028 and U+2029 — written as is. Invalid UTF-8 becomes
+// U+FFFD, as encoding/json does; JavaScript strings cannot hold it at all.
+func writeJSString(b *bytes.Buffer, s string) {
+	const hex = "0123456789abcdef"
+	b.WriteByte('"')
+	for _, r := range s {
+		switch {
+		case r == '"':
+			b.WriteString(`\"`)
+		case r == '\\':
+			b.WriteString(`\\`)
+		case r == '\b':
+			b.WriteString(`\b`)
+		case r == '\f':
+			b.WriteString(`\f`)
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r == '\t':
+			b.WriteString(`\t`)
+		case r < 0x20:
+			b.WriteString(`\u00`)
+			b.WriteByte(hex[r>>4])
+			b.WriteByte(hex[r&0xf])
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
 }
 
 // ContractHash identifies one canonical spec. The runtime routes and versions by

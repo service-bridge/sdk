@@ -112,9 +112,9 @@ func TestCanonicalSpecMatchesTheRuntimeByteForByte(t *testing.T) {
 					job.EventDep("orders.created"),
 					job.WorkflowDep("nightly-close"),
 				},
-				MaxAttempts:   3,
-				LeaseTTLMs:    45000,
-				MaxConcurrent: 2,
+				MaxAttempts:   ptr(3),
+				LeaseTTLMs:    ptr(int64(45000)),
+				MaxConcurrent: ptr(2),
 				Retry:         &job.RetryPolicy{InitialMs: 1000, MaxMs: 600000, Multiplier: 2, Jitter: 0.25},
 			},
 			want: `{"version":"test-v1","trigger":{"cron":{"expr":"*/5 * * * *","tz":"Europe/Moscow"}},` +
@@ -163,9 +163,9 @@ func TestCanonicalSpecDecodesIntoTheRuntimeStruct(t *testing.T) {
 		Catchup:       job.CatchupFireAll,
 		Overlap:       job.OverlapBufferOne,
 		Deps:          []job.Dep{job.RPCDep("billing.Charge")},
-		MaxAttempts:   7,
-		LeaseTTLMs:    30000,
-		MaxConcurrent: 4,
+		MaxAttempts:   ptr(7),
+		LeaseTTLMs:    ptr(int64(30000)),
+		MaxConcurrent: ptr(4),
 		Retry:         &job.RetryPolicy{InitialMs: 250, MaxMs: 5000, Multiplier: 1.5, Jitter: 0.1},
 	}
 	raw, err := spec.CanonicalJSON()
@@ -219,7 +219,7 @@ func TestUnsetOptionsStayOutOfTheSpec(t *testing.T) {
 func TestContractHashIsStableAndSpecific(t *testing.T) {
 	t.Parallel()
 
-	spec := job.Spec{Version: "test-v1", Trigger: mustCron(t, "*/5 * * * *", "UTC"), MaxAttempts: 3}
+	spec := job.Spec{Version: "test-v1", Trigger: mustCron(t, "*/5 * * * *", "UTC"), MaxAttempts: ptr(3)}
 	first, err := spec.CanonicalJSON()
 	if err != nil {
 		t.Fatalf("canonical json: %v", err)
@@ -236,7 +236,7 @@ func TestContractHashIsStableAndSpecific(t *testing.T) {
 	}
 
 	changed := spec
-	changed.MaxAttempts = 4
+	changed.MaxAttempts = ptr(4)
 	other, err := changed.CanonicalJSON()
 	if err != nil {
 		t.Fatalf("canonical json: %v", err)
@@ -392,7 +392,7 @@ func TestSpecRejectsWhatTheRuntimeWouldRefuseOrRewrite(t *testing.T) {
 		},
 		{
 			name:  "negative limit",
-			build: func() job.Spec { s := base(); s.MaxAttempts = -1; return s },
+			build: func() job.Spec { s := base(); s.MaxAttempts = ptr(-1); return s },
 			want:  job.ErrNegativeLimit,
 		},
 		{
@@ -548,3 +548,5 @@ func TestExecutableVersionGoldenAndRetainedHandlers(t *testing.T) {
 		t.Fatal("unknown fingerprint fell back to current")
 	}
 }
+
+func ptr[T any](v T) *T { return &v }

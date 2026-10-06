@@ -407,7 +407,7 @@ func TestConcurrencyIsCappedPerJob(t *testing.T) {
 	var live, peak atomic.Int64
 	var done atomic.Int64
 	capped := cronSpec(t)
-	capped.MaxConcurrent = 2
+	capped.MaxConcurrent = ptr(2)
 	capped.Overlap = job.OverlapAllow
 	declare(t, decls, "capped", capped, func(ctx context.Context, _ job.Execution) error {
 		cur := live.Add(1)
@@ -962,7 +962,7 @@ func TestQueuedExecutionsAreDroppedOnStop(t *testing.T) {
 	srv, client := startJobs(t)
 	decls := job.NewDeclarations()
 	spec := cronSpec(t)
-	spec.MaxConcurrent = 1
+	spec.MaxConcurrent = ptr(1)
 
 	running := make(chan struct{}, 1)
 	var started atomic.Int64
@@ -1052,7 +1052,7 @@ func TestSkipRedeliveryWaitsForHandlerAcrossIdentityReconnect(t *testing.T) {
 			decls := job.NewDeclarations()
 			spec := cronSpec(t)
 			spec.Overlap = overlap
-			spec.MaxConcurrent = 8
+			spec.MaxConcurrent = ptr(8)
 			release := make(chan struct{})
 			var releaseOnce sync.Once
 			var running, peak, calls atomic.Int64

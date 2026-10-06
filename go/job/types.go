@@ -115,20 +115,23 @@ func WithDeps(deps ...Dep) Option {
 
 // WithMaxAttempts caps how many times one fire is attempted.
 func WithMaxAttempts(n int) Option {
-	return func(s *Spec) { s.MaxAttempts = n }
+	return func(s *Spec) { s.MaxAttempts = &n }
 }
 
 // WithLeaseTTL sets how long the runtime waits on a silent instance before it
 // reassigns the execution.
 func WithLeaseTTL(d time.Duration) Option {
-	return func(s *Spec) { s.LeaseTTLMs = d.Milliseconds() }
+	return func(s *Spec) {
+		ms := d.Milliseconds()
+		s.LeaseTTLMs = &ms
+	}
 }
 
 // WithMaxConcurrent caps how many executions of this job run at once. It bounds
 // both the runtime's dispatch under OverlapAllow and the SDK's own handler
 // concurrency.
 func WithMaxConcurrent(n int) Option {
-	return func(s *Spec) { s.MaxConcurrent = n }
+	return func(s *Spec) { s.MaxConcurrent = &n }
 }
 
 // WithRetry replaces the runtime's default backoff.

@@ -23,9 +23,9 @@
 
 | Имя | Тип | По умолчанию | Что делает |
 |-----|-----|--------------|------------|
-| `Spec` | struct | все поля нулевые | `Trigger`, `Catchup`, `Overlap`, `Deps`, `MaxAttempts`, `LeaseTTLMs`, `MaxConcurrent`, `Retry`. Нулевое поле не попадает в JSON — значение проставит рантайм. |
+| `Spec` | struct | все поля не заданы | `Version`, `Trigger`, `Catchup`, `Overlap`, `Deps`, `MaxAttempts *int`, `LeaseTTLMs *int64`, `MaxConcurrent *int`, `Retry *RetryPolicy`. Незаданное поле (`nil`, пустая строка, пустой список) не попадает в JSON; заданный лимит пишется, даже если он `0`. |
 | `Spec.Validate()` | `error` | — | Отвергает формы, на которые рантайм отвечает `InvalidArgument`, и ту одну, которую он молча переписывает (retry без начальной задержки). |
-| `Spec.CanonicalJSON()` | `([]byte, error)` | — | Каноническая форма для `input_schema_json`. Валидирует перед сериализацией. |
+| `Spec.CanonicalJSON()` | `([]byte, error)` | — | Каноническая форма для `input_schema_json` — байт в байт `JSON.stringify` Node SDK (векторы в `sdk/job-canonical-vectors.json`). Валидирует перед сериализацией. |
 | `ContractHash(canonicalJSON []byte)` | `string` | — | SHA-256 в hex от ровно тех байт, что уедут на провод. |
 | `CatchupPolicy` | `string` | пусто | `CatchupSkip`, `CatchupFireOnce`, `CatchupFireAll`. |
 | `OverlapPolicy` | `string` | пусто | `OverlapSkip`, `OverlapAllow`, `OverlapBufferOne`. |
@@ -80,7 +80,8 @@
 | `cronParser` | `cron.Parser` | 5 полей | Ровно та же конфигурация, что в `runtime/internal/jobs/register.go`. |
 | `triggerKind` | `uint8` | `triggerNone` | Дискриминант триггера. |
 | `canonicalSpec` / `canonicalTrigger` / `canonicalCron` / `canonicalDelayed` / `canonicalInterval` / `canonicalDep` | struct | — | Зеркало `runtime/internal/jobs/canonical.go`. Порядок полей = порядок ключей в JSON. |
-| `Trigger.canonical()` | метод | — | Триггер в канонической форме. `panic` на отсутствующем виде: `Validate` не пускает такую спецификацию дальше. |
+| `Trigger.write(w)` | метод | — | Триггер в канонической форме. `panic` на отсутствующем виде: `Validate` не пускает такую спецификацию дальше. |
+| `canonicalWriter` · `writeJSString` | тип, функция | — | Объект JSON по правилам `JSON.stringify`: строки экранируют только `"`, `\` и управляющие символы; `<`, `>`, `&`, U+2028/U+2029 — как есть; числа — через `encoding/json` (формат ECMAScript). |
 | `Subscriber.open` / `onData` / `dispatch` / `acquire` / `run` / `withTrace` / `sendResult` | методы | — | Хуки супервизора и путь одного исполнения. |
 | `Subscriber.heartbeat` / `beat` / `onHeartbeatFailure` | методы | — | Горутина хартбита и учёт подряд идущих отказов. |
 | `Subscriber.slots` | `map[string]chan struct{}` | — | Токены одновременности на задачу. |
@@ -90,6 +91,8 @@
 **Каноническая форма повторяет Go-структуру рантайма построчно.** Регистрация задачи идёт не отдельным RPC, а через `Registry.RegisterAndWatch` как `IncomingMethod{type=JOB}`, где вся спецификация лежит внутри `input_schema_json`, а `contract_hash` — SHA-256 от этих байт. Рантайм разбирает документ по именам ключей, поэтому переименованное поле не ломается громко — задача просто не регистрируется, и по логам это не читается. В Go порядок полей структуры задаёт порядок ключей `encoding/json`, поэтому совпадение достижимо и зафиксировано тестом с эталонной строкой; второй тест декодирует наш вывод в копию структуры рантайма с `DisallowUnknownFields`.
 
 **`retry` — snake_case внутри camelCase документа.** Рантайм декодирует этот блок в `jobs.RetryPolicy`, чьи теги пришли из колонки `job_definitions.retry_policy`. Обе половины воспроизводятся как есть. Node SDK шлёт здесь camelCase — блок молча разбирается в нули, и рантайм заменяет всю политику своим дефолтом.
+
+**Каноническая форма — общая с Node.** Ключи в порядке `CanonicalJobSpec` рантайма, присутствие поля — как у Node (`!== undefined`): заданный ноль пишется. Строки кодируются как в `JSON.stringify`; `encoding/json` отличался бы `\u003c`/`\u003e`/`\u0026` и `\u2028`/`\u2029`, и такая спецификация получала бы в Go другой хеш. Общие векторы `sdk/job-canonical-vectors.json` прогоняют оба SDK.
 
 **Дефолтов у SDK нет.** Незаданная опция не попадает в документ; максимум попыток, TTL лиза, лимит одновременности и политика ретраев приходят из настроек рантайма. Копия дефолтов в SDK разошлась бы с первой же правкой настроек. Единственное исключение — `retry` с нулевой начальной задержкой: рантайм молча выбрасывает такую политику целиком, поэтому она отвергается здесь.
 
