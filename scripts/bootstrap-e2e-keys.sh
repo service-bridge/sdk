@@ -42,12 +42,12 @@
 #   bash scripts/bootstrap-e2e-keys.sh
 #
 # Environment overrides:
-#   POSTGRES_DSN   default: postgres://servicebridge:servicebridge@localhost:5433/service-bridge?sslmode=disable
+#   POSTGRES_DSN   default: postgres://postgres:postgres@localhost:5433/service-bridge?sslmode=disable
 #   RUNTIME_URL    default: localhost:14445
 #   GW_ADDR        default: http://127.0.0.1:14444 (sb UI-gateway address)
 #   SB_USER        default: admin (UI account used to create services)
 #   SB_PASSWORD    default: admin (dev account; created on first boot)
-#   PG_USER        default: servicebridge (Docker database user)
+#   PG_USER        default: postgres (Docker database user)
 #   PG_DATABASE    default: service-bridge (Docker database name)
 #   PG_CONTAINER   default: servicebridge2-pg (docker container name for psql)
 #   PG_MODE        default: docker — how to reach psql; `direct` uses system
@@ -62,14 +62,14 @@ cd "$REPO_ROOT"
 # The runtime is a sibling repo in the workspace (../runtime), not under sdk/.
 RUNTIME_DIR=${RUNTIME_DIR:-"$REPO_ROOT/../runtime"}
 
-POSTGRES_DSN=${POSTGRES_DSN:-'postgres://servicebridge:servicebridge@localhost:5433/service-bridge?sslmode=disable'}
+POSTGRES_DSN=${POSTGRES_DSN:-'postgres://postgres:postgres@localhost:5433/service-bridge?sslmode=disable'}
 RUNTIME_URL=${RUNTIME_URL:-localhost:14445}
 GW_ADDR=${GW_ADDR:-http://127.0.0.1:14444}
 SB_USER=${SB_USER:-admin}
 SB_PASSWORD=${SB_PASSWORD:-admin}
 PG_CONTAINER=${PG_CONTAINER:-servicebridge2-pg}
 PG_MODE=${PG_MODE:-docker}
-PG_USER=${PG_USER:-servicebridge}
+PG_USER=${PG_USER:-postgres}
 PG_DATABASE=${PG_DATABASE:-service-bridge}
 
 # Per-domain service identities. Each e2e domain runs as its own process
