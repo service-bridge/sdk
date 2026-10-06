@@ -101,7 +101,7 @@ function harness(
 	const registers: RegisterRequest[] = [];
 	const clients = { control: 0, registry: 0, closed: 0 };
 	let provisions = 0;
-	const sb = new ServiceBridge("localhost:0", VALID_KEY, {
+	const sb = new ServiceBridge("localhost:1", VALID_KEY, {
 		advertise: false,
 		logger: silentLogger,
 		_disableTelemetryTransport: true,
@@ -301,14 +301,17 @@ describe("start()", () => {
 	test("an invalid option is rejected at construction", () => {
 		expect(
 			() =>
-				new ServiceBridge("localhost:0", VALID_KEY, { maxPendingPublishes: 0 }),
+				new ServiceBridge("localhost:1", VALID_KEY, { maxPendingPublishes: 0 }),
 		).toThrow(ConfigurationError);
 		expect(
 			() =>
-				new ServiceBridge("localhost:0", VALID_KEY, {
+				new ServiceBridge("localhost:1", VALID_KEY, {
 					callDefaults: { timeout: "soon" },
 				}),
 		).toThrow(ConfigurationError);
+		expect(() => new ServiceBridge("localhost", VALID_KEY)).toThrow(
+			ConfigurationError,
+		);
 	});
 });
 

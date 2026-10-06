@@ -81,7 +81,7 @@ import type { Step } from "../workflow/types";
 import { PROTOCOL_VERSION } from "./handshake";
 import { parseBootstrapKey } from "./key";
 import type { ProvisionResult } from "./provision";
-import { provision as defaultProvision, refresh } from "./provision";
+import { provision as defaultProvision, parseURL, refresh } from "./provision";
 import { ConnectionError, isTerminal } from "./service-bridge-error";
 import { openControlStream, Session } from "./session";
 import { makeSpiffeCheck, RUNTIME_SPIFFE_URI } from "./spiffe";
@@ -471,6 +471,7 @@ export class ServiceBridge {
 		if (options.callDefaults?.timeout !== undefined)
 			timeoutMs(options.callDefaults.timeout);
 
+		parseURL(url);
 		this.url = url;
 		// A malformed key is a configuration error, reported here rather than
 		// on the connect path where it would read like a network condition.

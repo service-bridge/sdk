@@ -1,4 +1,5 @@
 import * as grpc from "@grpc/grpc-js";
+import { ConfigurationError } from "../errors";
 import { BootstrapClient } from "../pb/servicebridge/v1/bootstrap";
 import type { ControlClient } from "../pb/servicebridge/v1/control";
 import { buildCsr } from "./csr";
@@ -29,11 +30,12 @@ export interface ProvisionResult {
 /** @internal см. ./README.md */
 export function parseURL(url: string): { host: string; port: number } {
 	const idx = url.lastIndexOf(":");
-	if (idx < 0) throw new Error(`invalid URL (host:port required): ${url}`);
+	if (idx < 0)
+		throw new ConfigurationError(`invalid URL (host:port required): ${url}`);
 	const host = url.slice(0, idx);
 	const port = Number(url.slice(idx + 1));
 	if (!Number.isFinite(port) || port <= 0 || port > 65535) {
-		throw new Error(`invalid port in URL: ${url}`);
+		throw new ConfigurationError(`invalid port in URL: ${url}`);
 	}
 	return { host, port };
 }
@@ -96,7 +98,6 @@ export async function provision(
 	key: BootstrapKey,
 	clientFactory: BootstrapClientFactory = newBootstrapClient,
 ): Promise<ProvisionResult> {
-	parseURL(url); // validate format early — throws on garbage
 	const { privateKey, csrDer } = await generateKeypairAndCSR();
 	const privateKeyDer = Buffer.from(
 		await crypto.subtle.exportKey("pkcs8", privateKey),

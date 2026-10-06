@@ -183,7 +183,7 @@ function refusal(result: UnaryResult): ServiceBridgeError {
 export function createTestHarness(
 	options: Pick<ServiceBridgeOptions, "callDefaults" | "publishTimeoutMs"> = {},
 ): TestHarness {
-	const sb = new ServiceBridge("in-memory:0", IN_MEMORY_KEY, {
+	const sb = new ServiceBridge("in-memory:1", IN_MEMORY_KEY, {
 		...options,
 		advertise: false,
 		logger: silentLogger,

@@ -73,7 +73,7 @@ function keyForRole(role: Role): { url: string; key: string } {
 }
 
 // Builds an extra dedicated instance under a role key.
-function extraInstance(role: Role, tag: string): ServiceBridge {
+function extraInstance(role: Role): ServiceBridge {
 	const { url, key } = keyForRole(role);
 	return new ServiceBridge(url, key, {
 		reconnectIntervalMs: 500,
@@ -705,7 +705,7 @@ describe("events", () => {
 
 		// Second distinct SDK instance under the SAME identity (primary key) →
 		// dedup is scoped by publisherSvcId, so it still applies across instances.
-		const publisher2 = track(extraInstance("primary", "idem-pub2"));
+		const publisher2 = track(extraInstance("primary"));
 		publisher2.event.define(name, V1_SCHEMA);
 		await connect(publisher2);
 		await publisher2.event.publish(
@@ -750,7 +750,7 @@ describe("events", () => {
 
 		// PublisherB: v2 schema, a SECOND instance under the same primary key →
 		// distinct (service_id, instance_id, method_name, contract_hash) row.
-		const publisherB = track(extraInstance("primary", "schema-pubB"));
+		const publisherB = track(extraInstance("primary"));
 		publisherB.event.define(name, V2_SCHEMA);
 		await connect(publisherB);
 
