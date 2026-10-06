@@ -72,6 +72,9 @@ export type SchemaResolver = (
 	methodName: string,
 ) => CallerSchema | undefined;
 
+/** What the domain needs from an outbound client. @internal */
+export type RpcCaller = Pick<RpcClient, "call" | "stream">;
+
 /** @internal */
 export interface RpcClientDeps {
 	proxy: ProxyTransport;

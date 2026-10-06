@@ -6,7 +6,7 @@ import type {
 	RpcHandlerOpts,
 	RpcStreamHandlerFn,
 } from "../registry/registry";
-import type { CallOpts, RpcClient } from "./client";
+import type { CallOpts, RpcCaller } from "./client";
 
 // Sink for call-time policy denials; the owner wires it to `policy_violation`.
 type PolicyViolationSink = (v: {
@@ -19,7 +19,7 @@ type PolicyViolationSink = (v: {
 export class RpcDomain {
 	constructor(
 		private readonly registry: Registry,
-		private readonly getClient: () => RpcClient | null,
+		private readonly getClient: () => RpcCaller | null,
 		private readonly onPolicyViolation?: PolicyViolationSink,
 	) {}
 

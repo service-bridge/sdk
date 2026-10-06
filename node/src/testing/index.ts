@@ -3,14 +3,14 @@
  * См. ./README.md.
  */
 export {
-	type EventDeliveryResult,
-	type EventHandlerFn,
-	type PublishedEventRecord,
-	TestEventDomain,
-} from "./event-harness";
-export { createTestHarness, type TestHarness } from "./harness";
-export {
-	type RpcCallRecord,
-	type RpcMockResponder,
-	TestRpcDomain,
-} from "./rpc-harness";
+	type CallRecord,
+	createTestHarness,
+	type DeliverOpts,
+	type DeliveryResult,
+	type InvokeOpts,
+	matchPattern,
+	type PublishedRecord,
+	type Responder,
+	TEST_IDENTITY,
+	type TestHarness,
+} from "./harness";

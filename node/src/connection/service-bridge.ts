@@ -36,7 +36,12 @@ import { MethodType, Registry } from "../registry/registry";
 import { WatchStream } from "../registry/watch";
 import { CircuitBreakerRegistry } from "../rpc/circuit-breaker";
 import type { CallOpts } from "../rpc/client";
-import { RpcClient, SchemaRegistry, timeoutMs } from "../rpc/client";
+import {
+	type RpcCaller,
+	RpcClient,
+	SchemaRegistry,
+	timeoutMs,
+} from "../rpc/client";
 import { DirectTransport } from "../rpc/direct-transport";
 import { RpcDomain } from "../rpc/domain";
 import { InstanceCache } from "../rpc/instance-cache";
@@ -425,7 +430,7 @@ export class ServiceBridge {
 	private readonly cb = new CircuitBreakerRegistry();
 	private readonly lb = new LoadBalancer(this.cb);
 	private callServer: CallServer | null = null;
-	private rpcClient: RpcClient | null = null;
+	private rpcClient: RpcCaller | null = null;
 	private publisher: Publisher | null = null;
 	private subscriber: Subscriber | null = null;
 	private jobSubscriber: JobSubscriber | null = null;
@@ -784,6 +789,38 @@ export class ServiceBridge {
 	/** The access policy the runtime last pushed; null before the first snapshot. */
 	policyEvaluation(): PolicyEvaluation | null {
 		return this.watch.policyEvaluation();
+	}
+
+	/**
+	 * Starts the bridge against an in-memory runtime: outbound calls go to
+	 * `rpc`, publishes to `events`, no network is opened. Used by
+	 * `service-bridge/testing` only. @internal
+	 */
+	async _startInMemory(rt: {
+		rpc: RpcCaller;
+		events: EventsClient;
+		identity: Identity;
+	}): Promise<{ handle: Registry["_handle"]; schemas: SchemaRegistry }> {
+		if (this.started) throw new StateError("ServiceBridge is already started");
+		this.started = true;
+		await this._registry._handle.finalize();
+		this.rpcClient = rt.rpc;
+		this.publisher = new Publisher({
+			client: () => rt.events,
+			schemaIndex: this.schemaIndex,
+			logger: this.log,
+			timeoutMs: this.opts.publishTimeoutMs,
+			maxPending: this.opts.maxPendingPublishes,
+			xSbTraceFn: () => {
+				const ctx = currentTraceContext();
+				return ctx ? formatXSbTrace(ctx.traceId, ctx.parentOpId) : "";
+			},
+			onPolicyViolation: (v) => this.emitPolicyViolation(v),
+		});
+		this.currentIdentity = rt.identity;
+		this.telemetryInstanceId = rt.identity.instanceId;
+		this.live = true;
+		return { handle: this._registry._handle, schemas: this.schemas };
 	}
 
 	// ── internals ──────────────────────────────────────────────────────────────
