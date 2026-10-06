@@ -91,7 +91,6 @@ type EventEnvelope struct {
 	ContractHash     string                 `protobuf:"bytes,4,opt,name=contract_hash,json=contractHash,proto3" json:"contract_hash,omitempty"`
 	PartitionKey     string                 `protobuf:"bytes,5,opt,name=partition_key,json=partitionKey,proto3" json:"partition_key,omitempty"`
 	IdempotencyKey   string                 `protobuf:"bytes,6,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
-	FireAndForget    bool                   `protobuf:"varint,7,opt,name=fire_and_forget,json=fireAndForget,proto3" json:"fire_and_forget,omitempty"`
 	Headers          map[string]string      `protobuf:"bytes,8,rep,name=headers,proto3" json:"headers,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	OccurredAtUnixMs int64                  `protobuf:"varint,9,opt,name=occurred_at_unix_ms,json=occurredAtUnixMs,proto3" json:"occurred_at_unix_ms,omitempty"`
 	// X-SB-Trace propagation: carried in EventEnvelope for publisher→consumer.
@@ -176,13 +175,6 @@ func (x *EventEnvelope) GetIdempotencyKey() string {
 		return x.IdempotencyKey
 	}
 	return ""
-}
-
-func (x *EventEnvelope) GetFireAndForget() bool {
-	if x != nil {
-		return x.FireAndForget
-	}
-	return false
 }
 
 func (x *EventEnvelope) GetHeaders() map[string]string {
@@ -943,8 +935,14 @@ type DlqEntry struct {
 	DlqAtUnixMs     int64                  `protobuf:"varint,5,opt,name=dlq_at_unix_ms,json=dlqAtUnixMs,proto3" json:"dlq_at_unix_ms,omitempty"`
 	ReplayCount     int32                  `protobuf:"varint,6,opt,name=replay_count,json=replayCount,proto3" json:"replay_count,omitempty"`
 	TotalAttempts   int32                  `protobuf:"varint,7,opt,name=total_attempts,json=totalAttempts,proto3" json:"total_attempts,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Why the delivery was dead-lettered: "max_attempts" (nack/visibility
+	// retries exhausted), "orphaned_pattern" (no live instance declares a
+	// matching pattern any more) or "subscriber_unavailable" (no live instance
+	// for events.offline_dlq_after_ms, or events.max_pending_per_subscriber
+	// exceeded).
+	Reason        string `protobuf:"bytes,8,opt,name=reason,proto3" json:"reason,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *DlqEntry) Reset() {
@@ -1026,6 +1024,13 @@ func (x *DlqEntry) GetTotalAttempts() int32 {
 	return 0
 }
 
+func (x *DlqEntry) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
 type ListDlqResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Entries       []*DlqEntry            `protobuf:"bytes,1,rep,name=entries,proto3" json:"entries,omitempty"`
@@ -1082,15 +1087,14 @@ var File_servicebridge_v1_events_proto protoreflect.FileDescriptor
 
 const file_servicebridge_v1_events_proto_rawDesc = "" +
 	"\n" +
-	"\x1dservicebridge/v1/events.proto\x12\x10servicebridge.v1\"\xdc\x03\n" +
+	"\x1dservicebridge/v1/events.proto\x12\x10servicebridge.v1\"\xcb\x03\n" +
 	"\rEventEnvelope\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x18\n" +
 	"\apayload\x18\x03 \x01(\fR\apayload\x12#\n" +
 	"\rcontract_hash\x18\x04 \x01(\tR\fcontractHash\x12#\n" +
 	"\rpartition_key\x18\x05 \x01(\tR\fpartitionKey\x12'\n" +
-	"\x0fidempotency_key\x18\x06 \x01(\tR\x0eidempotencyKey\x12&\n" +
-	"\x0ffire_and_forget\x18\a \x01(\bR\rfireAndForget\x12F\n" +
+	"\x0fidempotency_key\x18\x06 \x01(\tR\x0eidempotencyKey\x12F\n" +
 	"\aheaders\x18\b \x03(\v2,.servicebridge.v1.EventEnvelope.HeadersEntryR\aheaders\x12-\n" +
 	"\x13occurred_at_unix_ms\x18\t \x01(\x03R\x10occurredAtUnixMs\x12\x1c\n" +
 	"\n" +
@@ -1099,7 +1103,7 @@ const file_servicebridge_v1_events_proto_rawDesc = "" +
 	"\fpayload_json\x18\v \x01(\fR\vpayloadJson\x1a:\n" +
 	"\fHeadersEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x82\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\a\x10\bR\x0ffire_and_forget\"\x82\x01\n" +
 	"\x0ePublishRequest\x127\n" +
 	"\x06events\x18\x03 \x03(\v2\x1f.servicebridge.v1.EventEnvelopeR\x06eventsJ\x04\b\x01\x10\x02J\x04\b\x02\x10\x03R\x14publisher_service_idR\x15publisher_instance_id\"\x82\x01\n" +
 	"\x12PublishStatusEntry\x12\x19\n" +
@@ -1147,7 +1151,7 @@ const file_servicebridge_v1_events_proto_rawDesc = "" +
 	"\bevent_id\x18\x01 \x01(\tR\aeventId\">\n" +
 	"\x0eListDlqRequest\x12\x14\n" +
 	"\x05limit\x18\x01 \x01(\x05R\x05limit\x12\x16\n" +
-	"\x06cursor\x18\x02 \x01(\tR\x06cursor\"\xfd\x01\n" +
+	"\x06cursor\x18\x02 \x01(\tR\x06cursor\"\x95\x02\n" +
 	"\bDlqEntry\x12\x19\n" +
 	"\bevent_id\x18\x01 \x01(\tR\aeventId\x12\x1d\n" +
 	"\n" +
@@ -1157,7 +1161,8 @@ const file_servicebridge_v1_events_proto_rawDesc = "" +
 	"last_error\x18\x04 \x01(\tR\tlastError\x12#\n" +
 	"\x0edlq_at_unix_ms\x18\x05 \x01(\x03R\vdlqAtUnixMs\x12!\n" +
 	"\freplay_count\x18\x06 \x01(\x05R\vreplayCount\x12%\n" +
-	"\x0etotal_attempts\x18\a \x01(\x05R\rtotalAttempts\"h\n" +
+	"\x0etotal_attempts\x18\a \x01(\x05R\rtotalAttempts\x12\x16\n" +
+	"\x06reason\x18\b \x01(\tR\x06reason\"h\n" +
 	"\x0fListDlqResponse\x124\n" +
 	"\aentries\x18\x01 \x03(\v2\x1a.servicebridge.v1.DlqEntryR\aentries\x12\x1f\n" +
 	"\vnext_cursor\x18\x02 \x01(\tR\n" +

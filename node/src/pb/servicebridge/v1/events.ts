@@ -44,7 +44,6 @@ export interface EventEnvelope {
   contractHash: string;
   partitionKey: string;
   idempotencyKey: string;
-  fireAndForget: boolean;
   headers: { [key: string]: string };
   occurredAtUnixMs: number;
   /** X-SB-Trace propagation: carried in EventEnvelope for publisher→consumer. */
@@ -145,6 +144,14 @@ export interface DlqEntry {
   dlqAtUnixMs: number;
   replayCount: number;
   totalAttempts: number;
+  /**
+   * Why the delivery was dead-lettered: "max_attempts" (nack/visibility
+   * retries exhausted), "orphaned_pattern" (no live instance declares a
+   * matching pattern any more) or "subscriber_unavailable" (no live instance
+   * for events.offline_dlq_after_ms, or events.max_pending_per_subscriber
+   * exceeded).
+   */
+  reason: string;
 }
 
 export interface ListDlqResponse {
@@ -160,7 +167,6 @@ function createBaseEventEnvelope(): EventEnvelope {
     contractHash: "",
     partitionKey: "",
     idempotencyKey: "",
-    fireAndForget: false,
     headers: {},
     occurredAtUnixMs: 0,
     xSbTrace: "",
@@ -187,9 +193,6 @@ export const EventEnvelope: MessageFns<EventEnvelope> = {
     }
     if (message.idempotencyKey !== "") {
       writer.uint32(50).string(message.idempotencyKey);
-    }
-    if (message.fireAndForget !== false) {
-      writer.uint32(56).bool(message.fireAndForget);
     }
     globalThis.Object.entries(message.headers).forEach(([key, value]: [string, string]) => {
       EventEnvelope_HeadersEntry.encode({ key: key as any, value }, writer.uint32(66).fork()).join();
@@ -267,14 +270,6 @@ export const EventEnvelope: MessageFns<EventEnvelope> = {
             message.idempotencyKey = reader.string();
             continue;
           }
-          case 7: {
-            if (tag !== 56) {
-              break;
-            }
-
-            message.fireAndForget = reader.bool();
-            continue;
-          }
           case 8: {
             if (tag !== 66) {
               break;
@@ -333,7 +328,6 @@ export const EventEnvelope: MessageFns<EventEnvelope> = {
     message.contractHash = object.contractHash ?? "";
     message.partitionKey = object.partitionKey ?? "";
     message.idempotencyKey = object.idempotencyKey ?? "";
-    message.fireAndForget = object.fireAndForget ?? false;
     message.headers = (globalThis.Object.entries(object.headers ?? {}) as [string, string][]).reduce(
       (acc: { [key: string]: string }, [key, value]: [string, string]) => {
         if (value !== undefined) {
@@ -1284,6 +1278,7 @@ function createBaseDlqEntry(): DlqEntry {
     dlqAtUnixMs: 0,
     replayCount: 0,
     totalAttempts: 0,
+    reason: "",
   };
 }
 
@@ -1309,6 +1304,9 @@ export const DlqEntry: MessageFns<DlqEntry> = {
     }
     if (message.totalAttempts !== 0) {
       writer.uint32(56).int32(message.totalAttempts);
+    }
+    if (message.reason !== "") {
+      writer.uint32(66).string(message.reason);
     }
     return writer;
   },
@@ -1382,6 +1380,14 @@ export const DlqEntry: MessageFns<DlqEntry> = {
             message.totalAttempts = reader.int32();
             continue;
           }
+          case 8: {
+            if (tag !== 66) {
+              break;
+            }
+
+            message.reason = reader.string();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -1406,6 +1412,7 @@ export const DlqEntry: MessageFns<DlqEntry> = {
     message.dlqAtUnixMs = object.dlqAtUnixMs ?? 0;
     message.replayCount = object.replayCount ?? 0;
     message.totalAttempts = object.totalAttempts ?? 0;
+    message.reason = object.reason ?? "";
     return message;
   },
 };

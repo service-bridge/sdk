@@ -16,7 +16,10 @@ message EventEnvelope {
   string contract_hash    = 4;
   string partition_key    = 5;
   string idempotency_key  = 6;
-  bool   fire_and_forget  = 7;
+  // fire-and-forget is a publisher-side option (do not wait for the ACK);
+  // the runtime never read the flag.
+  reserved 7;
+  reserved "fire_and_forget";
   map<string, string> headers = 8;
   int64  occurred_at_unix_ms = 9;
 
@@ -127,6 +130,12 @@ message DlqEntry {
   int64  dlq_at_unix_ms    = 5;
   int32  replay_count      = 6;
   int32  total_attempts    = 7;
+  // Why the delivery was dead-lettered: "max_attempts" (nack/visibility
+  // retries exhausted), "orphaned_pattern" (no live instance declares a
+  // matching pattern any more) or "subscriber_unavailable" (no live instance
+  // for events.offline_dlq_after_ms, or events.max_pending_per_subscriber
+  // exceeded).
+  string reason            = 8;
 }
 
 message ListDlqResponse {

@@ -340,7 +340,7 @@ func TestFireAndForgetBypassesTheOutbox(t *testing.T) {
 		t.Fatal("the no-wait path sent nothing")
 	}
 	env := req.GetEvents()[0]
-	if env.GetId() != id || !env.GetFireAndForget() {
+	if env.GetId() != id {
 		t.Fatalf("envelope = %+v", env)
 	}
 	if len(env.GetPayloadJson()) == 0 {

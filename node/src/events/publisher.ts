@@ -129,7 +129,6 @@ export class Publisher {
 								contractHash: entry.contractHash,
 								partitionKey: opts?.partitionKey ?? "",
 								idempotencyKey: opts?.idempotencyKey ?? "",
-								fireAndForget: true,
 								headers: opts?.headers ?? {},
 								occurredAtUnixMs: occurredAtMs,
 								xSbTrace,

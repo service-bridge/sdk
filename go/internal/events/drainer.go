@@ -230,7 +230,6 @@ func (d *Drainer) send(ctx context.Context, recs []outbox.Record) (*pb.PublishRe
 			ContractHash:     r.ContractHash,
 			PartitionKey:     r.PartitionKey,
 			IdempotencyKey:   r.IdempotencyKey,
-			FireAndForget:    r.FireAndForget,
 			Headers:          r.Headers,
 			OccurredAtUnixMs: r.OccurredAtMs,
 			XSbTrace:         r.Trace,
