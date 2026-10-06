@@ -2,110 +2,62 @@
 
 ## Зона ответственности
 
-SDK-сторона Durable Events: domain namespace (`EventDomain`), публикация событий в локальный SQLite outbox (Publisher), фоновая доставка в runtime (Drainer), приём входящих событий через bidi Subscribe stream (Subscriber). Не работает напрямую с сетью — только через gRPC-клиент `EventsClient`. Wire format — Protobuf binary через `serde/` (ADR-0002); runtime трактует payload как opaque bytes. Routing и dedup живут на сервере (ADR-0002); handlers обязаны быть идемпотентны.
+SDK-сторона Durable Events: namespace `sb.event` (`EventDomain`), отправка событий в runtime с ожиданием подтверждения (`Publisher`) и приём доставок через bidi-стрим `Events.Subscribe` (`Subscriber`). Payload — Protobuf через `serde/` (ADR-0002); маршрутизация, фильтры, ретраи доставки и DLQ — на runtime. Не хранит события на диске: долговечность начинается с ACK runtime (событие в Postgres).
 
 ## Публичный контракт
 
 | Имя | Тип | По умолчанию | Что делает |
 |-----|-----|--------------|------------|
-| `EventDomain` | class | — | Domain namespace для событий. Доступен через `sb.event`. Реэкспортируется как type. |
-| `EventDomain.define(name, spec?)` | метод | — | Декларирует published event. `spec` — `SchemaSpec` (`.proto` файл или `.schema.json` c явными `fieldNumber`), тот же что у `sb.rpc.handle`; формат требует пару input/output, но событие использует только input — output не кодируется, не декодируется и не входит в `contract_hash`. Повторный `define` с тем же объектом `spec` (или оба без spec) — no-op; с другим spec — throws. Без spec регистрируется только имя (schema-less): `publish` такого события бросает «no schema registered», а subscriber отвечает `Nack` `no_schema` — реальная публикация/доставка требует spec. |
-| `EventDomain.handle(pattern, fn)` | метод | — | Регистрирует subscription (subscriber-side). `pattern` — точное имя или AMQP wildcard; матчинг выполняет сервер. |
-| `EventDomain.publish(name, payload, opts?)` | `async (...) => { eventId }` | — | Публикует event. Требует `sb.start()` (иначе throws — publisher не готов). Encode идёт через Protobuf serde — `type.verify()` бросает на невалидный payload до записи в outbox. |
-| `PublishOpts` | interface | — | Опции `publish`. Поля ниже. |
-| `PublishOpts.idempotencyKey` | `string?` | `""` | Ключ идемпотентности; runtime дедупит по нему. |
-| `PublishOpts.partitionKey` | `string?` | `""` | Ключ партиции; гарантирует FIFO-доставку внутри ключа. Пустой ключ — параллельная доставка. |
-| `PublishOpts.fireAndForget` | `boolean?` | `false` | `true` — отправка напрямую в runtime, минуя outbox (без durability, без ретраев). |
-| `PublishOpts.headers` | `Record<string,string>?` | `{}` | Произвольные заголовки envelope. |
-| `PublishOpts.occurredAtMs` | `number?` | `Date.now()` | Время события, unix-ms. Уходит в `EventEnvelope.occurred_at_unix_ms`. |
-| `Publisher` | class | — | Публикует события; конструктор принимает `PublisherDeps`. |
-| `Publisher.publish(name, payload, opts?)` | `async (...) => { eventId }` | — | Валидирует имя по `EVENT_NAME_RE`, кодирует payload, пишет в outbox (durable) либо шлёт напрямую (`fireAndForget`). Бросает `InvalidEventNameError`, `OutboxFullError`, либо ошибку при отсутствии схемы. |
-| `Drainer` | class | — | Фоновый loop; конструктор принимает `DrainerDeps`. |
-| `Drainer.start()` | `() => void` | — | Запускает фоновый drain-loop (идемпотентен). |
-| `Drainer.kick()` | `() => void` | — | Будит drainer из ожидания (edge-triggered). |
-| `Drainer.stop()` | `async () => void` | — | Сигналит loop выйти; ждёт завершения текущей итерации. |
-| `DrainerDeps` | interface | — | Зависимости Drainer. Публичные поля ниже; `clockFn`/`sleepFn` — test-only (см. приватный контракт). |
-| `DrainerDeps.batchSize` | `number` | `50` (`ServiceBridgeOptions.eventsDrainerBatch`) | Сколько строк outbox забирать за итерацию. |
-| `DrainerDeps.onPolicyViolation` | `((v) => void)?` | `undefined` | Вызывается при `PUBLISH_STATUS_REJECTED_FORBIDDEN` (запрет `event.publish` на стороне runtime). Forbidden — терминальный статус: строка outbox помечается `failed` (`last_error='forbidden:<reason>'`), без ретраев. Публикация в outbox асинхронна, поэтому ошибку нельзя бросить в `publish()` — она всплывает через этот callback + `logger.warn`. Вызывается ПОСЛЕ коммита батч-транзакции: колбэк сам публикует событие и иначе реентерил бы `storage.transaction()`. Owner подключает его к эмиту `policy_violation`. |
-| `Subscriber` | class | — | Открывает long-lived bidi Subscribe stream; конструктор принимает `SubscriberDeps`. Жизненный цикл стрима держит `registry/StreamSupervisor`. |
-| `Subscriber.start()` | `() => void` | — | Запускает supervisor: открывает стрим и шлёт `SubscribeInit` первым фреймом. |
-| `Subscriber.stop()` | `async () => void` | — | Отменяет reconnect-таймер, `cancel()` стрима, глушит дальнейшие реконнекты. |
-| `SubscriberDeps` | interface | — | Зависимости Subscriber. Поля: `rpcClient`, `schemaIndex`, `identity`, `handlers`, `maxInFlight?`, `logger?`, `sb?`, `reconnectOpts?`, `onSchedule?`, `runWithTrace`. |
-| `SubscriberDeps.maxInFlight` | `number?` | `32` (`ServiceBridgeOptions.eventsMaxInFlight`) | Макс. параллельных доставок (объявляется серверу в `SubscribeInit.max_in_flight`). |
-| `SubscriberDeps.logger` | `Logger?` | `{ warn: console.warn, error: console.error }` | Логгер для ошибок stream/ack/nack. |
-| `SubscriberDeps.sb` | `ServiceBridge?` | `undefined` | Reserved. EVENT.DELIVER op пишет runtime (ADR 0007 §5); SDK только ack/nack обратно. |
-| `SubscriberDeps.runWithTrace` | `(xSbTrace, fn) => Promise<void>` | — (обязателен) | Оборачивает handler в ALS trace scope из `envelope.x_sb_trace`, чтобы вложенные RPC/event-публикации наследовали trace. |
-| `uuidv7()` | `() => string` | — | Реэкспорт `uuidv7()` из npm-пакета `uuidv7` (монотонна в пределах ms через внутренний counter; работает под Node и Bun). |
-| `InvalidEventNameError` | class | — | Бросается при невалидном имени события. |
-| `OutboxFullError` | class | — | Бросается при превышении `maxOutboxRows`. |
-| `Logger` | interface | — | `{ warn, error }` — единый logger contract для Publisher / Drainer / Subscriber. |
+| `EventDomain.define(name, spec)` | метод | — | Объявляет публикуемое событие и его схему (`SchemaSpec`: `.proto` или `.schema.json`). Повтор с тем же объектом `spec` — no-op, с другим — `ValidationError`. Только для издателя. |
+| `EventDomain.handle(pattern, fn, opts?)` | метод | — | Подписка на имя или AMQP-шаблон (`*` — сегмент, `#` — ноль и более). Один handler на шаблон в процессе (дубль — `ValidationError`). Подписка не попадает в `published`. |
+| `EventHandlerOpts.schema` | `SchemaSpec?` | нет | Схема подписчика для декодирования payload. Без неё handler получает сырые байты (`Uint8Array`). |
+| `EventHandlerOpts.filter` | `Record<string, unknown>?` | нет | Filter Expression: объект `{"$.path": literal}`, все условия — равенства; вычисляется runtime по JSON-виду payload до доставки (решение 7). Уходит строкой в `EventSubscription.filter`. Невалидный фильтр → runtime отклоняет регистрацию `INVALID_ARGUMENT` → bridge останавливается с `ValidationError`. |
+| `EventHandlerFn` | `(payload, ctx) => void \| Promise<void>` | — | Handler. Бросок → Nack с текстом ошибки; ретраи/DLQ — на runtime. |
+| `EventHandlerContext` | interface | — | `{ eventId, eventName, attempt, deliveryId, leaseToken, partitionKey, headers, occurredAtMs, signal }`. `signal` прерывается при обрыве стрима или остановке. |
+| `EventDomain.publish(name, payload, opts?)` | `Promise<{ eventId }>` | — | Публикует и ждёт ACK runtime. До `start()` — `StateError`. |
+| `PublishOpts.idempotencyKey` | `string?` | `""` | Дедуп на runtime: повтор с тем же содержимым — успех с id исходного события, с другим — `CONFLICT`. |
+| `PublishOpts.partitionKey` | `string?` | `""` | FIFO-полоса: подписчик видит события одного ключа в порядке публикации. |
+| `PublishOpts.headers` | `Record<string,string>?` | `{}` | Заголовки envelope. |
+| `PublishOpts.occurredAtMs` | `number?` | `Date.now()` | Время события, unix-ms. |
+| `PublishOpts.fireAndForget` | `boolean?` | `false` | Резолвится сразу после постановки в очередь, не ждёт ACK. Событие всё равно отправляется с ретраями, но теряется при падении процесса; терминальный отказ только логируется. |
+| `InvalidEventNameError` | class | — | `code: "INVALID_EVENT_NAME"`. Имя вне `^[a-z0-9_-]+(\.[a-z0-9_-]+)*$`. |
+| `ServiceBridgeOptions.publishTimeoutMs` | `number` | `30000` | Сколько publish ждёт ACK. Истёк до отправки — `TimeoutError` «not sent»; после — «outcome unknown» (повтор с тем же `idempotencyKey` безопасен). |
+| `ServiceBridgeOptions.maxPendingPublishes` | `number` | `10000` | Предел очереди ожидающих ACK; сверх — `ServiceBridgeError` `QUEUE_FULL` (retryable). |
+| `ServiceBridgeOptions.eventsMaxInFlight` | `number` | `32` | Параллельно обрабатываемые доставки (`SubscribeInit.max_in_flight`). |
+
+Коды отказа publish: `REJECTED_DUPLICATE` → успех с `results[i].event_id` (id исходного события); `REJECTED_CONFLICT` → `CONFLICT`; `REJECTED_INVALID_NAME` → `InvalidEventNameError`; `REJECTED_FORBIDDEN` → `AccessDeniedError` + событие `policy_violation`; `UNSPECIFIED` или транспортная ошибка → повтор того же envelope (тот же id) с backoff 100/250/500/1000/2000/5000 мс до `publishTimeoutMs`.
 
 ## Приватный контракт
 
 | Имя | Тип | По умолчанию | Что делает |
 |-----|-----|--------------|------------|
-| `PublisherDeps` | interface (`@internal`) | — | Зависимости Publisher: `storage`, `rpcClient`, `schemaIndex`, `drainer`, `identity`, `maxOutboxRows`, `logger`, `sb?`, `xSbTraceFn`. Граф собирается в `connection/service-bridge.ts`. |
-| `PublisherDeps.maxOutboxRows` | `number` | `100000` (`ServiceBridgeOptions.maxOutboxRows`) | Cap строк в outbox; при достижении — `OutboxFullError`. |
-| `PublisherDeps.sb` | `ServiceBridge?` | `undefined` | Reserved; событийные ops пишет сам runtime (ADR 0007 §5). |
-| `PublisherDeps.xSbTraceFn` | `() => string` | — (обязателен) | Возвращает текущий X-SB-Trace header (из ALS) для каждого publish. Пустая строка → runtime минтит свежий root trace на ingest (ADR 0006 §3). |
-| `SchemaIndex` | interface (`@internal`) | — | `{ get(name): { contractHash, pair } \| undefined }` — schema-lookup для Publisher. |
-| `DrainerHandle` | interface (`@internal`) | — | `{ kick() }` — edge-triggered wakeup, который Publisher дёргает после INSERT в outbox. |
-| `SubscriberDeps.runWithTrace` | callback | — | (описан в публичном контракте; реализация — `@internal` hook composition root'а.) |
-| `SubscriberDeps.reconnectOpts` | `ReconnectDelayOptions?` (`@internal`) | общая лестница + ±20% jitter | Тестовый hook: пиннит лестницу/jitter, чтобы reconnect-поведение наблюдалось за миллисекунды. |
-| `SubscriberDeps.onSchedule` | `((delayMs: number) => void)?` (`@internal`) | нет | Тестовый hook: наблюдает каждую задержку reconnect. См. `registry/README.md`. |
-| `SubscriberSchemaIndex` | interface (`@internal`) | — | `{ get(name): { contractHash, pair } \| undefined }` — schema-lookup для Subscriber (decode входящих). |
-| `SubscriberDeps.handlers` | `(pattern: string) => readonly EventHandlerFn[]` | — (обязателен) | Fan-out of exact and wildcard patterns matching the delivered concrete name via Handle.eventHandlers(name). |
-| `SubscriberIdentity` | interface (`@internal`) | — | `{ serviceId, instanceId }` — идентичность подписчика для `SubscribeInit`. |
-| `DrainerDeps.clockFn` | `(() => number)?` | `Date.now` | Test-only hook: источник текущего времени unix-ms. |
-| `DrainerDeps.sleepFn` | `((ms: number, signal: AbortSignal) => Promise<void>)?` | `setTimeout` | Test-only hook: задержка ожидания, отменяемая через `signal` при `kick()`. |
-| `OutboxRow` | interface (`@internal`) | — | Строка `event_outbox`, селектится drainer'ом. |
-| `EVENT_NAME_RE` | `RegExp` | — | `^[a-z0-9_-]+(\.[a-z0-9_-]+)*$` (единственный источник — `publisher.ts`). |
-| `BACKOFF_MS` | `number[]` | `[1000, 5000, 30000, 120000, 600000]` | Drainer retry-лестница, ±25% jitter. Последняя ступень насыщается — транзиентные отказы ретраятся бесконечно. |
-| `MAX_BACKOFF_MS` | `number` | `600000` | Задержка, которую переиспользует любая попытка за пределами лестницы. |
-| `SELECT_DUE_SQL` | `string` (`@internal`, экспортирован) | — | Запрос дренажа: `status='pending' AND next_attempt_at_ms <= ?`, `ORDER BY enqueued_at_ms, id`, `LIMIT ?`. Порядок колонок совпадает с индексом `event_outbox_pending_order_idx`, поэтому SQLite идёт по индексу и `LIMIT` обрывает скан — без temp b-tree сортировки всего бэклога. Экспортирован ради теста плана запроса. |
-| `DEFAULT_MAX_IN_FLIGHT` | `number` | `32` | Дефолт `Subscriber.maxInFlight` при отсутствии явного значения. |
+| `Publisher` | class (`@internal`) | — | Очередь + отправитель. `publish`, `kick()` (сразу повторить, вызывается на Welcome), `close(deadlineMs)` (дослать, остаток — `CONNECTION` «client stopped»), `pending()`. |
+| `PublisherDeps` | interface (`@internal`) | — | `client()`, `schemaIndex`, `logger`, `timeoutMs`, `maxPending`, `xSbTraceFn()`, `onPolicyViolation`, `now?` (тест). |
+| `SchemaIndex` | interface (`@internal`) | — | `get(name) → { contractHash, pair }` — схемы объявленных событий. |
+| `Subscriber` | class (`@internal`) | — | `start`, `restart`, `drain(timeoutMs)` (новые доставки — Nack, ждать запущенные), `stop`. |
+| `SubscriberDeps` | interface (`@internal`) | — | `client()`, `identity()`, `subscription(pattern)`, `maxInFlight`, `logger`, `runWithTrace`, `reconnectOpts?`, `onSchedule?` (тест). |
+| `DEFAULT_PUBLISH_TIMEOUT_MS` / `DEFAULT_MAX_PENDING_PUBLISHES` / `DEFAULT_EVENTS_MAX_IN_FLIGHT` | const | `30000` / `10000` / `32` | Дефолты, те же в Go SDK. |
+| `uuidv7()` | function | — | Реэкспорт пакета `uuidv7`: монотонные id в порядке publish (runtime упорядочивает партицию по id). |
 
 ## Архитектурные решения и почему
 
-**Wire format — Protobuf через serde/ (ADR-0002).** `EventDomain.define(name, spec)` принимает тот же `SchemaSpec`, что и `sb.rpc.handle`. `buildSchemaPair(spec)` строит Protobuf encoder через `protobufjs`; `pair.input.encode()` валидирует payload (`type.verify()`) и кодирует в binary. Runtime не декодит payload — это passthrough bytes. Inline JSON Schema не поддерживается.
+**ACK вместо локального outbox (решение 4).** Сервисы stateless: локальный диск в контейнере эфемерен, общий SQLite-файл нарушал FIFO, тянул нативную зависимость и всё равно не решал dual-write. Поэтому `publish` резолвится только после того, как runtime записал событие в Postgres; на время обрыва — ограниченная очередь в памяти с повтором и таймаутом, при переполнении/таймауте — типизированная ошибка вызывающему. Никаких «тихих» буферов, где publish возвращает успех до ACK, кроме явного `fireAndForget`.
 
-**payload_json рядом с canonical payload.** Publisher кладёт JSON-вид того же payload в `EventEnvelope.payload_json` (через `JSON.stringify`, пустые байты если payload не сериализуем). Runtime использует его только для JSON-path `wait_event` фильтров в workflow-роутере, не декодя protobuf-форму.
+**Порядок по partition key.** В полёте один запрос `Publish`, в запросе не больше одного события на непустой ключ: если событие ключа получило временный отказ, следующие события того же ключа ждут за ним и не могут его обогнать. События без ключа идут пачкой до 100. Старт отправки откладывается на микротаск — публикации одного тика уходят одним запросом.
 
-**Schema loading async, finalize() ждёт.** `Registry._handle.publishEvent(name, spec)` синхронно регистрирует декларацию и кладёт promise в общий `pending[]`. `finalize()` (из `sb.start()`) await'ит все pending до построения `RegisterRequest`. Это унифицирует загрузку event- и rpc-схем.
+**Ответы сопоставляются по позиции.** `results[i]` отвечает `events[i]` (гарантия runtime): для дубля runtime возвращает id исходного события, поэтому id не может быть ключом сопоставления.
 
-**Идентичность события считается только по payload.** `SchemaSpec` описывает пару input/output, но событию отвечать некому: encode и decode идут через `pair.input`, в `RegisterRequest` едет только `input_schema_json`, а объявленный output не участвует ни в чём. Поэтому `contract_hash` события — `computeEventContractHash(pair.input)`: payload против пустого message. Так же считает Go SDK (`serde.EventContractHash`, вторая половина — `google.protobuf.Empty`), поэтому одна и та же схема даёт один и тот же хеш в обоих SDK; общий golden-вектор — `event_payload` в `sdk/contract-hash-vectors.json`.
+**Подписчик со своей схемой, маршрутизация по `matched_patterns` (NSDK-08).** Подписчик не объявляет чужое событие (раньше это давало ложное ребро «публикует» в Service Map) и не матчит шаблоны сам (ADR-0002): runtime присылает в доставке список совпавших шаблонов этого сервиса, прошедших фильтр, и SDK вызывает handler каждого, который есть у процесса. Ни одного — Nack (rolling deploy: доставка уйдёт на повтор, вероятно, к другому инстансу). Ack — только если все вызванные handler'ы успешны.
 
-**SchemaIndex backed by `getPublishedEvent`.** Publisher и Subscriber получают адаптер, читающий `Handle.getPublishedEvent(name)`. Локальная декларация — единственный источник правды для encode/decode pair; schemaIndex не делится между процессами. Подписчик чужого события сам объявляет `define(name, spec)` с той же схемой.
+**payload_json всегда.** JSON-вид payload заполняется при каждой публикации: по нему runtime вычисляет фильтры подписок и `wait_event` workflow.
 
-**UUID v7 — npm-пакет `uuidv7`.** Пакет хранит монотонный counter внутри процесса (sequential id'ы в пределах одной ms), даёт ту же защиту от clock skew, что требует ADR-0006, и работает под чистым Node (`node:crypto`) и под Bun одинаково. `ids.ts` реэкспортирует `uuidv7` как единую точку входа SDK; реализация не дублируется.
+**Drain при остановке.** `Subscriber.drain` перестаёт брать новые доставки (Nack, runtime передоставит другому инстансу), а стрим остаётся открытым, пока запущенные handler'ы не отправят свои Ack.
 
-**Subscriber dispatch by concrete `event.name`.** Server TopicMatch determines delivery. Local Handle.eventHandlers(name) selects every matching exact and wildcard registration through matchEventPattern. Client Seen dedup is absent: the handler contract remains at-least-once with business idempotency. Nonempty partition_key serializes execution in FIFO order; empty keys run concurrently within the global cap.
+**Жизненный цикл стрима — `registry/StreamSupervisor`.** Лестница переподключения `utils/reconnect-ladder` (1s, 5s, 15s, 30s, 60s ±20%), identity-guard стрима, один таймер; общая с jobs и workflow.
 
-**Ack/Nack семантика.** Успешный handler → `Ack`. Отсутствие envelope/схемы, decode-ошибка, throw из handler → `Nack` с причиной; ретраи и DLQ — на стороне runtime (events = статус доставки, не клиентские ретраи). Reconnect-счётчик сбрасывается синхронно при получении фрейма на стриме (доказательство, что стрим жив), а не из async-пути handler→ack — иначе сброс гонялся бы с инкрементом счётчика в обработчиках `error`/`end`. Чистое закрытие стрима счётчик НЕ сбрасывает.
-
-**Drainer статусы (PublishStatus).** `ACCEPTED` и `REJECTED_DUPLICATE` → строка удаляется из outbox (успех/идемпотентный дубль). `REJECTED_INVALID_NAME` → `failed` (терминально). `REJECTED_FORBIDDEN` → `failed` + `onPolicyViolation` (терминально). `UNSPECIFIED` и сетевые ошибки → бесконечный retry с backoff (лестница насыщается на 10 мин), `failed` не выставляется никогда; `failed` бывает только терминальным — `REJECTED_INVALID_NAME` и `REJECTED_FORBIDDEN`. Outbox-колонка `status` принимает значения `pending`/`inflight`/`failed` — это локальные SQLite-состояния, не wire-статусы.
-
-**Транспортный отказ не тратит бюджет попыток.** Раньше пять неудачных попыток помечали строку `failed` навсегда, а лестница `[1s,5s,30s,2m,10m]` исчерпывалась за 2 минуты 40 секунд: после трёх минут недоступности рантайма все буферизованные события молча умирали в локальном SQLite — при том что `publish()` уже вернул пользователю успех и пообещал durability. Outbox существует ровно для того, чтобы пережить даунтайм, поэтому лестница теперь только ограничивает частоту (последняя ступень повторяется бесконечно), а бюджет попыток тратят исключительно терминальные отказы — те, где ретрай ничего не изменит.
-
-**Батч результатов — одна транзакция.** Результаты всего батча применяются в одной `storage.transaction()`: построчный autocommit давал бы по WAL-фрейму и commit-записи на событие. Успехи собираются в список и удаляются одним `DELETE ... WHERE id IN (...)`. Наблюдатели (`logger.warn`, `onPolicyViolation`) вызываются ПОСЛЕ коммита — `onPolicyViolation` сам публикует событие и реентерил бы транзакцию.
-
-**Drainer edge-triggered kick.** При `pendingKick=true` в момент `kick()` wakeResolve вызывается немедленно; если kick приходит во время активной итерации — флаг сохраняется, следующий wait пропускается. Предотвращает потерю сигнала.
-
-**Ожидание в простое — до ближайшего `next_attempt_at_ms`.** Drainer спрашивает у outbox минимальный `next_attempt_at_ms` среди `pending` и спит ровно до него, а не поллит по фиксированному интервалу. При пустом outbox ждёт только `kick()` — таймера нет вообще, простаивающий SDK не держит event loop. Таймер отменяется через `AbortSignal`, когда `kick()` выигрывает гонку.
-
-**cap check + INSERT в одной `storage.transaction()`** — нативный SQLite-драйвер сериализует транзакции, исключая гонку при конкурентных publish.
-
-**Файл outbox не мигрируется.** Версия схемы штампуется в файл через `PRAGMA user_version` (владелец — `sqlite/`); файл с любой другой версией не открывается, `Storage.open` бросает с инструкцией остановить сервис и удалить каталог. Совместимости старых файлов нет: события, оставшиеся в старом outbox, теряются. Громкая ошибка вместо тихого `ALTER TABLE` — молчаливая миграция дала бы схему, о которой ни одна из сторон не знает точно.
-
-**fireAndForget bypass** — напрямую в `rpcClient.publish`, без записи в outbox и без kick. Для use-case без требования durability.
-
-**Жизненный цикл стрима — `registry/StreamSupervisor`.** Subscriber даёт супервизору только `open()` (subscribe + `SubscribeInit`) и `onData()` (обработка delivery); stop-флаг, единственный pending-таймер, identity-guard стрима и счётчик попыток на лестнице `utils/reconnect-ladder` (1s, 5s, 15s, 30s, 60s + удержание максимума, ±20% jitter) живут там же и одинаково у job- и workflow-подписчиков. `identity()` без значения → `open()` возвращает `null`, супервизор ждёт следующую ступень.
-
-**Trace propagation (ADR 0007 §5, ADR 0006 §3).** Publisher кладёт текущий X-SB-Trace в `EventEnvelope.x_sb_trace` ("traceID-parentOpID"); runtime связывает EVENT.PUBLISH op в существующее trace-дерево, либо минтит свежий root при пустом trace. Subscriber читает `envelope.x_sb_trace` (DELIVER-level header от runtime) и оборачивает handler в `runWithTrace`, чтобы вложенные `sb.rpc.call` / `sb.event.publish` / `sb.workflow.start` наследовали trace. EVENT.DELIVER op-строку пишет runtime.
+**Trace propagation (ADR 0006 §3).** Publisher кладёт X-SB-Trace текущего ALS-контекста в envelope; Subscriber запускает handler в trace-контексте доставки.
 
 ## Зависимости
 
-- Использует: `sdk/node/src/sqlite/` (`Storage`), `sdk/node/src/pb/servicebridge/v1/events` (`EventsClient`, `PublishStatus`, `SubscribeClientMessage`, `Ack`, `Nack`, `SubscribeInit`), `sdk/node/src/connection/service-bridge` (`Identity`, `ServiceBridge`), `sdk/node/src/registry/registry` (`Registry`, `EventHandlerFn`), `sdk/node/src/registry/stream-supervisor` (`StreamSupervisor`), `sdk/node/src/serde/serializer` (`SchemaSpec`, `SchemaPair`), `sdk/node/src/utils/reconnect-ladder` (тип `ReconnectDelayOptions`; сама лестница крутится внутри `StreamSupervisor`), npm-пакет `uuidv7`.
-- Используется: `sdk/node/src/connection/service-bridge.ts` (собирает Publisher, Drainer, Subscriber, EventDomain), `sdk/node/index.ts` (реэкспортирует `EventDomain`, `PublishOpts`, `InvalidEventNameError`, `OutboxFullError`).
-
-Handlers receive `(payload, context)` with attempt, deliveryId, eventId, leaseToken and AbortSignal. Local maxInFlight bounds handlers across partitions; overload is NACKed. Tokens are echoed unchanged. Fire-and-forget checks per-event Publish results and rejects policy/schema failures. Failed rows remain counted and visible through `sb.event.listFailed(limit, afterId)`; `retryFailed(id)` preserves event id and attempt history; `discardFailed(id)` deletes only a failed row. Claim and completion are transactional; completion storage failure retries locally without republishing accepted events. Stop cancels active publish and preserves uncertain rows for recovery.
+- Использует: `pb/servicebridge/v1/events`, `registry/registry` (`SubscriptionEntry`, `EventHandlerFn`), `registry/stream-supervisor`, `serde/serializer`, `utils/semaphore`, `errors`, `logger`, npm-пакет `uuidv7`.
+- Используется: `connection/service-bridge.ts` (собирает Publisher, Subscriber, EventDomain), `index.ts` (`EventDomain`, `PublishOpts`, `InvalidEventNameError`, типы handler'а).

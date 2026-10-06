@@ -36,8 +36,14 @@ SETTINGS_LANE=(
   "misc:misc.test.ts misc-lifecycle.test.ts"
 )
 
+# Logs and results live in a directory of this run: parallel agents and CI
+# lanes on one machine must not overwrite each other's /tmp/e2e-*.log.
+LOG_DIR=${E2E_LOG_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/sb-e2e.XXXXXX")}
+mkdir -p "$LOG_DIR"
+echo "e2e logs: $LOG_DIR"
+
 run_domain() {
-  local domain=$1 files=$2 log="/tmp/e2e-$1.log"
+  local domain=$1 files=$2 log="$LOG_DIR/e2e-$1.log"
   local paths=""
   for f in $files; do paths="$paths ./tests/e2e/$f"; done
   SB_E2E_DOMAIN="$domain" bun test $paths >"$log" 2>&1
@@ -45,7 +51,7 @@ run_domain() {
 }
 
 pids=()
-results="/tmp/e2e-parallel-results"
+results="$LOG_DIR/e2e-parallel-results"
 : >"$results"
 
 start=$(date +%s)
@@ -74,13 +80,13 @@ for lane in "${PARALLEL_LANES[@]}" "${SETTINGS_LANE[@]}"; do
   domain="${lane%%:*}"
   line=$(grep -E " $domain\$" "$results" | tail -1)
   code="${line%% *}"
-  pass=$(grep -cE '\(pass\)|[0-9]+ pass' "/tmp/e2e-$domain.log" 2>/dev/null || echo "?")
-  fail_n=$(grep -oE '[0-9]+ fail' "/tmp/e2e-$domain.log" 2>/dev/null | tail -1 || echo "")
+  pass=$(grep -cE '\(pass\)|[0-9]+ pass' "$LOG_DIR/e2e-$domain.log" 2>/dev/null || echo "?")
+  fail_n=$(grep -oE '[0-9]+ fail' "$LOG_DIR/e2e-$domain.log" 2>/dev/null | tail -1 || echo "")
   status=$([ "$code" = "0" ] && echo "OK" || echo "FAIL($code)")
-  printf "  %-14s %s  (%s)\n" "$domain" "$status" "$(grep -E 'Ran [0-9]+ tests' "/tmp/e2e-$domain.log" | tail -1)"
+  printf "  %-14s %s  (%s)\n" "$domain" "$status" "$(grep -E 'Ran [0-9]+ tests' "$LOG_DIR/e2e-$domain.log" | tail -1)"
   [ "$code" != "0" ] && fail=1
 done
 
 echo ""
-[ "$fail" = "0" ] && echo "ALL DOMAINS GREEN" || echo "SOME DOMAINS FAILED — see /tmp/e2e-<domain>.log"
+[ "$fail" = "0" ] && echo "ALL DOMAINS GREEN" || echo "SOME DOMAINS FAILED — see $LOG_DIR/e2e-<domain>.log"
 exit "$fail"
