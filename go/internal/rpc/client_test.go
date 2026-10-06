@@ -789,6 +789,9 @@ func TestAutoFallsBackToTheProxyAfterADirectPreDispatchFailure(t *testing.T) {
 	if string(got) != "body" || stub.calls != 1 {
 		t.Fatalf("payload %q, proxy calls %d; want the proxy to answer once", got, stub.calls)
 	}
+	if ex := stub.requests[0].GetExcludeInstanceIds(); len(ex) != 1 || ex[0] != "inst-1" {
+		t.Fatalf("exclude_instance_ids = %v, want the instance the direct path could not reach", ex)
+	}
 }
 
 func TestDirectTransportNeverFallsBack(t *testing.T) {

@@ -205,6 +205,9 @@ func (c *Client) Unary(ctx context.Context, req Request) ([]byte, error) {
 	callCtx := ctx
 	var lastErr error
 	viaProxy := req.Transport == TransportProxy
+	// unreachable names the instances the direct path failed to reach; the
+	// proxy is asked to try them last.
+	var unreachable []string
 
 	for attempt := 0; attempt < c.retry.MaxAttempts; attempt++ {
 		res, selErr := c.reserve(c.candidates(req), req, viaProxy)
@@ -231,7 +234,7 @@ func (c *Client) Unary(ctx context.Context, req Request) ([]byte, error) {
 		}
 		op.SetAttempt(int32(attempt))
 
-		payload, err := c.dispatch(callCtx, req, res.target, op, viaProxy)
+		payload, err := c.dispatch(callCtx, req, res.target, op, viaProxy, unreachable)
 		res.settle(err)
 		if err == nil {
 			op.End(pb.Status_SUCCESS, "")
@@ -244,6 +247,7 @@ func (c *Client) Unary(ctx context.Context, req Request) ([]byte, error) {
 			// runtime may still reach it. Switch now, no backoff: the failure
 			// was the path's, not the callee's.
 			viaProxy = true
+			unreachable = append(unreachable, res.target.InstanceID)
 			if attempt < c.retry.MaxAttempts-1 {
 				continue
 			}
@@ -466,13 +470,13 @@ func trace(ctx context.Context) (context.Context, string) {
 	return telemetry.InjectMetadata(ctx, tc), telemetry.FormatHeader(tc)
 }
 
-func (c *Client) dispatch(ctx context.Context, req Request, target Candidate, op *telemetry.Op, viaProxy bool) ([]byte, error) {
+func (c *Client) dispatch(ctx context.Context, req Request, target Candidate, op *telemetry.Op, viaProxy bool, exclude []string) ([]byte, error) {
 	mdCtx, header := trace(ctx)
 
 	var payload []byte
 	var err error
 	if viaProxy {
-		payload, err = c.proxy.Unary(mdCtx, c.invokeRequest(req, target, op, header))
+		payload, err = c.proxy.Unary(mdCtx, c.invokeRequest(req, target, op, header, exclude))
 	} else {
 		payload, err = c.direct.Unary(mdCtx, target, c.callRequest(req, op, header))
 	}
@@ -487,7 +491,7 @@ func (c *Client) openStream(ctx context.Context, req Request, target Candidate, 
 	mdCtx, header := trace(ctx)
 
 	if viaProxy {
-		return c.proxy.Stream(mdCtx, c.invokeRequest(req, target, op, header))
+		return c.proxy.Stream(mdCtx, c.invokeRequest(req, target, op, header, nil))
 	}
 	return c.direct.Stream(mdCtx, target, c.callRequest(req, op, header))
 }
@@ -505,7 +509,7 @@ func (c *Client) callRequest(req Request, op *telemetry.Op, header string) *pb.C
 	}
 }
 
-func (c *Client) invokeRequest(req Request, target Candidate, op *telemetry.Op, header string) *pb.InvokeRequest {
+func (c *Client) invokeRequest(req Request, target Candidate, op *telemetry.Op, header string, exclude []string) *pb.InvokeRequest {
 	return &pb.InvokeRequest{
 		TargetServiceId: target.ServiceID,
 		Method:          req.Method,
@@ -514,6 +518,9 @@ func (c *Client) invokeRequest(req Request, target Candidate, op *telemetry.Op, 
 		IdempotencyKey:  req.IdempotencyKey,
 		XSbTrace:        header,
 		ContractHash:    EncodeContractHash(req.ContractHash),
+		// The runtime tries these last: the direct path just failed to reach
+		// them before anything was sent.
+		ExcludeInstanceIds: exclude,
 	}
 }
 
