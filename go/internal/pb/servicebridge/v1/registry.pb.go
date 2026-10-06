@@ -442,9 +442,12 @@ func (x *OutgoingDep) GetType() MethodType {
 }
 
 type EventSubscription struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Pattern       string                 `protobuf:"bytes,1,opt,name=pattern,proto3" json:"pattern,omitempty"`
-	Durable       bool                   `protobuf:"varint,2,opt,name=durable,proto3" json:"durable,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Pattern string                 `protobuf:"bytes,1,opt,name=pattern,proto3" json:"pattern,omitempty"`
+	// Filter Expression evaluated by the runtime against the event payload
+	// before delivery (same language as workflow wait_event). Empty = every
+	// event matching pattern.
+	Filter        string `protobuf:"bytes,3,opt,name=filter,proto3" json:"filter,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -486,11 +489,11 @@ func (x *EventSubscription) GetPattern() string {
 	return ""
 }
 
-func (x *EventSubscription) GetDurable() bool {
+func (x *EventSubscription) GetFilter() string {
 	if x != nil {
-		return x.Durable
+		return x.Filter
 	}
-	return false
+	return ""
 }
 
 type RegisterRequest struct {
@@ -503,9 +506,13 @@ type RegisterRequest struct {
 	// Public HTTP host:port of this SDK instance (ADR 0001 — HTTP lives in user
 	// app). Used only by Service Map / Discovery; runtime does not proxy HTTP.
 	// Empty when SDK has no HTTP integration registered.
-	HttpEndpoint  string `protobuf:"bytes,6,opt,name=http_endpoint,json=httpEndpoint,proto3" json:"http_endpoint,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	HttpEndpoint string `protobuf:"bytes,6,opt,name=http_endpoint,json=httpEndpoint,proto3" json:"http_endpoint,omitempty"`
+	// Handshake identity, same meaning as OpenRequest.
+	ProtocolVersion uint32 `protobuf:"varint,7,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"`
+	SdkLanguage     string `protobuf:"bytes,8,opt,name=sdk_language,json=sdkLanguage,proto3" json:"sdk_language,omitempty"`
+	SdkVersion      string `protobuf:"bytes,9,opt,name=sdk_version,json=sdkVersion,proto3" json:"sdk_version,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *RegisterRequest) Reset() {
@@ -576,6 +583,27 @@ func (x *RegisterRequest) GetEventSubscriptions() []*EventSubscription {
 func (x *RegisterRequest) GetHttpEndpoint() string {
 	if x != nil {
 		return x.HttpEndpoint
+	}
+	return ""
+}
+
+func (x *RegisterRequest) GetProtocolVersion() uint32 {
+	if x != nil {
+		return x.ProtocolVersion
+	}
+	return 0
+}
+
+func (x *RegisterRequest) GetSdkLanguage() string {
+	if x != nil {
+		return x.SdkLanguage
+	}
+	return ""
+}
+
+func (x *RegisterRequest) GetSdkVersion() string {
+	if x != nil {
+		return x.SdkVersion
 	}
 	return ""
 }
@@ -893,11 +921,6 @@ type RegistryUpdate struct {
 	Removed          []*MethodDescriptor    `protobuf:"bytes,2,rep,name=removed,proto3" json:"removed,omitempty"`
 	AddedInstances   []*ServiceInstanceInfo `protobuf:"bytes,3,rep,name=added_instances,json=addedInstances,proto3" json:"added_instances,omitempty"`
 	RemovedInstances []*ServiceInstanceInfo `protobuf:"bytes,4,rep,name=removed_instances,json=removedInstances,proto3" json:"removed_instances,omitempty"`
-	// Same enrichment as RegistrySnapshot.* but incremental.
-	AddedEventSubscriptions   []*EventSubscriptionDescriptor `protobuf:"bytes,5,rep,name=added_event_subscriptions,json=addedEventSubscriptions,proto3" json:"added_event_subscriptions,omitempty"`
-	RemovedEventSubscriptions []*EventSubscriptionDescriptor `protobuf:"bytes,6,rep,name=removed_event_subscriptions,json=removedEventSubscriptions,proto3" json:"removed_event_subscriptions,omitempty"`
-	AddedOutgoingCalls        []*OutgoingCallDescriptor      `protobuf:"bytes,7,rep,name=added_outgoing_calls,json=addedOutgoingCalls,proto3" json:"added_outgoing_calls,omitempty"`
-	RemovedOutgoingCalls      []*OutgoingCallDescriptor      `protobuf:"bytes,8,rep,name=removed_outgoing_calls,json=removedOutgoingCalls,proto3" json:"removed_outgoing_calls,omitempty"`
 	// When policy changes (NOTIFY policy_changed touches caller), runtime
 	// re-emits the full PolicyEvaluation. Not incremental on purpose: policy
 	// edits are rare and the evaluation is small.
@@ -910,9 +933,14 @@ type RegistryUpdate struct {
 	RemovedPeers []string `protobuf:"bytes,11,rep,name=removed_peers,json=removedPeers,proto3" json:"removed_peers,omitempty"`
 	// Re-emitted full per-channel capture modes when any channel's mode changes.
 	// Like policy, not incremental: the whole set is sent on change.
-	CaptureModes  *CaptureModes `protobuf:"bytes,13,opt,name=capture_modes,json=captureModes,proto3" json:"capture_modes,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	CaptureModes *CaptureModes `protobuf:"bytes,13,opt,name=capture_modes,json=captureModes,proto3" json:"capture_modes,omitempty"`
+	// Access revoked since the previous frame. SDKs drop the revoked services'
+	// and instances' direct connections and reject calls to them at once,
+	// without waiting for their certificates to expire.
+	RevokedServices  []string `protobuf:"bytes,14,rep,name=revoked_services,json=revokedServices,proto3" json:"revoked_services,omitempty"`    // service UUIDs
+	RevokedInstances []string `protobuf:"bytes,15,rep,name=revoked_instances,json=revokedInstances,proto3" json:"revoked_instances,omitempty"` // instance UUIDs
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *RegistryUpdate) Reset() {
@@ -973,34 +1001,6 @@ func (x *RegistryUpdate) GetRemovedInstances() []*ServiceInstanceInfo {
 	return nil
 }
 
-func (x *RegistryUpdate) GetAddedEventSubscriptions() []*EventSubscriptionDescriptor {
-	if x != nil {
-		return x.AddedEventSubscriptions
-	}
-	return nil
-}
-
-func (x *RegistryUpdate) GetRemovedEventSubscriptions() []*EventSubscriptionDescriptor {
-	if x != nil {
-		return x.RemovedEventSubscriptions
-	}
-	return nil
-}
-
-func (x *RegistryUpdate) GetAddedOutgoingCalls() []*OutgoingCallDescriptor {
-	if x != nil {
-		return x.AddedOutgoingCalls
-	}
-	return nil
-}
-
-func (x *RegistryUpdate) GetRemovedOutgoingCalls() []*OutgoingCallDescriptor {
-	if x != nil {
-		return x.RemovedOutgoingCalls
-	}
-	return nil
-}
-
 func (x *RegistryUpdate) GetPolicy() *PolicyEvaluation {
 	if x != nil {
 		return x.Policy
@@ -1025,6 +1025,20 @@ func (x *RegistryUpdate) GetRemovedPeers() []string {
 func (x *RegistryUpdate) GetCaptureModes() *CaptureModes {
 	if x != nil {
 		return x.CaptureModes
+	}
+	return nil
+}
+
+func (x *RegistryUpdate) GetRevokedServices() []string {
+	if x != nil {
+		return x.RevokedServices
+	}
+	return nil
+}
+
+func (x *RegistryUpdate) GetRevokedInstances() []string {
+	if x != nil {
+		return x.RevokedInstances
 	}
 	return nil
 }
@@ -1116,7 +1130,7 @@ type EventSubscriptionDescriptor struct {
 	ServiceId     string                 `protobuf:"bytes,1,opt,name=service_id,json=serviceId,proto3" json:"service_id,omitempty"`
 	ServiceName   string                 `protobuf:"bytes,2,opt,name=service_name,json=serviceName,proto3" json:"service_name,omitempty"`
 	Pattern       string                 `protobuf:"bytes,3,opt,name=pattern,proto3" json:"pattern,omitempty"` // AMQP pattern, supports * and #
-	Durable       bool                   `protobuf:"varint,4,opt,name=durable,proto3" json:"durable,omitempty"`
+	Filter        string                 `protobuf:"bytes,5,opt,name=filter,proto3" json:"filter,omitempty"`   // Filter Expression, empty = none
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1172,23 +1186,21 @@ func (x *EventSubscriptionDescriptor) GetPattern() string {
 	return ""
 }
 
-func (x *EventSubscriptionDescriptor) GetDurable() bool {
+func (x *EventSubscriptionDescriptor) GetFilter() string {
 	if x != nil {
-		return x.Durable
+		return x.Filter
 	}
-	return false
+	return ""
 }
 
 type OutgoingCallDescriptor struct {
-	state             protoimpl.MessageState `protogen:"open.v1"`
-	CallerServiceId   string                 `protobuf:"bytes,1,opt,name=caller_service_id,json=callerServiceId,proto3" json:"caller_service_id,omitempty"`
-	CallerServiceName string                 `protobuf:"bytes,2,opt,name=caller_service_name,json=callerServiceName,proto3" json:"caller_service_name,omitempty"`
-	TargetServiceId   string                 `protobuf:"bytes,3,opt,name=target_service_id,json=targetServiceId,proto3" json:"target_service_id,omitempty"`
-	TargetServiceName string                 `protobuf:"bytes,4,opt,name=target_service_name,json=targetServiceName,proto3" json:"target_service_name,omitempty"`
-	TargetMethod      string                 `protobuf:"bytes,5,opt,name=target_method,json=targetMethod,proto3" json:"target_method,omitempty"`
-	TargetType        MethodType             `protobuf:"varint,6,opt,name=target_type,json=targetType,proto3,enum=servicebridge.v1.MethodType" json:"target_type,omitempty"` // RPC, WORKFLOW, HTTP
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	CallerServiceId string                 `protobuf:"bytes,1,opt,name=caller_service_id,json=callerServiceId,proto3" json:"caller_service_id,omitempty"`
+	TargetServiceId string                 `protobuf:"bytes,3,opt,name=target_service_id,json=targetServiceId,proto3" json:"target_service_id,omitempty"`
+	TargetMethod    string                 `protobuf:"bytes,5,opt,name=target_method,json=targetMethod,proto3" json:"target_method,omitempty"`
+	TargetType      MethodType             `protobuf:"varint,6,opt,name=target_type,json=targetType,proto3,enum=servicebridge.v1.MethodType" json:"target_type,omitempty"` // RPC, WORKFLOW, HTTP
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *OutgoingCallDescriptor) Reset() {
@@ -1228,23 +1240,9 @@ func (x *OutgoingCallDescriptor) GetCallerServiceId() string {
 	return ""
 }
 
-func (x *OutgoingCallDescriptor) GetCallerServiceName() string {
-	if x != nil {
-		return x.CallerServiceName
-	}
-	return ""
-}
-
 func (x *OutgoingCallDescriptor) GetTargetServiceId() string {
 	if x != nil {
 		return x.TargetServiceId
-	}
-	return ""
-}
-
-func (x *OutgoingCallDescriptor) GetTargetServiceName() string {
-	if x != nil {
-		return x.TargetServiceName
 	}
 	return ""
 }
@@ -1513,17 +1511,21 @@ const file_servicebridge_v1_registry_proto_rawDesc = "" +
 	"\fservice_name\x18\x01 \x01(\tR\vserviceName\x12\x1f\n" +
 	"\vmethod_name\x18\x02 \x01(\tR\n" +
 	"methodName\x120\n" +
-	"\x04type\x18\x03 \x01(\x0e2\x1c.servicebridge.v1.MethodTypeR\x04type\"G\n" +
+	"\x04type\x18\x03 \x01(\x0e2\x1c.servicebridge.v1.MethodTypeR\x04type\"T\n" +
 	"\x11EventSubscription\x12\x18\n" +
-	"\apattern\x18\x01 \x01(\tR\apattern\x12\x18\n" +
-	"\adurable\x18\x02 \x01(\bR\adurable\"\xea\x02\n" +
+	"\apattern\x18\x01 \x01(\tR\apattern\x12\x16\n" +
+	"\x06filter\x18\x03 \x01(\tR\x06filterJ\x04\b\x02\x10\x03R\adurable\"\xd9\x03\n" +
 	"\x0fRegisterRequest\x12<\n" +
 	"\bincoming\x18\x01 \x03(\v2 .servicebridge.v1.IncomingMethodR\bincoming\x12>\n" +
 	"\tpublished\x18\x02 \x03(\v2 .servicebridge.v1.PublishedEventR\tpublished\x129\n" +
 	"\boutgoing\x18\x03 \x03(\v2\x1d.servicebridge.v1.OutgoingDepR\boutgoing\x12#\n" +
 	"\rcall_endpoint\x18\x04 \x01(\tR\fcallEndpoint\x12T\n" +
 	"\x13event_subscriptions\x18\x05 \x03(\v2#.servicebridge.v1.EventSubscriptionR\x12eventSubscriptions\x12#\n" +
-	"\rhttp_endpoint\x18\x06 \x01(\tR\fhttpEndpoint\"\xe4\x02\n" +
+	"\rhttp_endpoint\x18\x06 \x01(\tR\fhttpEndpoint\x12)\n" +
+	"\x10protocol_version\x18\a \x01(\rR\x0fprotocolVersion\x12!\n" +
+	"\fsdk_language\x18\b \x01(\tR\vsdkLanguage\x12\x1f\n" +
+	"\vsdk_version\x18\t \x01(\tR\n" +
+	"sdkVersion\"\xe4\x02\n" +
 	"\x10MethodDescriptor\x12!\n" +
 	"\fservice_name\x18\x01 \x01(\tR\vserviceName\x12\x1d\n" +
 	"\n" +
@@ -1554,40 +1556,36 @@ const file_servicebridge_v1_registry_proto_rawDesc = "" +
 	"\x13event_subscriptions\x18\x03 \x03(\v2-.servicebridge.v1.EventSubscriptionDescriptorR\x12eventSubscriptions\x12O\n" +
 	"\x0eoutgoing_calls\x18\x04 \x03(\v2(.servicebridge.v1.OutgoingCallDescriptorR\routgoingCalls\x12:\n" +
 	"\x06policy\x18\x05 \x01(\v2\".servicebridge.v1.PolicyEvaluationR\x06policy\x12C\n" +
-	"\rcapture_modes\x18\a \x01(\v2\x1e.servicebridge.v1.CaptureModesR\fcaptureModesJ\x04\b\x06\x10\aR\fcapture_mode\"\x9d\a\n" +
+	"\rcapture_modes\x18\a \x01(\v2\x1e.servicebridge.v1.CaptureModesR\fcaptureModesJ\x04\b\x06\x10\aR\fcapture_mode\"\xdd\x05\n" +
 	"\x0eRegistryUpdate\x128\n" +
 	"\x05added\x18\x01 \x03(\v2\".servicebridge.v1.MethodDescriptorR\x05added\x12<\n" +
 	"\aremoved\x18\x02 \x03(\v2\".servicebridge.v1.MethodDescriptorR\aremoved\x12N\n" +
 	"\x0fadded_instances\x18\x03 \x03(\v2%.servicebridge.v1.ServiceInstanceInfoR\x0eaddedInstances\x12R\n" +
-	"\x11removed_instances\x18\x04 \x03(\v2%.servicebridge.v1.ServiceInstanceInfoR\x10removedInstances\x12i\n" +
-	"\x19added_event_subscriptions\x18\x05 \x03(\v2-.servicebridge.v1.EventSubscriptionDescriptorR\x17addedEventSubscriptions\x12m\n" +
-	"\x1bremoved_event_subscriptions\x18\x06 \x03(\v2-.servicebridge.v1.EventSubscriptionDescriptorR\x19removedEventSubscriptions\x12Z\n" +
-	"\x14added_outgoing_calls\x18\a \x03(\v2(.servicebridge.v1.OutgoingCallDescriptorR\x12addedOutgoingCalls\x12^\n" +
-	"\x16removed_outgoing_calls\x18\b \x03(\v2(.servicebridge.v1.OutgoingCallDescriptorR\x14removedOutgoingCalls\x12:\n" +
+	"\x11removed_instances\x18\x04 \x03(\v2%.servicebridge.v1.ServiceInstanceInfoR\x10removedInstances\x12:\n" +
 	"\x06policy\x18\t \x01(\v2\".servicebridge.v1.PolicyEvaluationR\x06policy\x12\x1f\n" +
 	"\vadded_peers\x18\n" +
 	" \x03(\tR\n" +
 	"addedPeers\x12#\n" +
 	"\rremoved_peers\x18\v \x03(\tR\fremovedPeers\x12C\n" +
-	"\rcapture_modes\x18\r \x01(\v2\x1e.servicebridge.v1.CaptureModesR\fcaptureModesJ\x04\b\f\x10\rR\fcapture_mode\"\x95\x01\n" +
+	"\rcapture_modes\x18\r \x01(\v2\x1e.servicebridge.v1.CaptureModesR\fcaptureModes\x12)\n" +
+	"\x10revoked_services\x18\x0e \x03(\tR\x0frevokedServices\x12+\n" +
+	"\x11revoked_instances\x18\x0f \x03(\tR\x10revokedInstancesJ\x04\b\x05\x10\x06J\x04\b\x06\x10\aJ\x04\b\a\x10\bJ\x04\b\b\x10\tJ\x04\b\f\x10\rR\x19added_event_subscriptionsR\x1bremoved_event_subscriptionsR\x14added_outgoing_callsR\x16removed_outgoing_callsR\fcapture_mode\"\x95\x01\n" +
 	"\rRegistryEvent\x12@\n" +
 	"\bsnapshot\x18\x01 \x01(\v2\".servicebridge.v1.RegistrySnapshotH\x00R\bsnapshot\x12:\n" +
 	"\x06update\x18\x02 \x01(\v2 .servicebridge.v1.RegistryUpdateH\x00R\x06updateB\x06\n" +
-	"\x04kind\"\x93\x01\n" +
+	"\x04kind\"\xa0\x01\n" +
 	"\x1bEventSubscriptionDescriptor\x12\x1d\n" +
 	"\n" +
 	"service_id\x18\x01 \x01(\tR\tserviceId\x12!\n" +
 	"\fservice_name\x18\x02 \x01(\tR\vserviceName\x12\x18\n" +
-	"\apattern\x18\x03 \x01(\tR\apattern\x12\x18\n" +
-	"\adurable\x18\x04 \x01(\bR\adurable\"\xb4\x02\n" +
+	"\apattern\x18\x03 \x01(\tR\apattern\x12\x16\n" +
+	"\x06filter\x18\x05 \x01(\tR\x06filterJ\x04\b\x04\x10\x05R\adurable\"\x8a\x02\n" +
 	"\x16OutgoingCallDescriptor\x12*\n" +
-	"\x11caller_service_id\x18\x01 \x01(\tR\x0fcallerServiceId\x12.\n" +
-	"\x13caller_service_name\x18\x02 \x01(\tR\x11callerServiceName\x12*\n" +
-	"\x11target_service_id\x18\x03 \x01(\tR\x0ftargetServiceId\x12.\n" +
-	"\x13target_service_name\x18\x04 \x01(\tR\x11targetServiceName\x12#\n" +
+	"\x11caller_service_id\x18\x01 \x01(\tR\x0fcallerServiceId\x12*\n" +
+	"\x11target_service_id\x18\x03 \x01(\tR\x0ftargetServiceId\x12#\n" +
 	"\rtarget_method\x18\x05 \x01(\tR\ftargetMethod\x12=\n" +
 	"\vtarget_type\x18\x06 \x01(\x0e2\x1c.servicebridge.v1.MethodTypeR\n" +
-	"targetType\"\xe9\x01\n" +
+	"targetTypeJ\x04\b\x02\x10\x03J\x04\b\x04\x10\x05R\x13caller_service_nameR\x13target_service_name\"\xe9\x01\n" +
 	"\x10PolicyEvaluation\x12\"\n" +
 	"\fcapabilities\x18\x01 \x03(\tR\fcapabilities\x124\n" +
 	"\x06egress\x18\x02 \x03(\v2\x1c.servicebridge.v1.PolicyRuleR\x06egress\x12<\n" +
@@ -1679,25 +1677,21 @@ var file_servicebridge_v1_registry_proto_depIdxs = []int32{
 	8,  // 18: servicebridge.v1.RegistryUpdate.removed:type_name -> servicebridge.v1.MethodDescriptor
 	9,  // 19: servicebridge.v1.RegistryUpdate.added_instances:type_name -> servicebridge.v1.ServiceInstanceInfo
 	9,  // 20: servicebridge.v1.RegistryUpdate.removed_instances:type_name -> servicebridge.v1.ServiceInstanceInfo
-	13, // 21: servicebridge.v1.RegistryUpdate.added_event_subscriptions:type_name -> servicebridge.v1.EventSubscriptionDescriptor
-	13, // 22: servicebridge.v1.RegistryUpdate.removed_event_subscriptions:type_name -> servicebridge.v1.EventSubscriptionDescriptor
-	14, // 23: servicebridge.v1.RegistryUpdate.added_outgoing_calls:type_name -> servicebridge.v1.OutgoingCallDescriptor
-	14, // 24: servicebridge.v1.RegistryUpdate.removed_outgoing_calls:type_name -> servicebridge.v1.OutgoingCallDescriptor
-	15, // 25: servicebridge.v1.RegistryUpdate.policy:type_name -> servicebridge.v1.PolicyEvaluation
-	2,  // 26: servicebridge.v1.RegistryUpdate.capture_modes:type_name -> servicebridge.v1.CaptureModes
-	10, // 27: servicebridge.v1.RegistryEvent.snapshot:type_name -> servicebridge.v1.RegistrySnapshot
-	11, // 28: servicebridge.v1.RegistryEvent.update:type_name -> servicebridge.v1.RegistryUpdate
-	0,  // 29: servicebridge.v1.OutgoingCallDescriptor.target_type:type_name -> servicebridge.v1.MethodType
-	16, // 30: servicebridge.v1.PolicyEvaluation.egress:type_name -> servicebridge.v1.PolicyRule
-	16, // 31: servicebridge.v1.PolicyEvaluation.acceptance:type_name -> servicebridge.v1.PolicyRule
-	17, // 32: servicebridge.v1.PolicyEvaluation.warnings:type_name -> servicebridge.v1.PolicyViolation
-	7,  // 33: servicebridge.v1.Registry.RegisterAndWatch:input_type -> servicebridge.v1.RegisterRequest
-	12, // 34: servicebridge.v1.Registry.RegisterAndWatch:output_type -> servicebridge.v1.RegistryEvent
-	34, // [34:35] is the sub-list for method output_type
-	33, // [33:34] is the sub-list for method input_type
-	33, // [33:33] is the sub-list for extension type_name
-	33, // [33:33] is the sub-list for extension extendee
-	0,  // [0:33] is the sub-list for field type_name
+	15, // 21: servicebridge.v1.RegistryUpdate.policy:type_name -> servicebridge.v1.PolicyEvaluation
+	2,  // 22: servicebridge.v1.RegistryUpdate.capture_modes:type_name -> servicebridge.v1.CaptureModes
+	10, // 23: servicebridge.v1.RegistryEvent.snapshot:type_name -> servicebridge.v1.RegistrySnapshot
+	11, // 24: servicebridge.v1.RegistryEvent.update:type_name -> servicebridge.v1.RegistryUpdate
+	0,  // 25: servicebridge.v1.OutgoingCallDescriptor.target_type:type_name -> servicebridge.v1.MethodType
+	16, // 26: servicebridge.v1.PolicyEvaluation.egress:type_name -> servicebridge.v1.PolicyRule
+	16, // 27: servicebridge.v1.PolicyEvaluation.acceptance:type_name -> servicebridge.v1.PolicyRule
+	17, // 28: servicebridge.v1.PolicyEvaluation.warnings:type_name -> servicebridge.v1.PolicyViolation
+	7,  // 29: servicebridge.v1.Registry.RegisterAndWatch:input_type -> servicebridge.v1.RegisterRequest
+	12, // 30: servicebridge.v1.Registry.RegisterAndWatch:output_type -> servicebridge.v1.RegistryEvent
+	30, // [30:31] is the sub-list for method output_type
+	29, // [29:30] is the sub-list for method input_type
+	29, // [29:29] is the sub-list for extension type_name
+	29, // [29:29] is the sub-list for extension extendee
+	0,  // [0:29] is the sub-list for field type_name
 }
 
 func init() { file_servicebridge_v1_registry_proto_init() }

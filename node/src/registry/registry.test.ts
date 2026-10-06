@@ -333,13 +333,12 @@ describe("Registry.service", () => {
 // ── Registry.buildRegisterRequest — eventSubscriptions ───────────────────────
 
 describe("Registry.buildRegisterRequest eventSubscriptions", () => {
-	it("_handle.event maps to eventSubscriptions with durable=true", () => {
+	it("_handle.event maps to eventSubscriptions", () => {
 		const r = new Registry();
 		r._handle.event("payment.charged", () => {});
 		const req = r.buildRegisterRequest();
 		expect(req.eventSubscriptions).toHaveLength(1);
 		expect(req.eventSubscriptions[0]!.pattern).toBe("payment.charged");
-		expect(req.eventSubscriptions[0]!.durable).toBe(true);
 	});
 
 	it("multiple event handlers produce separate subscriptions", () => {

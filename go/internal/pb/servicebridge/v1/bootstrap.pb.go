@@ -144,15 +144,15 @@ func (x *ProvisionRequest) GetCsrDer() []byte {
 }
 
 type ProvisionResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	CertDer       []byte                 `protobuf:"bytes,1,opt,name=cert_der,json=certDer,proto3" json:"cert_der,omitempty"`
-	CaChainDer    []byte                 `protobuf:"bytes,2,opt,name=ca_chain_der,json=caChainDer,proto3" json:"ca_chain_der,omitempty"`
-	ServiceId     string                 `protobuf:"bytes,3,opt,name=service_id,json=serviceId,proto3" json:"service_id,omitempty"`             // stable UUID, in SAN cert
-	ServiceName   string                 `protobuf:"bytes,4,opt,name=service_name,json=serviceName,proto3" json:"service_name,omitempty"`       // human label, mutable, NOT in cert
-	InstanceId    string                 `protobuf:"bytes,5,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`          // UUID of this instance, in SAN cert
-	NotAfterUnix  int64                  `protobuf:"varint,6,opt,name=not_after_unix,json=notAfterUnix,proto3" json:"not_after_unix,omitempty"` // cert expiry for scheduling refresh
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	CertDer        []byte                 `protobuf:"bytes,1,opt,name=cert_der,json=certDer,proto3" json:"cert_der,omitempty"`
+	CaChainDer     []byte                 `protobuf:"bytes,2,opt,name=ca_chain_der,json=caChainDer,proto3" json:"ca_chain_der,omitempty"`
+	ServiceId      string                 `protobuf:"bytes,3,opt,name=service_id,json=serviceId,proto3" json:"service_id,omitempty"`                     // stable UUID, in SAN cert
+	ServiceName    string                 `protobuf:"bytes,4,opt,name=service_name,json=serviceName,proto3" json:"service_name,omitempty"`               // human label, mutable, NOT in cert
+	InstanceId     string                 `protobuf:"bytes,5,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`                  // UUID of this instance, in SAN cert
+	NotAfterUnixMs int64                  `protobuf:"varint,6,opt,name=not_after_unix_ms,json=notAfterUnixMs,proto3" json:"not_after_unix_ms,omitempty"` // cert expiry (unix-ms) for scheduling refresh
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ProvisionResponse) Reset() {
@@ -220,9 +220,9 @@ func (x *ProvisionResponse) GetInstanceId() string {
 	return ""
 }
 
-func (x *ProvisionResponse) GetNotAfterUnix() int64 {
+func (x *ProvisionResponse) GetNotAfterUnixMs() int64 {
 	if x != nil {
-		return x.NotAfterUnix
+		return x.NotAfterUnixMs
 	}
 	return 0
 }
@@ -239,7 +239,7 @@ const file_servicebridge_v1_bootstrap_proto_rawDesc = "" +
 	"\x10ProvisionRequest\x12\x15\n" +
 	"\x06key_id\x18\x01 \x01(\fR\x05keyId\x12\x16\n" +
 	"\x06secret\x18\x02 \x01(\fR\x06secret\x12\x17\n" +
-	"\acsr_der\x18\x03 \x01(\fR\x06csrDer\"\xd9\x01\n" +
+	"\acsr_der\x18\x03 \x01(\fR\x06csrDer\"\xde\x01\n" +
 	"\x11ProvisionResponse\x12\x19\n" +
 	"\bcert_der\x18\x01 \x01(\fR\acertDer\x12 \n" +
 	"\fca_chain_der\x18\x02 \x01(\fR\n" +
@@ -248,8 +248,8 @@ const file_servicebridge_v1_bootstrap_proto_rawDesc = "" +
 	"service_id\x18\x03 \x01(\tR\tserviceId\x12!\n" +
 	"\fservice_name\x18\x04 \x01(\tR\vserviceName\x12\x1f\n" +
 	"\vinstance_id\x18\x05 \x01(\tR\n" +
-	"instanceId\x12$\n" +
-	"\x0enot_after_unix\x18\x06 \x01(\x03R\fnotAfterUnix2a\n" +
+	"instanceId\x12)\n" +
+	"\x11not_after_unix_ms\x18\x06 \x01(\x03R\x0enotAfterUnixMs2a\n" +
 	"\tBootstrap\x12T\n" +
 	"\tProvision\x12\".servicebridge.v1.ProvisionRequest\x1a#.servicebridge.v1.ProvisionResponseb\x06proto3"
 

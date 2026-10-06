@@ -51,7 +51,6 @@ func esd(serviceID, service, pattern string) *pb.EventSubscriptionDescriptor {
 		ServiceId:   serviceID,
 		ServiceName: service,
 		Pattern:     pattern,
-		Durable:     true,
 	}
 }
 
@@ -387,11 +386,9 @@ func TestUpdateAppliesIncrementally(t *testing.T) {
 	})
 
 	change := c.ApplyUpdate(&pb.RegistryUpdate{
-		Added:                   []*pb.MethodDescriptor{md("billing", "svc-b", "i2", "charge", "h1")},
-		AddedInstances:          []*pb.ServiceInstanceInfo{si("i2", "svc-b", "billing")},
-		AddedEventSubscriptions: []*pb.EventSubscriptionDescriptor{esd("svc-b", "billing", "order.*")},
-		AddedOutgoingCalls:      []*pb.OutgoingCallDescriptor{ocd("svc-b", "svc-s", "ship")},
-		AddedPeers:              []string{"svc-s"},
+		Added:          []*pb.MethodDescriptor{md("billing", "svc-b", "i2", "charge", "h1")},
+		AddedInstances: []*pb.ServiceInstanceInfo{si("i2", "svc-b", "billing")},
+		AddedPeers:     []string{"svc-s"},
 	})
 
 	if change.Snapshot {
@@ -405,10 +402,8 @@ func TestUpdateAppliesIncrementally(t *testing.T) {
 	}
 
 	c.ApplyUpdate(&pb.RegistryUpdate{
-		Removed:                   []*pb.MethodDescriptor{md("billing", "svc-b", "i1", "charge", "h1")},
-		RemovedInstances:          []*pb.ServiceInstanceInfo{si("i1", "svc-b", "billing")},
-		RemovedEventSubscriptions: []*pb.EventSubscriptionDescriptor{esd("svc-b", "billing", "order.*")},
-		RemovedOutgoingCalls:      []*pb.OutgoingCallDescriptor{ocd("svc-b", "svc-s", "ship")},
+		Removed:          []*pb.MethodDescriptor{md("billing", "svc-b", "i1", "charge", "h1")},
+		RemovedInstances: []*pb.ServiceInstanceInfo{si("i1", "svc-b", "billing")},
 	})
 	if got := instanceIDsOf(c.Candidates("billing", "charge", "")); !reflect.DeepEqual(got, []string{"i2"}) {
 		t.Fatalf("candidates after removal: %v", got)

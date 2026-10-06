@@ -280,7 +280,6 @@ func (p *Publisher) Publish(ctx context.Context, name string, payload any, opts 
 // sendNow is the no-wait path: one envelope straight to the runtime, no buffer,
 // no retry.
 func (p *Publisher) sendNow(ctx context.Context, id, name string, enc Encoded, o PublishOptions, occurredAt int64, trace string) error {
-	ident := p.cfg.Identity()
 	env := &pb.EventEnvelope{
 		Id:               id,
 		Name:             name,
@@ -295,9 +294,7 @@ func (p *Publisher) sendNow(ctx context.Context, id, name string, enc Encoded, o
 		XSbTrace:         trace,
 	}
 	resp, err := p.cfg.Publish(ctx, &pb.PublishRequest{
-		PublisherServiceId:  ident.ServiceID,
-		PublisherInstanceId: ident.InstanceID,
-		Events:              []*pb.EventEnvelope{env},
+		Events: []*pb.EventEnvelope{env},
 	})
 	if err != nil {
 		return fmt.Errorf("events: publish %q: send: %w", name, err)

@@ -47,8 +47,8 @@ export interface ProvisionResponse {
   serviceName: string;
   /** UUID of this instance, in SAN cert */
   instanceId: string;
-  /** cert expiry for scheduling refresh */
-  notAfterUnix: number;
+  /** cert expiry (unix-ms) for scheduling refresh */
+  notAfterUnixMs: number;
 }
 
 function createBaseBootstrapKeyPayload(): BootstrapKeyPayload {
@@ -216,7 +216,7 @@ function createBaseProvisionResponse(): ProvisionResponse {
     serviceId: "",
     serviceName: "",
     instanceId: "",
-    notAfterUnix: 0,
+    notAfterUnixMs: 0,
   };
 }
 
@@ -237,8 +237,8 @@ export const ProvisionResponse: MessageFns<ProvisionResponse> = {
     if (message.instanceId !== "") {
       writer.uint32(42).string(message.instanceId);
     }
-    if (message.notAfterUnix !== 0) {
-      writer.uint32(48).int64(message.notAfterUnix);
+    if (message.notAfterUnixMs !== 0) {
+      writer.uint32(48).int64(message.notAfterUnixMs);
     }
     return writer;
   },
@@ -301,7 +301,7 @@ export const ProvisionResponse: MessageFns<ProvisionResponse> = {
               break;
             }
 
-            message.notAfterUnix = longToNumber(reader.int64());
+            message.notAfterUnixMs = longToNumber(reader.int64());
             continue;
           }
         }
@@ -326,7 +326,7 @@ export const ProvisionResponse: MessageFns<ProvisionResponse> = {
     message.serviceId = object.serviceId ?? "";
     message.serviceName = object.serviceName ?? "";
     message.instanceId = object.instanceId ?? "";
-    message.notAfterUnix = object.notAfterUnix ?? 0;
+    message.notAfterUnixMs = object.notAfterUnixMs ?? 0;
     return message;
   },
 };

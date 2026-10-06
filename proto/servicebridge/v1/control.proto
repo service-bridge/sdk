@@ -13,7 +13,17 @@ service Control {
   rpc RefreshCert(RefreshCertRequest) returns (RefreshCertResponse);
 }
 
-message OpenRequest {}
+// Handshake identity of the SDK opening the control stream. The runtime
+// rejects a protocol_version it does not support with FAILED_PRECONDITION.
+message OpenRequest {
+  // Wire contract revision the SDK was generated against (see
+  // PROTOCOL_VERSION in the SDKs). 0 = not sent.
+  uint32 protocol_version = 1;
+  // "node" | "go" | … — for diagnostics and the console.
+  string sdk_language     = 2;
+  // SDK package version, e.g. "2.0.0-alpha.15".
+  string sdk_version      = 3;
+}
 
 message RefreshCertRequest {
   bytes csr_der = 1;
@@ -22,7 +32,7 @@ message RefreshCertRequest {
 message RefreshCertResponse {
   bytes  cert_der       = 1;
   bytes  ca_chain_der   = 2;
-  int64  not_after_unix = 3;
+  int64  not_after_unix_ms = 3;
   string instance_id    = 4;
 }
 
@@ -34,9 +44,13 @@ message ServerControl {
 }
 
 message Welcome {
-  string session_id   = 1;
-  string service_id   = 2;
-  string service_name = 3;
+  string session_id       = 1;
+  string service_id       = 2;
+  string service_name     = 3;
+  // Build version of the runtime binary.
+  string runtime_version  = 4;
+  // Wire contract revision the runtime speaks.
+  uint32 protocol_version = 5;
 }
 
 message Drain {

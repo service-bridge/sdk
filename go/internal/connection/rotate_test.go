@@ -69,7 +69,7 @@ func (r *refreshRuntime) handle(n int, req *pb.RefreshCertRequest) (*pb.RefreshC
 		InstanceId: instanceID,
 		// not_after_unix is seconds, unlike the unix-ms of every other wire time
 		// field (ADR-0006).
-		NotAfterUnix: notAfter.Unix(),
+		NotAfterUnixMs: notAfter.UnixMilli(),
 	}, nil
 }
 

@@ -333,7 +333,7 @@ func SubscribeEvent[T proto.Message](c *Client, name string, fn func(ctx context
 	if err := events.Subscribe(c.eventSub, name, events.Handler[T](fn)); err != nil {
 		return wrap(op, err)
 	}
-	return wrap(op, c.decls.SubscribeEvent(name, true))
+	return wrap(op, c.decls.SubscribeEvent(name))
 }
 
 // SubscribeEventRaw registers a handler that receives the payload undecoded.
@@ -347,7 +347,7 @@ func SubscribeEventRaw(c *Client, name string, fn func(ctx context.Context, payl
 	if err := events.Subscribe(c.eventSub, name, events.Handler[[]byte](fn)); err != nil {
 		return wrap(op, err)
 	}
-	return wrap(op, c.decls.SubscribeEvent(name, true))
+	return wrap(op, c.decls.SubscribeEvent(name))
 }
 
 // PublishOption tunes one publication.

@@ -84,13 +84,11 @@ function update(
 			removed,
 			addedInstances: [],
 			removedInstances: [],
-			addedEventSubscriptions: [],
-			removedEventSubscriptions: [],
-			addedOutgoingCalls: [],
-			removedOutgoingCalls: [],
 			addedPeers: [],
 			removedPeers: [],
 			captureModes,
+			revokedServices: [],
+			revokedInstances: [],
 		},
 	} as RegistryEvent;
 }
@@ -102,6 +100,9 @@ const emptyReq: RegisterRequest = {
 	callEndpoint: "",
 	eventSubscriptions: [],
 	httpEndpoint: "",
+	protocolVersion: 0,
+	sdkLanguage: "node",
+	sdkVersion: "",
 };
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -134,6 +135,9 @@ describe("WatchStream change notifications are incrementally applicable", () => 
 			callEndpoint: `${instanceId}:1000`,
 			status: "connected",
 			httpEndpoint: "",
+			protocolVersion: 0,
+			sdkLanguage: "node",
+			sdkVersion: "",
 			isUnhealthySinceUnixMs: 0,
 		};
 	}
@@ -231,12 +235,10 @@ describe("WatchStream change notifications are incrementally applicable", () => 
 				removed: [],
 				addedInstances: [],
 				removedInstances: [],
-				addedEventSubscriptions: [],
-				removedEventSubscriptions: [],
-				addedOutgoingCalls: [],
-				removedOutgoingCalls: [],
 				addedPeers: [],
 				removedPeers: ["svc"],
+				revokedServices: [],
+				revokedInstances: [],
 			},
 		} as RegistryEvent);
 

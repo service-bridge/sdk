@@ -68,11 +68,7 @@ func (ControlRefresher) Refresh(ctx context.Context, conn grpc.ClientConnInterfa
 		CAChainDER:  resp.GetCaChainDer(),
 		PrivateKey:  priv,
 		TLSCert:     tlsCert,
-		// not_after_unix is SECONDS here and in ProvisionResponse, unlike every
-		// other time field on the wire, which is unix milliseconds (ADR-0006).
-		// Read as milliseconds the expiry lands in 1970 and the client renews in
-		// a hot loop.
-		NotAfter: NotAfterFromUnixSeconds(resp.GetNotAfterUnix()),
+		NotAfter:    time.UnixMilli(resp.GetNotAfterUnixMs()).UTC(),
 	}, nil
 }
 

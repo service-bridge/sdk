@@ -237,9 +237,6 @@ func TestDrainSendsTheWholeEnvelope(t *testing.T) {
 	if req == nil {
 		t.Fatal("nothing was sent")
 	}
-	if req.GetPublisherServiceId() != "svc-1" || req.GetPublisherInstanceId() != "inst-1" {
-		t.Fatalf("identity = %q/%q", req.GetPublisherServiceId(), req.GetPublisherInstanceId())
-	}
 	env := req.GetEvents()[0]
 	if env.GetPartitionKey() != "cust-1" || env.GetIdempotencyKey() != "idem-1" ||
 		env.GetHeaders()["tenant"] != "acme" || env.GetXSbTrace() != "trace-header" ||

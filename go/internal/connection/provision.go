@@ -76,19 +76,9 @@ func Provision(ctx context.Context, addr string, key BootstrapKey) (*ProvisionRe
 		CertDER:     resp.GetCertDer(),
 		CAChainDER:  resp.GetCaChainDer(),
 		PrivateKey:  priv,
-		NotAfter:    NotAfterFromUnixSeconds(resp.GetNotAfterUnix()),
+		NotAfter:    time.UnixMilli(resp.GetNotAfterUnixMs()).UTC(),
 		TLSCert:     tlsCert,
 	}, nil
-}
-
-// NotAfterFromUnixSeconds converts a cert expiry field off the wire.
-//
-// Every other time field in the protocol is unix milliseconds (ADR-0006), but
-// not_after_unix in ProvisionResponse and RefreshCertResponse is SECONDS — the
-// runtime fills it with time.Time.Unix(). Reading it as milliseconds puts the
-// expiry in 1970 and makes the client rotate its certificate in a hot loop.
-func NotAfterFromUnixSeconds(sec int64) time.Time {
-	return time.Unix(sec, 0).UTC()
 }
 
 // NewCSR generates a fresh ECDSA P-256 key pair and a PKCS#10 CSR for it. The

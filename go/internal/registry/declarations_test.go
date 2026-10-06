@@ -81,7 +81,7 @@ func TestBuildRegisterRequestNeverProducesAFrameTheRuntimeRejects(t *testing.T) 
 	if err := d.PublishEvent("order.created", []byte(`{}`), "h2"); err != nil {
 		t.Fatalf("publish event: %v", err)
 	}
-	if err := d.SubscribeEvent("order.*", true); err != nil {
+	if err := d.SubscribeEvent("order.*"); err != nil {
 		t.Fatalf("subscribe event: %v", err)
 	}
 	if err := d.AddOutgoing("billing", "charge", pb.MethodType_METHOD_TYPE_RPC); err != nil {
@@ -158,7 +158,7 @@ func TestAddIncomingRejectsNamelessAndUntypedDeclarations(t *testing.T) {
 	if err := d.PublishEvent("", nil, ""); !errors.Is(err, registry.ErrEmptyName) {
 		t.Fatalf("empty event name: got %v, want ErrEmptyName", err)
 	}
-	if err := d.SubscribeEvent("", false); !errors.Is(err, registry.ErrEmptyName) {
+	if err := d.SubscribeEvent(""); !errors.Is(err, registry.ErrEmptyName) {
 		t.Fatalf("empty pattern: got %v, want ErrEmptyName", err)
 	}
 	if err := d.AddOutgoing("", "m", pb.MethodType_METHOD_TYPE_RPC); !errors.Is(err, registry.ErrEmptyName) {
@@ -223,16 +223,15 @@ func TestAddOutgoingAcceptsRPCWorkflowAndHTTP(t *testing.T) {
 func TestSubscribeEventCollapsesDuplicatePatterns(t *testing.T) {
 	d := registry.NewDeclarations()
 	for range 3 {
-		if err := d.SubscribeEvent("order.*", true); err != nil {
+		if err := d.SubscribeEvent("order.*"); err != nil {
 			t.Fatalf("subscribe: %v", err)
 		}
 	}
-	// A second handler on the same pattern may ask for a different durability;
-	// the pattern is still one row on the wire.
-	if err := d.SubscribeEvent("order.*", false); err != nil {
+	// A second handler on the same pattern is still one row on the wire.
+	if err := d.SubscribeEvent("order.*"); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
-	if err := d.SubscribeEvent("payment.*", false); err != nil {
+	if err := d.SubscribeEvent("payment.*"); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
 
@@ -240,8 +239,8 @@ func TestSubscribeEventCollapsesDuplicatePatterns(t *testing.T) {
 	if len(subs) != 2 {
 		t.Fatalf("got %d subscriptions, want 2", len(subs))
 	}
-	if subs[0].GetPattern() != "order.*" || !subs[0].GetDurable() {
-		t.Fatalf("first subscription %v lost the durability of the first declaration", subs[0])
+	if subs[0].GetPattern() != "order.*" {
+		t.Fatalf("first subscription = %v, want order.*", subs[0])
 	}
 	if bad := runtimeRejections(d.BuildRegisterRequest()); len(bad) > 0 {
 		t.Fatalf("duplicate subscriptions reached the frame: %v", bad)
@@ -342,7 +341,7 @@ func TestDeclarationsAreSafeForConcurrentDeclaration(t *testing.T) {
 			}); err != nil {
 				t.Errorf("add incoming: %v", err)
 			}
-			if err := d.SubscribeEvent("order.*", true); err != nil {
+			if err := d.SubscribeEvent("order.*"); err != nil {
 				t.Errorf("subscribe: %v", err)
 			}
 			if err := d.AddOutgoing("billing", "charge", pb.MethodType_METHOD_TYPE_RPC); err != nil {

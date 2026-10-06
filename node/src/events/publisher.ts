@@ -117,12 +117,9 @@ export class Publisher {
 		const xSbTrace = this.xSbTraceFn();
 
 		if (opts?.fireAndForget) {
-			const ident = this.deps.identity();
 			await new Promise<void>((resolve, reject) => {
 				this.deps.rpcClient.publish(
 					{
-						publisherServiceId: ident?.serviceId ?? "",
-						publisherInstanceId: ident?.instanceId ?? "",
 						events: [
 							{
 								id: eventId,

@@ -509,18 +509,6 @@ func (c *Cache) ApplyUpdate(u *pb.RegistryUpdate) Change {
 			change.RemovedInstances = append(change.RemovedInstances, old)
 		}
 	}
-	for _, es := range u.GetAddedEventSubscriptions() {
-		c.eventSubs[eventSubKey{serviceID: es.GetServiceId(), pattern: es.GetPattern()}] = es
-	}
-	for _, es := range u.GetRemovedEventSubscriptions() {
-		delete(c.eventSubs, eventSubKey{serviceID: es.GetServiceId(), pattern: es.GetPattern()})
-	}
-	for _, oc := range u.GetAddedOutgoingCalls() {
-		c.outgoing[keyOfOutgoing(oc)] = oc
-	}
-	for _, oc := range u.GetRemovedOutgoingCalls() {
-		delete(c.outgoing, keyOfOutgoing(oc))
-	}
 
 	if peers := u.GetRemovedPeers(); len(peers) > 0 {
 		c.purgePeers(peers, dt, &change)

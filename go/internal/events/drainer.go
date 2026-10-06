@@ -220,7 +220,6 @@ func (d *Drainer) drainOnce(ctx context.Context) (int, error) {
 }
 
 func (d *Drainer) send(ctx context.Context, recs []outbox.Record) (*pb.PublishResponse, error) {
-	ident := d.cfg.Identity()
 	events := make([]*pb.EventEnvelope, len(recs))
 	for i, r := range recs {
 		events[i] = &pb.EventEnvelope{
@@ -241,9 +240,7 @@ func (d *Drainer) send(ctx context.Context, recs []outbox.Record) (*pb.PublishRe
 	defer cancel()
 
 	resp, err := d.cfg.Publish(callCtx, &pb.PublishRequest{
-		PublisherServiceId:  ident.ServiceID,
-		PublisherInstanceId: ident.InstanceID,
-		Events:              events,
+		Events: events,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("events: drain: publish %d event(s): %w", len(recs), err)

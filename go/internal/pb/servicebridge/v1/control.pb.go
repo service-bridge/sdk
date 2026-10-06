@@ -21,8 +21,17 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// Handshake identity of the SDK opening the control stream. The runtime
+// rejects a protocol_version it does not support with FAILED_PRECONDITION.
 type OpenRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Wire contract revision the SDK was generated against (see
+	// PROTOCOL_VERSION in the SDKs). 0 = not sent.
+	ProtocolVersion uint32 `protobuf:"varint,1,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"`
+	// "node" | "go" | … — for diagnostics and the console.
+	SdkLanguage string `protobuf:"bytes,2,opt,name=sdk_language,json=sdkLanguage,proto3" json:"sdk_language,omitempty"`
+	// SDK package version, e.g. "2.0.0-alpha.15".
+	SdkVersion    string `protobuf:"bytes,3,opt,name=sdk_version,json=sdkVersion,proto3" json:"sdk_version,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -55,6 +64,27 @@ func (x *OpenRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use OpenRequest.ProtoReflect.Descriptor instead.
 func (*OpenRequest) Descriptor() ([]byte, []int) {
 	return file_servicebridge_v1_control_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *OpenRequest) GetProtocolVersion() uint32 {
+	if x != nil {
+		return x.ProtocolVersion
+	}
+	return 0
+}
+
+func (x *OpenRequest) GetSdkLanguage() string {
+	if x != nil {
+		return x.SdkLanguage
+	}
+	return ""
+}
+
+func (x *OpenRequest) GetSdkVersion() string {
+	if x != nil {
+		return x.SdkVersion
+	}
+	return ""
 }
 
 type RefreshCertRequest struct {
@@ -102,13 +132,13 @@ func (x *RefreshCertRequest) GetCsrDer() []byte {
 }
 
 type RefreshCertResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	CertDer       []byte                 `protobuf:"bytes,1,opt,name=cert_der,json=certDer,proto3" json:"cert_der,omitempty"`
-	CaChainDer    []byte                 `protobuf:"bytes,2,opt,name=ca_chain_der,json=caChainDer,proto3" json:"ca_chain_der,omitempty"`
-	NotAfterUnix  int64                  `protobuf:"varint,3,opt,name=not_after_unix,json=notAfterUnix,proto3" json:"not_after_unix,omitempty"`
-	InstanceId    string                 `protobuf:"bytes,4,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	CertDer        []byte                 `protobuf:"bytes,1,opt,name=cert_der,json=certDer,proto3" json:"cert_der,omitempty"`
+	CaChainDer     []byte                 `protobuf:"bytes,2,opt,name=ca_chain_der,json=caChainDer,proto3" json:"ca_chain_der,omitempty"`
+	NotAfterUnixMs int64                  `protobuf:"varint,3,opt,name=not_after_unix_ms,json=notAfterUnixMs,proto3" json:"not_after_unix_ms,omitempty"`
+	InstanceId     string                 `protobuf:"bytes,4,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *RefreshCertResponse) Reset() {
@@ -155,9 +185,9 @@ func (x *RefreshCertResponse) GetCaChainDer() []byte {
 	return nil
 }
 
-func (x *RefreshCertResponse) GetNotAfterUnix() int64 {
+func (x *RefreshCertResponse) GetNotAfterUnixMs() int64 {
 	if x != nil {
-		return x.NotAfterUnix
+		return x.NotAfterUnixMs
 	}
 	return 0
 }
@@ -252,12 +282,16 @@ func (*ServerControl_Welcome) isServerControl_Kind() {}
 func (*ServerControl_Drain) isServerControl_Kind() {}
 
 type Welcome struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	SessionId     string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
-	ServiceId     string                 `protobuf:"bytes,2,opt,name=service_id,json=serviceId,proto3" json:"service_id,omitempty"`
-	ServiceName   string                 `protobuf:"bytes,3,opt,name=service_name,json=serviceName,proto3" json:"service_name,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	SessionId   string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	ServiceId   string                 `protobuf:"bytes,2,opt,name=service_id,json=serviceId,proto3" json:"service_id,omitempty"`
+	ServiceName string                 `protobuf:"bytes,3,opt,name=service_name,json=serviceName,proto3" json:"service_name,omitempty"`
+	// Build version of the runtime binary.
+	RuntimeVersion string `protobuf:"bytes,4,opt,name=runtime_version,json=runtimeVersion,proto3" json:"runtime_version,omitempty"`
+	// Wire contract revision the runtime speaks.
+	ProtocolVersion uint32 `protobuf:"varint,5,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *Welcome) Reset() {
@@ -311,6 +345,20 @@ func (x *Welcome) GetServiceName() string {
 	return ""
 }
 
+func (x *Welcome) GetRuntimeVersion() string {
+	if x != nil {
+		return x.RuntimeVersion
+	}
+	return ""
+}
+
+func (x *Welcome) GetProtocolVersion() uint32 {
+	if x != nil {
+		return x.ProtocolVersion
+	}
+	return 0
+}
+
 type Drain struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Reason        string                 `protobuf:"bytes,1,opt,name=reason,proto3" json:"reason,omitempty"`
@@ -359,27 +407,33 @@ var File_servicebridge_v1_control_proto protoreflect.FileDescriptor
 
 const file_servicebridge_v1_control_proto_rawDesc = "" +
 	"\n" +
-	"\x1eservicebridge/v1/control.proto\x12\x10servicebridge.v1\"\r\n" +
-	"\vOpenRequest\"-\n" +
+	"\x1eservicebridge/v1/control.proto\x12\x10servicebridge.v1\"|\n" +
+	"\vOpenRequest\x12)\n" +
+	"\x10protocol_version\x18\x01 \x01(\rR\x0fprotocolVersion\x12!\n" +
+	"\fsdk_language\x18\x02 \x01(\tR\vsdkLanguage\x12\x1f\n" +
+	"\vsdk_version\x18\x03 \x01(\tR\n" +
+	"sdkVersion\"-\n" +
 	"\x12RefreshCertRequest\x12\x17\n" +
-	"\acsr_der\x18\x01 \x01(\fR\x06csrDer\"\x99\x01\n" +
+	"\acsr_der\x18\x01 \x01(\fR\x06csrDer\"\x9e\x01\n" +
 	"\x13RefreshCertResponse\x12\x19\n" +
 	"\bcert_der\x18\x01 \x01(\fR\acertDer\x12 \n" +
 	"\fca_chain_der\x18\x02 \x01(\fR\n" +
-	"caChainDer\x12$\n" +
-	"\x0enot_after_unix\x18\x03 \x01(\x03R\fnotAfterUnix\x12\x1f\n" +
+	"caChainDer\x12)\n" +
+	"\x11not_after_unix_ms\x18\x03 \x01(\x03R\x0enotAfterUnixMs\x12\x1f\n" +
 	"\vinstance_id\x18\x04 \x01(\tR\n" +
 	"instanceId\"\x7f\n" +
 	"\rServerControl\x125\n" +
 	"\awelcome\x18\x01 \x01(\v2\x19.servicebridge.v1.WelcomeH\x00R\awelcome\x12/\n" +
 	"\x05drain\x18\x02 \x01(\v2\x17.servicebridge.v1.DrainH\x00R\x05drainB\x06\n" +
-	"\x04kind\"j\n" +
+	"\x04kind\"\xbe\x01\n" +
 	"\aWelcome\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x1d\n" +
 	"\n" +
 	"service_id\x18\x02 \x01(\tR\tserviceId\x12!\n" +
-	"\fservice_name\x18\x03 \x01(\tR\vserviceName\"\x1f\n" +
+	"\fservice_name\x18\x03 \x01(\tR\vserviceName\x12'\n" +
+	"\x0fruntime_version\x18\x04 \x01(\tR\x0eruntimeVersion\x12)\n" +
+	"\x10protocol_version\x18\x05 \x01(\rR\x0fprotocolVersion\"\x1f\n" +
 	"\x05Drain\x12\x16\n" +
 	"\x06reason\x18\x01 \x01(\tR\x06reason2\xaf\x01\n" +
 	"\aControl\x12H\n" +

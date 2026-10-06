@@ -136,7 +136,7 @@ export async function provision(
 						serviceId: response.serviceId,
 						serviceName: response.serviceName,
 						instanceId: response.instanceId,
-						notAfterUnix: BigInt(response.notAfterUnix),
+						notAfterUnix: BigInt(Math.floor(response.notAfterUnixMs / 1000)),
 						privateKey,
 						privateKeyDer,
 					});
@@ -186,7 +186,7 @@ export async function refresh(
 				serviceId: previous.serviceId,
 				serviceName: previous.serviceName,
 				instanceId: response.instanceId,
-				notAfterUnix: BigInt(response.notAfterUnix),
+				notAfterUnix: BigInt(Math.floor(response.notAfterUnixMs / 1000)),
 				privateKey,
 				privateKeyDer,
 			});

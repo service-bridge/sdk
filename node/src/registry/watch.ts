@@ -427,18 +427,6 @@ export class WatchStream {
 			for (const i of evt.update.removedInstances) {
 				this.instances.delete(i.instanceId);
 			}
-			for (const es of evt.update.addedEventSubscriptions ?? []) {
-				this.eventSubs.set(eventSubKey(es), es);
-			}
-			for (const es of evt.update.removedEventSubscriptions ?? []) {
-				this.eventSubs.delete(eventSubKey(es));
-			}
-			for (const oc of evt.update.addedOutgoingCalls ?? []) {
-				this.outgoing.set(outgoingKey(oc), oc);
-			}
-			for (const oc of evt.update.removedOutgoingCalls ?? []) {
-				this.outgoing.delete(outgoingKey(oc));
-			}
 			// removedPeers: when a peer falls out of the caller's policy scope
 			// (e.g. rule revoked), runtime emits the peer's serviceId in
 			// removedPeers. SDK must drop every cached entry tied to that peer

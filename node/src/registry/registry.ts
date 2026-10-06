@@ -635,12 +635,12 @@ export class Registry {
 		// `ReplaceEventSubs` and roll back the entire registration. One row per
 		// distinct pattern is enough — the SDK side handles in-process fan-out.
 		const seenPatterns = new Set<string>();
-		const eventSubscriptions: { pattern: string; durable: boolean }[] = [];
+		const eventSubscriptions: { pattern: string; filter: string }[] = [];
 		for (const e of this._handle._entries) {
 			if (e.type !== MethodType.METHOD_TYPE_EVENT) continue;
 			if (seenPatterns.has(e.name)) continue;
 			seenPatterns.add(e.name);
-			eventSubscriptions.push({ pattern: e.name, durable: true });
+			eventSubscriptions.push({ pattern: e.name, filter: "" });
 		}
 
 		return {
@@ -650,6 +650,9 @@ export class Registry {
 			callEndpoint: this._callEndpoint,
 			eventSubscriptions,
 			httpEndpoint: this._httpEndpoint,
+			protocolVersion: 0,
+			sdkLanguage: "node",
+			sdkVersion: "",
 		};
 	}
 

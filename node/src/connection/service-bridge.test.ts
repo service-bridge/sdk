@@ -228,6 +228,8 @@ describe("ServiceBridge connect lifecycle", () => {
 				sessionId: "s1",
 				serviceId: "svc",
 				serviceName: "svc-name",
+				runtimeVersion: "",
+				protocolVersion: 0,
 			},
 		});
 		await connected;
@@ -255,6 +257,8 @@ describe("ServiceBridge connect lifecycle", () => {
 				sessionId: "sess-42",
 				serviceId: "svc-id-7",
 				serviceName: "billing",
+				runtimeVersion: "",
+				protocolVersion: 0,
 			},
 		});
 		await waitFor(
@@ -300,7 +304,13 @@ describe("ServiceBridge connect lifecycle", () => {
 		await sb.start();
 		await waitFor(() => streams.length >= 1, "first stream opened");
 		streams[0]?.emitData({
-			welcome: { sessionId: "s1", serviceId: "svc", serviceName: "n" },
+			welcome: {
+				sessionId: "s1",
+				serviceId: "svc",
+				serviceName: "n",
+				runtimeVersion: "",
+				protocolVersion: 0,
+			},
 		});
 		await tick();
 		expect(provisionCalls).toBe(1);
@@ -317,7 +327,13 @@ describe("ServiceBridge connect lifecycle", () => {
 		streams[0]?.emitError(new Error("transport drop"));
 		await waitFor(() => streams.length >= 2, "reconnect opened a new stream");
 		streams[1]?.emitData({
-			welcome: { sessionId: "s2", serviceId: "svc", serviceName: "n" },
+			welcome: {
+				sessionId: "s2",
+				serviceId: "svc",
+				serviceName: "n",
+				runtimeVersion: "",
+				protocolVersion: 0,
+			},
 		});
 		await tick();
 
@@ -399,6 +415,8 @@ describe("ServiceBridge connect lifecycle", () => {
 				sessionId: "s1",
 				serviceId: "svc",
 				serviceName: "svc-name",
+				runtimeVersion: "",
+				protocolVersion: 0,
 			},
 		});
 		stream.emitData({ drain: { reason: "maintenance" } });
@@ -508,7 +526,13 @@ describe("ServiceBridge telemetry identity", () => {
 		await sb.start();
 		await waitFor(() => registryStreams.length >= 1, "first registry stream");
 		controlStreams[0]?.emitData({
-			welcome: { sessionId: "s1", serviceId: "svc", serviceName: "n" },
+			welcome: {
+				sessionId: "s1",
+				serviceId: "svc",
+				serviceName: "n",
+				runtimeVersion: "",
+				protocolVersion: 0,
+			},
 		});
 		await tick();
 
@@ -581,7 +605,13 @@ describe("ServiceBridge telemetry identity", () => {
 
 		await sb.start();
 		stream.emitData({
-			welcome: { sessionId: "s1", serviceId: "svc", serviceName: "svc-name" },
+			welcome: {
+				sessionId: "s1",
+				serviceId: "svc",
+				serviceName: "svc-name",
+				runtimeVersion: "",
+				protocolVersion: 0,
+			},
 		});
 		await waitFor(() => sb.identity() !== null, "identity after Welcome");
 
@@ -766,7 +796,13 @@ describe("ServiceBridge gRPC channel lifecycle (no leak on reconnect)", () => {
 		await sb.start();
 		await waitFor(() => registryStreams.length >= 1, "first registry stream");
 		controlStreams[0]?.emitData({
-			welcome: { sessionId: "s1", serviceId: "svc", serviceName: "n" },
+			welcome: {
+				sessionId: "s1",
+				serviceId: "svc",
+				serviceName: "n",
+				runtimeVersion: "",
+				protocolVersion: 0,
+			},
 		});
 		await tick();
 
@@ -781,7 +817,13 @@ describe("ServiceBridge gRPC channel lifecycle (no leak on reconnect)", () => {
 				`reconnect ${i} opened a new control stream`,
 			);
 			controlStreams[controlStreams.length - 1]?.emitData({
-				welcome: { sessionId: `s${i + 2}`, serviceId: "svc", serviceName: "n" },
+				welcome: {
+					sessionId: `s${i + 2}`,
+					serviceId: "svc",
+					serviceName: "n",
+					runtimeVersion: "",
+					protocolVersion: 0,
+				},
 			});
 			await tick();
 		}
@@ -822,12 +864,24 @@ describe("ServiceBridge gRPC channel lifecycle (no leak on reconnect)", () => {
 
 		await sb.start();
 		controlStreams[0]?.emitData({
-			welcome: { sessionId: "s1", serviceId: "svc", serviceName: "n" },
+			welcome: {
+				sessionId: "s1",
+				serviceId: "svc",
+				serviceName: "n",
+				runtimeVersion: "",
+				protocolVersion: 0,
+			},
 		});
 		// Rotation timer fires (TTL=1s, lead=0) → new channels opened.
 		await waitFor(() => control.counts.created >= 2, "rotation opened channel");
 		controlStreams[controlStreams.length - 1]?.emitData({
-			welcome: { sessionId: "s2", serviceId: "svc", serviceName: "n" },
+			welcome: {
+				sessionId: "s2",
+				serviceId: "svc",
+				serviceName: "n",
+				runtimeVersion: "",
+				protocolVersion: 0,
+			},
 		});
 		// After Welcome on the new stream, the old pair must be closed.
 		await waitFor(
@@ -869,7 +923,13 @@ describe("ServiceBridge gRPC channel lifecycle (no leak on reconnect)", () => {
 
 		await sb.start();
 		controlStreams[0]?.emitData({
-			welcome: { sessionId: "s1", serviceId: "svc", serviceName: "n" },
+			welcome: {
+				sessionId: "s1",
+				serviceId: "svc",
+				serviceName: "n",
+				runtimeVersion: "",
+				protocolVersion: 0,
+			},
 		});
 
 		const reconnects: ReconnectingEvent[] = [];
@@ -925,7 +985,13 @@ describe("ServiceBridge gRPC channel lifecycle (no leak on reconnect)", () => {
 		await sb.start();
 		await waitFor(() => controlStreams.length >= 1, "first control stream");
 		controlStreams[0]?.emitData({
-			welcome: { sessionId: "s1", serviceId: "svc", serviceName: "n" },
+			welcome: {
+				sessionId: "s1",
+				serviceId: "svc",
+				serviceName: "n",
+				runtimeVersion: "",
+				protocolVersion: 0,
+			},
 		});
 		await tick();
 
@@ -1043,7 +1109,13 @@ describe("ServiceBridge policy listener registration (BUG-18)", () => {
 		await sb.start();
 		await waitFor(() => registryStreams.length >= 1, "first registry stream");
 		controlStreams[0]?.emitData({
-			welcome: { sessionId: "s1", serviceId: "svc", serviceName: "n" },
+			welcome: {
+				sessionId: "s1",
+				serviceId: "svc",
+				serviceName: "n",
+				runtimeVersion: "",
+				protocolVersion: 0,
+			},
 		});
 		await tick();
 
@@ -1054,7 +1126,13 @@ describe("ServiceBridge policy listener registration (BUG-18)", () => {
 			"second registry stream after reconnect 1",
 		);
 		controlStreams[1]?.emitData({
-			welcome: { sessionId: "s2", serviceId: "svc", serviceName: "n" },
+			welcome: {
+				sessionId: "s2",
+				serviceId: "svc",
+				serviceName: "n",
+				runtimeVersion: "",
+				protocolVersion: 0,
+			},
 		});
 		await tick();
 
@@ -1064,7 +1142,13 @@ describe("ServiceBridge policy listener registration (BUG-18)", () => {
 			"third registry stream after reconnect 2",
 		);
 		controlStreams[2]?.emitData({
-			welcome: { sessionId: "s3", serviceId: "svc", serviceName: "n" },
+			welcome: {
+				sessionId: "s3",
+				serviceId: "svc",
+				serviceName: "n",
+				runtimeVersion: "",
+				protocolVersion: 0,
+			},
 		});
 		await tick();
 
@@ -1119,6 +1203,8 @@ describe("ServiceBridge cert rotation (overlap)", () => {
 				sessionId: "s1",
 				serviceId: "svc",
 				serviceName: "svc-name",
+				runtimeVersion: "",
+				protocolVersion: 0,
 			},
 		});
 
@@ -1138,6 +1224,8 @@ describe("ServiceBridge cert rotation (overlap)", () => {
 				sessionId: "s2",
 				serviceId: "svc",
 				serviceName: "svc-name",
+				runtimeVersion: "",
+				protocolVersion: 0,
 			},
 		});
 		await waitFor(
@@ -1162,11 +1250,23 @@ describe("ServiceBridge cert rotation (overlap)", () => {
 
 		await sb.start();
 		controlStreams[0]?.emitData({
-			welcome: { sessionId: "s1", serviceId: "svc", serviceName: "n" },
+			welcome: {
+				sessionId: "s1",
+				serviceId: "svc",
+				serviceName: "n",
+				runtimeVersion: "",
+				protocolVersion: 0,
+			},
 		});
 		await waitFor(() => controlStreams.length >= 2, "rotation opened a stream");
 		controlStreams[1]?.emitData({
-			welcome: { sessionId: "s2", serviceId: "svc", serviceName: "n" },
+			welcome: {
+				sessionId: "s2",
+				serviceId: "svc",
+				serviceName: "n",
+				runtimeVersion: "",
+				protocolVersion: 0,
+			},
 		});
 		await waitFor(
 			() => sb.identity()?.sessionId === "s2",
@@ -1198,11 +1298,23 @@ describe("ServiceBridge cert rotation (overlap)", () => {
 
 		await sb.start();
 		controlStreams[0]?.emitData({
-			welcome: { sessionId: "s1", serviceId: "svc", serviceName: "n" },
+			welcome: {
+				sessionId: "s1",
+				serviceId: "svc",
+				serviceName: "n",
+				runtimeVersion: "",
+				protocolVersion: 0,
+			},
 		});
 		await waitFor(() => controlStreams.length >= 2, "rotation opened a stream");
 		controlStreams[1]?.emitData({
-			welcome: { sessionId: "s2", serviceId: "svc", serviceName: "n" },
+			welcome: {
+				sessionId: "s2",
+				serviceId: "svc",
+				serviceName: "n",
+				runtimeVersion: "",
+				protocolVersion: 0,
+			},
 		});
 		await waitFor(
 			() => sb.identity()?.sessionId === "s2",
@@ -1237,7 +1349,13 @@ describe("ServiceBridge cert rotation (overlap)", () => {
 
 		await sb.start();
 		controlStreams[0]?.emitData({
-			welcome: { sessionId: "s1", serviceId: "svc", serviceName: "n" },
+			welcome: {
+				sessionId: "s1",
+				serviceId: "svc",
+				serviceName: "n",
+				runtimeVersion: "",
+				protocolVersion: 0,
+			},
 		});
 		await tick();
 
@@ -1255,7 +1373,13 @@ describe("ServiceBridge cert rotation (overlap)", () => {
 
 		await waitFor(() => controlStreams.length >= 2, "rotation opened a stream");
 		controlStreams[1]?.emitData({
-			welcome: { sessionId: "s2", serviceId: "svc", serviceName: "n" },
+			welcome: {
+				sessionId: "s2",
+				serviceId: "svc",
+				serviceName: "n",
+				runtimeVersion: "",
+				protocolVersion: 0,
+			},
 		});
 		await waitFor(
 			() => internals._eventsClient !== before.events,
@@ -1307,11 +1431,23 @@ describe("ServiceBridge cert rotation (overlap)", () => {
 		await sb.start();
 		expect(provisionCalls).toBe(1);
 		controlStreams[0]?.emitData({
-			welcome: { sessionId: "s1", serviceId: "svc", serviceName: "n" },
+			welcome: {
+				sessionId: "s1",
+				serviceId: "svc",
+				serviceName: "n",
+				runtimeVersion: "",
+				protocolVersion: 0,
+			},
 		});
 		await waitFor(() => controlStreams.length >= 2, "rotation opened a stream");
 		controlStreams[1]?.emitData({
-			welcome: { sessionId: "s2", serviceId: "svc", serviceName: "n" },
+			welcome: {
+				sessionId: "s2",
+				serviceId: "svc",
+				serviceName: "n",
+				runtimeVersion: "",
+				protocolVersion: 0,
+			},
 		});
 		await waitFor(
 			() => sb.identity()?.sessionId === "s2",
@@ -1357,6 +1493,8 @@ describe("ServiceBridge cert rotation (overlap)", () => {
 				sessionId: "s1",
 				serviceId: "svc",
 				serviceName: "svc-name",
+				runtimeVersion: "",
+				protocolVersion: 0,
 			},
 		});
 

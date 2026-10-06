@@ -18,7 +18,6 @@ plugins:
       - Mservicebridge/v1/jobs.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
       - Mservicebridge/v1/registry.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
       - Mservicebridge/v1/telemetry.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
-      - Mservicebridge/v1/ui.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
       - Mservicebridge/v1/workflows.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
   - local: ["go", "run", "google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2"]
     out: internal/pb
@@ -33,5 +32,4 @@ plugins:
       - Mservicebridge/v1/jobs.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
       - Mservicebridge/v1/registry.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
       - Mservicebridge/v1/telemetry.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
-      - Mservicebridge/v1/ui.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb
       - Mservicebridge/v1/workflows.proto=github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1;pb

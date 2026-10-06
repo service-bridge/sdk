@@ -139,7 +139,7 @@ export class Drainer {
 	private async loop(): Promise<void> {
 		while (this.running) {
 			const now = this.clockFn();
-			const { storage, rpcClient, identity, batchSize } = this.deps;
+			const { storage, rpcClient, batchSize } = this.deps;
 
 			let rows: OutboxRow[];
 			try {
@@ -171,7 +171,6 @@ export class Drainer {
 			}
 
 			// Build and send PublishRequest.
-			const ident = identity();
 			const events = rows.map((r) => ({
 				id: r.id,
 				name: r.name,
@@ -228,8 +227,6 @@ export class Drainer {
 					this.abortPublish = cancel;
 					call = rpcClient.publish(
 						{
-							publisherServiceId: ident?.serviceId ?? "",
-							publisherInstanceId: ident?.instanceId ?? "",
 							events,
 						},
 						(err, res) => finish(err, res),

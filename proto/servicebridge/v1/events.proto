@@ -31,9 +31,11 @@ message EventEnvelope {
   bytes  payload_json = 11;
 }
 
+// The publisher's identity comes from its mTLS certificate, never from the
+// request body.
 message PublishRequest {
-  string publisher_service_id  = 1;
-  string publisher_instance_id = 2;
+  reserved 1, 2;
+  reserved "publisher_service_id", "publisher_instance_id";
   repeated EventEnvelope events = 3;
 }
 
@@ -56,6 +58,8 @@ enum PublishStatus {
   // event name (or its capability is disabled). Per-envelope reject — other
   // events in the batch proceed.
   PUBLISH_STATUS_REJECTED_FORBIDDEN     = 6;
+  // An event with the same id was already accepted with different content.
+  PUBLISH_STATUS_REJECTED_CONFLICT      = 7;
 }
 
 message SubscribeInit {
@@ -86,10 +90,14 @@ message SubscribeClientMessage {
 }
 
 message EventDelivery {
-  string        delivery_id = 1;
-  EventEnvelope envelope    = 2;
-  int32         attempt     = 3;
-  string        lease_token = 4;
+  string        delivery_id      = 1;
+  EventEnvelope envelope         = 2;
+  int32         attempt          = 3;
+  string        lease_token      = 4;
+  // The subscriber's patterns (EventSubscription.pattern, verbatim) that this
+  // event matched. SDKs route to handlers by these, without matching
+  // wildcards themselves.
+  repeated string matched_patterns = 5;
 }
 
 message SubscribeServerMessage {

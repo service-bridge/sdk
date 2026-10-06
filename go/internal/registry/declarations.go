@@ -131,7 +131,7 @@ func (d *Declarations) PublishEvent(name string, schemaJSON []byte, contractHash
 // into one row: event_subscriptions has PRIMARY KEY (subscriber_id, pattern),
 // so a duplicate rolls the whole registration back. In-process fan-out across
 // several handlers for the same pattern is the SDK's own business.
-func (d *Declarations) SubscribeEvent(pattern string, durable bool) error {
+func (d *Declarations) SubscribeEvent(pattern string) error {
 	if pattern == "" {
 		return fmt.Errorf("registry: subscribe event: %w", ErrEmptyName)
 	}
@@ -141,7 +141,7 @@ func (d *Declarations) SubscribeEvent(pattern string, durable bool) error {
 		return nil
 	}
 	d.subsSeen[pattern] = struct{}{}
-	d.subs = append(d.subs, &pb.EventSubscription{Pattern: pattern, Durable: durable})
+	d.subs = append(d.subs, &pb.EventSubscription{Pattern: pattern})
 	return nil
 }
 

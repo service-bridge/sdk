@@ -102,7 +102,12 @@ export interface OutgoingDep {
 
 export interface EventSubscription {
   pattern: string;
-  durable: boolean;
+  /**
+   * Filter Expression evaluated by the runtime against the event payload
+   * before delivery (same language as workflow wait_event). Empty = every
+   * event matching pattern.
+   */
+  filter: string;
 }
 
 export interface RegisterRequest {
@@ -117,6 +122,10 @@ export interface RegisterRequest {
    * Empty when SDK has no HTTP integration registered.
    */
   httpEndpoint: string;
+  /** Handshake identity, same meaning as OpenRequest. */
+  protocolVersion: number;
+  sdkLanguage: string;
+  sdkVersion: string;
 }
 
 export interface MethodDescriptor {
@@ -185,11 +194,6 @@ export interface RegistryUpdate {
   removed: MethodDescriptor[];
   addedInstances: ServiceInstanceInfo[];
   removedInstances: ServiceInstanceInfo[];
-  /** Same enrichment as RegistrySnapshot.* but incremental. */
-  addedEventSubscriptions: EventSubscriptionDescriptor[];
-  removedEventSubscriptions: EventSubscriptionDescriptor[];
-  addedOutgoingCalls: OutgoingCallDescriptor[];
-  removedOutgoingCalls: OutgoingCallDescriptor[];
   /**
    * When policy changes (NOTIFY policy_changed touches caller), runtime
    * re-emits the full PolicyEvaluation. Not incremental on purpose: policy
@@ -210,7 +214,17 @@ export interface RegistryUpdate {
    * Re-emitted full per-channel capture modes when any channel's mode changes.
    * Like policy, not incremental: the whole set is sent on change.
    */
-  captureModes?: CaptureModes | undefined;
+  captureModes?:
+    | CaptureModes
+    | undefined;
+  /**
+   * Access revoked since the previous frame. SDKs drop the revoked services'
+   * and instances' direct connections and reject calls to them at once,
+   * without waiting for their certificates to expire.
+   */
+  revokedServices: string[];
+  /** instance UUIDs */
+  revokedInstances: string[];
 }
 
 export interface RegistryEvent {
@@ -223,14 +237,13 @@ export interface EventSubscriptionDescriptor {
   serviceName: string;
   /** AMQP pattern, supports * and # */
   pattern: string;
-  durable: boolean;
+  /** Filter Expression, empty = none */
+  filter: string;
 }
 
 export interface OutgoingCallDescriptor {
   callerServiceId: string;
-  callerServiceName: string;
   targetServiceId: string;
-  targetServiceName: string;
   targetMethod: string;
   /** RPC, WORKFLOW, HTTP */
   targetType: MethodType;
@@ -681,7 +694,7 @@ export const OutgoingDep: MessageFns<OutgoingDep> = {
 };
 
 function createBaseEventSubscription(): EventSubscription {
-  return { pattern: "", durable: false };
+  return { pattern: "", filter: "" };
 }
 
 export const EventSubscription: MessageFns<EventSubscription> = {
@@ -689,8 +702,8 @@ export const EventSubscription: MessageFns<EventSubscription> = {
     if (message.pattern !== "") {
       writer.uint32(10).string(message.pattern);
     }
-    if (message.durable !== false) {
-      writer.uint32(16).bool(message.durable);
+    if (message.filter !== "") {
+      writer.uint32(26).string(message.filter);
     }
     return writer;
   },
@@ -716,12 +729,12 @@ export const EventSubscription: MessageFns<EventSubscription> = {
             message.pattern = reader.string();
             continue;
           }
-          case 2: {
-            if (tag !== 16) {
+          case 3: {
+            if (tag !== 26) {
               break;
             }
 
-            message.durable = reader.bool();
+            message.filter = reader.string();
             continue;
           }
         }
@@ -742,13 +755,23 @@ export const EventSubscription: MessageFns<EventSubscription> = {
   fromPartial<I extends Exact<DeepPartial<EventSubscription>, I>>(object: I): EventSubscription {
     const message = createBaseEventSubscription();
     message.pattern = object.pattern ?? "";
-    message.durable = object.durable ?? false;
+    message.filter = object.filter ?? "";
     return message;
   },
 };
 
 function createBaseRegisterRequest(): RegisterRequest {
-  return { incoming: [], published: [], outgoing: [], callEndpoint: "", eventSubscriptions: [], httpEndpoint: "" };
+  return {
+    incoming: [],
+    published: [],
+    outgoing: [],
+    callEndpoint: "",
+    eventSubscriptions: [],
+    httpEndpoint: "",
+    protocolVersion: 0,
+    sdkLanguage: "",
+    sdkVersion: "",
+  };
 }
 
 export const RegisterRequest: MessageFns<RegisterRequest> = {
@@ -770,6 +793,15 @@ export const RegisterRequest: MessageFns<RegisterRequest> = {
     }
     if (message.httpEndpoint !== "") {
       writer.uint32(50).string(message.httpEndpoint);
+    }
+    if (message.protocolVersion !== 0) {
+      writer.uint32(56).uint32(message.protocolVersion);
+    }
+    if (message.sdkLanguage !== "") {
+      writer.uint32(66).string(message.sdkLanguage);
+    }
+    if (message.sdkVersion !== "") {
+      writer.uint32(74).string(message.sdkVersion);
     }
     return writer;
   },
@@ -835,6 +867,30 @@ export const RegisterRequest: MessageFns<RegisterRequest> = {
             message.httpEndpoint = reader.string();
             continue;
           }
+          case 7: {
+            if (tag !== 56) {
+              break;
+            }
+
+            message.protocolVersion = reader.uint32();
+            continue;
+          }
+          case 8: {
+            if (tag !== 66) {
+              break;
+            }
+
+            message.sdkLanguage = reader.string();
+            continue;
+          }
+          case 9: {
+            if (tag !== 74) {
+              break;
+            }
+
+            message.sdkVersion = reader.string();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -858,6 +914,9 @@ export const RegisterRequest: MessageFns<RegisterRequest> = {
     message.callEndpoint = object.callEndpoint ?? "";
     message.eventSubscriptions = object.eventSubscriptions?.map((e) => EventSubscription.fromPartial(e)) || [];
     message.httpEndpoint = object.httpEndpoint ?? "";
+    message.protocolVersion = object.protocolVersion ?? 0;
+    message.sdkLanguage = object.sdkLanguage ?? "";
+    message.sdkVersion = object.sdkVersion ?? "";
     return message;
   },
 };
@@ -1304,14 +1363,12 @@ function createBaseRegistryUpdate(): RegistryUpdate {
     removed: [],
     addedInstances: [],
     removedInstances: [],
-    addedEventSubscriptions: [],
-    removedEventSubscriptions: [],
-    addedOutgoingCalls: [],
-    removedOutgoingCalls: [],
     policy: undefined,
     addedPeers: [],
     removedPeers: [],
     captureModes: undefined,
+    revokedServices: [],
+    revokedInstances: [],
   };
 }
 
@@ -1329,18 +1386,6 @@ export const RegistryUpdate: MessageFns<RegistryUpdate> = {
     for (const v of message.removedInstances) {
       ServiceInstanceInfo.encode(v!, writer.uint32(34).fork()).join();
     }
-    for (const v of message.addedEventSubscriptions) {
-      EventSubscriptionDescriptor.encode(v!, writer.uint32(42).fork()).join();
-    }
-    for (const v of message.removedEventSubscriptions) {
-      EventSubscriptionDescriptor.encode(v!, writer.uint32(50).fork()).join();
-    }
-    for (const v of message.addedOutgoingCalls) {
-      OutgoingCallDescriptor.encode(v!, writer.uint32(58).fork()).join();
-    }
-    for (const v of message.removedOutgoingCalls) {
-      OutgoingCallDescriptor.encode(v!, writer.uint32(66).fork()).join();
-    }
     if (message.policy !== undefined) {
       PolicyEvaluation.encode(message.policy, writer.uint32(74).fork()).join();
     }
@@ -1352,6 +1397,12 @@ export const RegistryUpdate: MessageFns<RegistryUpdate> = {
     }
     if (message.captureModes !== undefined) {
       CaptureModes.encode(message.captureModes, writer.uint32(106).fork()).join();
+    }
+    for (const v of message.revokedServices) {
+      writer.uint32(114).string(v!);
+    }
+    for (const v of message.revokedInstances) {
+      writer.uint32(122).string(v!);
     }
     return writer;
   },
@@ -1401,38 +1452,6 @@ export const RegistryUpdate: MessageFns<RegistryUpdate> = {
             message.removedInstances.push(ServiceInstanceInfo.decode(reader, reader.uint32()));
             continue;
           }
-          case 5: {
-            if (tag !== 42) {
-              break;
-            }
-
-            message.addedEventSubscriptions.push(EventSubscriptionDescriptor.decode(reader, reader.uint32()));
-            continue;
-          }
-          case 6: {
-            if (tag !== 50) {
-              break;
-            }
-
-            message.removedEventSubscriptions.push(EventSubscriptionDescriptor.decode(reader, reader.uint32()));
-            continue;
-          }
-          case 7: {
-            if (tag !== 58) {
-              break;
-            }
-
-            message.addedOutgoingCalls.push(OutgoingCallDescriptor.decode(reader, reader.uint32()));
-            continue;
-          }
-          case 8: {
-            if (tag !== 66) {
-              break;
-            }
-
-            message.removedOutgoingCalls.push(OutgoingCallDescriptor.decode(reader, reader.uint32()));
-            continue;
-          }
           case 9: {
             if (tag !== 74) {
               break;
@@ -1465,6 +1484,22 @@ export const RegistryUpdate: MessageFns<RegistryUpdate> = {
             message.captureModes = CaptureModes.decode(reader, reader.uint32());
             continue;
           }
+          case 14: {
+            if (tag !== 114) {
+              break;
+            }
+
+            message.revokedServices.push(reader.string());
+            continue;
+          }
+          case 15: {
+            if (tag !== 122) {
+              break;
+            }
+
+            message.revokedInstances.push(reader.string());
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -1486,12 +1521,6 @@ export const RegistryUpdate: MessageFns<RegistryUpdate> = {
     message.removed = object.removed?.map((e) => MethodDescriptor.fromPartial(e)) || [];
     message.addedInstances = object.addedInstances?.map((e) => ServiceInstanceInfo.fromPartial(e)) || [];
     message.removedInstances = object.removedInstances?.map((e) => ServiceInstanceInfo.fromPartial(e)) || [];
-    message.addedEventSubscriptions =
-      object.addedEventSubscriptions?.map((e) => EventSubscriptionDescriptor.fromPartial(e)) || [];
-    message.removedEventSubscriptions =
-      object.removedEventSubscriptions?.map((e) => EventSubscriptionDescriptor.fromPartial(e)) || [];
-    message.addedOutgoingCalls = object.addedOutgoingCalls?.map((e) => OutgoingCallDescriptor.fromPartial(e)) || [];
-    message.removedOutgoingCalls = object.removedOutgoingCalls?.map((e) => OutgoingCallDescriptor.fromPartial(e)) || [];
     message.policy = (object.policy !== undefined && object.policy !== null)
       ? PolicyEvaluation.fromPartial(object.policy)
       : undefined;
@@ -1500,6 +1529,8 @@ export const RegistryUpdate: MessageFns<RegistryUpdate> = {
     message.captureModes = (object.captureModes !== undefined && object.captureModes !== null)
       ? CaptureModes.fromPartial(object.captureModes)
       : undefined;
+    message.revokedServices = object.revokedServices?.map((e) => e) || [];
+    message.revokedInstances = object.revokedInstances?.map((e) => e) || [];
     return message;
   },
 };
@@ -1576,7 +1607,7 @@ export const RegistryEvent: MessageFns<RegistryEvent> = {
 };
 
 function createBaseEventSubscriptionDescriptor(): EventSubscriptionDescriptor {
-  return { serviceId: "", serviceName: "", pattern: "", durable: false };
+  return { serviceId: "", serviceName: "", pattern: "", filter: "" };
 }
 
 export const EventSubscriptionDescriptor: MessageFns<EventSubscriptionDescriptor> = {
@@ -1590,8 +1621,8 @@ export const EventSubscriptionDescriptor: MessageFns<EventSubscriptionDescriptor
     if (message.pattern !== "") {
       writer.uint32(26).string(message.pattern);
     }
-    if (message.durable !== false) {
-      writer.uint32(32).bool(message.durable);
+    if (message.filter !== "") {
+      writer.uint32(42).string(message.filter);
     }
     return writer;
   },
@@ -1633,12 +1664,12 @@ export const EventSubscriptionDescriptor: MessageFns<EventSubscriptionDescriptor
             message.pattern = reader.string();
             continue;
           }
-          case 4: {
-            if (tag !== 32) {
+          case 5: {
+            if (tag !== 42) {
               break;
             }
 
-            message.durable = reader.bool();
+            message.filter = reader.string();
             continue;
           }
         }
@@ -1661,20 +1692,13 @@ export const EventSubscriptionDescriptor: MessageFns<EventSubscriptionDescriptor
     message.serviceId = object.serviceId ?? "";
     message.serviceName = object.serviceName ?? "";
     message.pattern = object.pattern ?? "";
-    message.durable = object.durable ?? false;
+    message.filter = object.filter ?? "";
     return message;
   },
 };
 
 function createBaseOutgoingCallDescriptor(): OutgoingCallDescriptor {
-  return {
-    callerServiceId: "",
-    callerServiceName: "",
-    targetServiceId: "",
-    targetServiceName: "",
-    targetMethod: "",
-    targetType: 0,
-  };
+  return { callerServiceId: "", targetServiceId: "", targetMethod: "", targetType: 0 };
 }
 
 export const OutgoingCallDescriptor: MessageFns<OutgoingCallDescriptor> = {
@@ -1682,14 +1706,8 @@ export const OutgoingCallDescriptor: MessageFns<OutgoingCallDescriptor> = {
     if (message.callerServiceId !== "") {
       writer.uint32(10).string(message.callerServiceId);
     }
-    if (message.callerServiceName !== "") {
-      writer.uint32(18).string(message.callerServiceName);
-    }
     if (message.targetServiceId !== "") {
       writer.uint32(26).string(message.targetServiceId);
-    }
-    if (message.targetServiceName !== "") {
-      writer.uint32(34).string(message.targetServiceName);
     }
     if (message.targetMethod !== "") {
       writer.uint32(42).string(message.targetMethod);
@@ -1721,28 +1739,12 @@ export const OutgoingCallDescriptor: MessageFns<OutgoingCallDescriptor> = {
             message.callerServiceId = reader.string();
             continue;
           }
-          case 2: {
-            if (tag !== 18) {
-              break;
-            }
-
-            message.callerServiceName = reader.string();
-            continue;
-          }
           case 3: {
             if (tag !== 26) {
               break;
             }
 
             message.targetServiceId = reader.string();
-            continue;
-          }
-          case 4: {
-            if (tag !== 34) {
-              break;
-            }
-
-            message.targetServiceName = reader.string();
             continue;
           }
           case 5: {
@@ -1779,9 +1781,7 @@ export const OutgoingCallDescriptor: MessageFns<OutgoingCallDescriptor> = {
   fromPartial<I extends Exact<DeepPartial<OutgoingCallDescriptor>, I>>(object: I): OutgoingCallDescriptor {
     const message = createBaseOutgoingCallDescriptor();
     message.callerServiceId = object.callerServiceId ?? "";
-    message.callerServiceName = object.callerServiceName ?? "";
     message.targetServiceId = object.targetServiceId ?? "";
-    message.targetServiceName = object.targetServiceName ?? "";
     message.targetMethod = object.targetMethod ?? "";
     message.targetType = object.targetType ?? 0;
     return message;

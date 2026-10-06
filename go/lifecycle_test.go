@@ -72,7 +72,7 @@ func (f *lifecycleRuntime) Provision(ctx context.Context, req *pb.ProvisionReque
 	if err != nil {
 		return nil, err
 	}
-	return &pb.ProvisionResponse{CertDer: der, CaChainDer: f.ca.Raw, ServiceId: "service", ServiceName: "test", InstanceId: "instance", NotAfterUnix: leaf.NotAfter.Unix()}, nil
+	return &pb.ProvisionResponse{CertDer: der, CaChainDer: f.ca.Raw, ServiceId: "service", ServiceName: "test", InstanceId: "instance", NotAfterUnixMs: leaf.NotAfter.UnixMilli()}, nil
 }
 func (f *lifecycleRuntime) Open(_ *pb.OpenRequest, st pb.Control_OpenServer) error {
 	if err := st.Send(&pb.ServerControl{Kind: &pb.ServerControl_Welcome{Welcome: &pb.Welcome{ServiceId: "service", ServiceName: "test", SessionId: "session"}}}); err != nil {

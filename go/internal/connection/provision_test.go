@@ -64,12 +64,12 @@ func (f *fakeBootstrap) Provision(_ context.Context, req *pb.ProvisionRequest) (
 
 	certDER := f.ca.issueLeaf(f.t, pub, connection.Identity{ServiceID: f.serviceID, InstanceID: f.instanceID})
 	return &pb.ProvisionResponse{
-		CertDer:      certDER,
-		CaChainDer:   f.ca.der,
-		ServiceId:    f.serviceID,
-		ServiceName:  f.svcName,
-		InstanceId:   f.instanceID,
-		NotAfterUnix: f.notAfter.Unix(),
+		CertDer:        certDER,
+		CaChainDer:     f.ca.der,
+		ServiceId:      f.serviceID,
+		ServiceName:    f.svcName,
+		InstanceId:     f.instanceID,
+		NotAfterUnixMs: f.notAfter.UnixMilli(),
 	}, nil
 }
 
@@ -293,17 +293,5 @@ func TestProvisionRejectsBadAddress(t *testing.T) {
 	}
 	if !errors.Is(err, connection.ErrProvision) {
 		t.Errorf("kind: got %v want ErrProvision", err)
-	}
-}
-
-func TestNotAfterFromUnixSeconds(t *testing.T) {
-	t.Parallel()
-	want := time.Date(2026, 8, 13, 10, 30, 0, 0, time.UTC)
-	if got := connection.NotAfterFromUnixSeconds(want.Unix()); !got.Equal(want) {
-		t.Errorf("got %s want %s", got, want)
-	}
-	// Reading the field as milliseconds would land the expiry in 1970.
-	if got := connection.NotAfterFromUnixSeconds(want.UnixMilli()); got.Year() == want.Year() {
-		t.Errorf("milliseconds must not decode to the same instant: %s", got)
 	}
 }

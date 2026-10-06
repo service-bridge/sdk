@@ -26,5 +26,5 @@ message ProvisionResponse {
   string service_id    = 3;  // stable UUID, in SAN cert
   string service_name  = 4;  // human label, mutable, NOT in cert
   string instance_id   = 5;  // UUID of this instance, in SAN cert
-  int64  not_after_unix = 6; // cert expiry for scheduling refresh
+  int64  not_after_unix_ms = 6; // cert expiry (unix-ms) for scheduling refresh
 }

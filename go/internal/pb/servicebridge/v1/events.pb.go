@@ -32,6 +32,8 @@ const (
 	// event name (or its capability is disabled). Per-envelope reject — other
 	// events in the batch proceed.
 	PublishStatus_PUBLISH_STATUS_REJECTED_FORBIDDEN PublishStatus = 6
+	// An event with the same id was already accepted with different content.
+	PublishStatus_PUBLISH_STATUS_REJECTED_CONFLICT PublishStatus = 7
 )
 
 // Enum value maps for PublishStatus.
@@ -42,6 +44,7 @@ var (
 		3: "PUBLISH_STATUS_REJECTED_DUPLICATE",
 		5: "PUBLISH_STATUS_REJECTED_INVALID_NAME",
 		6: "PUBLISH_STATUS_REJECTED_FORBIDDEN",
+		7: "PUBLISH_STATUS_REJECTED_CONFLICT",
 	}
 	PublishStatus_value = map[string]int32{
 		"PUBLISH_STATUS_UNSPECIFIED":           0,
@@ -49,6 +52,7 @@ var (
 		"PUBLISH_STATUS_REJECTED_DUPLICATE":    3,
 		"PUBLISH_STATUS_REJECTED_INVALID_NAME": 5,
 		"PUBLISH_STATUS_REJECTED_FORBIDDEN":    6,
+		"PUBLISH_STATUS_REJECTED_CONFLICT":     7,
 	}
 )
 
@@ -209,13 +213,13 @@ func (x *EventEnvelope) GetPayloadJson() []byte {
 	return nil
 }
 
+// The publisher's identity comes from its mTLS certificate, never from the
+// request body.
 type PublishRequest struct {
-	state               protoimpl.MessageState `protogen:"open.v1"`
-	PublisherServiceId  string                 `protobuf:"bytes,1,opt,name=publisher_service_id,json=publisherServiceId,proto3" json:"publisher_service_id,omitempty"`
-	PublisherInstanceId string                 `protobuf:"bytes,2,opt,name=publisher_instance_id,json=publisherInstanceId,proto3" json:"publisher_instance_id,omitempty"`
-	Events              []*EventEnvelope       `protobuf:"bytes,3,rep,name=events,proto3" json:"events,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Events        []*EventEnvelope       `protobuf:"bytes,3,rep,name=events,proto3" json:"events,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PublishRequest) Reset() {
@@ -246,20 +250,6 @@ func (x *PublishRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use PublishRequest.ProtoReflect.Descriptor instead.
 func (*PublishRequest) Descriptor() ([]byte, []int) {
 	return file_servicebridge_v1_events_proto_rawDescGZIP(), []int{1}
-}
-
-func (x *PublishRequest) GetPublisherServiceId() string {
-	if x != nil {
-		return x.PublisherServiceId
-	}
-	return ""
-}
-
-func (x *PublishRequest) GetPublisherInstanceId() string {
-	if x != nil {
-		return x.PublisherInstanceId
-	}
-	return ""
 }
 
 func (x *PublishRequest) GetEvents() []*EventEnvelope {
@@ -660,13 +650,17 @@ func (*SubscribeClientMessage_Ack) isSubscribeClientMessage_Kind() {}
 func (*SubscribeClientMessage_Nack) isSubscribeClientMessage_Kind() {}
 
 type EventDelivery struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	DeliveryId    string                 `protobuf:"bytes,1,opt,name=delivery_id,json=deliveryId,proto3" json:"delivery_id,omitempty"`
-	Envelope      *EventEnvelope         `protobuf:"bytes,2,opt,name=envelope,proto3" json:"envelope,omitempty"`
-	Attempt       int32                  `protobuf:"varint,3,opt,name=attempt,proto3" json:"attempt,omitempty"`
-	LeaseToken    string                 `protobuf:"bytes,4,opt,name=lease_token,json=leaseToken,proto3" json:"lease_token,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	DeliveryId string                 `protobuf:"bytes,1,opt,name=delivery_id,json=deliveryId,proto3" json:"delivery_id,omitempty"`
+	Envelope   *EventEnvelope         `protobuf:"bytes,2,opt,name=envelope,proto3" json:"envelope,omitempty"`
+	Attempt    int32                  `protobuf:"varint,3,opt,name=attempt,proto3" json:"attempt,omitempty"`
+	LeaseToken string                 `protobuf:"bytes,4,opt,name=lease_token,json=leaseToken,proto3" json:"lease_token,omitempty"`
+	// The subscriber's patterns (EventSubscription.pattern, verbatim) that this
+	// event matched. SDKs route to handlers by these, without matching
+	// wildcards themselves.
+	MatchedPatterns []string `protobuf:"bytes,5,rep,name=matched_patterns,json=matchedPatterns,proto3" json:"matched_patterns,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *EventDelivery) Reset() {
@@ -725,6 +719,13 @@ func (x *EventDelivery) GetLeaseToken() string {
 		return x.LeaseToken
 	}
 	return ""
+}
+
+func (x *EventDelivery) GetMatchedPatterns() []string {
+	if x != nil {
+		return x.MatchedPatterns
+	}
+	return nil
 }
 
 type SubscribeServerMessage struct {
@@ -1098,11 +1099,9 @@ const file_servicebridge_v1_events_proto_rawDesc = "" +
 	"\fpayload_json\x18\v \x01(\fR\vpayloadJson\x1a:\n" +
 	"\fHeadersEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xaf\x01\n" +
-	"\x0ePublishRequest\x120\n" +
-	"\x14publisher_service_id\x18\x01 \x01(\tR\x12publisherServiceId\x122\n" +
-	"\x15publisher_instance_id\x18\x02 \x01(\tR\x13publisherInstanceId\x127\n" +
-	"\x06events\x18\x03 \x03(\v2\x1f.servicebridge.v1.EventEnvelopeR\x06events\"\x82\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x82\x01\n" +
+	"\x0ePublishRequest\x127\n" +
+	"\x06events\x18\x03 \x03(\v2\x1f.servicebridge.v1.EventEnvelopeR\x06eventsJ\x04\b\x01\x10\x02J\x04\b\x02\x10\x03R\x14publisher_service_idR\x15publisher_instance_id\"\x82\x01\n" +
 	"\x12PublishStatusEntry\x12\x19\n" +
 	"\bevent_id\x18\x01 \x01(\tR\aeventId\x127\n" +
 	"\x06status\x18\x02 \x01(\x0e2\x1f.servicebridge.v1.PublishStatusR\x06status\x12\x18\n" +
@@ -1130,14 +1129,15 @@ const file_servicebridge_v1_events_proto_rawDesc = "" +
 	"\x04init\x18\x01 \x01(\v2\x1f.servicebridge.v1.SubscribeInitH\x00R\x04init\x12)\n" +
 	"\x03ack\x18\x02 \x01(\v2\x15.servicebridge.v1.AckH\x00R\x03ack\x12,\n" +
 	"\x04nack\x18\x03 \x01(\v2\x16.servicebridge.v1.NackH\x00R\x04nackB\x06\n" +
-	"\x04kind\"\xa8\x01\n" +
+	"\x04kind\"\xd3\x01\n" +
 	"\rEventDelivery\x12\x1f\n" +
 	"\vdelivery_id\x18\x01 \x01(\tR\n" +
 	"deliveryId\x12;\n" +
 	"\benvelope\x18\x02 \x01(\v2\x1f.servicebridge.v1.EventEnvelopeR\benvelope\x12\x18\n" +
 	"\aattempt\x18\x03 \x01(\x05R\aattempt\x12\x1f\n" +
 	"\vlease_token\x18\x04 \x01(\tR\n" +
-	"leaseToken\"_\n" +
+	"leaseToken\x12)\n" +
+	"\x10matched_patterns\x18\x05 \x03(\tR\x0fmatchedPatterns\"_\n" +
 	"\x16SubscribeServerMessage\x12=\n" +
 	"\bdelivery\x18\x01 \x01(\v2\x1f.servicebridge.v1.EventDeliveryH\x00R\bdeliveryB\x06\n" +
 	"\x04kind\"-\n" +
@@ -1161,13 +1161,14 @@ const file_servicebridge_v1_events_proto_rawDesc = "" +
 	"\x0fListDlqResponse\x124\n" +
 	"\aentries\x18\x01 \x03(\v2\x1a.servicebridge.v1.DlqEntryR\aentries\x12\x1f\n" +
 	"\vnext_cursor\x18\x02 \x01(\tR\n" +
-	"nextCursor*\xc4\x01\n" +
+	"nextCursor*\xea\x01\n" +
 	"\rPublishStatus\x12\x1e\n" +
 	"\x1aPUBLISH_STATUS_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17PUBLISH_STATUS_ACCEPTED\x10\x01\x12%\n" +
 	"!PUBLISH_STATUS_REJECTED_DUPLICATE\x10\x03\x12(\n" +
 	"$PUBLISH_STATUS_REJECTED_INVALID_NAME\x10\x05\x12%\n" +
-	"!PUBLISH_STATUS_REJECTED_FORBIDDEN\x10\x062\xe3\x02\n" +
+	"!PUBLISH_STATUS_REJECTED_FORBIDDEN\x10\x06\x12$\n" +
+	" PUBLISH_STATUS_REJECTED_CONFLICT\x10\a2\xe3\x02\n" +
 	"\x06Events\x12N\n" +
 	"\aPublish\x12 .servicebridge.v1.PublishRequest\x1a!.servicebridge.v1.PublishResponse\x12c\n" +
 	"\tSubscribe\x12(.servicebridge.v1.SubscribeClientMessage\x1a(.servicebridge.v1.SubscribeServerMessage(\x010\x01\x12T\n" +

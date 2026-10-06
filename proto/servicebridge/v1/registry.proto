@@ -78,7 +78,12 @@ message OutgoingDep {
 
 message EventSubscription {
   string pattern = 1;
-  bool   durable = 2;
+  reserved 2;
+  reserved "durable";
+  // Filter Expression evaluated by the runtime against the event payload
+  // before delivery (same language as workflow wait_event). Empty = every
+  // event matching pattern.
+  string filter  = 3;
 }
 
 message RegisterRequest {
@@ -91,6 +96,10 @@ message RegisterRequest {
   // app). Used only by Service Map / Discovery; runtime does not proxy HTTP.
   // Empty when SDK has no HTTP integration registered.
   string                    http_endpoint       = 6;
+  // Handshake identity, same meaning as OpenRequest.
+  uint32                    protocol_version    = 7;
+  string                    sdk_language        = 8;
+  string                    sdk_version         = 9;
 }
 
 message MethodDescriptor {
@@ -147,11 +156,9 @@ message RegistryUpdate {
   repeated MethodDescriptor    removed           = 2;
   repeated ServiceInstanceInfo added_instances   = 3;
   repeated ServiceInstanceInfo removed_instances = 4;
-  // Same enrichment as RegistrySnapshot.* but incremental.
-  repeated EventSubscriptionDescriptor added_event_subscriptions   = 5;
-  repeated EventSubscriptionDescriptor removed_event_subscriptions = 6;
-  repeated OutgoingCallDescriptor      added_outgoing_calls        = 7;
-  repeated OutgoingCallDescriptor      removed_outgoing_calls      = 8;
+  reserved 5, 6, 7, 8;
+  reserved "added_event_subscriptions", "removed_event_subscriptions",
+    "added_outgoing_calls", "removed_outgoing_calls";
   // When policy changes (NOTIFY policy_changed touches caller), runtime
   // re-emits the full PolicyEvaluation. Not incremental on purpose: policy
   // edits are rare and the evaluation is small.
@@ -169,6 +176,12 @@ message RegistryUpdate {
   // Re-emitted full per-channel capture modes when any channel's mode changes.
   // Like policy, not incremental: the whole set is sent on change.
   CaptureModes capture_modes = 13;
+
+  // Access revoked since the previous frame. SDKs drop the revoked services'
+  // and instances' direct connections and reject calls to them at once,
+  // without waiting for their certificates to expire.
+  repeated string revoked_services  = 14;  // service UUIDs
+  repeated string revoked_instances = 15;  // instance UUIDs
 }
 
 message RegistryEvent {
@@ -184,16 +197,18 @@ message EventSubscriptionDescriptor {
   string service_id   = 1;
   string service_name = 2;
   string pattern      = 3;  // AMQP pattern, supports * and #
-  bool   durable      = 4;
+  reserved 4;
+  reserved "durable";
+  string filter       = 5;  // Filter Expression, empty = none
 }
 
 message OutgoingCallDescriptor {
-  string     caller_service_id   = 1;
-  string     caller_service_name = 2;
-  string     target_service_id   = 3;
-  string     target_service_name = 4;
-  string     target_method       = 5;
-  MethodType target_type         = 6;  // RPC, WORKFLOW, HTTP
+  string     caller_service_id = 1;
+  reserved 2, 4;
+  reserved "caller_service_name", "target_service_name";
+  string     target_service_id = 3;
+  string     target_method     = 5;
+  MethodType target_type       = 6;  // RPC, WORKFLOW, HTTP
 }
 
 // ── Policy (ADR-0004) ──────────────────────────────────────────────────────

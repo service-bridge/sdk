@@ -32,6 +32,8 @@ export enum PublishStatus {
    * events in the batch proceed.
    */
   PUBLISH_STATUS_REJECTED_FORBIDDEN = 6,
+  /** PUBLISH_STATUS_REJECTED_CONFLICT - An event with the same id was already accepted with different content. */
+  PUBLISH_STATUS_REJECTED_CONFLICT = 7,
   UNRECOGNIZED = -1,
 }
 
@@ -62,9 +64,11 @@ export interface EventEnvelope_HeadersEntry {
   value: string;
 }
 
+/**
+ * The publisher's identity comes from its mTLS certificate, never from the
+ * request body.
+ */
 export interface PublishRequest {
-  publisherServiceId: string;
-  publisherInstanceId: string;
   events: EventEnvelope[];
 }
 
@@ -108,6 +112,12 @@ export interface EventDelivery {
   envelope?: EventEnvelope | undefined;
   attempt: number;
   leaseToken: string;
+  /**
+   * The subscriber's patterns (EventSubscription.pattern, verbatim) that this
+   * event matched. SDKs route to handlers by these, without matching
+   * wildcards themselves.
+   */
+  matchedPatterns: string[];
 }
 
 export interface SubscribeServerMessage {
@@ -408,17 +418,11 @@ export const EventEnvelope_HeadersEntry: MessageFns<EventEnvelope_HeadersEntry> 
 };
 
 function createBasePublishRequest(): PublishRequest {
-  return { publisherServiceId: "", publisherInstanceId: "", events: [] };
+  return { events: [] };
 }
 
 export const PublishRequest: MessageFns<PublishRequest> = {
   encode(message: PublishRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.publisherServiceId !== "") {
-      writer.uint32(10).string(message.publisherServiceId);
-    }
-    if (message.publisherInstanceId !== "") {
-      writer.uint32(18).string(message.publisherInstanceId);
-    }
     for (const v of message.events) {
       EventEnvelope.encode(v!, writer.uint32(26).fork()).join();
     }
@@ -438,22 +442,6 @@ export const PublishRequest: MessageFns<PublishRequest> = {
       while (reader.pos < end) {
         const tag = reader.uint32();
         switch (tag >>> 3) {
-          case 1: {
-            if (tag !== 10) {
-              break;
-            }
-
-            message.publisherServiceId = reader.string();
-            continue;
-          }
-          case 2: {
-            if (tag !== 18) {
-              break;
-            }
-
-            message.publisherInstanceId = reader.string();
-            continue;
-          }
           case 3: {
             if (tag !== 26) {
               break;
@@ -479,8 +467,6 @@ export const PublishRequest: MessageFns<PublishRequest> = {
   },
   fromPartial<I extends Exact<DeepPartial<PublishRequest>, I>>(object: I): PublishRequest {
     const message = createBasePublishRequest();
-    message.publisherServiceId = object.publisherServiceId ?? "";
-    message.publisherInstanceId = object.publisherInstanceId ?? "";
     message.events = object.events?.map((e) => EventEnvelope.fromPartial(e)) || [];
     return message;
   },
@@ -951,7 +937,7 @@ export const SubscribeClientMessage: MessageFns<SubscribeClientMessage> = {
 };
 
 function createBaseEventDelivery(): EventDelivery {
-  return { deliveryId: "", envelope: undefined, attempt: 0, leaseToken: "" };
+  return { deliveryId: "", envelope: undefined, attempt: 0, leaseToken: "", matchedPatterns: [] };
 }
 
 export const EventDelivery: MessageFns<EventDelivery> = {
@@ -967,6 +953,9 @@ export const EventDelivery: MessageFns<EventDelivery> = {
     }
     if (message.leaseToken !== "") {
       writer.uint32(34).string(message.leaseToken);
+    }
+    for (const v of message.matchedPatterns) {
+      writer.uint32(42).string(v!);
     }
     return writer;
   },
@@ -1016,6 +1005,14 @@ export const EventDelivery: MessageFns<EventDelivery> = {
             message.leaseToken = reader.string();
             continue;
           }
+          case 5: {
+            if (tag !== 42) {
+              break;
+            }
+
+            message.matchedPatterns.push(reader.string());
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -1039,6 +1036,7 @@ export const EventDelivery: MessageFns<EventDelivery> = {
       : undefined;
     message.attempt = object.attempt ?? 0;
     message.leaseToken = object.leaseToken ?? "";
+    message.matchedPatterns = object.matchedPatterns?.map((e) => e) || [];
     return message;
   },
 };

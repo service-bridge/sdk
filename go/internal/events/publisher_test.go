@@ -339,9 +339,6 @@ func TestFireAndForgetBypassesTheOutbox(t *testing.T) {
 	if req == nil {
 		t.Fatal("the no-wait path sent nothing")
 	}
-	if req.GetPublisherServiceId() != "svc-1" || req.GetPublisherInstanceId() != "inst-1" {
-		t.Fatalf("identity on the wire = %q/%q", req.GetPublisherServiceId(), req.GetPublisherInstanceId())
-	}
 	env := req.GetEvents()[0]
 	if env.GetId() != id || !env.GetFireAndForget() {
 		t.Fatalf("envelope = %+v", env)

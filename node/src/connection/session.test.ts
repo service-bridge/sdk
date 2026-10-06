@@ -86,6 +86,8 @@ describe("Session (Open server-stream)", () => {
 				sessionId: "s1",
 				serviceId: "svc1",
 				serviceName: "my-svc",
+				runtimeVersion: "",
+				protocolVersion: 0,
 			},
 		});
 		expect(callbacks.onWelcome).toHaveBeenCalledTimes(1);
@@ -152,6 +154,9 @@ describe("Session (Open server-stream)", () => {
 			callEndpoint: "",
 			eventSubscriptions: [],
 			httpEndpoint: "127.0.0.1:3000",
+			protocolVersion: 0,
+			sdkLanguage: "node",
+			sdkVersion: "",
 		} as RegisterRequest;
 		session.updateRegistration(req);
 		expect(restarts).toHaveLength(1);
@@ -169,6 +174,9 @@ describe("Session (Open server-stream)", () => {
 			callEndpoint: "",
 			eventSubscriptions: [],
 			httpEndpoint: "h:1",
+			protocolVersion: 0,
+			sdkLanguage: "node",
+			sdkVersion: "",
 		} as RegisterRequest;
 		session.updateRegistration(req);
 		expect(restarts).toHaveLength(0);

@@ -94,7 +94,7 @@ describe("provision channel lifecycle", () => {
 						serviceId: "svc",
 						serviceName: "svc-name",
 						instanceId: "inst",
-						notAfterUnix: Math.floor(Date.now() / 1000) + 3600,
+						notAfterUnixMs: Date.now() + 3_600_000,
 					});
 				},
 				close: () => {

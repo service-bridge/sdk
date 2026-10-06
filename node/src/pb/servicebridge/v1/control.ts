@@ -21,7 +21,20 @@ import {
   type UntypedServiceImplementation,
 } from "@grpc/grpc-js";
 
+/**
+ * Handshake identity of the SDK opening the control stream. The runtime
+ * rejects a protocol_version it does not support with FAILED_PRECONDITION.
+ */
 export interface OpenRequest {
+  /**
+   * Wire contract revision the SDK was generated against (see
+   * PROTOCOL_VERSION in the SDKs). 0 = not sent.
+   */
+  protocolVersion: number;
+  /** "node" | "go" | … — for diagnostics and the console. */
+  sdkLanguage: string;
+  /** SDK package version, e.g. "2.0.0-alpha.15". */
+  sdkVersion: string;
 }
 
 export interface RefreshCertRequest {
@@ -31,7 +44,7 @@ export interface RefreshCertRequest {
 export interface RefreshCertResponse {
   certDer: Buffer;
   caChainDer: Buffer;
-  notAfterUnix: number;
+  notAfterUnixMs: number;
   instanceId: string;
 }
 
@@ -44,6 +57,10 @@ export interface Welcome {
   sessionId: string;
   serviceId: string;
   serviceName: string;
+  /** Build version of the runtime binary. */
+  runtimeVersion: string;
+  /** Wire contract revision the runtime speaks. */
+  protocolVersion: number;
 }
 
 export interface Drain {
@@ -51,11 +68,20 @@ export interface Drain {
 }
 
 function createBaseOpenRequest(): OpenRequest {
-  return {};
+  return { protocolVersion: 0, sdkLanguage: "", sdkVersion: "" };
 }
 
 export const OpenRequest: MessageFns<OpenRequest> = {
-  encode(_: OpenRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+  encode(message: OpenRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.protocolVersion !== 0) {
+      writer.uint32(8).uint32(message.protocolVersion);
+    }
+    if (message.sdkLanguage !== "") {
+      writer.uint32(18).string(message.sdkLanguage);
+    }
+    if (message.sdkVersion !== "") {
+      writer.uint32(26).string(message.sdkVersion);
+    }
     return writer;
   },
 
@@ -72,6 +98,30 @@ export const OpenRequest: MessageFns<OpenRequest> = {
       while (reader.pos < end) {
         const tag = reader.uint32();
         switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 8) {
+              break;
+            }
+
+            message.protocolVersion = reader.uint32();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.sdkLanguage = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.sdkVersion = reader.string();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -87,8 +137,11 @@ export const OpenRequest: MessageFns<OpenRequest> = {
   create<I extends Exact<DeepPartial<OpenRequest>, I>>(base?: I): OpenRequest {
     return OpenRequest.fromPartial(base ?? ({} as any));
   },
-  fromPartial<I extends Exact<DeepPartial<OpenRequest>, I>>(_: I): OpenRequest {
+  fromPartial<I extends Exact<DeepPartial<OpenRequest>, I>>(object: I): OpenRequest {
     const message = createBaseOpenRequest();
+    message.protocolVersion = object.protocolVersion ?? 0;
+    message.sdkLanguage = object.sdkLanguage ?? "";
+    message.sdkVersion = object.sdkVersion ?? "";
     return message;
   },
 };
@@ -149,7 +202,7 @@ export const RefreshCertRequest: MessageFns<RefreshCertRequest> = {
 };
 
 function createBaseRefreshCertResponse(): RefreshCertResponse {
-  return { certDer: Buffer.alloc(0), caChainDer: Buffer.alloc(0), notAfterUnix: 0, instanceId: "" };
+  return { certDer: Buffer.alloc(0), caChainDer: Buffer.alloc(0), notAfterUnixMs: 0, instanceId: "" };
 }
 
 export const RefreshCertResponse: MessageFns<RefreshCertResponse> = {
@@ -160,8 +213,8 @@ export const RefreshCertResponse: MessageFns<RefreshCertResponse> = {
     if (message.caChainDer.length !== 0) {
       writer.uint32(18).bytes(message.caChainDer);
     }
-    if (message.notAfterUnix !== 0) {
-      writer.uint32(24).int64(message.notAfterUnix);
+    if (message.notAfterUnixMs !== 0) {
+      writer.uint32(24).int64(message.notAfterUnixMs);
     }
     if (message.instanceId !== "") {
       writer.uint32(34).string(message.instanceId);
@@ -203,7 +256,7 @@ export const RefreshCertResponse: MessageFns<RefreshCertResponse> = {
               break;
             }
 
-            message.notAfterUnix = longToNumber(reader.int64());
+            message.notAfterUnixMs = longToNumber(reader.int64());
             continue;
           }
           case 4: {
@@ -233,7 +286,7 @@ export const RefreshCertResponse: MessageFns<RefreshCertResponse> = {
     const message = createBaseRefreshCertResponse();
     message.certDer = object.certDer ?? Buffer.alloc(0);
     message.caChainDer = object.caChainDer ?? Buffer.alloc(0);
-    message.notAfterUnix = object.notAfterUnix ?? 0;
+    message.notAfterUnixMs = object.notAfterUnixMs ?? 0;
     message.instanceId = object.instanceId ?? "";
     return message;
   },
@@ -309,7 +362,7 @@ export const ServerControl: MessageFns<ServerControl> = {
 };
 
 function createBaseWelcome(): Welcome {
-  return { sessionId: "", serviceId: "", serviceName: "" };
+  return { sessionId: "", serviceId: "", serviceName: "", runtimeVersion: "", protocolVersion: 0 };
 }
 
 export const Welcome: MessageFns<Welcome> = {
@@ -322,6 +375,12 @@ export const Welcome: MessageFns<Welcome> = {
     }
     if (message.serviceName !== "") {
       writer.uint32(26).string(message.serviceName);
+    }
+    if (message.runtimeVersion !== "") {
+      writer.uint32(34).string(message.runtimeVersion);
+    }
+    if (message.protocolVersion !== 0) {
+      writer.uint32(40).uint32(message.protocolVersion);
     }
     return writer;
   },
@@ -363,6 +422,22 @@ export const Welcome: MessageFns<Welcome> = {
             message.serviceName = reader.string();
             continue;
           }
+          case 4: {
+            if (tag !== 34) {
+              break;
+            }
+
+            message.runtimeVersion = reader.string();
+            continue;
+          }
+          case 5: {
+            if (tag !== 40) {
+              break;
+            }
+
+            message.protocolVersion = reader.uint32();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -383,6 +458,8 @@ export const Welcome: MessageFns<Welcome> = {
     message.sessionId = object.sessionId ?? "";
     message.serviceId = object.serviceId ?? "";
     message.serviceName = object.serviceName ?? "";
+    message.runtimeVersion = object.runtimeVersion ?? "";
+    message.protocolVersion = object.protocolVersion ?? 0;
     return message;
   },
 };

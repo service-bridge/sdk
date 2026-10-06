@@ -167,7 +167,6 @@ describe("EventDomain.handle", () => {
 		const req = registry.buildRegisterRequest();
 		expect(req.eventSubscriptions).toHaveLength(1);
 		expect(req.eventSubscriptions[0]!.pattern).toBe("payment.charged");
-		expect(req.eventSubscriptions[0]!.durable).toBe(true);
 	});
 });
 
