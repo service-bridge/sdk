@@ -48,7 +48,7 @@
 | `ErrStopped` | `error` | — | Событие осталось в очереди при остановке клиента. |
 | `DefaultMaxPending` · `DefaultPublishTimeout` · `DefaultBatchSize` | константы | `10000` · `30s` · `100` | Дефолты. |
 
-Вердикты рантайма: `ACCEPTED` — успех; `REJECTED_DUPLICATE` — успех, id = `results[].event_id` (исходный); `REJECTED_CONFLICT` → `ErrConflict`; `REJECTED_INVALID_NAME` → `ErrInvalidName`; `REJECTED_FORBIDDEN` → `ErrForbidden` + `OnPolicyViolation`; `UNSPECIFIED`, отсутствие вердикта и транспортная ошибка → повтор того же конверта с тем же id.
+Вердикты рантайма: `ACCEPTED` — успех; `REJECTED_DUPLICATE` — успех, id = `results[].event_id` (исходный); `REJECTED_CONFLICT` → `ErrConflict`; `REJECTED_INVALID_NAME` → `ErrInvalidName`; `REJECTED_FORBIDDEN` → `ErrForbidden` + `OnPolicyViolation`; `UNSPECIFIED`, транспортная ошибка и ответ, где число вердиктов не равно числу событий (вердикты сопоставляются по позиции), → повтор того же конверта с тем же id.
 
 ### Подписка (`subscriber.go`)
 

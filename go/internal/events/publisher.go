@@ -490,12 +490,16 @@ func (p *Publisher) settle(batch []*entry, resp *pb.PublishResponse, err error) 
 		p.cfg.Logger.Warn("events: publish batch failed, retrying", "events", len(batch), "error", err)
 	}
 	results := resp.GetResults()
+	// Verdicts are matched by position — a duplicate's verdict names the
+	// original id, not the one sent. A response of another length cannot be
+	// matched at all, so the whole batch counts as unsettled.
+	unmatched := err != nil || len(results) != len(batch)
 	var violations []PolicyViolation
 	retry := false
 
 	p.mu.Lock()
 	for i, e := range batch {
-		if err != nil || i >= len(results) {
+		if unmatched {
 			retry = true
 			p.unflightLocked(e)
 			continue

@@ -489,3 +489,36 @@ func waitFor(t *testing.T, cond func() bool) {
 		time.Sleep(2 * time.Millisecond)
 	}
 }
+
+// A response whose length does not match the batch cannot be matched by
+// position, so every event in the batch is retried.
+func TestMismatchedVerdictCountRetriesTheWholeBatch(t *testing.T) {
+	rt := newFakeRuntime()
+	var mu sync.Mutex
+	calls := 0
+	p := newTestPublisher(t, rt, func(c *PublisherConfig) {
+		inner := rt.publish
+		c.Publish = func(ctx context.Context, req *pb.PublishRequest) (*pb.PublishResponse, error) {
+			mu.Lock()
+			calls++
+			n := calls
+			mu.Unlock()
+			resp, err := inner(ctx, req)
+			if n == 1 && err == nil {
+				resp.Results = resp.Results[:len(resp.Results)-1]
+			}
+			return resp, err
+		}
+	})
+	for range 2 {
+		if _, err := p.Publish(context.Background(), "order.created", order{}, WithFireAndForget()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	startPublisher(t, p)
+	waitFor(t, func() bool { return p.Pending() == 0 })
+	reqs := rt.sent()
+	if len(reqs) != 2 || len(reqs[1]) != 2 {
+		t.Fatalf("requests %d, second carries %d events; want the whole batch resent", len(reqs), len(reqs[len(reqs)-1]))
+	}
+}
