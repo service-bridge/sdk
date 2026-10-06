@@ -249,6 +249,11 @@ func TestOneOperationPerLogicalCall(t *testing.T) {
 	if frames[0].GetPeerServiceId() != "svc-uuid" {
 		t.Fatalf("peer service = %q, want the callee's UUID", frames[0].GetPeerServiceId())
 	}
+	// Via the proxy the runtime picks the callee instance; the SDK cannot name it.
+	if frames[0].GetPeerInstanceId() != "" || frames[1].GetPeerInstanceId() != "" {
+		t.Fatalf("peer instance = %q/%q on the proxy path, want empty",
+			frames[0].GetPeerInstanceId(), frames[1].GetPeerInstanceId())
+	}
 
 	var meta callMeta
 	if err := json.Unmarshal(frames[0].GetMetaJson(), &meta); err != nil {

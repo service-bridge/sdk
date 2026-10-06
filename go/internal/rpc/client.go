@@ -233,6 +233,7 @@ func (c *Client) Unary(ctx context.Context, req Request) ([]byte, error) {
 			op.CaptureIn(req.Payload, req.ContractHash)
 		}
 		op.SetAttempt(int32(attempt))
+		op.SetPeerInstance(peerInstance(res.target, viaProxy))
 
 		payload, err := c.dispatch(callCtx, req, res.target, op, viaProxy, unreachable)
 		res.settle(err)
@@ -441,17 +442,27 @@ func (c *Client) startOp(ctx context.Context, req Request, target Candidate, via
 		return ctx, nil, fmt.Errorf("rpc: start call operation: encode meta: %w", err)
 	}
 	callCtx, op, err := c.recorder.Start(ctx, telemetry.OpSpec{
-		Channel:       pb.Channel_RPC,
-		Kind:          telemetry.OpKindRPCCall,
-		Subject:       req.subject(),
-		PeerServiceID: target.ServiceID,
-		BusinessKey:   req.BusinessKey,
-		MetaJSON:      meta,
+		Channel:        pb.Channel_RPC,
+		Kind:           telemetry.OpKindRPCCall,
+		Subject:        req.subject(),
+		PeerServiceID:  target.ServiceID,
+		PeerInstanceID: peerInstance(target, viaProxy),
+		BusinessKey:    req.BusinessKey,
+		MetaJSON:       meta,
 	})
 	if err != nil {
 		return ctx, nil, fmt.Errorf("rpc: start call operation: %w", err)
 	}
 	return callCtx, op, nil
+}
+
+// peerInstance is the callee instance an RPC.CALL reports: known on the direct
+// path, picked by the runtime on the proxy path.
+func peerInstance(target Candidate, viaProxy bool) string {
+	if viaProxy {
+		return ""
+	}
+	return target.InstanceID
 }
 
 type callMeta struct {

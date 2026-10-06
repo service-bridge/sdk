@@ -49,8 +49,11 @@ type OpSpec struct {
 	Kind          OpKind
 	Subject       string
 	PeerServiceID string
-	BusinessKey   string
-	Attempt       int32
+	// PeerInstanceID is the callee instance of an RPC.CALL; the runtime keys
+	// the callee's health on it.
+	PeerInstanceID string
+	BusinessKey    string
+	Attempt        int32
 	// StartedAtMs is unix-ms; zero means now.
 	StartedAtMs int64
 	MetaJSON    []byte
@@ -119,16 +122,17 @@ func (r *Recorder) Start(ctx context.Context, spec OpSpec) (context.Context, *Op
 	}
 
 	op := &Op{
-		ring:        r.ring,
-		traceID:     tc.TraceID,
-		opID:        opID,
-		parentOpID:  tc.ParentOpID,
-		channel:     spec.Channel,
-		kind:        spec.Kind,
-		attempt:     spec.Attempt,
-		startedAtMs: startedAtMs,
-		mode:        r.policy.Resolve(spec.Channel, spec.CaptureOverride),
-		maxBytes:    r.policy.PayloadMaxBytes(),
+		ring:         r.ring,
+		traceID:      tc.TraceID,
+		opID:         opID,
+		parentOpID:   tc.ParentOpID,
+		channel:      spec.Channel,
+		kind:         spec.Kind,
+		attempt:      spec.Attempt,
+		peerInstance: spec.PeerInstanceID,
+		startedAtMs:  startedAtMs,
+		mode:         r.policy.Resolve(spec.Channel, spec.CaptureOverride),
+		maxBytes:     r.policy.PayloadMaxBytes(),
 	}
 	op.pushStart(spec)
 
@@ -149,10 +153,11 @@ type Op struct {
 	mode        Mode
 	maxBytes    int32
 
-	mu       sync.Mutex
-	attempt  int32
-	ended    bool
-	buffered map[uint32]capturedPayload
+	mu           sync.Mutex
+	attempt      int32
+	peerInstance string
+	ended        bool
+	buffered     map[uint32]capturedPayload
 }
 
 type capturedPayload struct {
@@ -181,6 +186,14 @@ func (o *Op) Capturing() bool { return o.mode != ModeNone }
 // SetAttempt records the retry counter on this operation. A retry mutates the
 // same operation rather than minting a new one, so one logical call stays one
 // row (ADR-0001); the END frame carries the final count.
+// SetPeerInstance records the instance a retry or a fallback moved the call to;
+// empty when the runtime proxy picks it.
+func (o *Op) SetPeerInstance(instanceID string) {
+	o.mu.Lock()
+	o.peerInstance = instanceID
+	o.mu.Unlock()
+}
+
 func (o *Op) SetAttempt(attempt int32) {
 	o.mu.Lock()
 	o.attempt = attempt
@@ -243,6 +256,7 @@ func (o *Op) EndWithMeta(status pb.Status, statusMessage string, metaJSON []byte
 	}
 	o.ended = true
 	attempt := o.attempt
+	peerInstance := o.peerInstance
 	var pending []capturedPayload
 	if failed(status) {
 		pending = make([]capturedPayload, 0, len(o.buffered))
@@ -256,7 +270,7 @@ func (o *Op) EndWithMeta(status pb.Status, statusMessage string, metaJSON []byte
 	for _, att := range pending {
 		o.emitPayload(att)
 	}
-	o.pushEnd(status, statusMessage, attempt, metaJSON)
+	o.pushEnd(status, statusMessage, attempt, peerInstance, metaJSON)
 }
 
 // failed reports whether a terminal status is worth capturing payloads for.
@@ -279,36 +293,38 @@ func (o *Op) emitPayload(att capturedPayload) {
 // pushStart buffers the opening frame: no finished_at_ms, status PENDING.
 func (o *Op) pushStart(spec OpSpec) {
 	o.ring.PushOp(&pb.OpReport{
-		TraceId:       o.traceID.String(),
-		OpId:          o.opID.String(),
-		ParentOpId:    parentOpIDString(o.parentOpID),
-		Channel:       o.channel,
-		Kind:          uint32(o.kind),
-		Subject:       spec.Subject,
-		PeerServiceId: spec.PeerServiceID,
-		BusinessKey:   spec.BusinessKey,
-		Attempt:       spec.Attempt,
-		StartedAtMs:   o.startedAtMs,
-		Status:        pb.Status_PENDING,
-		MetaJson:      jsonOrEmptyObject(spec.MetaJSON),
-		AttrsJson:     jsonOrEmptyObject(spec.AttrsJSON),
+		TraceId:        o.traceID.String(),
+		OpId:           o.opID.String(),
+		ParentOpId:     parentOpIDString(o.parentOpID),
+		Channel:        o.channel,
+		Kind:           uint32(o.kind),
+		Subject:        spec.Subject,
+		PeerServiceId:  spec.PeerServiceID,
+		PeerInstanceId: spec.PeerInstanceID,
+		BusinessKey:    spec.BusinessKey,
+		Attempt:        spec.Attempt,
+		StartedAtMs:    o.startedAtMs,
+		Status:         pb.Status_PENDING,
+		MetaJson:       jsonOrEmptyObject(spec.MetaJSON),
+		AttrsJson:      jsonOrEmptyObject(spec.AttrsJSON),
 	})
 }
 
 // pushEnd buffers the closing delta: only the fields that changed since START.
 // The runtime upserts them onto the existing row.
-func (o *Op) pushEnd(status pb.Status, statusMessage string, attempt int32, metaJSON []byte) {
+func (o *Op) pushEnd(status pb.Status, statusMessage string, attempt int32, peerInstance string, metaJSON []byte) {
 	finishedAtMs := nowUnixMs()
 	o.ring.PushOp(&pb.OpReport{
-		TraceId:       o.traceID.String(),
-		OpId:          o.opID.String(),
-		Channel:       o.channel,
-		Kind:          uint32(o.kind),
-		Attempt:       attempt,
-		FinishedAtMs:  &finishedAtMs,
-		Status:        status,
-		StatusMessage: statusMessage,
-		MetaJson:      metaJSON,
+		TraceId:        o.traceID.String(),
+		OpId:           o.opID.String(),
+		Channel:        o.channel,
+		Kind:           uint32(o.kind),
+		Attempt:        attempt,
+		PeerInstanceId: peerInstance,
+		FinishedAtMs:   &finishedAtMs,
+		Status:         status,
+		StatusMessage:  statusMessage,
+		MetaJson:       metaJSON,
 	})
 }
 
