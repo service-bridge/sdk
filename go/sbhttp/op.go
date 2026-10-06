@@ -7,11 +7,13 @@
 package sbhttp
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 
 	pb "github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1"
@@ -28,8 +30,11 @@ var (
 )
 
 // idempotencyKeyHeader carries the caller's business key. Absent, the key
-// falls back to "<METHOD> <path>".
+// falls back to "<METHOD> <route>".
 const idempotencyKeyHeader = "Idempotency-Key"
+
+// UnmatchedRoute is the route template of a request no route matched.
+const UnmatchedRoute = "*"
 
 // rawJSONContract marks a payload that is already JSON rather than proto wire.
 // It must equal runtime telemetry.ContractRawJSON, which is what makes the
@@ -59,6 +64,9 @@ type Integration struct {
 
 	hostWarn sync.Once
 
+	trustTrace bool
+	resolve    func(*http.Request) string
+
 	mu   sync.Mutex
 	seen map[string]struct{}
 }
@@ -74,6 +82,21 @@ func WithLogger(log *slog.Logger) Option {
 			i.log = log
 		}
 	}
+}
+
+// WithTrustTraceHeader adopts an incoming X-SB-Trace header as the parent of
+// the request's span. Off by default: on a public edge a client must not be
+// able to graft its requests into arbitrary traces. Turn it on only behind a
+// gateway that sets the header itself.
+func WithTrustTraceHeader() Option {
+	return func(i *Integration) { i.trustTrace = true }
+}
+
+// WithRouteResolver names the route template of a request for routers the
+// middleware cannot read on its own. It returns the template with its leading
+// slash, or "" when no route matched.
+func WithRouteResolver(fn func(*http.Request) string) Option {
+	return func(i *Integration) { i.resolve = fn }
 }
 
 // New builds an integration over rt.
@@ -106,29 +129,46 @@ func (i *Integration) Logger() *slog.Logger { return i.log }
 // request carrying the operation's trace context. Every framework adapter goes
 // through it: the operation logic exists once, in this package.
 //
+// route is the route template the request matched ("/users/{id}"), never the
+// raw path: a path makes every user id its own subject. Empty means no route
+// matched and is recorded as "*".
+//
 // The returned request must replace the one handed to the handler. Without it
 // the RPC calls and event publishes made inside the handler start their own
 // root trace and the request falls apart into two trees.
-func (i *Integration) Begin(r *http.Request) (*http.Request, *Operation, error) {
-	tc, err := telemetry.ParseHeader(r.Header.Get(telemetry.HeaderName))
+func (i *Integration) Begin(r *http.Request, route string) (*http.Request, *Operation, error) {
+	if route == "" {
+		route = UnmatchedRoute
+	}
+	var tc telemetry.TraceContext
+	var err error
+	if i.trustTrace {
+		tc, err = telemetry.ParseHeader(r.Header.Get(telemetry.HeaderName))
+	} else {
+		tc, err = telemetry.ParseHeader("")
+	}
 	if err != nil {
 		return r, nil, fmt.Errorf("sbhttp: begin request: %w", err)
 	}
 
-	path := r.URL.Path
 	businessKey := r.Header.Get(idempotencyKeyHeader)
 	if businessKey == "" {
-		businessKey = r.Method + " " + path
+		businessKey = r.Method + " " + route
+	}
+	meta, err := json.Marshal(map[string]string{"method": r.Method, "route": route})
+	if err != nil {
+		return r, nil, fmt.Errorf("sbhttp: begin request: encode meta: %w", err)
 	}
 
 	ctx, op, err := i.rec.Start(telemetry.WithTraceContext(r.Context(), tc), telemetry.OpSpec{
 		Channel: pb.Channel_HTTP,
 		Kind:    telemetry.OpKindHTTPHandle,
-		// Canonical HTTP subject (ADR-0007): the path keeps its leading slash,
-		// so the runtime's subject_http_route_key can turn the first slash back
-		// into the space that joins it to the declared route name.
-		Subject:     "http.handle:" + r.Method + "/" + path,
+		// Canonical HTTP subject (ADR-0007): the route keeps its leading
+		// slash, so the runtime's subject_http_route_key can turn the first
+		// slash back into the space that joins it to the declared route name.
+		Subject:     "http.handle:" + r.Method + "/" + route,
 		BusinessKey: businessKey,
+		MetaJSON:    meta,
 	})
 	if err != nil {
 		return r, nil, fmt.Errorf("sbhttp: begin request: %w", err)
@@ -140,6 +180,21 @@ func (i *Integration) Begin(r *http.Request) (*http.Request, *Operation, error) 
 		r = oper.captureRequestBody(r)
 	}
 	return r, oper, nil
+}
+
+// routeTemplate strips the method from a Go 1.22 pattern ("GET /users/{id}").
+func routeTemplate(pattern string) string {
+	_, rest := splitPattern(pattern)
+	if pattern == "" {
+		return ""
+	}
+	return rest
+}
+
+// RouteOf reads the route template net/http stored on a routed request.
+// Exposed for adapters that wrap a ServeMux themselves.
+func RouteOf(r *http.Request) string {
+	return routeTemplate(strings.TrimSpace(r.Pattern))
 }
 
 // Operation is one in-flight HTTP.HANDLE span. Its whole surface is stdlib
@@ -192,7 +247,15 @@ func (o *Operation) Finish(out Outcome) {
 		}
 	}
 	status, message := statusOf(out)
-	o.op.End(status, message)
+	code := out.StatusCode
+	if code == 0 {
+		code = http.StatusOK
+	}
+	meta, err := json.Marshal(map[string]int{"status": code})
+	if err != nil {
+		meta = nil
+	}
+	o.op.EndWithMeta(status, message, meta)
 }
 
 // statusOf maps an outcome onto the operation status. The order is by

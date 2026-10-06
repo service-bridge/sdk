@@ -47,6 +47,13 @@ func (m *Mux) HandleFunc(pattern string, handler func(http.ResponseWriter, *http
 // ServeHTTP routes through the underlying http.ServeMux.
 func (m *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request) { m.mux.ServeHTTP(w, r) }
 
+// Route is the route template the request would be served by, method and
+// host stripped ("/users/{id}"), or "" when nothing matches.
+func (m *Mux) Route(r *http.Request) string {
+	_, pattern := m.mux.Handler(r)
+	return routeTemplate(pattern)
+}
+
 // Routes returns the recorded routes in registration order.
 func (m *Mux) Routes() []Route {
 	m.mu.Lock()

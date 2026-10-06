@@ -6,19 +6,27 @@ import (
 	"net"
 	"net/http"
 	"sync"
+
+	"github.com/go-chi/chi/v5"
 )
 
 // Middleware wraps a handler in one HTTP.HANDLE span. Its signature is the
 // net/http middleware shape, which chi takes as is:
 //
-//	mux.Handle("/", integ.Middleware(routes))
-//	router.Use(integ.Middleware)
+//	srv.Handler = integ.Middleware(mux)   // *sbhttp.Mux or *http.ServeMux
+//	router.Use(integ.Middleware)          // chi
+//
+// The span is named by the route template, which the middleware finds
+// before the handler runs: through WithRouteResolver when set, the wrapped
+// *sbhttp.Mux or *http.ServeMux, chi's routing context, or r.Pattern when the
+// middleware wraps a single route inside a ServeMux. A request no route
+// matches is recorded as "*".
 //
 // A span that cannot be started never costs the request: the failure is
 // logged and the handler runs untraced.
 func (i *Integration) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		req, op, err := i.Begin(r)
+		req, op, err := i.Begin(r, i.routeFor(next, r))
 		if err != nil {
 			i.log.Error("sbhttp: http span not started", "error", err, "method", r.Method, "path", r.URL.Path)
 			next.ServeHTTP(w, r)
@@ -46,6 +54,28 @@ func (i *Integration) Middleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(wrapResponseWriter(w, rec), req)
 	})
+}
+
+// routeFor finds the route template of r before the handler runs.
+func (i *Integration) routeFor(next http.Handler, r *http.Request) string {
+	if i.resolve != nil {
+		return i.resolve(r)
+	}
+	switch mux := next.(type) {
+	case *Mux:
+		return mux.Route(r)
+	case *http.ServeMux:
+		_, pattern := mux.Handler(r)
+		return routeTemplate(pattern)
+	}
+	if rctx := chi.RouteContext(r.Context()); rctx != nil && rctx.Routes != nil {
+		path := r.URL.RawPath
+		if path == "" {
+			path = r.URL.Path
+		}
+		return rctx.Routes.Find(chi.NewRouteContext(), r.Method, path)
+	}
+	return RouteOf(r)
 }
 
 // responseRecorder observes the status code and, while capture is on, the

@@ -551,6 +551,8 @@ err = sbgin.Publish(integration, engine, sbhttp.Endpoint{Host: "10.0.0.4", Port:
 log.Fatal(engine.Run(":3000"))
 ```
 
+Each request becomes one span named by its route template — `http.handle:POST//orders/{id}`, never the raw path; a request that matched no route is `*`. The template is found before the handler runs: for a wrapped `sbhttp.Mux` or `http.ServeMux`, from chi's routing context, from gin's `c.FullPath()`, or through `sbhttp.WithRouteResolver` for anything else. The span carries `{method, route, status}`; its business key is the `Idempotency-Key` header or `"<METHOD> <route>"`, never with a query string. An incoming `X-SB-Trace` header is ignored unless the integration is built with `sbhttp.WithTrustTraceHeader()` — a public edge must not let clients graft requests into arbitrary traces. Bodies are captured as-is when the runtime's capture mode asks for them; the runtime masks them on ingest.
+
 The host is explicit or it is loopback: guessing an address from the environment is wrong more often than right inside a container. Details and the capture rules are in [`sbhttp/README.md`](./sbhttp/README.md).
 
 ### Introspection and lifecycle callbacks

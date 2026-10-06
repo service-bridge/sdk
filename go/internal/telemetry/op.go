@@ -230,6 +230,12 @@ func (o *Op) capture(direction uint32, payload []byte, contractHash string) {
 
 // End buffers the END frame. Calling it again does nothing.
 func (o *Op) End(status pb.Status, statusMessage string) {
+	o.EndWithMeta(status, statusMessage, nil)
+}
+
+// EndWithMeta is End plus meta fields learned only at the end of the
+// operation; the runtime merges them into the meta written at START.
+func (o *Op) EndWithMeta(status pb.Status, statusMessage string, metaJSON []byte) {
 	o.mu.Lock()
 	if o.ended {
 		o.mu.Unlock()
@@ -250,7 +256,7 @@ func (o *Op) End(status pb.Status, statusMessage string) {
 	for _, att := range pending {
 		o.emitPayload(att)
 	}
-	o.pushEnd(status, statusMessage, attempt)
+	o.pushEnd(status, statusMessage, attempt, metaJSON)
 }
 
 // failed reports whether a terminal status is worth capturing payloads for.
@@ -291,7 +297,7 @@ func (o *Op) pushStart(spec OpSpec) {
 
 // pushEnd buffers the closing delta: only the fields that changed since START.
 // The runtime upserts them onto the existing row.
-func (o *Op) pushEnd(status pb.Status, statusMessage string, attempt int32) {
+func (o *Op) pushEnd(status pb.Status, statusMessage string, attempt int32, metaJSON []byte) {
 	finishedAtMs := nowUnixMs()
 	o.ring.PushOp(&pb.OpReport{
 		TraceId:       o.traceID.String(),
@@ -302,6 +308,7 @@ func (o *Op) pushEnd(status pb.Status, statusMessage string, attempt int32) {
 		FinishedAtMs:  &finishedAtMs,
 		Status:        status,
 		StatusMessage: statusMessage,
+		MetaJson:      metaJSON,
 	})
 }
 
