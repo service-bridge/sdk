@@ -395,7 +395,7 @@ type Waiter = { resolve: () => void; reject: (err: Error) => void };
  */
 export class ServiceBridge {
 	private readonly url: string;
-	private readonly rawKey: string;
+	private readonly key: ReturnType<typeof parseBootstrapKey>;
 	private readonly opts: ResolvedOptions;
 	private readonly log: Logger;
 	private readonly handlers = new Map<
@@ -472,7 +472,16 @@ export class ServiceBridge {
 			timeoutMs(options.callDefaults.timeout);
 
 		this.url = url;
-		this.rawKey = key;
+		// A malformed key is a configuration error, reported here rather than
+		// on the connect path where it would read like a network condition.
+		try {
+			this.key = parseBootstrapKey(key);
+		} catch (err) {
+			throw new ConfigurationError(
+				`ServiceBridge: bootstrap key is not usable — ${(err as Error).message}`,
+				{ cause: err },
+			);
+		}
 		this.log = options.logger ?? consoleLogger;
 		this.opts = {
 			reconnectIntervalMs: options.reconnectIntervalMs,
@@ -779,10 +788,29 @@ export class ServiceBridge {
 			for (const m of entry.methods) byServiceId.set(m.serviceId, entry);
 			for (const i of entry.instances) byServiceId.set(i.serviceId, entry);
 		}
+		// A service may have no method or instance in this caller's view (a pure
+		// subscriber, this very service): its subscriptions and outgoing calls
+		// still get an entry, by name.
+		const entryFor = (serviceId: string, serviceName: string) => {
+			let entry = byServiceId.get(serviceId) ?? result.get(serviceName);
+			if (!entry) {
+				entry = blank();
+				result.set(serviceName, entry);
+			}
+			byServiceId.set(serviceId, entry);
+			return entry;
+		};
 		for (const es of this.watch.eventSubscriptionsSnapshot().values())
-			byServiceId.get(es.serviceId)?.eventSubscriptions.push(es);
-		for (const oc of this.watch.outgoingCallsSnapshot().values())
-			byServiceId.get(oc.callerServiceId)?.outgoingCalls.push(oc);
+			entryFor(es.serviceId, es.serviceName).eventSubscriptions.push(es);
+		const self = this.currentIdentity;
+		for (const oc of this.watch.outgoingCallsSnapshot().values()) {
+			const entry =
+				byServiceId.get(oc.callerServiceId) ??
+				(self && oc.callerServiceId === self.serviceId
+					? entryFor(self.serviceId, self.serviceName)
+					: undefined);
+			entry?.outgoingCalls.push(oc);
+		}
 		return result;
 	}
 
@@ -974,7 +1002,7 @@ export class ServiceBridge {
 		try {
 			const prov =
 				this.reusableProvision() ??
-				(await this.opts.provisionFn(this.url, parseBootstrapKey(this.rawKey)));
+				(await this.opts.provisionFn(this.url, this.key));
 			if (this.stale(gen)) return;
 			this.adoptProvision(prov);
 			await this.ensureCallServer();

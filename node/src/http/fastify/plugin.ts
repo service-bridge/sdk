@@ -159,7 +159,8 @@ const plugin: FastifyPluginAsync<SbFastifyOptions> = async (
 			);
 			return;
 		}
-		const host = opts.host ?? resolveHttpAdvertiseHost(addr.address, sb.diagnostics);
+		const host =
+			opts.host ?? resolveHttpAdvertiseHost(addr.address, sb.diagnostics);
 		sb.routes.publishHttp({ host, port: addr.port });
 	});
 };

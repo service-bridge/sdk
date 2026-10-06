@@ -26,6 +26,7 @@ import {
 } from "../errors";
 import { Subscriber } from "../events/subscriber";
 import { silentLogger } from "../logger";
+import { BootstrapKeyPayload } from "../pb/servicebridge/v1/bootstrap";
 import type {
 	EventEnvelope,
 	EventsClient,
@@ -37,6 +38,15 @@ import { PublishStatus } from "../pb/servicebridge/v1/events";
 import type { Handle } from "../registry/registry";
 import type { CallOpts, RpcCaller, SchemaRegistry } from "../rpc/client";
 import type { RpcHandlerContext, UnaryResult } from "../rpc/dispatch-port";
+
+// A syntactically valid bootstrap key; the in-memory runtime never checks it.
+const IN_MEMORY_KEY = `sb.${Buffer.from(
+	BootstrapKeyPayload.encode({
+		keyId: Buffer.alloc(8, 1),
+		secret: Buffer.alloc(32, 2),
+		caCertDer: Buffer.alloc(1, 3),
+	}).finish(),
+).toString("base64url")}`;
 
 /** Identity the harness's in-memory session reports. */
 export const TEST_IDENTITY: Identity = {
@@ -173,7 +183,7 @@ function refusal(result: UnaryResult): ServiceBridgeError {
 export function createTestHarness(
 	options: Pick<ServiceBridgeOptions, "callDefaults" | "publishTimeoutMs"> = {},
 ): TestHarness {
-	const sb = new ServiceBridge("in-memory:0", "in-memory", {
+	const sb = new ServiceBridge("in-memory:0", IN_MEMORY_KEY, {
 		...options,
 		advertise: false,
 		logger: silentLogger,

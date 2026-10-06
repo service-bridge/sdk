@@ -18,6 +18,9 @@ import {
 	ServiceBridge,
 	type ServiceMapEntry,
 } from "../../src/connection/service-bridge";
+import { ConnectionError } from "../../src/connection/service-bridge-error";
+import { ConfigurationError } from "../../src/errors";
+import { BootstrapKeyPayload } from "../../src/pb/servicebridge/v1/bootstrap";
 import { Channel } from "../../src/pb/servicebridge/v1/telemetry";
 import {
 	connect,
@@ -80,13 +83,18 @@ function rawKey(role: Role): { url: string; key: string } {
 
 // corruptSecret flips a byte in the secret region (offset 8..40) of a bootstrap
 // key, keeping the key shape valid so auth fails rather than parsing fails.
+// corruptSecret keeps the key well-formed but flips one secret byte, so the
+// runtime rejects it (UNAUTHENTICATED) instead of the SDK refusing to parse it.
 function corruptSecret(raw: string): string {
 	if (!raw.startsWith("sb.")) throw new Error("invalid key format");
-	const payload = Buffer.from(raw.slice(3), "base64url");
-	const b = payload[10];
-	if (b === undefined) throw new Error("payload too short");
-	payload[10] = b ^ 0xff;
-	return `sb.${payload.toString("base64url")}`;
+	const payload = BootstrapKeyPayload.decode(
+		Buffer.from(raw.slice(3), "base64url"),
+	);
+	const secret = Buffer.from(payload.secret);
+	secret[0] = (secret[0] ?? 0) ^ 0xff;
+	return `sb.${Buffer.from(
+		BootstrapKeyPayload.encode({ ...payload, secret }).finish(),
+	).toString("base64url")}`;
 }
 
 function allMethods(
@@ -154,11 +162,10 @@ describe("misc: connect lifecycle", () => {
 		expect(events.length).toBe(before);
 	}, 15_000);
 
-	test("corrupted secret drives reconnect FSM to disconnected{exhausted}", async () => {
+	test("a rejected key stops at once: start() rejects, one disconnected, no reconnect", async () => {
 		const { url, key } = rawKey("primary");
 		sb = new ServiceBridge(url, corruptSecret(key), {
 			reconnectIntervalMs: 200,
-			reconnectAttempts: 2,
 			certRefreshLeadMs: 60_000,
 			certRefreshJitterMs: 0,
 		});
@@ -171,21 +178,20 @@ describe("misc: connect lifecycle", () => {
 			events.push({ type: "disconnected", payload: e }),
 		);
 
-		await sb.start();
-		await waitFor(
-			() => events.some((e) => e.type === "disconnected"),
-			10_000,
-			"disconnected event",
-		);
+		const err = await sb.start().catch((e) => e);
+		expect(err).toBeInstanceOf(ConnectionError);
+		expect((err as ConnectionError).grpcCode).toBe(16); // UNAUTHENTICATED
+		await sleep(500);
+		expect(events.filter((e) => e.type === "reconnecting")).toHaveLength(0);
+		expect(events.filter((e) => e.type === "disconnected")).toHaveLength(1);
+	}, 20_000);
 
-		expect(events.some((e) => e.type === "reconnecting")).toBe(true);
-		const exhausted = events.find(
-			(e) =>
-				e.type === "disconnected" &&
-				(e.payload as { reason: string }).reason === "exhausted",
+	test("a malformed key is a ConfigurationError at construction", () => {
+		const { url } = rawKey("primary");
+		expect(() => new ServiceBridge(url, "sb.not-a-key")).toThrow(
+			ConfigurationError,
 		);
-		expect(exhausted).toBeDefined();
-	}, 15_000);
+	});
 });
 
 describe("misc: registry discovery", () => {

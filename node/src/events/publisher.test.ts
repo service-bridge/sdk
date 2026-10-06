@@ -4,6 +4,7 @@ import {
 	type ServiceBridgeError,
 	StateError,
 	TimeoutError,
+	ValidationError,
 } from "../errors";
 import type { Logger } from "../logger";
 import { silentLogger } from "../logger";
@@ -321,5 +322,43 @@ describe("Publisher fire-and-forget and close", () => {
 		await pub.close(5_000);
 		await sent;
 		expect(Date.now() - started).toBeLessThan(1_000);
+	});
+});
+
+describe("Publisher schema validation", () => {
+	it("a payload the schema rejects is a ValidationError rejection, nothing is sent", async () => {
+		const { pub, requests } = make(accept);
+		const strict = new Publisher({
+			client: () => null,
+			schemaIndex: {
+				get: () => ({
+					contractHash: "h",
+					pair: {
+						input: {
+							encode: () => {
+								throw new Error("orderId: string expected");
+							},
+						},
+					} as unknown as SchemaPair,
+				}),
+			},
+			logger: silentLogger,
+			timeoutMs: 1000,
+			maxPending: 10,
+			xSbTraceFn: () => "",
+			onPolicyViolation: () => {},
+		});
+		const pending = strict.publish("order.created", { orderId: 1 });
+		await expect(pending).rejects.toBeInstanceOf(ValidationError);
+		void pub;
+		expect(requests).toHaveLength(0);
+	});
+});
+
+describe("Publisher sequencing", () => {
+	it("a publish issued right after the previous one resolved is sent too", async () => {
+		const { pub, requests } = make(accept);
+		for (let i = 0; i < 5; i++) await pub.publish("order.created", { n: i });
+		expect(requests).toHaveLength(5);
 	});
 });

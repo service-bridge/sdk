@@ -16,6 +16,7 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { ServiceBridge } from "../../src/connection/service-bridge";
+import { ValidationError } from "../../src/errors";
 import { InvalidEventNameError } from "../../src/events/errors";
 import type {
 	DlqEntry,
@@ -147,22 +148,22 @@ describe("events", () => {
 		expect(elapsed).toBeLessThan(500);
 	}, 15_000);
 
-	test("publish with wrong field type throws before any outbox insert", async () => {
+	test("publish with a wrong field type is a ValidationError, nothing is sent", async () => {
 		const name = uniqueName("events.invalid-type");
 
 		const publisher = track(dedicated("primary"));
 		publisher.event.define(name, V1_SCHEMA);
 		await connect(publisher);
 
-		// orderId must be a string; a number triggers protobufjs type.verify()
-		// synchronously inside publish(), before any outbox INSERT or network.
+		// orderId must be a string; the schema rejects the payload before
+		// anything is queued or sent.
 		await expect(
 			publisher.event.publish(name, {
 				orderId: 42,
 				amount: 10,
 				currency: "USD",
 			}),
-		).rejects.toThrow(/string|verify|invalid|orderId/i);
+		).rejects.toBeInstanceOf(ValidationError);
 	}, 15_000);
 
 	test("invalid event names are rejected synchronously and one valid edge name is accepted", async () => {

@@ -264,7 +264,7 @@ describe("access-policy (ADR-0004)", () => {
 					{ userId: "u", amount: 1 },
 					{ timeout: "5s" },
 				),
-			/PermissionDenied|denied|egress|no descriptor|not subscribed|Unavailable/i,
+			/no live instance|denied/i,
 		);
 	}, 30_000);
 
@@ -756,6 +756,7 @@ describe("access-policy (ADR-0004)", () => {
 
 		caller = dedicated("second");
 		caller.service(PUBLISHER_SVC, { rpc: [liveMethod] });
+		await caller.useSchema(PUBLISHER_SVC, liveMethod, PAY);
 		await connect(caller);
 		await waitFor(() => caller!.identity() !== null, 5_000, "caller connected");
 
@@ -801,7 +802,7 @@ describe("access-policy (ADR-0004)", () => {
 					{ userId: "u", amount: 1 },
 					{ timeout: "3s" },
 				),
-			/Unavailable|PermissionDenied|denied|no descriptor|cancelled|CANCELLED|no instance|egress/i,
+			/no live instance|denied/i,
 		);
 	}, 40_000);
 

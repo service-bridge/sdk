@@ -21,6 +21,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ServiceBridge } from "../../src/connection/service-bridge";
+import { ConfigurationError, NoLiveInstanceError } from "../../src/errors";
 import { connect, uniqueId, uniqueName, waitFor } from "./_helpers/fixtures";
 import { withDb } from "./_helpers/policy-db";
 
@@ -419,7 +420,7 @@ describe("rpc", () => {
 		).rejects.toThrow(/no endpoint|no instance.*matches caller contract/);
 	}, 30_000);
 
-	test("rpc.call without useSchema rejects (no SchemaPair)", async () => {
+	test("rpc.call without a caller schema is a ConfigurationError", async () => {
 		const method = uniqueName("charge");
 
 		const callee = newClient(primaryKey(), ADVERTISE);
@@ -434,10 +435,10 @@ describe("rpc", () => {
 
 		await expect(
 			caller.rpc.call(calleeName, method, { userId: "u", amount: 1 }),
-		).rejects.toThrow(/no SchemaPair/);
+		).rejects.toBeInstanceOf(ConfigurationError);
 	}, 30_000);
 
-	test("rpc.call before discovery rejects (no descriptor)", async () => {
+	test("rpc.call to a service nobody serves is a retryable NoLiveInstanceError", async () => {
 		const svc = uniqueName("nonexistent");
 		const method = uniqueName("missing");
 
@@ -448,9 +449,11 @@ describe("rpc", () => {
 		await connect(caller);
 		await caller.useSchema(svc, method, SCHEMA);
 
-		await expect(
-			caller.rpc.call(svc, method, { userId: "u", amount: 1 }),
-		).rejects.toThrow(/no descriptor/);
+		const err = await caller.rpc
+			.call(svc, method, { userId: "u", amount: 1 }, { timeout: "2s" })
+			.catch((e) => e);
+		expect(err).toBeInstanceOf(NoLiveInstanceError);
+		expect((err as NoLiveInstanceError).retryable).toBe(true);
 	}, 30_000);
 
 	test("server-side streaming over proxy yields ordered chunks", async () => {
@@ -721,7 +724,7 @@ describe("rpc", () => {
 				{ userId: "u", amount: 1, region: "eu" },
 				{ transport: "proxy", retry: { maxAttempts: 1 } },
 			),
-		).rejects.toThrow(/no instance.*matches caller contract/);
+		).rejects.toThrow(/no live instance.*matches caller contract/);
 	}, 30_000);
 
 	test("advertise defaults to 127.0.0.1 and handler schema auto-resolves from proto service block", async () => {

@@ -11,7 +11,16 @@ assert.equal(typeof sbFastify, "function");
 assert.equal(typeof attachHono, "function");
 assert.equal(typeof createTestHarness, "function");
 // Cross-entry AsyncLocalStorage: HTTP adapter scope must parent core telemetry.
-const bridge = new ServiceBridge("localhost:50051", "not-used", {
+// A well-formed bootstrap key (BootstrapKeyPayload{key_id, secret, ca_cert_der});
+// this smoke never connects.
+const key = `sb.${Buffer.concat([
+	Buffer.from([0x0a, 8]),
+	Buffer.alloc(8, 1),
+	Buffer.from([0x12, 32]),
+	Buffer.alloc(32, 2),
+	Buffer.from([0x1a, 1, 3]),
+]).toString("base64url")}`;
+const bridge = new ServiceBridge("localhost:50051", key, {
 	advertise: false,
 });
 let observed;

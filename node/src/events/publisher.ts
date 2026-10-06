@@ -5,6 +5,7 @@ import {
 	StateError,
 	TimeoutError,
 	toServiceBridgeError,
+	ValidationError,
 } from "../errors";
 import type { Logger } from "../logger";
 import type {
@@ -137,7 +138,17 @@ export class Publisher {
 				),
 			);
 
-		const encoded = entry.pair.input.encode(payload);
+		let encoded: Uint8Array;
+		try {
+			encoded = entry.pair.input.encode(payload);
+		} catch (err) {
+			return Promise.reject(
+				new ValidationError(
+					`events: payload of "${name}" does not match its schema — ${(err as Error).message}`,
+					{ cause: err },
+				),
+			);
+		}
 		// JSON view of the same payload: subscription filters and workflow
 		// wait_event conditions are evaluated on it.
 		let payloadJson: Buffer;
@@ -215,46 +226,49 @@ export class Publisher {
 		this.running = true;
 		// Start on the next microtask so publishes issued in the same tick share
 		// one request.
-		this.idle = Promise.resolve()
-			.then(() => this.loop())
-			.finally(() => {
-				this.running = false;
-			});
+		this.idle = Promise.resolve().then(() => this.loop());
 	}
 
 	private async loop(): Promise<void> {
-		while (this.queue.length > 0) {
-			this.expire();
-			const batch = this.nextBatch();
-			if (batch.length === 0) break;
-			const client = this.d.client();
-			if (!client) {
-				await this.backoff();
-				continue;
+		try {
+			while (this.queue.length > 0) {
+				this.expire();
+				const batch = this.nextBatch();
+				if (batch.length === 0) break;
+				const client = this.d.client();
+				if (!client) {
+					await this.backoff();
+					continue;
+				}
+				for (const p of batch) {
+					p.inFlight = true;
+					p.sent = true;
+				}
+				let response: PublishResponse | null = null;
+				let failure: unknown = null;
+				try {
+					response = await send(client, batch);
+				} catch (err) {
+					failure = err;
+				}
+				for (const p of batch) p.inFlight = false;
+				if (failure !== null) {
+					this.d.logger.warn("events: publish failed, retrying", {
+						events: batch.length,
+						error: failure instanceof Error ? failure.message : String(failure),
+					});
+					await this.backoff();
+					continue;
+				}
+				const transient = this.apply(batch, response);
+				if (transient) await this.backoff();
+				else this.attempt = 0;
 			}
-			for (const p of batch) {
-				p.inFlight = true;
-				p.sent = true;
-			}
-			let response: PublishResponse | null = null;
-			let failure: unknown = null;
-			try {
-				response = await send(client, batch);
-			} catch (err) {
-				failure = err;
-			}
-			for (const p of batch) p.inFlight = false;
-			if (failure !== null) {
-				this.d.logger.warn("events: publish failed, retrying", {
-					events: batch.length,
-					error: failure instanceof Error ? failure.message : String(failure),
-				});
-				await this.backoff();
-				continue;
-			}
-			const transient = this.apply(batch, response);
-			if (transient) await this.backoff();
-			else this.attempt = 0;
+		} finally {
+			// Cleared in the same turn as the last queue check: a publish whose
+			// caller resumed on an acknowledgement above must find the loop
+			// stopped and start it again, never a loop about to exit.
+			this.running = false;
 		}
 	}
 
