@@ -4,46 +4,218 @@ package servicebridge.v1;
 
 import "google/protobuf/empty.proto";
 
-// Workflows — durable workflow execution service.
-// Caller-side RPCs: Start, Cancel, Signal, Query, Await, Replay.
-// Owner-side RPCs: Subscribe, BeginStep, CompleteStep, FailStep, Park, Heartbeat.
+// Workflows — durable workflow execution (runtime ADR 0003).
+//
+// The runtime interprets the workflow DAG. SDKs declare definitions
+// (RegisterRequest.incoming[].workflow), steer runs (caller side) and execute
+// the step tasks the runtime leases to them (owner side).
 service Workflows {
-  // Caller-side
-  rpc Start(StartRunRequest)   returns (StartRunResponse);
+  // Caller side. Start: bilateral workflow.run / workflow.handle policy. The
+  // rest: the owner service, the service that started the run, or a caller
+  // with an explicit workflow.run policy rule for the workflow.
+  rpc Start(StartRunRequest) returns (StartRunResponse);
   rpc Cancel(CancelRunRequest) returns (google.protobuf.Empty);
-  rpc Signal(SignalRunRequest) returns (google.protobuf.Empty);
-  rpc Query(QueryRunRequest)   returns (QueryRunResponse);
-  rpc Await(AwaitRunRequest)   returns (stream RunStatusUpdate);
+  rpc Signal(SignalRunRequest) returns (SignalRunResponse);
+  rpc Query(QueryRunRequest) returns (RunSnapshot);
+  // Await sends the run status on subscribe and on every change; the stream
+  // ends after the first terminal status.
+  rpc Await(AwaitRunRequest) returns (stream RunStatusUpdate);
   rpc Replay(ReplayRunRequest) returns (ReplayRunResponse);
+  // RetryCompensation re-runs the failed compensations of a
+  // failed_compensated run.
+  rpc RetryCompensation(RetryCompensationRequest) returns (google.protobuf.Empty);
 
-  // Owner-side
-  rpc Subscribe(SubscribeRequest)       returns (stream RunAssignment);
-  rpc BeginStep(BeginStepRequest)       returns (BeginStepResponse);
-  rpc CompleteStep(CompleteStepRequest) returns (google.protobuf.Empty);
-  rpc CompleteRun(CompleteRunRequest)   returns (google.protobuf.Empty);
-  rpc FailStep(FailStepRequest)         returns (FailStepResponse);
-  rpc Park(ParkRequest)                 returns (google.protobuf.Empty);
-  rpc Heartbeat(HeartbeatRequest)       returns (google.protobuf.Empty);
+  // Owner side. Subscribe streams step tasks to one instance; every task is a
+  // lease on one step attempt identified by task_token.
+  rpc Subscribe(SubscribeRequest) returns (stream StepTask);
+  rpc CompleteTask(CompleteTaskRequest) returns (google.protobuf.Empty);
+  rpc FailTask(FailTaskRequest) returns (google.protobuf.Empty);
+  // Heartbeat extends the leases of the given tokens and reports the tokens
+  // the runtime no longer recognizes; the SDK aborts those executions.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 }
 
 // ---------------------------------------------------------------------------
-// Caller-side messages
+// Definitions
+// ---------------------------------------------------------------------------
+
+// WorkflowDefinition is what an owner declares. The runtime validates it,
+// freezes it and computes its fingerprint.
+message WorkflowDefinition {
+  string name = 1;
+  // version identifies the executable code behind local steps; it is part of
+  // the fingerprint.
+  string version = 2;
+  // JSON Schema of the run input; empty = any JSON.
+  bytes input_schema_json = 3;
+  repeated Step steps = 4;
+  // Default retry policy of task steps that declare none.
+  RetryPolicy retry = 5;
+  // Maximum concurrently leased task steps of one run; 0 = unlimited.
+  uint32 max_parallelism = 6;
+  // Run timeout; 0 = none. StartRunRequest.timeout_ms overrides it.
+  int64 timeout_ms = 7;
+}
+
+message Step {
+  // Lowercase letters, digits and underscores; unique across the graph.
+  string id = 1;
+  // Ids of sibling steps (same group) this step waits for.
+  repeated string wait_for = 2;
+  // Skip the step (output null) when the predicate is false.
+  Predicate when = 3;
+  // Step deadline; on expiry the step fails and the run stops. 0 = none.
+  int64 timeout_ms = 4;
+  // Retry policy of a task step (call / publish / local).
+  RetryPolicy retry = 5;
+
+  oneof kind {
+    CallStep        call        = 10;
+    PublishStep     publish     = 11;
+    LocalStep       local       = 12;
+    SleepStep       sleep       = 13;
+    WaitEventStep   wait_event  = 14;
+    WaitSignalStep  wait_signal = 15;
+    SubWorkflowStep workflow    = 16;
+    GroupStep       parallel    = 17;
+    GroupStep       sequence    = 18;
+  }
+}
+
+// Expr is a JSONPath-lite path ("$.a.b[0]", "$.list[*].field") resolved
+// against run state, a JSON literal, or an object / list whose members are
+// expressions themselves.
+message Expr {
+  oneof value {
+    string   path    = 1;
+    bytes    literal = 2;  // JSON
+    ExprMap  object  = 3;
+    ExprList list    = 4;
+  }
+}
+
+message ExprMap  { map<string, Expr> fields = 1; }
+message ExprList { repeated Expr items = 1; }
+
+message Predicate {
+  oneof op {
+    Expr          truthy = 1;
+    Predicate     not    = 2;
+    ExprPair      equals = 3;
+    ExprPair      in     = 4;  // left is an element of right (a list)
+    PredicateList and    = 5;
+    PredicateList or     = 6;
+  }
+}
+
+message ExprPair      { Expr left = 1; Expr right = 2; }
+message PredicateList { repeated Predicate items = 1; }
+
+message RetryPolicy {
+  uint32 max_attempts  = 1;  // attempts including the first; 0 = 1
+  int64  base_delay_ms = 2;  // 0 = 200
+  double factor        = 3;  // 0 = 2
+  int64  max_delay_ms  = 4;  // 0 = 5000
+  double jitter        = 5;  // fraction in [0,1]
+}
+
+message CallStep {
+  Expr         service    = 1;
+  Expr         method     = 2;
+  Expr         input      = 3;
+  CallStepOptions opts       = 4;
+  Compensation compensate = 5;
+}
+
+message CallStepOptions {
+  int64       timeout_ms      = 1;
+  string      transport       = 2;  // "" | auto | direct | proxy
+  Expr        idempotency_key = 3;
+  Expr        request_id      = 4;
+  RetryPolicy retry           = 5;  // RPC-level retry inside the SDK client
+}
+
+message PublishStep {
+  Expr           event      = 1;
+  Expr           input      = 2;
+  PublishStepOptions opts       = 3;
+  Compensation   compensate = 4;
+}
+
+message PublishStepOptions {
+  Expr              idempotency_key = 1;
+  Expr              partition_key   = 2;
+  map<string, Expr> headers         = 3;
+}
+
+// Compensation reverses a successful call or publish step. With neither call
+// nor publish set it mirrors the step it is attached to.
+message Compensation {
+  oneof kind {
+    CallCompensation    call    = 1;
+    PublishCompensation publish = 2;
+  }
+  Expr        input = 3;
+  RetryPolicy retry = 4;
+}
+
+message CallCompensation {
+  Expr        service = 1;  // empty = the step's service
+  Expr        method  = 2;
+  CallStepOptions opts    = 3;
+}
+
+message PublishCompensation {
+  Expr           event = 1;  // empty = the step's event
+  PublishStepOptions opts  = 2;
+}
+
+message LocalStep {}
+
+message SleepStep {
+  int64 duration_ms = 1;
+}
+
+message WaitEventStep {
+  string event = 1;
+  // Filter Expression: path → expected value (resolved against run state
+  // when the step parks). All pairs must match.
+  map<string, Expr> filter = 2;
+}
+
+message WaitSignalStep {
+  string signal = 1;
+}
+
+message SubWorkflowStep {
+  Expr  service         = 1;  // empty = the owner service
+  Expr  workflow        = 2;
+  Expr  input           = 3;
+  Expr  idempotency_key = 4;
+  int64 timeout_ms      = 5;
+}
+
+message GroupStep {
+  repeated Step steps    = 1;
+  ForEach       for_each = 2;
+}
+
+message ForEach {
+  string from = 1;  // path resolving to a JSON array
+  string as   = 2;  // name the element is bound to inside the group
+}
+
+// ---------------------------------------------------------------------------
+// Caller side
 // ---------------------------------------------------------------------------
 
 message StartRunRequest {
-  string workflow_name    = 1;
-  bytes  input            = 2;  // JSON-encoded workflow input
-  string idempotency_key  = 3;
-  uint32 timeout_sec      = 4;  // 0 = no global timeout override
-
-  // X-SB-Trace propagation from caller.
-  string x_sb_trace = 5;   // "traceID-parentOpID" canonical format (ADR 0006 §3)
-
-  // parent_run_id — when non-empty, the request originates from a workflow
-  // step on an in-flight parent run. Runtime enforces dynamic cycle
-  // detection (ADR 0003 §7) by walking the ancestor chain via this id.
-  // Empty for top-level starts initiated by external callers.
-  string parent_run_id = 8;
+  string service         = 1;  // owner service name
+  string workflow        = 2;
+  bytes  input           = 3;  // JSON
+  string idempotency_key = 4;
+  int64  timeout_ms      = 5;  // 0 = the definition's timeout
+  string x_sb_trace      = 6;  // "traceID-parentOpID"; empty = new trace
 }
 
 message StartRunResponse {
@@ -57,26 +229,66 @@ message CancelRunRequest {
 message SignalRunRequest {
   string run_id      = 1;
   string signal_name = 2;
-  bytes  payload     = 3;
+  bytes  payload     = 3;  // JSON
+  // Optional idempotency key: a repeated signal with the same id is accepted
+  // without enqueuing it again.
+  string signal_id   = 4;
+}
+
+message SignalRunResponse {
+  bool duplicate = 1;
 }
 
 message QueryRunRequest {
   string run_id = 1;
 }
 
-message QueryRunResponse {
-  string run_id         = 1;
-  string status         = 2;
-  bytes  state          = 3;  // JSON-encoded run state map
-  repeated StepInfo steps = 4;
+message RunSnapshot {
+  string run_id             = 1;
+  string service            = 2;
+  string workflow           = 3;
+  string fingerprint        = 4;
+  // active | compensating | success | failed | cancelled | timed_out | failed_compensated
+  string status             = 5;
+  // '' | step_failure | cancelled | timed_out
+  string stop_reason        = 6;
+  // '' | no_instance | retry | sleep | signal | event | child
+  string waiting_reason     = 7;
+  bytes  input              = 8;
+  bytes  output             = 9;  // JSON state map; set on success
+  string error_code         = 10;
+  string error_message      = 11;
+  string parent_run_id      = 12;
+  int64  started_at_unix_ms = 13;
+  int64  ended_at_unix_ms   = 14;
+  repeated StepInfo      steps   = 15;
+  repeated PendingSignal signals = 16;
 }
 
 message StepInfo {
-  string step_id        = 1;
-  string status         = 2;
-  bytes  output         = 3;
-  string last_error     = 4;
-  string compensated_by = 5;  // step_id of the compensation step, if compensated
+  string step_id             = 1;
+  string parent_step_id      = 2;
+  // call|publish|local|sleep|wait_event|wait_signal|workflow|parallel|sequence|compensate
+  string kind                = 3;
+  // pending | leased | parked | success | failed | compensated
+  string status              = 4;
+  uint32 attempt             = 5;
+  bytes  output              = 6;
+  string error_code          = 7;
+  string error_message       = 8;
+  string waiting_reason      = 9;
+  string wait_key            = 10;  // signal / event name of a wait
+  string child_run_id        = 11;
+  string compensates_step_id = 12;
+  int64  started_at_unix_ms  = 13;
+  int64  ended_at_unix_ms    = 14;
+}
+
+message PendingSignal {
+  string signal_name         = 1;
+  string signal_id           = 2;
+  bytes  payload             = 3;
+  int64  enqueued_at_unix_ms = 4;
 }
 
 message AwaitRunRequest {
@@ -84,131 +296,110 @@ message AwaitRunRequest {
 }
 
 message RunStatusUpdate {
-  string run_id = 1;
-  string status = 2;
-  bytes  state  = 3;  // JSON-encoded final state; non-empty only on terminal status
+  string run_id         = 1;
+  string status         = 2;
+  string waiting_reason = 3;
+  bool   terminal       = 4;
+  bytes  output         = 5;  // JSON state map; set on success
+  string error_code     = 6;
+  string error_message  = 7;
 }
 
 message ReplayRunRequest {
-  string run_id      = 1;
+  string run_id       = 1;
+  // Empty = from the start; otherwise the source's successful steps that do
+  // not depend on this step are copied.
   string from_step_id = 2;
 }
 
 message ReplayRunResponse {
-  string run_id = 1;  // new run id
+  string run_id = 1;
+}
+
+message RetryCompensationRequest {
+  string run_id = 1;
 }
 
 // ---------------------------------------------------------------------------
-// Owner-side messages
+// Owner side
 // ---------------------------------------------------------------------------
 
-message SubscribeRequest {
-  string service_id   = 1;  // UUID
-  string instance_id  = 2;  // UUID
+message SubscribeRequest {}
+
+enum TaskKind {
+  TASK_KIND_UNSPECIFIED = 0;
+  TASK_KIND_LOCAL       = 1;
+  TASK_KIND_CALL        = 2;
+  TASK_KIND_PUBLISH     = 3;
 }
 
-message RunAssignment {
-  string run_id           = 1;
-  string workflow_name    = 2;
-  string fingerprint      = 3;
-  bytes  frozen_plan      = 4;   // canonical JSON graph
-  bytes  input            = 5;   // JSON-encoded workflow input
-  bytes  state            = 6;   // JSON-encoded current state (checkpointed outputs)
-  uint64 lease_epoch      = 7;
-  uint32 max_parallelism  = 8;
+// StepTask leases one attempt of one step to the receiving instance.
+message StepTask {
+  string   task_token       = 1;
+  string   run_id           = 2;
+  string   workflow         = 3;
+  string   version          = 4;  // definition version (locates local functions)
+  string   fingerprint      = 5;
+  string   step_id          = 6;  // concrete id (forEach suffixes included)
+  string   template_step_id = 7;  // id as declared
+  TaskKind kind             = 8;
+  uint32   attempt          = 9;
 
-  // X-SB-Trace propagation — workflow root op.
-  string x_sb_trace = 9;   // "traceID-parentOpID" canonical format (ADR 0006 §3)
+  // call
+  string                 service      = 10;
+  string                 method       = 11;
+  ResolvedCallOptions    call_opts    = 12;
+  // publish
+  string                 event        = 13;
+  ResolvedPublishOptions publish_opts = 14;
+  // call / publish body; JSON
+  bytes                  input        = 15;
+  // local: the run state the function sees; JSON object
+  bytes                  state        = 16;
 
-  // Compensation: if set, SDK must execute compensation steps.
-  bool   compensating  = 12;
-  // cancel_reason mirrors workflow_runs.cancel_reason. Values: '' | 'user_cancel' | 'step_failure'.
-  string cancel_reason = 13;
+  bool   is_compensation     = 17;
+  string compensates_step_id = 18;
+
+  int64  lease_ttl_ms          = 19;
+  int64  heartbeat_interval_ms = 20;
+  // Step deadline; 0 = none. The SDK cancels the execution once it passes.
+  int64  deadline_unix_ms      = 21;
+  // "traceID-rootOpID" of the run.
+  string x_sb_trace            = 22;
 }
 
-message BeginStepRequest {
-  string run_id        = 1;
-  string step_id       = 2;
-  string parent_step_id = 3;  // empty for top-level steps
-  string kind          = 4;   // call|publish|sleep|wait_event|wait_signal|workflow|parallel|sequence|local
-  bytes  input_snapshot = 5;  // JSON-encoded resolved inputs
-  uint64 lease_epoch   = 6;
-  string instance_id   = 7;   // UUID of the claiming SDK instance
+message ResolvedCallOptions {
+  int64       timeout_ms      = 1;
+  string      transport       = 2;
+  string      idempotency_key = 3;
+  string      request_id      = 4;
+  RetryPolicy retry           = 5;
 }
 
-message BeginStepResponse {
-  // If the step was already completed (idempotent replay), cached_output is
-  // non-nil and the SDK must use it without re-executing.
-  bytes  cached_output = 1;
-  bool   already_done  = 2;
-  uint64 lease_epoch   = 3;
+message ResolvedPublishOptions {
+  string              idempotency_key = 1;
+  string              partition_key   = 2;
+  map<string, string> headers         = 3;
 }
 
-message CompleteStepRequest {
-  string run_id        = 1;
-  string step_id       = 2;
-  bytes  output        = 3;   // JSON-encoded step output
-  uint64 lease_epoch   = 4;
+message CompleteTaskRequest {
+  string task_token = 1;
+  bytes  output     = 2;  // JSON
 }
 
-message FailStepRequest {
-  string run_id        = 1;
-  string step_id       = 2;
-  string error_code    = 3;
-  string error_message = 4;
-  uint64 lease_epoch   = 5;
-  bool   retriable     = 6;
-}
-
-message FailStepResponse {
-  // Runtime's decision after the failure.
-  string next_action = 1;  // "retry" | "compensate" | "fail_run"
-  uint32 retry_delay_sec = 2;
-}
-
-message ParkRequest {
-  string run_id      = 1;
-  string step_id     = 2;
-  uint64 lease_epoch = 3;
-
-  oneof wait_spec {
-    SleepSpec       sleep       = 4;
-    EventWaitSpec   event_wait  = 5;
-    SignalWaitSpec  signal_wait = 6;
-    NestedRunSpec   nested_run  = 7;
-  }
-}
-
-message SleepSpec {
-  uint32 duration_sec = 1;
-}
-
-message EventWaitSpec {
-  string event       = 1;
-  string filter_json = 2;  // JSON-encoded {"$.path": "expected"} filter; empty = match all
-  uint32 timeout_sec = 3;  // 0 = no timeout
-}
-
-message SignalWaitSpec {
-  string signal      = 1;
-  uint32 timeout_sec = 2;  // 0 = no timeout
-}
-
-message NestedRunSpec {
-  string child_run_id = 1;
-}
-
-message CompleteRunRequest {
-  string run_id         = 1;
-  bytes  final_state    = 2;   // JSON-encoded final state map (output of last step)
-  uint64 lease_epoch    = 3;
-  // terminal_status: 'success' | 'failed_compensated' | 'cancelled'.
-  // If empty, defaults to 'success'.
-  string terminal_status = 4;
+message FailTaskRequest {
+  string task_token    = 1;
+  string error_code    = 2;
+  string error_message = 3;
+  // non_retriable fails the step at once regardless of its retry policy.
+  bool   non_retriable = 4;
 }
 
 message HeartbeatRequest {
-  string run_id      = 1;
-  string instance_id = 2;  // UUID
-  uint64 lease_epoch = 3;
+  repeated string task_tokens = 1;
+}
+
+message HeartbeatResponse {
+  // Tokens whose lease is gone (expired, stopped, completed).
+  repeated string lost_tokens = 1;
 }

@@ -7,10 +7,9 @@ import { NoLiveInstanceError } from "./rpc/lb";
 import {
 	WorkflowAccessDeniedError,
 	WorkflowNotFoundError,
+	WorkflowRunFailedError,
 	WorkflowTerminalError,
 } from "./workflow/errors";
-import { JsonPathError } from "./workflow/jsonpath";
-import { WorkflowValidationError } from "./workflow/validate";
 
 describe("error hierarchy", () => {
 	const errors: [string, Error][] = [
@@ -22,8 +21,10 @@ describe("error hierarchy", () => {
 		["WorkflowAccessDeniedError", new WorkflowAccessDeniedError("wf", "no")],
 		["WorkflowNotFoundError", new WorkflowNotFoundError("wf")],
 		["WorkflowTerminalError", new WorkflowTerminalError("run-1", "success")],
-		["WorkflowValidationError", new WorkflowValidationError("bad graph")],
-		["JsonPathError", new JsonPathError("unexpected token", "$.[")],
+		[
+			"WorkflowRunFailedError",
+			new WorkflowRunFailedError("run-1", "failed", "X", "boom"),
+		],
 	];
 
 	// The point of the base class: catching SDK failures must not require

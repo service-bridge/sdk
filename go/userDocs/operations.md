@@ -348,13 +348,7 @@ func logging(c *sb.Client) {
 
 В Go вы пишете `time.Duration` (`WithTimeout`, `job.WithLeaseTTL`, `wf.CallOpts.Timeout`, `wf.RetryPolicy.BaseDelay`), а SDK переводит. Где поле уже число, единица стоит в имени: `OccurredAtMs`, `ScheduledAtUnixMs`, `LocalScheduledAtUnixMs`, `UnhealthySinceMs`, `InitialMs`, `MaxMs`, `LeaseTTLMs`.
 
-Секунды встречаются ровно в пяти местах и всегда написаны в имени — это единица контракта workflow, а не опечатка:
-
-- `wf.Control.TimeoutSec`
-- `wf.Definition.TimeoutSec`
-- `wf.Sleep.DurationSec`
-- `wf.StartOpts.TimeoutSec`
-- `sb.WithRunTimeoutSec`
+Длительности workflow — тоже `time.Duration`: `wf.Control.Timeout`, `wf.Definition.Timeout`, `wf.Sleep.Duration`, `sb.WithRunTimeout`.
 
 ---
 

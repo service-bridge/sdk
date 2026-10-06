@@ -80,21 +80,6 @@ function buildClient(role: Role, tag: string): ServiceBridge {
 	});
 }
 
-// The owner-side workflow subscriber only boots on Welcome, and only if a
-// workflow handler is registered at that moment. A warm client is started bare,
-// so without this sentinel its subscriber would never start and runs dispatched
-// to it would hang. The sentinel is never started by anyone (fixed name, no
-// policy permits it); real per-test handlers added later are dispatched because
-// the runner looks handlers up dynamically by name.
-const SENTINEL_WF = "__sb_pool_sentinel__";
-
-function registerWorkflowSentinel(sb: ServiceBridge): void {
-	sb.workflow.handle(SENTINEL_WF, {
-		version: "test-v1",
-		steps: [{ type: "local", id: "noop", fn: async () => ({}) }],
-	});
-}
-
 // connect starts a client and resolves once it is connected (identity() set).
 // Used by the pool and by dedicated clients a test owns and stop()s itself.
 export async function connect(sb: ServiceBridge): Promise<ServiceBridge> {
@@ -133,7 +118,6 @@ export function shared(role: Role = "primary"): Promise<ServiceBridge> {
 	let entry = pool.get(role);
 	if (!entry) {
 		const sb = buildClient(role, role);
-		registerWorkflowSentinel(sb);
 		entry = { sb, ready: connect(sb) };
 		pool.set(role, entry);
 	}

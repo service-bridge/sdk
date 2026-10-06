@@ -1,144 +1,251 @@
-// Workflow graph type system.
-//
-// Per ADR-W-018, `CallStep`/`PublishStep`/`WorkflowStep` compose their options
-// from the owner modules through `TemplatableOpts<T>` — they do not redeclare
-// `transport`/`idempotencyKey`/`requestId`/`retry`/`timeout` and so on.
-// Adding a new field to `CallOpts` (rpc/client.ts) automatically surfaces in
-// `CallStep.opts` without touching workflow code.
+// Workflow definition DSL. A definition is a description: the runtime freezes
+// it, interprets the DAG and leases task steps (local / call / publish /
+// compensation) to an instance of the owner service (runtime ADR 0003).
 //
 // @public — см. ./README.md
 
-import type { PublishOpts } from "../events/publisher";
-import type { CallOpts, RetryOpts } from "../rpc/client";
-import type { CompensateSpec } from "./compensate";
-import type { JsonExpression, Predicate } from "./jsonpath";
-import type { WorkflowStartOpts } from "./start-opts";
+// JsonExpression is resolved by the runtime against run state:
+//   - a string starting with "$" is a JSONPath-lite path ($.a.b, $.list[0],
+//     $.list[*].field);
+//   - { literal: value } is the value itself (escape for strings that start
+//     with "$");
+//   - an array or an object is resolved member by member;
+//   - anything else is a JSON literal.
+export type JsonExpression =
+	| string
+	| number
+	| boolean
+	| null
+	| { literal: unknown }
+	| JsonExpression[]
+	| { [key: string]: JsonExpression };
 
-export type { CompensateSpec } from "./compensate";
-export type { JsonExpression, Predicate } from "./jsonpath";
-export type { WorkflowStartOpts } from "./start-opts";
+// Predicate gates a step through `when`: a path (truthy test) or a
+// combination.
+export type Predicate =
+	| string
+	| { not: Predicate }
+	| { equals: [JsonExpression, JsonExpression] }
+	| { in: [JsonExpression, JsonExpression] }
+	| { and: Predicate[] }
+	| { or: Predicate[] };
 
-// TemplatableOpts<T> — every field of T can be either the original literal
-// type or a JsonExpression (state path that resolves to the same shape).
-// Preserves Partial/optional modifiers because the mapping does not unwrap them.
-export type TemplatableOpts<T> = {
-	[K in keyof T]: T[K] | JsonExpression;
-};
+// RetryPolicy is applied by the runtime: the attempt after n failures waits
+// min(maxDelayMs, baseDelayMs·factor^(n-1))·(1±jitter).
+export interface RetryPolicy {
+	maxAttempts?: number; // attempts including the first; default 1
+	baseDelayMs?: number; // default 200
+	factor?: number; // default 2
+	maxDelayMs?: number; // default 5000
+	jitter?: number; // fraction in [0,1]
+}
 
-export type TemplatableCallOpts = TemplatableOpts<Omit<CallOpts, "signal">>;
-export type TemplatablePublishOpts = TemplatableOpts<PublishOpts>;
-export type TemplatableWorkflowStartOpts = TemplatableOpts<WorkflowStartOpts>;
-
-// StepControlFields — workflow-level fields that govern *the step itself*,
-// NOT the underlying RPC/publish call. These are owned by the workflow module
-// and never duplicate fields that live in CallOpts/PublishOpts/WorkflowStartOpts.
-//
-// `timeoutSec` here is the workflow-control timeout: expiry → run enters
-// `compensating` (ADR-W-007). DIFFERENT from `opts.timeout` (CallOpts) which is
-// the RPC-level timeout — see ADR-W-018 §"Семантика двух timeout'ов".
-export interface StepControlFields {
+export interface StepControl {
 	id: string;
 	waitFor?: string[];
 	when?: Predicate;
-	compensate?: CompensateSpec;
-	timeoutSec?: number;
-	retry?: Partial<RetryOpts>;
+	// Step deadline: on expiry the step fails and the run stops.
+	timeoutMs?: number;
+	// Retry policy of a task step (call / publish / local).
+	retry?: RetryPolicy;
 }
 
-// CallStep — `sb.rpc.call(service, method, input, opts)`. ADR-W-018.
-export interface CallStep extends StepControlFields {
+export interface WorkflowCallOpts {
+	timeoutMs?: number;
+	transport?: "auto" | "direct" | "proxy";
+	idempotencyKey?: JsonExpression;
+	requestId?: JsonExpression;
+	// RPC-level retry inside the client, separate from the step retry.
+	retry?: RetryPolicy;
+}
+
+export interface WorkflowPublishOpts {
+	idempotencyKey?: JsonExpression;
+	partitionKey?: JsonExpression;
+	headers?: Record<string, JsonExpression>;
+}
+
+// Compensation reverses a successful call or publish step when the run stops.
+// Without `type` it mirrors the step; empty targets reuse the step's.
+export interface Compensation {
+	type?: "call" | "publish";
+	service?: JsonExpression;
+	method?: JsonExpression;
+	event?: JsonExpression;
+	input?: JsonExpression;
+	callOpts?: WorkflowCallOpts;
+	publishOpts?: WorkflowPublishOpts;
+	retry?: RetryPolicy;
+}
+
+export interface CallStep extends StepControl {
 	type: "call";
-	service: string | JsonExpression;
-	method: string | JsonExpression;
-	input: JsonExpression;
-	opts?: TemplatableCallOpts;
+	service: JsonExpression;
+	method: JsonExpression;
+	input?: JsonExpression;
+	opts?: WorkflowCallOpts;
+	compensate?: Compensation;
 }
 
-// PublishStep — `sb.event.publish(event, payload, opts)`. ADR-W-018.
-export interface PublishStep extends StepControlFields {
+export interface PublishStep extends StepControl {
 	type: "publish";
-	event: string | JsonExpression;
-	input: JsonExpression;
-	opts?: TemplatablePublishOpts;
+	event: JsonExpression;
+	input?: JsonExpression;
+	opts?: WorkflowPublishOpts;
+	compensate?: Compensation;
 }
 
-// SleepStep — durable timer in runtime.
-export interface SleepStep extends StepControlFields {
+// LocalContext is what a local function receives besides the run state.
+export interface LocalContext {
+	// Aborted when the lease is lost, the step deadline passes or the client stops.
+	signal: AbortSignal;
+	runId: string;
+	stepId: string;
+	attempt: number;
+}
+
+export interface LocalStep extends StepControl {
+	type: "local";
+	fn: (state: Record<string, unknown>, ctx: LocalContext) => unknown;
+}
+
+export interface SleepStep extends StepControl {
 	type: "sleep";
-	durationSec: number;
+	durationMs: number;
 }
 
-// WaitEventStep — park until matching ingested event.
-export interface WaitEventStep extends StepControlFields {
+export interface WaitEventStep extends StepControl {
 	type: "wait_event";
 	event: string;
+	// Filter Expression: payload path → expected value (an expression resolved
+	// when the step parks). All pairs must match.
 	filter?: Record<string, JsonExpression>;
 }
 
-// WaitSignalStep — park until external Signal RPC.
-export interface WaitSignalStep extends StepControlFields {
+export interface WaitSignalStep extends StepControl {
 	type: "wait_signal";
 	signal: string;
 }
 
-// WorkflowStep — `sb.workflow.start(workflow, input, opts)` + completion wait.
-// ADR-W-018.
-export interface WorkflowStep extends StepControlFields {
+export interface WorkflowStep extends StepControl {
 	type: "workflow";
-	workflow: string | JsonExpression;
-	input: JsonExpression;
-	opts?: TemplatableWorkflowStartOpts;
+	// Owner service of the child workflow; default — this service.
+	service?: JsonExpression;
+	workflow: JsonExpression;
+	input?: JsonExpression;
+	idempotencyKey?: JsonExpression;
+	// Child run timeout; default — the child definition's.
+	childTimeoutMs?: number;
 }
 
-// ForEachSpec — dynamic fan-out for parallel/sequence groups.
 export interface ForEachSpec {
-	from: JsonExpression;
-	as: string;
+	from: string; // path resolving to an array
+	as: string; // name the element is bound to inside the group
 }
 
-// ParallelStep — group: all inner steps start at once, completes when all done.
-export interface ParallelStep extends StepControlFields {
+export interface ParallelStep extends StepControl {
 	type: "parallel";
 	steps: Step[];
 	forEach?: ForEachSpec;
 }
 
-// SequenceStep — group: inner steps run one after another.
-export interface SequenceStep extends StepControlFields {
+export interface SequenceStep extends StepControl {
 	type: "sequence";
 	steps: Step[];
 	forEach?: ForEachSpec;
 }
 
-// LocalStep — arbitrary JS executed inside the SDK. Use sparingly.
-export interface LocalStep extends StepControlFields {
-	type: "local";
-	fn: (
-		state: Record<string, unknown>,
-		context: { signal?: AbortSignal },
-	) => Promise<unknown>;
-}
-
 export type Step =
 	| CallStep
 	| PublishStep
+	| LocalStep
 	| SleepStep
 	| WaitEventStep
 	| WaitSignalStep
 	| WorkflowStep
 	| ParallelStep
-	| SequenceStep
-	| LocalStep;
+	| SequenceStep;
 
-// SchemaShape — JSON Schema description for workflow input (ADR-W-009).
-export type SchemaShape = Record<string, unknown>;
-
-// WorkflowDef — passed to `sb.workflow.handle(name, def)`.
+// WorkflowDef is passed to `sb.workflow.handle(name, def)`.
 export interface WorkflowDef {
+	// Identifies the code behind local steps; part of the fingerprint. Bump it
+	// when a local function changes.
 	version?: string;
-	input?: SchemaShape;
+	// JSON Schema of the run input.
+	input?: Record<string, unknown>;
 	steps: Step[];
-	retry?: Partial<RetryOpts>;
+	// Default retry policy of task steps that declare none.
+	retry?: RetryPolicy;
+	// Maximum concurrently executing task steps of one run; 0 = unlimited.
 	maxParallelism?: number;
-	timeoutSec?: number;
+	// Run timeout; ends the run as timed_out.
+	timeoutMs?: number;
+}
+
+export interface WorkflowStartOpts {
+	idempotencyKey?: string;
+	// Run timeout overriding the definition's.
+	timeoutMs?: number;
+}
+
+export interface WorkflowSignalOpts {
+	// Idempotency key: a repeated signal with the same id is not enqueued again.
+	signalId?: string;
+}
+
+export type RunStatus =
+	| "active"
+	| "compensating"
+	| "success"
+	| "failed"
+	| "cancelled"
+	| "timed_out"
+	| "failed_compensated";
+
+export type StepStatus =
+	| "pending"
+	| "leased"
+	| "parked"
+	| "success"
+	| "failed"
+	| "compensated";
+
+export interface StepSnapshot {
+	stepId: string;
+	parentStepId: string;
+	kind: string;
+	status: StepStatus;
+	attempt: number;
+	output: unknown;
+	errorCode: string;
+	errorMessage: string;
+	waitingReason: string;
+	waitKey: string;
+	childRunId: string;
+	compensatesStepId: string;
+	startedAtMs: number;
+	endedAtMs: number;
+}
+
+export interface RunSnapshot {
+	runId: string;
+	service: string;
+	workflow: string;
+	status: RunStatus;
+	stopReason: string;
+	waitingReason: string;
+	input: unknown;
+	output: Record<string, unknown> | null;
+	errorCode: string;
+	errorMessage: string;
+	parentRunId: string;
+	startedAtMs: number;
+	endedAtMs: number;
+	steps: StepSnapshot[];
+	signals: Array<{
+		signalName: string;
+		signalId: string;
+		payload: unknown;
+		enqueuedAtMs: number;
+	}>;
 }

@@ -608,10 +608,10 @@ describe("access-policy (ADR-0004)", () => {
 
 		callee = dedicated("primary");
 		callee.workflow.handle(flowA, {
-			steps: [{ id: "noop", type: "sleep", durationSec: 0 }],
+			steps: [{ id: "noop", type: "sleep", durationMs: 1 }],
 		});
 		callee.workflow.handle(flowB, {
-			steps: [{ id: "noop", type: "sleep", durationSec: 0 }],
+			steps: [{ id: "noop", type: "sleep", durationMs: 1 }],
 		});
 		await connect(callee);
 		await waitFor(() => callee!.identity() !== null, 5_000, "callee connected");

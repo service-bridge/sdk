@@ -22,22 +22,243 @@ import {
 } from "@grpc/grpc-js";
 import { Empty } from "../../google/protobuf/empty";
 
+export enum TaskKind {
+  TASK_KIND_UNSPECIFIED = 0,
+  TASK_KIND_LOCAL = 1,
+  TASK_KIND_CALL = 2,
+  TASK_KIND_PUBLISH = 3,
+  UNRECOGNIZED = -1,
+}
+
+/**
+ * WorkflowDefinition is what an owner declares. The runtime validates it,
+ * freezes it and computes its fingerprint.
+ */
+export interface WorkflowDefinition {
+  name: string;
+  /**
+   * version identifies the executable code behind local steps; it is part of
+   * the fingerprint.
+   */
+  version: string;
+  /** JSON Schema of the run input; empty = any JSON. */
+  inputSchemaJson: Buffer;
+  steps: Step[];
+  /** Default retry policy of task steps that declare none. */
+  retry?:
+    | RetryPolicy
+    | undefined;
+  /** Maximum concurrently leased task steps of one run; 0 = unlimited. */
+  maxParallelism: number;
+  /** Run timeout; 0 = none. StartRunRequest.timeout_ms overrides it. */
+  timeoutMs: number;
+}
+
+export interface Step {
+  /** Lowercase letters, digits and underscores; unique across the graph. */
+  id: string;
+  /** Ids of sibling steps (same group) this step waits for. */
+  waitFor: string[];
+  /** Skip the step (output null) when the predicate is false. */
+  when?:
+    | Predicate
+    | undefined;
+  /** Step deadline; on expiry the step fails and the run stops. 0 = none. */
+  timeoutMs: number;
+  /** Retry policy of a task step (call / publish / local). */
+  retry?: RetryPolicy | undefined;
+  call?: CallStep | undefined;
+  publish?: PublishStep | undefined;
+  local?: LocalStep | undefined;
+  sleep?: SleepStep | undefined;
+  waitEvent?: WaitEventStep | undefined;
+  waitSignal?: WaitSignalStep | undefined;
+  workflow?: SubWorkflowStep | undefined;
+  parallel?: GroupStep | undefined;
+  sequence?: GroupStep | undefined;
+}
+
+/**
+ * Expr is a JSONPath-lite path ("$.a.b[0]", "$.list[*].field") resolved
+ * against run state, a JSON literal, or an object / list whose members are
+ * expressions themselves.
+ */
+export interface Expr {
+  path?:
+    | string
+    | undefined;
+  /** JSON */
+  literal?: Buffer | undefined;
+  object?: ExprMap | undefined;
+  list?: ExprList | undefined;
+}
+
+export interface ExprMap {
+  fields: { [key: string]: Expr };
+}
+
+export interface ExprMap_FieldsEntry {
+  key: string;
+  value?: Expr | undefined;
+}
+
+export interface ExprList {
+  items: Expr[];
+}
+
+export interface Predicate {
+  truthy?: Expr | undefined;
+  not?: Predicate | undefined;
+  equals?:
+    | ExprPair
+    | undefined;
+  /** left is an element of right (a list) */
+  in?: ExprPair | undefined;
+  and?: PredicateList | undefined;
+  or?: PredicateList | undefined;
+}
+
+export interface ExprPair {
+  left?: Expr | undefined;
+  right?: Expr | undefined;
+}
+
+export interface PredicateList {
+  items: Predicate[];
+}
+
+export interface RetryPolicy {
+  /** attempts including the first; 0 = 1 */
+  maxAttempts: number;
+  /** 0 = 200 */
+  baseDelayMs: number;
+  /** 0 = 2 */
+  factor: number;
+  /** 0 = 5000 */
+  maxDelayMs: number;
+  /** fraction in [0,1] */
+  jitter: number;
+}
+
+export interface CallStep {
+  service?: Expr | undefined;
+  method?: Expr | undefined;
+  input?: Expr | undefined;
+  opts?: CallStepOptions | undefined;
+  compensate?: Compensation | undefined;
+}
+
+export interface CallStepOptions {
+  timeoutMs: number;
+  /** "" | auto | direct | proxy */
+  transport: string;
+  idempotencyKey?: Expr | undefined;
+  requestId?:
+    | Expr
+    | undefined;
+  /** RPC-level retry inside the SDK client */
+  retry?: RetryPolicy | undefined;
+}
+
+export interface PublishStep {
+  event?: Expr | undefined;
+  input?: Expr | undefined;
+  opts?: PublishStepOptions | undefined;
+  compensate?: Compensation | undefined;
+}
+
+export interface PublishStepOptions {
+  idempotencyKey?: Expr | undefined;
+  partitionKey?: Expr | undefined;
+  headers: { [key: string]: Expr };
+}
+
+export interface PublishStepOptions_HeadersEntry {
+  key: string;
+  value?: Expr | undefined;
+}
+
+/**
+ * Compensation reverses a successful call or publish step. With neither call
+ * nor publish set it mirrors the step it is attached to.
+ */
+export interface Compensation {
+  call?: CallCompensation | undefined;
+  publish?: PublishCompensation | undefined;
+  input?: Expr | undefined;
+  retry?: RetryPolicy | undefined;
+}
+
+export interface CallCompensation {
+  /** empty = the step's service */
+  service?: Expr | undefined;
+  method?: Expr | undefined;
+  opts?: CallStepOptions | undefined;
+}
+
+export interface PublishCompensation {
+  /** empty = the step's event */
+  event?: Expr | undefined;
+  opts?: PublishStepOptions | undefined;
+}
+
+export interface LocalStep {
+}
+
+export interface SleepStep {
+  durationMs: number;
+}
+
+export interface WaitEventStep {
+  event: string;
+  /**
+   * Filter Expression: path → expected value (resolved against run state
+   * when the step parks). All pairs must match.
+   */
+  filter: { [key: string]: Expr };
+}
+
+export interface WaitEventStep_FilterEntry {
+  key: string;
+  value?: Expr | undefined;
+}
+
+export interface WaitSignalStep {
+  signal: string;
+}
+
+export interface SubWorkflowStep {
+  /** empty = the owner service */
+  service?: Expr | undefined;
+  workflow?: Expr | undefined;
+  input?: Expr | undefined;
+  idempotencyKey?: Expr | undefined;
+  timeoutMs: number;
+}
+
+export interface GroupStep {
+  steps: Step[];
+  forEach?: ForEach | undefined;
+}
+
+export interface ForEach {
+  /** path resolving to a JSON array */
+  from: string;
+  /** name the element is bound to inside the group */
+  as: string;
+}
+
 export interface StartRunRequest {
-  workflowName: string;
-  /** JSON-encoded workflow input */
+  /** owner service name */
+  service: string;
+  workflow: string;
+  /** JSON */
   input: Buffer;
   idempotencyKey: string;
-  /** 0 = no global timeout override */
-  timeoutSec: number;
-  /** X-SB-Trace propagation from caller. */
+  /** 0 = the definition's timeout */
+  timeoutMs: number;
+  /** "traceID-parentOpID"; empty = new trace */
   xSbTrace: string;
-  /**
-   * parent_run_id — when non-empty, the request originates from a workflow
-   * step on an in-flight parent run. Runtime enforces dynamic cycle
-   * detection (ADR 0003 §7) by walking the ancestor chain via this id.
-   * Empty for top-level starts initiated by external callers.
-   */
-  parentRunId: string;
 }
 
 export interface StartRunResponse {
@@ -51,28 +272,71 @@ export interface CancelRunRequest {
 export interface SignalRunRequest {
   runId: string;
   signalName: string;
+  /** JSON */
   payload: Buffer;
+  /**
+   * Optional idempotency key: a repeated signal with the same id is accepted
+   * without enqueuing it again.
+   */
+  signalId: string;
+}
+
+export interface SignalRunResponse {
+  duplicate: boolean;
 }
 
 export interface QueryRunRequest {
   runId: string;
 }
 
-export interface QueryRunResponse {
+export interface RunSnapshot {
   runId: string;
+  service: string;
+  workflow: string;
+  fingerprint: string;
+  /** active | compensating | success | failed | cancelled | timed_out | failed_compensated */
   status: string;
-  /** JSON-encoded run state map */
-  state: Buffer;
+  /** '' | step_failure | cancelled | timed_out */
+  stopReason: string;
+  /** '' | no_instance | retry | sleep | signal | event | child */
+  waitingReason: string;
+  input: Buffer;
+  /** JSON state map; set on success */
+  output: Buffer;
+  errorCode: string;
+  errorMessage: string;
+  parentRunId: string;
+  startedAtUnixMs: number;
+  endedAtUnixMs: number;
   steps: StepInfo[];
+  signals: PendingSignal[];
 }
 
 export interface StepInfo {
   stepId: string;
+  parentStepId: string;
+  /** call|publish|local|sleep|wait_event|wait_signal|workflow|parallel|sequence|compensate */
+  kind: string;
+  /** pending | leased | parked | success | failed | compensated */
   status: string;
+  attempt: number;
   output: Buffer;
-  lastError: string;
-  /** step_id of the compensation step, if compensated */
-  compensatedBy: string;
+  errorCode: string;
+  errorMessage: string;
+  waitingReason: string;
+  /** signal / event name of a wait */
+  waitKey: string;
+  childRunId: string;
+  compensatesStepId: string;
+  startedAtUnixMs: number;
+  endedAtUnixMs: number;
+}
+
+export interface PendingSignal {
+  signalName: string;
+  signalId: string;
+  payload: Buffer;
+  enqueuedAtUnixMs: number;
 }
 
 export interface AwaitRunRequest {
@@ -82,168 +346,2416 @@ export interface AwaitRunRequest {
 export interface RunStatusUpdate {
   runId: string;
   status: string;
-  /** JSON-encoded final state; non-empty only on terminal status */
-  state: Buffer;
+  waitingReason: string;
+  terminal: boolean;
+  /** JSON state map; set on success */
+  output: Buffer;
+  errorCode: string;
+  errorMessage: string;
 }
 
 export interface ReplayRunRequest {
   runId: string;
+  /**
+   * Empty = from the start; otherwise the source's successful steps that do
+   * not depend on this step are copied.
+   */
   fromStepId: string;
 }
 
 export interface ReplayRunResponse {
-  /** new run id */
+  runId: string;
+}
+
+export interface RetryCompensationRequest {
   runId: string;
 }
 
 export interface SubscribeRequest {
-  /** UUID */
-  serviceId: string;
-  /** UUID */
-  instanceId: string;
 }
 
-export interface RunAssignment {
+/** StepTask leases one attempt of one step to the receiving instance. */
+export interface StepTask {
+  taskToken: string;
   runId: string;
-  workflowName: string;
+  workflow: string;
+  /** definition version (locates local functions) */
+  version: string;
   fingerprint: string;
-  /** canonical JSON graph */
-  frozenPlan: Buffer;
-  /** JSON-encoded workflow input */
+  /** concrete id (forEach suffixes included) */
+  stepId: string;
+  /** id as declared */
+  templateStepId: string;
+  kind: TaskKind;
+  attempt: number;
+  /** call */
+  service: string;
+  method: string;
+  callOpts?:
+    | ResolvedCallOptions
+    | undefined;
+  /** publish */
+  event: string;
+  publishOpts?:
+    | ResolvedPublishOptions
+    | undefined;
+  /** call / publish body; JSON */
   input: Buffer;
-  /** JSON-encoded current state (checkpointed outputs) */
+  /** local: the run state the function sees; JSON object */
   state: Buffer;
-  leaseEpoch: number;
-  maxParallelism: number;
-  /** X-SB-Trace propagation — workflow root op. */
+  isCompensation: boolean;
+  compensatesStepId: string;
+  leaseTtlMs: number;
+  heartbeatIntervalMs: number;
+  /** Step deadline; 0 = none. The SDK cancels the execution once it passes. */
+  deadlineUnixMs: number;
+  /** "traceID-rootOpID" of the run. */
   xSbTrace: string;
-  /** Compensation: if set, SDK must execute compensation steps. */
-  compensating: boolean;
-  /** cancel_reason mirrors workflow_runs.cancel_reason. Values: '' | 'user_cancel' | 'step_failure'. */
-  cancelReason: string;
 }
 
-export interface BeginStepRequest {
-  runId: string;
-  stepId: string;
-  /** empty for top-level steps */
-  parentStepId: string;
-  /** call|publish|sleep|wait_event|wait_signal|workflow|parallel|sequence|local */
-  kind: string;
-  /** JSON-encoded resolved inputs */
-  inputSnapshot: Buffer;
-  leaseEpoch: number;
-  /** UUID of the claiming SDK instance */
-  instanceId: string;
+export interface ResolvedCallOptions {
+  timeoutMs: number;
+  transport: string;
+  idempotencyKey: string;
+  requestId: string;
+  retry?: RetryPolicy | undefined;
 }
 
-export interface BeginStepResponse {
-  /**
-   * If the step was already completed (idempotent replay), cached_output is
-   * non-nil and the SDK must use it without re-executing.
-   */
-  cachedOutput: Buffer;
-  alreadyDone: boolean;
-  leaseEpoch: number;
+export interface ResolvedPublishOptions {
+  idempotencyKey: string;
+  partitionKey: string;
+  headers: { [key: string]: string };
 }
 
-export interface CompleteStepRequest {
-  runId: string;
-  stepId: string;
-  /** JSON-encoded step output */
+export interface ResolvedPublishOptions_HeadersEntry {
+  key: string;
+  value: string;
+}
+
+export interface CompleteTaskRequest {
+  taskToken: string;
+  /** JSON */
   output: Buffer;
-  leaseEpoch: number;
 }
 
-export interface FailStepRequest {
-  runId: string;
-  stepId: string;
+export interface FailTaskRequest {
+  taskToken: string;
   errorCode: string;
   errorMessage: string;
-  leaseEpoch: number;
-  retriable: boolean;
-}
-
-export interface FailStepResponse {
-  /** Runtime's decision after the failure. */
-  nextAction: string;
-  retryDelaySec: number;
-}
-
-export interface ParkRequest {
-  runId: string;
-  stepId: string;
-  leaseEpoch: number;
-  sleep?: SleepSpec | undefined;
-  eventWait?: EventWaitSpec | undefined;
-  signalWait?: SignalWaitSpec | undefined;
-  nestedRun?: NestedRunSpec | undefined;
-}
-
-export interface SleepSpec {
-  durationSec: number;
-}
-
-export interface EventWaitSpec {
-  event: string;
-  /** JSON-encoded {"$.path": "expected"} filter; empty = match all */
-  filterJson: string;
-  /** 0 = no timeout */
-  timeoutSec: number;
-}
-
-export interface SignalWaitSpec {
-  signal: string;
-  /** 0 = no timeout */
-  timeoutSec: number;
-}
-
-export interface NestedRunSpec {
-  childRunId: string;
-}
-
-export interface CompleteRunRequest {
-  runId: string;
-  /** JSON-encoded final state map (output of last step) */
-  finalState: Buffer;
-  leaseEpoch: number;
-  /**
-   * terminal_status: 'success' | 'failed_compensated' | 'cancelled'.
-   * If empty, defaults to 'success'.
-   */
-  terminalStatus: string;
+  /** non_retriable fails the step at once regardless of its retry policy. */
+  nonRetriable: boolean;
 }
 
 export interface HeartbeatRequest {
-  runId: string;
-  /** UUID */
-  instanceId: string;
-  leaseEpoch: number;
+  taskTokens: string[];
 }
 
+export interface HeartbeatResponse {
+  /** Tokens whose lease is gone (expired, stopped, completed). */
+  lostTokens: string[];
+}
+
+function createBaseWorkflowDefinition(): WorkflowDefinition {
+  return {
+    name: "",
+    version: "",
+    inputSchemaJson: Buffer.alloc(0),
+    steps: [],
+    retry: undefined,
+    maxParallelism: 0,
+    timeoutMs: 0,
+  };
+}
+
+export const WorkflowDefinition: MessageFns<WorkflowDefinition> = {
+  encode(message: WorkflowDefinition, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.name !== "") {
+      writer.uint32(10).string(message.name);
+    }
+    if (message.version !== "") {
+      writer.uint32(18).string(message.version);
+    }
+    if (message.inputSchemaJson.length !== 0) {
+      writer.uint32(26).bytes(message.inputSchemaJson);
+    }
+    for (const v of message.steps) {
+      Step.encode(v!, writer.uint32(34).fork()).join();
+    }
+    if (message.retry !== undefined) {
+      RetryPolicy.encode(message.retry, writer.uint32(42).fork()).join();
+    }
+    if (message.maxParallelism !== 0) {
+      writer.uint32(48).uint32(message.maxParallelism);
+    }
+    if (message.timeoutMs !== 0) {
+      writer.uint32(56).int64(message.timeoutMs);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): WorkflowDefinition {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseWorkflowDefinition();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.name = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.version = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.inputSchemaJson = Buffer.from(reader.bytes());
+            continue;
+          }
+          case 4: {
+            if (tag !== 34) {
+              break;
+            }
+
+            message.steps.push(Step.decode(reader, reader.uint32()));
+            continue;
+          }
+          case 5: {
+            if (tag !== 42) {
+              break;
+            }
+
+            message.retry = RetryPolicy.decode(reader, reader.uint32());
+            continue;
+          }
+          case 6: {
+            if (tag !== 48) {
+              break;
+            }
+
+            message.maxParallelism = reader.uint32();
+            continue;
+          }
+          case 7: {
+            if (tag !== 56) {
+              break;
+            }
+
+            message.timeoutMs = longToNumber(reader.int64());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<WorkflowDefinition>, I>>(base?: I): WorkflowDefinition {
+    return WorkflowDefinition.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<WorkflowDefinition>, I>>(object: I): WorkflowDefinition {
+    const message = createBaseWorkflowDefinition();
+    message.name = object.name ?? "";
+    message.version = object.version ?? "";
+    message.inputSchemaJson = object.inputSchemaJson ?? Buffer.alloc(0);
+    message.steps = object.steps?.map((e) => Step.fromPartial(e)) || [];
+    message.retry = (object.retry !== undefined && object.retry !== null)
+      ? RetryPolicy.fromPartial(object.retry)
+      : undefined;
+    message.maxParallelism = object.maxParallelism ?? 0;
+    message.timeoutMs = object.timeoutMs ?? 0;
+    return message;
+  },
+};
+
+function createBaseStep(): Step {
+  return {
+    id: "",
+    waitFor: [],
+    when: undefined,
+    timeoutMs: 0,
+    retry: undefined,
+    call: undefined,
+    publish: undefined,
+    local: undefined,
+    sleep: undefined,
+    waitEvent: undefined,
+    waitSignal: undefined,
+    workflow: undefined,
+    parallel: undefined,
+    sequence: undefined,
+  };
+}
+
+export const Step: MessageFns<Step> = {
+  encode(message: Step, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.id !== "") {
+      writer.uint32(10).string(message.id);
+    }
+    for (const v of message.waitFor) {
+      writer.uint32(18).string(v!);
+    }
+    if (message.when !== undefined) {
+      Predicate.encode(message.when, writer.uint32(26).fork()).join();
+    }
+    if (message.timeoutMs !== 0) {
+      writer.uint32(32).int64(message.timeoutMs);
+    }
+    if (message.retry !== undefined) {
+      RetryPolicy.encode(message.retry, writer.uint32(42).fork()).join();
+    }
+    if (message.call !== undefined) {
+      CallStep.encode(message.call, writer.uint32(82).fork()).join();
+    }
+    if (message.publish !== undefined) {
+      PublishStep.encode(message.publish, writer.uint32(90).fork()).join();
+    }
+    if (message.local !== undefined) {
+      LocalStep.encode(message.local, writer.uint32(98).fork()).join();
+    }
+    if (message.sleep !== undefined) {
+      SleepStep.encode(message.sleep, writer.uint32(106).fork()).join();
+    }
+    if (message.waitEvent !== undefined) {
+      WaitEventStep.encode(message.waitEvent, writer.uint32(114).fork()).join();
+    }
+    if (message.waitSignal !== undefined) {
+      WaitSignalStep.encode(message.waitSignal, writer.uint32(122).fork()).join();
+    }
+    if (message.workflow !== undefined) {
+      SubWorkflowStep.encode(message.workflow, writer.uint32(130).fork()).join();
+    }
+    if (message.parallel !== undefined) {
+      GroupStep.encode(message.parallel, writer.uint32(138).fork()).join();
+    }
+    if (message.sequence !== undefined) {
+      GroupStep.encode(message.sequence, writer.uint32(146).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): Step {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseStep();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.id = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.waitFor.push(reader.string());
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.when = Predicate.decode(reader, reader.uint32());
+            continue;
+          }
+          case 4: {
+            if (tag !== 32) {
+              break;
+            }
+
+            message.timeoutMs = longToNumber(reader.int64());
+            continue;
+          }
+          case 5: {
+            if (tag !== 42) {
+              break;
+            }
+
+            message.retry = RetryPolicy.decode(reader, reader.uint32());
+            continue;
+          }
+          case 10: {
+            if (tag !== 82) {
+              break;
+            }
+
+            message.call = CallStep.decode(reader, reader.uint32());
+            continue;
+          }
+          case 11: {
+            if (tag !== 90) {
+              break;
+            }
+
+            message.publish = PublishStep.decode(reader, reader.uint32());
+            continue;
+          }
+          case 12: {
+            if (tag !== 98) {
+              break;
+            }
+
+            message.local = LocalStep.decode(reader, reader.uint32());
+            continue;
+          }
+          case 13: {
+            if (tag !== 106) {
+              break;
+            }
+
+            message.sleep = SleepStep.decode(reader, reader.uint32());
+            continue;
+          }
+          case 14: {
+            if (tag !== 114) {
+              break;
+            }
+
+            message.waitEvent = WaitEventStep.decode(reader, reader.uint32());
+            continue;
+          }
+          case 15: {
+            if (tag !== 122) {
+              break;
+            }
+
+            message.waitSignal = WaitSignalStep.decode(reader, reader.uint32());
+            continue;
+          }
+          case 16: {
+            if (tag !== 130) {
+              break;
+            }
+
+            message.workflow = SubWorkflowStep.decode(reader, reader.uint32());
+            continue;
+          }
+          case 17: {
+            if (tag !== 138) {
+              break;
+            }
+
+            message.parallel = GroupStep.decode(reader, reader.uint32());
+            continue;
+          }
+          case 18: {
+            if (tag !== 146) {
+              break;
+            }
+
+            message.sequence = GroupStep.decode(reader, reader.uint32());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<Step>, I>>(base?: I): Step {
+    return Step.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<Step>, I>>(object: I): Step {
+    const message = createBaseStep();
+    message.id = object.id ?? "";
+    message.waitFor = object.waitFor?.map((e) => e) || [];
+    message.when = (object.when !== undefined && object.when !== null) ? Predicate.fromPartial(object.when) : undefined;
+    message.timeoutMs = object.timeoutMs ?? 0;
+    message.retry = (object.retry !== undefined && object.retry !== null)
+      ? RetryPolicy.fromPartial(object.retry)
+      : undefined;
+    message.call = (object.call !== undefined && object.call !== null) ? CallStep.fromPartial(object.call) : undefined;
+    message.publish = (object.publish !== undefined && object.publish !== null)
+      ? PublishStep.fromPartial(object.publish)
+      : undefined;
+    message.local = (object.local !== undefined && object.local !== null)
+      ? LocalStep.fromPartial(object.local)
+      : undefined;
+    message.sleep = (object.sleep !== undefined && object.sleep !== null)
+      ? SleepStep.fromPartial(object.sleep)
+      : undefined;
+    message.waitEvent = (object.waitEvent !== undefined && object.waitEvent !== null)
+      ? WaitEventStep.fromPartial(object.waitEvent)
+      : undefined;
+    message.waitSignal = (object.waitSignal !== undefined && object.waitSignal !== null)
+      ? WaitSignalStep.fromPartial(object.waitSignal)
+      : undefined;
+    message.workflow = (object.workflow !== undefined && object.workflow !== null)
+      ? SubWorkflowStep.fromPartial(object.workflow)
+      : undefined;
+    message.parallel = (object.parallel !== undefined && object.parallel !== null)
+      ? GroupStep.fromPartial(object.parallel)
+      : undefined;
+    message.sequence = (object.sequence !== undefined && object.sequence !== null)
+      ? GroupStep.fromPartial(object.sequence)
+      : undefined;
+    return message;
+  },
+};
+
+function createBaseExpr(): Expr {
+  return { path: undefined, literal: undefined, object: undefined, list: undefined };
+}
+
+export const Expr: MessageFns<Expr> = {
+  encode(message: Expr, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.path !== undefined) {
+      writer.uint32(10).string(message.path);
+    }
+    if (message.literal !== undefined) {
+      writer.uint32(18).bytes(message.literal);
+    }
+    if (message.object !== undefined) {
+      ExprMap.encode(message.object, writer.uint32(26).fork()).join();
+    }
+    if (message.list !== undefined) {
+      ExprList.encode(message.list, writer.uint32(34).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): Expr {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseExpr();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.path = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.literal = Buffer.from(reader.bytes());
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.object = ExprMap.decode(reader, reader.uint32());
+            continue;
+          }
+          case 4: {
+            if (tag !== 34) {
+              break;
+            }
+
+            message.list = ExprList.decode(reader, reader.uint32());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<Expr>, I>>(base?: I): Expr {
+    return Expr.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<Expr>, I>>(object: I): Expr {
+    const message = createBaseExpr();
+    message.path = object.path ?? undefined;
+    message.literal = object.literal ?? undefined;
+    message.object = (object.object !== undefined && object.object !== null)
+      ? ExprMap.fromPartial(object.object)
+      : undefined;
+    message.list = (object.list !== undefined && object.list !== null) ? ExprList.fromPartial(object.list) : undefined;
+    return message;
+  },
+};
+
+function createBaseExprMap(): ExprMap {
+  return { fields: {} };
+}
+
+export const ExprMap: MessageFns<ExprMap> = {
+  encode(message: ExprMap, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    globalThis.Object.entries(message.fields).forEach(([key, value]: [string, Expr]) => {
+      ExprMap_FieldsEntry.encode({ key: key as any, value }, writer.uint32(10).fork()).join();
+    });
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ExprMap {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseExprMap();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            const entry1 = ExprMap_FieldsEntry.decode(reader, reader.uint32());
+            if (entry1.value !== undefined) {
+              message.fields[entry1.key] = entry1.value;
+            }
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<ExprMap>, I>>(base?: I): ExprMap {
+    return ExprMap.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ExprMap>, I>>(object: I): ExprMap {
+    const message = createBaseExprMap();
+    message.fields = (globalThis.Object.entries(object.fields ?? {}) as [string, Expr][]).reduce(
+      (acc: { [key: string]: Expr }, [key, value]: [string, Expr]) => {
+        if (value !== undefined) {
+          acc[key] = Expr.fromPartial(value);
+        }
+        return acc;
+      },
+      {},
+    );
+    return message;
+  },
+};
+
+function createBaseExprMap_FieldsEntry(): ExprMap_FieldsEntry {
+  return { key: "", value: undefined };
+}
+
+export const ExprMap_FieldsEntry: MessageFns<ExprMap_FieldsEntry> = {
+  encode(message: ExprMap_FieldsEntry, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.key !== "") {
+      writer.uint32(10).string(message.key);
+    }
+    if (message.value !== undefined) {
+      Expr.encode(message.value, writer.uint32(18).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ExprMap_FieldsEntry {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseExprMap_FieldsEntry();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.key = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.value = Expr.decode(reader, reader.uint32());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<ExprMap_FieldsEntry>, I>>(base?: I): ExprMap_FieldsEntry {
+    return ExprMap_FieldsEntry.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ExprMap_FieldsEntry>, I>>(object: I): ExprMap_FieldsEntry {
+    const message = createBaseExprMap_FieldsEntry();
+    message.key = object.key ?? "";
+    message.value = (object.value !== undefined && object.value !== null) ? Expr.fromPartial(object.value) : undefined;
+    return message;
+  },
+};
+
+function createBaseExprList(): ExprList {
+  return { items: [] };
+}
+
+export const ExprList: MessageFns<ExprList> = {
+  encode(message: ExprList, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.items) {
+      Expr.encode(v!, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ExprList {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseExprList();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.items.push(Expr.decode(reader, reader.uint32()));
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<ExprList>, I>>(base?: I): ExprList {
+    return ExprList.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ExprList>, I>>(object: I): ExprList {
+    const message = createBaseExprList();
+    message.items = object.items?.map((e) => Expr.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBasePredicate(): Predicate {
+  return { truthy: undefined, not: undefined, equals: undefined, in: undefined, and: undefined, or: undefined };
+}
+
+export const Predicate: MessageFns<Predicate> = {
+  encode(message: Predicate, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.truthy !== undefined) {
+      Expr.encode(message.truthy, writer.uint32(10).fork()).join();
+    }
+    if (message.not !== undefined) {
+      Predicate.encode(message.not, writer.uint32(18).fork()).join();
+    }
+    if (message.equals !== undefined) {
+      ExprPair.encode(message.equals, writer.uint32(26).fork()).join();
+    }
+    if (message.in !== undefined) {
+      ExprPair.encode(message.in, writer.uint32(34).fork()).join();
+    }
+    if (message.and !== undefined) {
+      PredicateList.encode(message.and, writer.uint32(42).fork()).join();
+    }
+    if (message.or !== undefined) {
+      PredicateList.encode(message.or, writer.uint32(50).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): Predicate {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBasePredicate();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.truthy = Expr.decode(reader, reader.uint32());
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.not = Predicate.decode(reader, reader.uint32());
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.equals = ExprPair.decode(reader, reader.uint32());
+            continue;
+          }
+          case 4: {
+            if (tag !== 34) {
+              break;
+            }
+
+            message.in = ExprPair.decode(reader, reader.uint32());
+            continue;
+          }
+          case 5: {
+            if (tag !== 42) {
+              break;
+            }
+
+            message.and = PredicateList.decode(reader, reader.uint32());
+            continue;
+          }
+          case 6: {
+            if (tag !== 50) {
+              break;
+            }
+
+            message.or = PredicateList.decode(reader, reader.uint32());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<Predicate>, I>>(base?: I): Predicate {
+    return Predicate.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<Predicate>, I>>(object: I): Predicate {
+    const message = createBasePredicate();
+    message.truthy = (object.truthy !== undefined && object.truthy !== null)
+      ? Expr.fromPartial(object.truthy)
+      : undefined;
+    message.not = (object.not !== undefined && object.not !== null) ? Predicate.fromPartial(object.not) : undefined;
+    message.equals = (object.equals !== undefined && object.equals !== null)
+      ? ExprPair.fromPartial(object.equals)
+      : undefined;
+    message.in = (object.in !== undefined && object.in !== null) ? ExprPair.fromPartial(object.in) : undefined;
+    message.and = (object.and !== undefined && object.and !== null) ? PredicateList.fromPartial(object.and) : undefined;
+    message.or = (object.or !== undefined && object.or !== null) ? PredicateList.fromPartial(object.or) : undefined;
+    return message;
+  },
+};
+
+function createBaseExprPair(): ExprPair {
+  return { left: undefined, right: undefined };
+}
+
+export const ExprPair: MessageFns<ExprPair> = {
+  encode(message: ExprPair, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.left !== undefined) {
+      Expr.encode(message.left, writer.uint32(10).fork()).join();
+    }
+    if (message.right !== undefined) {
+      Expr.encode(message.right, writer.uint32(18).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ExprPair {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseExprPair();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.left = Expr.decode(reader, reader.uint32());
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.right = Expr.decode(reader, reader.uint32());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<ExprPair>, I>>(base?: I): ExprPair {
+    return ExprPair.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ExprPair>, I>>(object: I): ExprPair {
+    const message = createBaseExprPair();
+    message.left = (object.left !== undefined && object.left !== null) ? Expr.fromPartial(object.left) : undefined;
+    message.right = (object.right !== undefined && object.right !== null) ? Expr.fromPartial(object.right) : undefined;
+    return message;
+  },
+};
+
+function createBasePredicateList(): PredicateList {
+  return { items: [] };
+}
+
+export const PredicateList: MessageFns<PredicateList> = {
+  encode(message: PredicateList, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.items) {
+      Predicate.encode(v!, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PredicateList {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBasePredicateList();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.items.push(Predicate.decode(reader, reader.uint32()));
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<PredicateList>, I>>(base?: I): PredicateList {
+    return PredicateList.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<PredicateList>, I>>(object: I): PredicateList {
+    const message = createBasePredicateList();
+    message.items = object.items?.map((e) => Predicate.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseRetryPolicy(): RetryPolicy {
+  return { maxAttempts: 0, baseDelayMs: 0, factor: 0, maxDelayMs: 0, jitter: 0 };
+}
+
+export const RetryPolicy: MessageFns<RetryPolicy> = {
+  encode(message: RetryPolicy, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.maxAttempts !== 0) {
+      writer.uint32(8).uint32(message.maxAttempts);
+    }
+    if (message.baseDelayMs !== 0) {
+      writer.uint32(16).int64(message.baseDelayMs);
+    }
+    if (message.factor !== 0) {
+      writer.uint32(25).double(message.factor);
+    }
+    if (message.maxDelayMs !== 0) {
+      writer.uint32(32).int64(message.maxDelayMs);
+    }
+    if (message.jitter !== 0) {
+      writer.uint32(41).double(message.jitter);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): RetryPolicy {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseRetryPolicy();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 8) {
+              break;
+            }
+
+            message.maxAttempts = reader.uint32();
+            continue;
+          }
+          case 2: {
+            if (tag !== 16) {
+              break;
+            }
+
+            message.baseDelayMs = longToNumber(reader.int64());
+            continue;
+          }
+          case 3: {
+            if (tag !== 25) {
+              break;
+            }
+
+            message.factor = reader.double();
+            continue;
+          }
+          case 4: {
+            if (tag !== 32) {
+              break;
+            }
+
+            message.maxDelayMs = longToNumber(reader.int64());
+            continue;
+          }
+          case 5: {
+            if (tag !== 41) {
+              break;
+            }
+
+            message.jitter = reader.double();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<RetryPolicy>, I>>(base?: I): RetryPolicy {
+    return RetryPolicy.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<RetryPolicy>, I>>(object: I): RetryPolicy {
+    const message = createBaseRetryPolicy();
+    message.maxAttempts = object.maxAttempts ?? 0;
+    message.baseDelayMs = object.baseDelayMs ?? 0;
+    message.factor = object.factor ?? 0;
+    message.maxDelayMs = object.maxDelayMs ?? 0;
+    message.jitter = object.jitter ?? 0;
+    return message;
+  },
+};
+
+function createBaseCallStep(): CallStep {
+  return { service: undefined, method: undefined, input: undefined, opts: undefined, compensate: undefined };
+}
+
+export const CallStep: MessageFns<CallStep> = {
+  encode(message: CallStep, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.service !== undefined) {
+      Expr.encode(message.service, writer.uint32(10).fork()).join();
+    }
+    if (message.method !== undefined) {
+      Expr.encode(message.method, writer.uint32(18).fork()).join();
+    }
+    if (message.input !== undefined) {
+      Expr.encode(message.input, writer.uint32(26).fork()).join();
+    }
+    if (message.opts !== undefined) {
+      CallStepOptions.encode(message.opts, writer.uint32(34).fork()).join();
+    }
+    if (message.compensate !== undefined) {
+      Compensation.encode(message.compensate, writer.uint32(42).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): CallStep {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseCallStep();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.service = Expr.decode(reader, reader.uint32());
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.method = Expr.decode(reader, reader.uint32());
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.input = Expr.decode(reader, reader.uint32());
+            continue;
+          }
+          case 4: {
+            if (tag !== 34) {
+              break;
+            }
+
+            message.opts = CallStepOptions.decode(reader, reader.uint32());
+            continue;
+          }
+          case 5: {
+            if (tag !== 42) {
+              break;
+            }
+
+            message.compensate = Compensation.decode(reader, reader.uint32());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<CallStep>, I>>(base?: I): CallStep {
+    return CallStep.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<CallStep>, I>>(object: I): CallStep {
+    const message = createBaseCallStep();
+    message.service = (object.service !== undefined && object.service !== null)
+      ? Expr.fromPartial(object.service)
+      : undefined;
+    message.method = (object.method !== undefined && object.method !== null)
+      ? Expr.fromPartial(object.method)
+      : undefined;
+    message.input = (object.input !== undefined && object.input !== null) ? Expr.fromPartial(object.input) : undefined;
+    message.opts = (object.opts !== undefined && object.opts !== null)
+      ? CallStepOptions.fromPartial(object.opts)
+      : undefined;
+    message.compensate = (object.compensate !== undefined && object.compensate !== null)
+      ? Compensation.fromPartial(object.compensate)
+      : undefined;
+    return message;
+  },
+};
+
+function createBaseCallStepOptions(): CallStepOptions {
+  return { timeoutMs: 0, transport: "", idempotencyKey: undefined, requestId: undefined, retry: undefined };
+}
+
+export const CallStepOptions: MessageFns<CallStepOptions> = {
+  encode(message: CallStepOptions, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.timeoutMs !== 0) {
+      writer.uint32(8).int64(message.timeoutMs);
+    }
+    if (message.transport !== "") {
+      writer.uint32(18).string(message.transport);
+    }
+    if (message.idempotencyKey !== undefined) {
+      Expr.encode(message.idempotencyKey, writer.uint32(26).fork()).join();
+    }
+    if (message.requestId !== undefined) {
+      Expr.encode(message.requestId, writer.uint32(34).fork()).join();
+    }
+    if (message.retry !== undefined) {
+      RetryPolicy.encode(message.retry, writer.uint32(42).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): CallStepOptions {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseCallStepOptions();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 8) {
+              break;
+            }
+
+            message.timeoutMs = longToNumber(reader.int64());
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.transport = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.idempotencyKey = Expr.decode(reader, reader.uint32());
+            continue;
+          }
+          case 4: {
+            if (tag !== 34) {
+              break;
+            }
+
+            message.requestId = Expr.decode(reader, reader.uint32());
+            continue;
+          }
+          case 5: {
+            if (tag !== 42) {
+              break;
+            }
+
+            message.retry = RetryPolicy.decode(reader, reader.uint32());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<CallStepOptions>, I>>(base?: I): CallStepOptions {
+    return CallStepOptions.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<CallStepOptions>, I>>(object: I): CallStepOptions {
+    const message = createBaseCallStepOptions();
+    message.timeoutMs = object.timeoutMs ?? 0;
+    message.transport = object.transport ?? "";
+    message.idempotencyKey = (object.idempotencyKey !== undefined && object.idempotencyKey !== null)
+      ? Expr.fromPartial(object.idempotencyKey)
+      : undefined;
+    message.requestId = (object.requestId !== undefined && object.requestId !== null)
+      ? Expr.fromPartial(object.requestId)
+      : undefined;
+    message.retry = (object.retry !== undefined && object.retry !== null)
+      ? RetryPolicy.fromPartial(object.retry)
+      : undefined;
+    return message;
+  },
+};
+
+function createBasePublishStep(): PublishStep {
+  return { event: undefined, input: undefined, opts: undefined, compensate: undefined };
+}
+
+export const PublishStep: MessageFns<PublishStep> = {
+  encode(message: PublishStep, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.event !== undefined) {
+      Expr.encode(message.event, writer.uint32(10).fork()).join();
+    }
+    if (message.input !== undefined) {
+      Expr.encode(message.input, writer.uint32(18).fork()).join();
+    }
+    if (message.opts !== undefined) {
+      PublishStepOptions.encode(message.opts, writer.uint32(26).fork()).join();
+    }
+    if (message.compensate !== undefined) {
+      Compensation.encode(message.compensate, writer.uint32(34).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PublishStep {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBasePublishStep();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.event = Expr.decode(reader, reader.uint32());
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.input = Expr.decode(reader, reader.uint32());
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.opts = PublishStepOptions.decode(reader, reader.uint32());
+            continue;
+          }
+          case 4: {
+            if (tag !== 34) {
+              break;
+            }
+
+            message.compensate = Compensation.decode(reader, reader.uint32());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<PublishStep>, I>>(base?: I): PublishStep {
+    return PublishStep.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<PublishStep>, I>>(object: I): PublishStep {
+    const message = createBasePublishStep();
+    message.event = (object.event !== undefined && object.event !== null) ? Expr.fromPartial(object.event) : undefined;
+    message.input = (object.input !== undefined && object.input !== null) ? Expr.fromPartial(object.input) : undefined;
+    message.opts = (object.opts !== undefined && object.opts !== null)
+      ? PublishStepOptions.fromPartial(object.opts)
+      : undefined;
+    message.compensate = (object.compensate !== undefined && object.compensate !== null)
+      ? Compensation.fromPartial(object.compensate)
+      : undefined;
+    return message;
+  },
+};
+
+function createBasePublishStepOptions(): PublishStepOptions {
+  return { idempotencyKey: undefined, partitionKey: undefined, headers: {} };
+}
+
+export const PublishStepOptions: MessageFns<PublishStepOptions> = {
+  encode(message: PublishStepOptions, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.idempotencyKey !== undefined) {
+      Expr.encode(message.idempotencyKey, writer.uint32(10).fork()).join();
+    }
+    if (message.partitionKey !== undefined) {
+      Expr.encode(message.partitionKey, writer.uint32(18).fork()).join();
+    }
+    globalThis.Object.entries(message.headers).forEach(([key, value]: [string, Expr]) => {
+      PublishStepOptions_HeadersEntry.encode({ key: key as any, value }, writer.uint32(26).fork()).join();
+    });
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PublishStepOptions {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBasePublishStepOptions();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.idempotencyKey = Expr.decode(reader, reader.uint32());
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.partitionKey = Expr.decode(reader, reader.uint32());
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            const entry3 = PublishStepOptions_HeadersEntry.decode(reader, reader.uint32());
+            if (entry3.value !== undefined) {
+              message.headers[entry3.key] = entry3.value;
+            }
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<PublishStepOptions>, I>>(base?: I): PublishStepOptions {
+    return PublishStepOptions.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<PublishStepOptions>, I>>(object: I): PublishStepOptions {
+    const message = createBasePublishStepOptions();
+    message.idempotencyKey = (object.idempotencyKey !== undefined && object.idempotencyKey !== null)
+      ? Expr.fromPartial(object.idempotencyKey)
+      : undefined;
+    message.partitionKey = (object.partitionKey !== undefined && object.partitionKey !== null)
+      ? Expr.fromPartial(object.partitionKey)
+      : undefined;
+    message.headers = (globalThis.Object.entries(object.headers ?? {}) as [string, Expr][]).reduce(
+      (acc: { [key: string]: Expr }, [key, value]: [string, Expr]) => {
+        if (value !== undefined) {
+          acc[key] = Expr.fromPartial(value);
+        }
+        return acc;
+      },
+      {},
+    );
+    return message;
+  },
+};
+
+function createBasePublishStepOptions_HeadersEntry(): PublishStepOptions_HeadersEntry {
+  return { key: "", value: undefined };
+}
+
+export const PublishStepOptions_HeadersEntry: MessageFns<PublishStepOptions_HeadersEntry> = {
+  encode(message: PublishStepOptions_HeadersEntry, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.key !== "") {
+      writer.uint32(10).string(message.key);
+    }
+    if (message.value !== undefined) {
+      Expr.encode(message.value, writer.uint32(18).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PublishStepOptions_HeadersEntry {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBasePublishStepOptions_HeadersEntry();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.key = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.value = Expr.decode(reader, reader.uint32());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<PublishStepOptions_HeadersEntry>, I>>(base?: I): PublishStepOptions_HeadersEntry {
+    return PublishStepOptions_HeadersEntry.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<PublishStepOptions_HeadersEntry>, I>>(
+    object: I,
+  ): PublishStepOptions_HeadersEntry {
+    const message = createBasePublishStepOptions_HeadersEntry();
+    message.key = object.key ?? "";
+    message.value = (object.value !== undefined && object.value !== null) ? Expr.fromPartial(object.value) : undefined;
+    return message;
+  },
+};
+
+function createBaseCompensation(): Compensation {
+  return { call: undefined, publish: undefined, input: undefined, retry: undefined };
+}
+
+export const Compensation: MessageFns<Compensation> = {
+  encode(message: Compensation, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.call !== undefined) {
+      CallCompensation.encode(message.call, writer.uint32(10).fork()).join();
+    }
+    if (message.publish !== undefined) {
+      PublishCompensation.encode(message.publish, writer.uint32(18).fork()).join();
+    }
+    if (message.input !== undefined) {
+      Expr.encode(message.input, writer.uint32(26).fork()).join();
+    }
+    if (message.retry !== undefined) {
+      RetryPolicy.encode(message.retry, writer.uint32(34).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): Compensation {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseCompensation();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.call = CallCompensation.decode(reader, reader.uint32());
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.publish = PublishCompensation.decode(reader, reader.uint32());
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.input = Expr.decode(reader, reader.uint32());
+            continue;
+          }
+          case 4: {
+            if (tag !== 34) {
+              break;
+            }
+
+            message.retry = RetryPolicy.decode(reader, reader.uint32());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<Compensation>, I>>(base?: I): Compensation {
+    return Compensation.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<Compensation>, I>>(object: I): Compensation {
+    const message = createBaseCompensation();
+    message.call = (object.call !== undefined && object.call !== null)
+      ? CallCompensation.fromPartial(object.call)
+      : undefined;
+    message.publish = (object.publish !== undefined && object.publish !== null)
+      ? PublishCompensation.fromPartial(object.publish)
+      : undefined;
+    message.input = (object.input !== undefined && object.input !== null) ? Expr.fromPartial(object.input) : undefined;
+    message.retry = (object.retry !== undefined && object.retry !== null)
+      ? RetryPolicy.fromPartial(object.retry)
+      : undefined;
+    return message;
+  },
+};
+
+function createBaseCallCompensation(): CallCompensation {
+  return { service: undefined, method: undefined, opts: undefined };
+}
+
+export const CallCompensation: MessageFns<CallCompensation> = {
+  encode(message: CallCompensation, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.service !== undefined) {
+      Expr.encode(message.service, writer.uint32(10).fork()).join();
+    }
+    if (message.method !== undefined) {
+      Expr.encode(message.method, writer.uint32(18).fork()).join();
+    }
+    if (message.opts !== undefined) {
+      CallStepOptions.encode(message.opts, writer.uint32(26).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): CallCompensation {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseCallCompensation();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.service = Expr.decode(reader, reader.uint32());
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.method = Expr.decode(reader, reader.uint32());
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.opts = CallStepOptions.decode(reader, reader.uint32());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<CallCompensation>, I>>(base?: I): CallCompensation {
+    return CallCompensation.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<CallCompensation>, I>>(object: I): CallCompensation {
+    const message = createBaseCallCompensation();
+    message.service = (object.service !== undefined && object.service !== null)
+      ? Expr.fromPartial(object.service)
+      : undefined;
+    message.method = (object.method !== undefined && object.method !== null)
+      ? Expr.fromPartial(object.method)
+      : undefined;
+    message.opts = (object.opts !== undefined && object.opts !== null)
+      ? CallStepOptions.fromPartial(object.opts)
+      : undefined;
+    return message;
+  },
+};
+
+function createBasePublishCompensation(): PublishCompensation {
+  return { event: undefined, opts: undefined };
+}
+
+export const PublishCompensation: MessageFns<PublishCompensation> = {
+  encode(message: PublishCompensation, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.event !== undefined) {
+      Expr.encode(message.event, writer.uint32(10).fork()).join();
+    }
+    if (message.opts !== undefined) {
+      PublishStepOptions.encode(message.opts, writer.uint32(18).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PublishCompensation {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBasePublishCompensation();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.event = Expr.decode(reader, reader.uint32());
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.opts = PublishStepOptions.decode(reader, reader.uint32());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<PublishCompensation>, I>>(base?: I): PublishCompensation {
+    return PublishCompensation.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<PublishCompensation>, I>>(object: I): PublishCompensation {
+    const message = createBasePublishCompensation();
+    message.event = (object.event !== undefined && object.event !== null) ? Expr.fromPartial(object.event) : undefined;
+    message.opts = (object.opts !== undefined && object.opts !== null)
+      ? PublishStepOptions.fromPartial(object.opts)
+      : undefined;
+    return message;
+  },
+};
+
+function createBaseLocalStep(): LocalStep {
+  return {};
+}
+
+export const LocalStep: MessageFns<LocalStep> = {
+  encode(_: LocalStep, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): LocalStep {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseLocalStep();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<LocalStep>, I>>(base?: I): LocalStep {
+    return LocalStep.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<LocalStep>, I>>(_: I): LocalStep {
+    const message = createBaseLocalStep();
+    return message;
+  },
+};
+
+function createBaseSleepStep(): SleepStep {
+  return { durationMs: 0 };
+}
+
+export const SleepStep: MessageFns<SleepStep> = {
+  encode(message: SleepStep, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.durationMs !== 0) {
+      writer.uint32(8).int64(message.durationMs);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SleepStep {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSleepStep();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 8) {
+              break;
+            }
+
+            message.durationMs = longToNumber(reader.int64());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<SleepStep>, I>>(base?: I): SleepStep {
+    return SleepStep.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SleepStep>, I>>(object: I): SleepStep {
+    const message = createBaseSleepStep();
+    message.durationMs = object.durationMs ?? 0;
+    return message;
+  },
+};
+
+function createBaseWaitEventStep(): WaitEventStep {
+  return { event: "", filter: {} };
+}
+
+export const WaitEventStep: MessageFns<WaitEventStep> = {
+  encode(message: WaitEventStep, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.event !== "") {
+      writer.uint32(10).string(message.event);
+    }
+    globalThis.Object.entries(message.filter).forEach(([key, value]: [string, Expr]) => {
+      WaitEventStep_FilterEntry.encode({ key: key as any, value }, writer.uint32(18).fork()).join();
+    });
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): WaitEventStep {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseWaitEventStep();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.event = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            const entry2 = WaitEventStep_FilterEntry.decode(reader, reader.uint32());
+            if (entry2.value !== undefined) {
+              message.filter[entry2.key] = entry2.value;
+            }
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<WaitEventStep>, I>>(base?: I): WaitEventStep {
+    return WaitEventStep.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<WaitEventStep>, I>>(object: I): WaitEventStep {
+    const message = createBaseWaitEventStep();
+    message.event = object.event ?? "";
+    message.filter = (globalThis.Object.entries(object.filter ?? {}) as [string, Expr][]).reduce(
+      (acc: { [key: string]: Expr }, [key, value]: [string, Expr]) => {
+        if (value !== undefined) {
+          acc[key] = Expr.fromPartial(value);
+        }
+        return acc;
+      },
+      {},
+    );
+    return message;
+  },
+};
+
+function createBaseWaitEventStep_FilterEntry(): WaitEventStep_FilterEntry {
+  return { key: "", value: undefined };
+}
+
+export const WaitEventStep_FilterEntry: MessageFns<WaitEventStep_FilterEntry> = {
+  encode(message: WaitEventStep_FilterEntry, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.key !== "") {
+      writer.uint32(10).string(message.key);
+    }
+    if (message.value !== undefined) {
+      Expr.encode(message.value, writer.uint32(18).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): WaitEventStep_FilterEntry {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseWaitEventStep_FilterEntry();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.key = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.value = Expr.decode(reader, reader.uint32());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<WaitEventStep_FilterEntry>, I>>(base?: I): WaitEventStep_FilterEntry {
+    return WaitEventStep_FilterEntry.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<WaitEventStep_FilterEntry>, I>>(object: I): WaitEventStep_FilterEntry {
+    const message = createBaseWaitEventStep_FilterEntry();
+    message.key = object.key ?? "";
+    message.value = (object.value !== undefined && object.value !== null) ? Expr.fromPartial(object.value) : undefined;
+    return message;
+  },
+};
+
+function createBaseWaitSignalStep(): WaitSignalStep {
+  return { signal: "" };
+}
+
+export const WaitSignalStep: MessageFns<WaitSignalStep> = {
+  encode(message: WaitSignalStep, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.signal !== "") {
+      writer.uint32(10).string(message.signal);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): WaitSignalStep {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseWaitSignalStep();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.signal = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<WaitSignalStep>, I>>(base?: I): WaitSignalStep {
+    return WaitSignalStep.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<WaitSignalStep>, I>>(object: I): WaitSignalStep {
+    const message = createBaseWaitSignalStep();
+    message.signal = object.signal ?? "";
+    return message;
+  },
+};
+
+function createBaseSubWorkflowStep(): SubWorkflowStep {
+  return { service: undefined, workflow: undefined, input: undefined, idempotencyKey: undefined, timeoutMs: 0 };
+}
+
+export const SubWorkflowStep: MessageFns<SubWorkflowStep> = {
+  encode(message: SubWorkflowStep, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.service !== undefined) {
+      Expr.encode(message.service, writer.uint32(10).fork()).join();
+    }
+    if (message.workflow !== undefined) {
+      Expr.encode(message.workflow, writer.uint32(18).fork()).join();
+    }
+    if (message.input !== undefined) {
+      Expr.encode(message.input, writer.uint32(26).fork()).join();
+    }
+    if (message.idempotencyKey !== undefined) {
+      Expr.encode(message.idempotencyKey, writer.uint32(34).fork()).join();
+    }
+    if (message.timeoutMs !== 0) {
+      writer.uint32(40).int64(message.timeoutMs);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SubWorkflowStep {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSubWorkflowStep();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.service = Expr.decode(reader, reader.uint32());
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.workflow = Expr.decode(reader, reader.uint32());
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.input = Expr.decode(reader, reader.uint32());
+            continue;
+          }
+          case 4: {
+            if (tag !== 34) {
+              break;
+            }
+
+            message.idempotencyKey = Expr.decode(reader, reader.uint32());
+            continue;
+          }
+          case 5: {
+            if (tag !== 40) {
+              break;
+            }
+
+            message.timeoutMs = longToNumber(reader.int64());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<SubWorkflowStep>, I>>(base?: I): SubWorkflowStep {
+    return SubWorkflowStep.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SubWorkflowStep>, I>>(object: I): SubWorkflowStep {
+    const message = createBaseSubWorkflowStep();
+    message.service = (object.service !== undefined && object.service !== null)
+      ? Expr.fromPartial(object.service)
+      : undefined;
+    message.workflow = (object.workflow !== undefined && object.workflow !== null)
+      ? Expr.fromPartial(object.workflow)
+      : undefined;
+    message.input = (object.input !== undefined && object.input !== null) ? Expr.fromPartial(object.input) : undefined;
+    message.idempotencyKey = (object.idempotencyKey !== undefined && object.idempotencyKey !== null)
+      ? Expr.fromPartial(object.idempotencyKey)
+      : undefined;
+    message.timeoutMs = object.timeoutMs ?? 0;
+    return message;
+  },
+};
+
+function createBaseGroupStep(): GroupStep {
+  return { steps: [], forEach: undefined };
+}
+
+export const GroupStep: MessageFns<GroupStep> = {
+  encode(message: GroupStep, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.steps) {
+      Step.encode(v!, writer.uint32(10).fork()).join();
+    }
+    if (message.forEach !== undefined) {
+      ForEach.encode(message.forEach, writer.uint32(18).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): GroupStep {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseGroupStep();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.steps.push(Step.decode(reader, reader.uint32()));
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.forEach = ForEach.decode(reader, reader.uint32());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<GroupStep>, I>>(base?: I): GroupStep {
+    return GroupStep.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<GroupStep>, I>>(object: I): GroupStep {
+    const message = createBaseGroupStep();
+    message.steps = object.steps?.map((e) => Step.fromPartial(e)) || [];
+    message.forEach = (object.forEach !== undefined && object.forEach !== null)
+      ? ForEach.fromPartial(object.forEach)
+      : undefined;
+    return message;
+  },
+};
+
+function createBaseForEach(): ForEach {
+  return { from: "", as: "" };
+}
+
+export const ForEach: MessageFns<ForEach> = {
+  encode(message: ForEach, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.from !== "") {
+      writer.uint32(10).string(message.from);
+    }
+    if (message.as !== "") {
+      writer.uint32(18).string(message.as);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ForEach {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseForEach();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.from = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.as = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<ForEach>, I>>(base?: I): ForEach {
+    return ForEach.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ForEach>, I>>(object: I): ForEach {
+    const message = createBaseForEach();
+    message.from = object.from ?? "";
+    message.as = object.as ?? "";
+    return message;
+  },
+};
+
 function createBaseStartRunRequest(): StartRunRequest {
-  return { workflowName: "", input: Buffer.alloc(0), idempotencyKey: "", timeoutSec: 0, xSbTrace: "", parentRunId: "" };
+  return { service: "", workflow: "", input: Buffer.alloc(0), idempotencyKey: "", timeoutMs: 0, xSbTrace: "" };
 }
 
 export const StartRunRequest: MessageFns<StartRunRequest> = {
   encode(message: StartRunRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.workflowName !== "") {
-      writer.uint32(10).string(message.workflowName);
+    if (message.service !== "") {
+      writer.uint32(10).string(message.service);
+    }
+    if (message.workflow !== "") {
+      writer.uint32(18).string(message.workflow);
     }
     if (message.input.length !== 0) {
-      writer.uint32(18).bytes(message.input);
+      writer.uint32(26).bytes(message.input);
     }
     if (message.idempotencyKey !== "") {
-      writer.uint32(26).string(message.idempotencyKey);
+      writer.uint32(34).string(message.idempotencyKey);
     }
-    if (message.timeoutSec !== 0) {
-      writer.uint32(32).uint32(message.timeoutSec);
+    if (message.timeoutMs !== 0) {
+      writer.uint32(40).int64(message.timeoutMs);
     }
     if (message.xSbTrace !== "") {
-      writer.uint32(42).string(message.xSbTrace);
-    }
-    if (message.parentRunId !== "") {
-      writer.uint32(66).string(message.parentRunId);
+      writer.uint32(50).string(message.xSbTrace);
     }
     return writer;
   },
@@ -266,7 +2778,7 @@ export const StartRunRequest: MessageFns<StartRunRequest> = {
               break;
             }
 
-            message.workflowName = reader.string();
+            message.service = reader.string();
             continue;
           }
           case 2: {
@@ -274,7 +2786,7 @@ export const StartRunRequest: MessageFns<StartRunRequest> = {
               break;
             }
 
-            message.input = Buffer.from(reader.bytes());
+            message.workflow = reader.string();
             continue;
           }
           case 3: {
@@ -282,31 +2794,31 @@ export const StartRunRequest: MessageFns<StartRunRequest> = {
               break;
             }
 
-            message.idempotencyKey = reader.string();
+            message.input = Buffer.from(reader.bytes());
             continue;
           }
           case 4: {
-            if (tag !== 32) {
+            if (tag !== 34) {
               break;
             }
 
-            message.timeoutSec = reader.uint32();
+            message.idempotencyKey = reader.string();
             continue;
           }
           case 5: {
-            if (tag !== 42) {
+            if (tag !== 40) {
+              break;
+            }
+
+            message.timeoutMs = longToNumber(reader.int64());
+            continue;
+          }
+          case 6: {
+            if (tag !== 50) {
               break;
             }
 
             message.xSbTrace = reader.string();
-            continue;
-          }
-          case 8: {
-            if (tag !== 66) {
-              break;
-            }
-
-            message.parentRunId = reader.string();
             continue;
           }
         }
@@ -326,12 +2838,12 @@ export const StartRunRequest: MessageFns<StartRunRequest> = {
   },
   fromPartial<I extends Exact<DeepPartial<StartRunRequest>, I>>(object: I): StartRunRequest {
     const message = createBaseStartRunRequest();
-    message.workflowName = object.workflowName ?? "";
+    message.service = object.service ?? "";
+    message.workflow = object.workflow ?? "";
     message.input = object.input ?? Buffer.alloc(0);
     message.idempotencyKey = object.idempotencyKey ?? "";
-    message.timeoutSec = object.timeoutSec ?? 0;
+    message.timeoutMs = object.timeoutMs ?? 0;
     message.xSbTrace = object.xSbTrace ?? "";
-    message.parentRunId = object.parentRunId ?? "";
     return message;
   },
 };
@@ -447,7 +2959,7 @@ export const CancelRunRequest: MessageFns<CancelRunRequest> = {
 };
 
 function createBaseSignalRunRequest(): SignalRunRequest {
-  return { runId: "", signalName: "", payload: Buffer.alloc(0) };
+  return { runId: "", signalName: "", payload: Buffer.alloc(0), signalId: "" };
 }
 
 export const SignalRunRequest: MessageFns<SignalRunRequest> = {
@@ -460,6 +2972,9 @@ export const SignalRunRequest: MessageFns<SignalRunRequest> = {
     }
     if (message.payload.length !== 0) {
       writer.uint32(26).bytes(message.payload);
+    }
+    if (message.signalId !== "") {
+      writer.uint32(34).string(message.signalId);
     }
     return writer;
   },
@@ -501,6 +3016,14 @@ export const SignalRunRequest: MessageFns<SignalRunRequest> = {
             message.payload = Buffer.from(reader.bytes());
             continue;
           }
+          case 4: {
+            if (tag !== 34) {
+              break;
+            }
+
+            message.signalId = reader.string();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -521,6 +3044,62 @@ export const SignalRunRequest: MessageFns<SignalRunRequest> = {
     message.runId = object.runId ?? "";
     message.signalName = object.signalName ?? "";
     message.payload = object.payload ?? Buffer.alloc(0);
+    message.signalId = object.signalId ?? "";
+    return message;
+  },
+};
+
+function createBaseSignalRunResponse(): SignalRunResponse {
+  return { duplicate: false };
+}
+
+export const SignalRunResponse: MessageFns<SignalRunResponse> = {
+  encode(message: SignalRunResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.duplicate !== false) {
+      writer.uint32(8).bool(message.duplicate);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SignalRunResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSignalRunResponse();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 8) {
+              break;
+            }
+
+            message.duplicate = reader.bool();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<SignalRunResponse>, I>>(base?: I): SignalRunResponse {
+    return SignalRunResponse.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SignalRunResponse>, I>>(object: I): SignalRunResponse {
+    const message = createBaseSignalRunResponse();
+    message.duplicate = object.duplicate ?? false;
     return message;
   },
 };
@@ -580,28 +3159,81 @@ export const QueryRunRequest: MessageFns<QueryRunRequest> = {
   },
 };
 
-function createBaseQueryRunResponse(): QueryRunResponse {
-  return { runId: "", status: "", state: Buffer.alloc(0), steps: [] };
+function createBaseRunSnapshot(): RunSnapshot {
+  return {
+    runId: "",
+    service: "",
+    workflow: "",
+    fingerprint: "",
+    status: "",
+    stopReason: "",
+    waitingReason: "",
+    input: Buffer.alloc(0),
+    output: Buffer.alloc(0),
+    errorCode: "",
+    errorMessage: "",
+    parentRunId: "",
+    startedAtUnixMs: 0,
+    endedAtUnixMs: 0,
+    steps: [],
+    signals: [],
+  };
 }
 
-export const QueryRunResponse: MessageFns<QueryRunResponse> = {
-  encode(message: QueryRunResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+export const RunSnapshot: MessageFns<RunSnapshot> = {
+  encode(message: RunSnapshot, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
     if (message.runId !== "") {
       writer.uint32(10).string(message.runId);
     }
-    if (message.status !== "") {
-      writer.uint32(18).string(message.status);
+    if (message.service !== "") {
+      writer.uint32(18).string(message.service);
     }
-    if (message.state.length !== 0) {
-      writer.uint32(26).bytes(message.state);
+    if (message.workflow !== "") {
+      writer.uint32(26).string(message.workflow);
+    }
+    if (message.fingerprint !== "") {
+      writer.uint32(34).string(message.fingerprint);
+    }
+    if (message.status !== "") {
+      writer.uint32(42).string(message.status);
+    }
+    if (message.stopReason !== "") {
+      writer.uint32(50).string(message.stopReason);
+    }
+    if (message.waitingReason !== "") {
+      writer.uint32(58).string(message.waitingReason);
+    }
+    if (message.input.length !== 0) {
+      writer.uint32(66).bytes(message.input);
+    }
+    if (message.output.length !== 0) {
+      writer.uint32(74).bytes(message.output);
+    }
+    if (message.errorCode !== "") {
+      writer.uint32(82).string(message.errorCode);
+    }
+    if (message.errorMessage !== "") {
+      writer.uint32(90).string(message.errorMessage);
+    }
+    if (message.parentRunId !== "") {
+      writer.uint32(98).string(message.parentRunId);
+    }
+    if (message.startedAtUnixMs !== 0) {
+      writer.uint32(104).int64(message.startedAtUnixMs);
+    }
+    if (message.endedAtUnixMs !== 0) {
+      writer.uint32(112).int64(message.endedAtUnixMs);
     }
     for (const v of message.steps) {
-      StepInfo.encode(v!, writer.uint32(34).fork()).join();
+      StepInfo.encode(v!, writer.uint32(122).fork()).join();
+    }
+    for (const v of message.signals) {
+      PendingSignal.encode(v!, writer.uint32(130).fork()).join();
     }
     return writer;
   },
 
-  decode(input: BinaryReader | Uint8Array, length?: number): QueryRunResponse {
+  decode(input: BinaryReader | Uint8Array, length?: number): RunSnapshot {
     const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
     const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
     if (previousRecursionDepth >= 100) {
@@ -610,7 +3242,7 @@ export const QueryRunResponse: MessageFns<QueryRunResponse> = {
     (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
     try {
       const end = length === undefined ? reader.len : reader.pos + length;
-      const message = createBaseQueryRunResponse();
+      const message = createBaseRunSnapshot();
       while (reader.pos < end) {
         const tag = reader.uint32();
         switch (tag >>> 3) {
@@ -627,7 +3259,7 @@ export const QueryRunResponse: MessageFns<QueryRunResponse> = {
               break;
             }
 
-            message.status = reader.string();
+            message.service = reader.string();
             continue;
           }
           case 3: {
@@ -635,7 +3267,7 @@ export const QueryRunResponse: MessageFns<QueryRunResponse> = {
               break;
             }
 
-            message.state = Buffer.from(reader.bytes());
+            message.workflow = reader.string();
             continue;
           }
           case 4: {
@@ -643,7 +3275,103 @@ export const QueryRunResponse: MessageFns<QueryRunResponse> = {
               break;
             }
 
+            message.fingerprint = reader.string();
+            continue;
+          }
+          case 5: {
+            if (tag !== 42) {
+              break;
+            }
+
+            message.status = reader.string();
+            continue;
+          }
+          case 6: {
+            if (tag !== 50) {
+              break;
+            }
+
+            message.stopReason = reader.string();
+            continue;
+          }
+          case 7: {
+            if (tag !== 58) {
+              break;
+            }
+
+            message.waitingReason = reader.string();
+            continue;
+          }
+          case 8: {
+            if (tag !== 66) {
+              break;
+            }
+
+            message.input = Buffer.from(reader.bytes());
+            continue;
+          }
+          case 9: {
+            if (tag !== 74) {
+              break;
+            }
+
+            message.output = Buffer.from(reader.bytes());
+            continue;
+          }
+          case 10: {
+            if (tag !== 82) {
+              break;
+            }
+
+            message.errorCode = reader.string();
+            continue;
+          }
+          case 11: {
+            if (tag !== 90) {
+              break;
+            }
+
+            message.errorMessage = reader.string();
+            continue;
+          }
+          case 12: {
+            if (tag !== 98) {
+              break;
+            }
+
+            message.parentRunId = reader.string();
+            continue;
+          }
+          case 13: {
+            if (tag !== 104) {
+              break;
+            }
+
+            message.startedAtUnixMs = longToNumber(reader.int64());
+            continue;
+          }
+          case 14: {
+            if (tag !== 112) {
+              break;
+            }
+
+            message.endedAtUnixMs = longToNumber(reader.int64());
+            continue;
+          }
+          case 15: {
+            if (tag !== 122) {
+              break;
+            }
+
             message.steps.push(StepInfo.decode(reader, reader.uint32()));
+            continue;
+          }
+          case 16: {
+            if (tag !== 130) {
+              break;
+            }
+
+            message.signals.push(PendingSignal.decode(reader, reader.uint32()));
             continue;
           }
         }
@@ -658,21 +3386,48 @@ export const QueryRunResponse: MessageFns<QueryRunResponse> = {
     }
   },
 
-  create<I extends Exact<DeepPartial<QueryRunResponse>, I>>(base?: I): QueryRunResponse {
-    return QueryRunResponse.fromPartial(base ?? ({} as any));
+  create<I extends Exact<DeepPartial<RunSnapshot>, I>>(base?: I): RunSnapshot {
+    return RunSnapshot.fromPartial(base ?? ({} as any));
   },
-  fromPartial<I extends Exact<DeepPartial<QueryRunResponse>, I>>(object: I): QueryRunResponse {
-    const message = createBaseQueryRunResponse();
+  fromPartial<I extends Exact<DeepPartial<RunSnapshot>, I>>(object: I): RunSnapshot {
+    const message = createBaseRunSnapshot();
     message.runId = object.runId ?? "";
+    message.service = object.service ?? "";
+    message.workflow = object.workflow ?? "";
+    message.fingerprint = object.fingerprint ?? "";
     message.status = object.status ?? "";
-    message.state = object.state ?? Buffer.alloc(0);
+    message.stopReason = object.stopReason ?? "";
+    message.waitingReason = object.waitingReason ?? "";
+    message.input = object.input ?? Buffer.alloc(0);
+    message.output = object.output ?? Buffer.alloc(0);
+    message.errorCode = object.errorCode ?? "";
+    message.errorMessage = object.errorMessage ?? "";
+    message.parentRunId = object.parentRunId ?? "";
+    message.startedAtUnixMs = object.startedAtUnixMs ?? 0;
+    message.endedAtUnixMs = object.endedAtUnixMs ?? 0;
     message.steps = object.steps?.map((e) => StepInfo.fromPartial(e)) || [];
+    message.signals = object.signals?.map((e) => PendingSignal.fromPartial(e)) || [];
     return message;
   },
 };
 
 function createBaseStepInfo(): StepInfo {
-  return { stepId: "", status: "", output: Buffer.alloc(0), lastError: "", compensatedBy: "" };
+  return {
+    stepId: "",
+    parentStepId: "",
+    kind: "",
+    status: "",
+    attempt: 0,
+    output: Buffer.alloc(0),
+    errorCode: "",
+    errorMessage: "",
+    waitingReason: "",
+    waitKey: "",
+    childRunId: "",
+    compensatesStepId: "",
+    startedAtUnixMs: 0,
+    endedAtUnixMs: 0,
+  };
 }
 
 export const StepInfo: MessageFns<StepInfo> = {
@@ -680,17 +3435,44 @@ export const StepInfo: MessageFns<StepInfo> = {
     if (message.stepId !== "") {
       writer.uint32(10).string(message.stepId);
     }
+    if (message.parentStepId !== "") {
+      writer.uint32(18).string(message.parentStepId);
+    }
+    if (message.kind !== "") {
+      writer.uint32(26).string(message.kind);
+    }
     if (message.status !== "") {
-      writer.uint32(18).string(message.status);
+      writer.uint32(34).string(message.status);
+    }
+    if (message.attempt !== 0) {
+      writer.uint32(40).uint32(message.attempt);
     }
     if (message.output.length !== 0) {
-      writer.uint32(26).bytes(message.output);
+      writer.uint32(50).bytes(message.output);
     }
-    if (message.lastError !== "") {
-      writer.uint32(34).string(message.lastError);
+    if (message.errorCode !== "") {
+      writer.uint32(58).string(message.errorCode);
     }
-    if (message.compensatedBy !== "") {
-      writer.uint32(42).string(message.compensatedBy);
+    if (message.errorMessage !== "") {
+      writer.uint32(66).string(message.errorMessage);
+    }
+    if (message.waitingReason !== "") {
+      writer.uint32(74).string(message.waitingReason);
+    }
+    if (message.waitKey !== "") {
+      writer.uint32(82).string(message.waitKey);
+    }
+    if (message.childRunId !== "") {
+      writer.uint32(90).string(message.childRunId);
+    }
+    if (message.compensatesStepId !== "") {
+      writer.uint32(98).string(message.compensatesStepId);
+    }
+    if (message.startedAtUnixMs !== 0) {
+      writer.uint32(104).int64(message.startedAtUnixMs);
+    }
+    if (message.endedAtUnixMs !== 0) {
+      writer.uint32(112).int64(message.endedAtUnixMs);
     }
     return writer;
   },
@@ -721,7 +3503,7 @@ export const StepInfo: MessageFns<StepInfo> = {
               break;
             }
 
-            message.status = reader.string();
+            message.parentStepId = reader.string();
             continue;
           }
           case 3: {
@@ -729,7 +3511,7 @@ export const StepInfo: MessageFns<StepInfo> = {
               break;
             }
 
-            message.output = Buffer.from(reader.bytes());
+            message.kind = reader.string();
             continue;
           }
           case 4: {
@@ -737,15 +3519,87 @@ export const StepInfo: MessageFns<StepInfo> = {
               break;
             }
 
-            message.lastError = reader.string();
+            message.status = reader.string();
             continue;
           }
           case 5: {
-            if (tag !== 42) {
+            if (tag !== 40) {
               break;
             }
 
-            message.compensatedBy = reader.string();
+            message.attempt = reader.uint32();
+            continue;
+          }
+          case 6: {
+            if (tag !== 50) {
+              break;
+            }
+
+            message.output = Buffer.from(reader.bytes());
+            continue;
+          }
+          case 7: {
+            if (tag !== 58) {
+              break;
+            }
+
+            message.errorCode = reader.string();
+            continue;
+          }
+          case 8: {
+            if (tag !== 66) {
+              break;
+            }
+
+            message.errorMessage = reader.string();
+            continue;
+          }
+          case 9: {
+            if (tag !== 74) {
+              break;
+            }
+
+            message.waitingReason = reader.string();
+            continue;
+          }
+          case 10: {
+            if (tag !== 82) {
+              break;
+            }
+
+            message.waitKey = reader.string();
+            continue;
+          }
+          case 11: {
+            if (tag !== 90) {
+              break;
+            }
+
+            message.childRunId = reader.string();
+            continue;
+          }
+          case 12: {
+            if (tag !== 98) {
+              break;
+            }
+
+            message.compensatesStepId = reader.string();
+            continue;
+          }
+          case 13: {
+            if (tag !== 104) {
+              break;
+            }
+
+            message.startedAtUnixMs = longToNumber(reader.int64());
+            continue;
+          }
+          case 14: {
+            if (tag !== 112) {
+              break;
+            }
+
+            message.endedAtUnixMs = longToNumber(reader.int64());
             continue;
           }
         }
@@ -766,10 +3620,110 @@ export const StepInfo: MessageFns<StepInfo> = {
   fromPartial<I extends Exact<DeepPartial<StepInfo>, I>>(object: I): StepInfo {
     const message = createBaseStepInfo();
     message.stepId = object.stepId ?? "";
+    message.parentStepId = object.parentStepId ?? "";
+    message.kind = object.kind ?? "";
     message.status = object.status ?? "";
+    message.attempt = object.attempt ?? 0;
     message.output = object.output ?? Buffer.alloc(0);
-    message.lastError = object.lastError ?? "";
-    message.compensatedBy = object.compensatedBy ?? "";
+    message.errorCode = object.errorCode ?? "";
+    message.errorMessage = object.errorMessage ?? "";
+    message.waitingReason = object.waitingReason ?? "";
+    message.waitKey = object.waitKey ?? "";
+    message.childRunId = object.childRunId ?? "";
+    message.compensatesStepId = object.compensatesStepId ?? "";
+    message.startedAtUnixMs = object.startedAtUnixMs ?? 0;
+    message.endedAtUnixMs = object.endedAtUnixMs ?? 0;
+    return message;
+  },
+};
+
+function createBasePendingSignal(): PendingSignal {
+  return { signalName: "", signalId: "", payload: Buffer.alloc(0), enqueuedAtUnixMs: 0 };
+}
+
+export const PendingSignal: MessageFns<PendingSignal> = {
+  encode(message: PendingSignal, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.signalName !== "") {
+      writer.uint32(10).string(message.signalName);
+    }
+    if (message.signalId !== "") {
+      writer.uint32(18).string(message.signalId);
+    }
+    if (message.payload.length !== 0) {
+      writer.uint32(26).bytes(message.payload);
+    }
+    if (message.enqueuedAtUnixMs !== 0) {
+      writer.uint32(32).int64(message.enqueuedAtUnixMs);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PendingSignal {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBasePendingSignal();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.signalName = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.signalId = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.payload = Buffer.from(reader.bytes());
+            continue;
+          }
+          case 4: {
+            if (tag !== 32) {
+              break;
+            }
+
+            message.enqueuedAtUnixMs = longToNumber(reader.int64());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<PendingSignal>, I>>(base?: I): PendingSignal {
+    return PendingSignal.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<PendingSignal>, I>>(object: I): PendingSignal {
+    const message = createBasePendingSignal();
+    message.signalName = object.signalName ?? "";
+    message.signalId = object.signalId ?? "";
+    message.payload = object.payload ?? Buffer.alloc(0);
+    message.enqueuedAtUnixMs = object.enqueuedAtUnixMs ?? 0;
     return message;
   },
 };
@@ -830,7 +3784,15 @@ export const AwaitRunRequest: MessageFns<AwaitRunRequest> = {
 };
 
 function createBaseRunStatusUpdate(): RunStatusUpdate {
-  return { runId: "", status: "", state: Buffer.alloc(0) };
+  return {
+    runId: "",
+    status: "",
+    waitingReason: "",
+    terminal: false,
+    output: Buffer.alloc(0),
+    errorCode: "",
+    errorMessage: "",
+  };
 }
 
 export const RunStatusUpdate: MessageFns<RunStatusUpdate> = {
@@ -841,8 +3803,20 @@ export const RunStatusUpdate: MessageFns<RunStatusUpdate> = {
     if (message.status !== "") {
       writer.uint32(18).string(message.status);
     }
-    if (message.state.length !== 0) {
-      writer.uint32(26).bytes(message.state);
+    if (message.waitingReason !== "") {
+      writer.uint32(26).string(message.waitingReason);
+    }
+    if (message.terminal !== false) {
+      writer.uint32(32).bool(message.terminal);
+    }
+    if (message.output.length !== 0) {
+      writer.uint32(42).bytes(message.output);
+    }
+    if (message.errorCode !== "") {
+      writer.uint32(50).string(message.errorCode);
+    }
+    if (message.errorMessage !== "") {
+      writer.uint32(58).string(message.errorMessage);
     }
     return writer;
   },
@@ -881,7 +3855,39 @@ export const RunStatusUpdate: MessageFns<RunStatusUpdate> = {
               break;
             }
 
-            message.state = Buffer.from(reader.bytes());
+            message.waitingReason = reader.string();
+            continue;
+          }
+          case 4: {
+            if (tag !== 32) {
+              break;
+            }
+
+            message.terminal = reader.bool();
+            continue;
+          }
+          case 5: {
+            if (tag !== 42) {
+              break;
+            }
+
+            message.output = Buffer.from(reader.bytes());
+            continue;
+          }
+          case 6: {
+            if (tag !== 50) {
+              break;
+            }
+
+            message.errorCode = reader.string();
+            continue;
+          }
+          case 7: {
+            if (tag !== 58) {
+              break;
+            }
+
+            message.errorMessage = reader.string();
             continue;
           }
         }
@@ -903,7 +3909,11 @@ export const RunStatusUpdate: MessageFns<RunStatusUpdate> = {
     const message = createBaseRunStatusUpdate();
     message.runId = object.runId ?? "";
     message.status = object.status ?? "";
-    message.state = object.state ?? Buffer.alloc(0);
+    message.waitingReason = object.waitingReason ?? "";
+    message.terminal = object.terminal ?? false;
+    message.output = object.output ?? Buffer.alloc(0);
+    message.errorCode = object.errorCode ?? "";
+    message.errorMessage = object.errorMessage ?? "";
     return message;
   },
 };
@@ -1030,18 +4040,67 @@ export const ReplayRunResponse: MessageFns<ReplayRunResponse> = {
   },
 };
 
+function createBaseRetryCompensationRequest(): RetryCompensationRequest {
+  return { runId: "" };
+}
+
+export const RetryCompensationRequest: MessageFns<RetryCompensationRequest> = {
+  encode(message: RetryCompensationRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.runId !== "") {
+      writer.uint32(10).string(message.runId);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): RetryCompensationRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseRetryCompensationRequest();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.runId = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<RetryCompensationRequest>, I>>(base?: I): RetryCompensationRequest {
+    return RetryCompensationRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<RetryCompensationRequest>, I>>(object: I): RetryCompensationRequest {
+    const message = createBaseRetryCompensationRequest();
+    message.runId = object.runId ?? "";
+    return message;
+  },
+};
+
 function createBaseSubscribeRequest(): SubscribeRequest {
-  return { serviceId: "", instanceId: "" };
+  return {};
 }
 
 export const SubscribeRequest: MessageFns<SubscribeRequest> = {
-  encode(message: SubscribeRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.serviceId !== "") {
-      writer.uint32(10).string(message.serviceId);
-    }
-    if (message.instanceId !== "") {
-      writer.uint32(18).string(message.instanceId);
-    }
+  encode(_: SubscribeRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
     return writer;
   },
 
@@ -1058,22 +4117,6 @@ export const SubscribeRequest: MessageFns<SubscribeRequest> = {
       while (reader.pos < end) {
         const tag = reader.uint32();
         switch (tag >>> 3) {
-          case 1: {
-            if (tag !== 10) {
-              break;
-            }
-
-            message.serviceId = reader.string();
-            continue;
-          }
-          case 2: {
-            if (tag !== 18) {
-              break;
-            }
-
-            message.instanceId = reader.string();
-            continue;
-          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -1089,69 +4132,111 @@ export const SubscribeRequest: MessageFns<SubscribeRequest> = {
   create<I extends Exact<DeepPartial<SubscribeRequest>, I>>(base?: I): SubscribeRequest {
     return SubscribeRequest.fromPartial(base ?? ({} as any));
   },
-  fromPartial<I extends Exact<DeepPartial<SubscribeRequest>, I>>(object: I): SubscribeRequest {
+  fromPartial<I extends Exact<DeepPartial<SubscribeRequest>, I>>(_: I): SubscribeRequest {
     const message = createBaseSubscribeRequest();
-    message.serviceId = object.serviceId ?? "";
-    message.instanceId = object.instanceId ?? "";
     return message;
   },
 };
 
-function createBaseRunAssignment(): RunAssignment {
+function createBaseStepTask(): StepTask {
   return {
+    taskToken: "",
     runId: "",
-    workflowName: "",
+    workflow: "",
+    version: "",
     fingerprint: "",
-    frozenPlan: Buffer.alloc(0),
+    stepId: "",
+    templateStepId: "",
+    kind: 0,
+    attempt: 0,
+    service: "",
+    method: "",
+    callOpts: undefined,
+    event: "",
+    publishOpts: undefined,
     input: Buffer.alloc(0),
     state: Buffer.alloc(0),
-    leaseEpoch: 0,
-    maxParallelism: 0,
+    isCompensation: false,
+    compensatesStepId: "",
+    leaseTtlMs: 0,
+    heartbeatIntervalMs: 0,
+    deadlineUnixMs: 0,
     xSbTrace: "",
-    compensating: false,
-    cancelReason: "",
   };
 }
 
-export const RunAssignment: MessageFns<RunAssignment> = {
-  encode(message: RunAssignment, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.runId !== "") {
-      writer.uint32(10).string(message.runId);
+export const StepTask: MessageFns<StepTask> = {
+  encode(message: StepTask, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.taskToken !== "") {
+      writer.uint32(10).string(message.taskToken);
     }
-    if (message.workflowName !== "") {
-      writer.uint32(18).string(message.workflowName);
+    if (message.runId !== "") {
+      writer.uint32(18).string(message.runId);
+    }
+    if (message.workflow !== "") {
+      writer.uint32(26).string(message.workflow);
+    }
+    if (message.version !== "") {
+      writer.uint32(34).string(message.version);
     }
     if (message.fingerprint !== "") {
-      writer.uint32(26).string(message.fingerprint);
+      writer.uint32(42).string(message.fingerprint);
     }
-    if (message.frozenPlan.length !== 0) {
-      writer.uint32(34).bytes(message.frozenPlan);
+    if (message.stepId !== "") {
+      writer.uint32(50).string(message.stepId);
+    }
+    if (message.templateStepId !== "") {
+      writer.uint32(58).string(message.templateStepId);
+    }
+    if (message.kind !== 0) {
+      writer.uint32(64).int32(message.kind);
+    }
+    if (message.attempt !== 0) {
+      writer.uint32(72).uint32(message.attempt);
+    }
+    if (message.service !== "") {
+      writer.uint32(82).string(message.service);
+    }
+    if (message.method !== "") {
+      writer.uint32(90).string(message.method);
+    }
+    if (message.callOpts !== undefined) {
+      ResolvedCallOptions.encode(message.callOpts, writer.uint32(98).fork()).join();
+    }
+    if (message.event !== "") {
+      writer.uint32(106).string(message.event);
+    }
+    if (message.publishOpts !== undefined) {
+      ResolvedPublishOptions.encode(message.publishOpts, writer.uint32(114).fork()).join();
     }
     if (message.input.length !== 0) {
-      writer.uint32(42).bytes(message.input);
+      writer.uint32(122).bytes(message.input);
     }
     if (message.state.length !== 0) {
-      writer.uint32(50).bytes(message.state);
+      writer.uint32(130).bytes(message.state);
     }
-    if (message.leaseEpoch !== 0) {
-      writer.uint32(56).uint64(message.leaseEpoch);
+    if (message.isCompensation !== false) {
+      writer.uint32(136).bool(message.isCompensation);
     }
-    if (message.maxParallelism !== 0) {
-      writer.uint32(64).uint32(message.maxParallelism);
+    if (message.compensatesStepId !== "") {
+      writer.uint32(146).string(message.compensatesStepId);
+    }
+    if (message.leaseTtlMs !== 0) {
+      writer.uint32(152).int64(message.leaseTtlMs);
+    }
+    if (message.heartbeatIntervalMs !== 0) {
+      writer.uint32(160).int64(message.heartbeatIntervalMs);
+    }
+    if (message.deadlineUnixMs !== 0) {
+      writer.uint32(168).int64(message.deadlineUnixMs);
     }
     if (message.xSbTrace !== "") {
-      writer.uint32(74).string(message.xSbTrace);
-    }
-    if (message.compensating !== false) {
-      writer.uint32(96).bool(message.compensating);
-    }
-    if (message.cancelReason !== "") {
-      writer.uint32(106).string(message.cancelReason);
+      writer.uint32(178).string(message.xSbTrace);
     }
     return writer;
   },
 
-  decode(input: BinaryReader | Uint8Array, length?: number): RunAssignment {
+  decode(input: BinaryReader | Uint8Array, length?: number): StepTask {
     const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
     const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
     if (previousRecursionDepth >= 100) {
@@ -1160,7 +4245,7 @@ export const RunAssignment: MessageFns<RunAssignment> = {
     (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
     try {
       const end = length === undefined ? reader.len : reader.pos + length;
-      const message = createBaseRunAssignment();
+      const message = createBaseStepTask();
       while (reader.pos < end) {
         const tag = reader.uint32();
         switch (tag >>> 3) {
@@ -1169,7 +4254,7 @@ export const RunAssignment: MessageFns<RunAssignment> = {
               break;
             }
 
-            message.runId = reader.string();
+            message.taskToken = reader.string();
             continue;
           }
           case 2: {
@@ -1177,7 +4262,7 @@ export const RunAssignment: MessageFns<RunAssignment> = {
               break;
             }
 
-            message.workflowName = reader.string();
+            message.runId = reader.string();
             continue;
           }
           case 3: {
@@ -1185,7 +4270,7 @@ export const RunAssignment: MessageFns<RunAssignment> = {
               break;
             }
 
-            message.fingerprint = reader.string();
+            message.workflow = reader.string();
             continue;
           }
           case 4: {
@@ -1193,7 +4278,7 @@ export const RunAssignment: MessageFns<RunAssignment> = {
               break;
             }
 
-            message.frozenPlan = Buffer.from(reader.bytes());
+            message.version = reader.string();
             continue;
           }
           case 5: {
@@ -1201,7 +4286,7 @@ export const RunAssignment: MessageFns<RunAssignment> = {
               break;
             }
 
-            message.input = Buffer.from(reader.bytes());
+            message.fingerprint = reader.string();
             continue;
           }
           case 6: {
@@ -1209,15 +4294,15 @@ export const RunAssignment: MessageFns<RunAssignment> = {
               break;
             }
 
-            message.state = Buffer.from(reader.bytes());
+            message.stepId = reader.string();
             continue;
           }
           case 7: {
-            if (tag !== 56) {
+            if (tag !== 58) {
               break;
             }
 
-            message.leaseEpoch = longToNumber(reader.uint64());
+            message.templateStepId = reader.string();
             continue;
           }
           case 8: {
@@ -1225,23 +4310,39 @@ export const RunAssignment: MessageFns<RunAssignment> = {
               break;
             }
 
-            message.maxParallelism = reader.uint32();
+            message.kind = reader.int32() as any;
             continue;
           }
           case 9: {
-            if (tag !== 74) {
+            if (tag !== 72) {
               break;
             }
 
-            message.xSbTrace = reader.string();
+            message.attempt = reader.uint32();
+            continue;
+          }
+          case 10: {
+            if (tag !== 82) {
+              break;
+            }
+
+            message.service = reader.string();
+            continue;
+          }
+          case 11: {
+            if (tag !== 90) {
+              break;
+            }
+
+            message.method = reader.string();
             continue;
           }
           case 12: {
-            if (tag !== 96) {
+            if (tag !== 98) {
               break;
             }
 
-            message.compensating = reader.bool();
+            message.callOpts = ResolvedCallOptions.decode(reader, reader.uint32());
             continue;
           }
           case 13: {
@@ -1249,7 +4350,79 @@ export const RunAssignment: MessageFns<RunAssignment> = {
               break;
             }
 
-            message.cancelReason = reader.string();
+            message.event = reader.string();
+            continue;
+          }
+          case 14: {
+            if (tag !== 114) {
+              break;
+            }
+
+            message.publishOpts = ResolvedPublishOptions.decode(reader, reader.uint32());
+            continue;
+          }
+          case 15: {
+            if (tag !== 122) {
+              break;
+            }
+
+            message.input = Buffer.from(reader.bytes());
+            continue;
+          }
+          case 16: {
+            if (tag !== 130) {
+              break;
+            }
+
+            message.state = Buffer.from(reader.bytes());
+            continue;
+          }
+          case 17: {
+            if (tag !== 136) {
+              break;
+            }
+
+            message.isCompensation = reader.bool();
+            continue;
+          }
+          case 18: {
+            if (tag !== 146) {
+              break;
+            }
+
+            message.compensatesStepId = reader.string();
+            continue;
+          }
+          case 19: {
+            if (tag !== 152) {
+              break;
+            }
+
+            message.leaseTtlMs = longToNumber(reader.int64());
+            continue;
+          }
+          case 20: {
+            if (tag !== 160) {
+              break;
+            }
+
+            message.heartbeatIntervalMs = longToNumber(reader.int64());
+            continue;
+          }
+          case 21: {
+            if (tag !== 168) {
+              break;
+            }
+
+            message.deadlineUnixMs = longToNumber(reader.int64());
+            continue;
+          }
+          case 22: {
+            if (tag !== 178) {
+              break;
+            }
+
+            message.xSbTrace = reader.string();
             continue;
           }
         }
@@ -1264,65 +4437,66 @@ export const RunAssignment: MessageFns<RunAssignment> = {
     }
   },
 
-  create<I extends Exact<DeepPartial<RunAssignment>, I>>(base?: I): RunAssignment {
-    return RunAssignment.fromPartial(base ?? ({} as any));
+  create<I extends Exact<DeepPartial<StepTask>, I>>(base?: I): StepTask {
+    return StepTask.fromPartial(base ?? ({} as any));
   },
-  fromPartial<I extends Exact<DeepPartial<RunAssignment>, I>>(object: I): RunAssignment {
-    const message = createBaseRunAssignment();
+  fromPartial<I extends Exact<DeepPartial<StepTask>, I>>(object: I): StepTask {
+    const message = createBaseStepTask();
+    message.taskToken = object.taskToken ?? "";
     message.runId = object.runId ?? "";
-    message.workflowName = object.workflowName ?? "";
+    message.workflow = object.workflow ?? "";
+    message.version = object.version ?? "";
     message.fingerprint = object.fingerprint ?? "";
-    message.frozenPlan = object.frozenPlan ?? Buffer.alloc(0);
+    message.stepId = object.stepId ?? "";
+    message.templateStepId = object.templateStepId ?? "";
+    message.kind = object.kind ?? 0;
+    message.attempt = object.attempt ?? 0;
+    message.service = object.service ?? "";
+    message.method = object.method ?? "";
+    message.callOpts = (object.callOpts !== undefined && object.callOpts !== null)
+      ? ResolvedCallOptions.fromPartial(object.callOpts)
+      : undefined;
+    message.event = object.event ?? "";
+    message.publishOpts = (object.publishOpts !== undefined && object.publishOpts !== null)
+      ? ResolvedPublishOptions.fromPartial(object.publishOpts)
+      : undefined;
     message.input = object.input ?? Buffer.alloc(0);
     message.state = object.state ?? Buffer.alloc(0);
-    message.leaseEpoch = object.leaseEpoch ?? 0;
-    message.maxParallelism = object.maxParallelism ?? 0;
+    message.isCompensation = object.isCompensation ?? false;
+    message.compensatesStepId = object.compensatesStepId ?? "";
+    message.leaseTtlMs = object.leaseTtlMs ?? 0;
+    message.heartbeatIntervalMs = object.heartbeatIntervalMs ?? 0;
+    message.deadlineUnixMs = object.deadlineUnixMs ?? 0;
     message.xSbTrace = object.xSbTrace ?? "";
-    message.compensating = object.compensating ?? false;
-    message.cancelReason = object.cancelReason ?? "";
     return message;
   },
 };
 
-function createBaseBeginStepRequest(): BeginStepRequest {
-  return {
-    runId: "",
-    stepId: "",
-    parentStepId: "",
-    kind: "",
-    inputSnapshot: Buffer.alloc(0),
-    leaseEpoch: 0,
-    instanceId: "",
-  };
+function createBaseResolvedCallOptions(): ResolvedCallOptions {
+  return { timeoutMs: 0, transport: "", idempotencyKey: "", requestId: "", retry: undefined };
 }
 
-export const BeginStepRequest: MessageFns<BeginStepRequest> = {
-  encode(message: BeginStepRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.runId !== "") {
-      writer.uint32(10).string(message.runId);
+export const ResolvedCallOptions: MessageFns<ResolvedCallOptions> = {
+  encode(message: ResolvedCallOptions, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.timeoutMs !== 0) {
+      writer.uint32(8).int64(message.timeoutMs);
     }
-    if (message.stepId !== "") {
-      writer.uint32(18).string(message.stepId);
+    if (message.transport !== "") {
+      writer.uint32(18).string(message.transport);
     }
-    if (message.parentStepId !== "") {
-      writer.uint32(26).string(message.parentStepId);
+    if (message.idempotencyKey !== "") {
+      writer.uint32(26).string(message.idempotencyKey);
     }
-    if (message.kind !== "") {
-      writer.uint32(34).string(message.kind);
+    if (message.requestId !== "") {
+      writer.uint32(34).string(message.requestId);
     }
-    if (message.inputSnapshot.length !== 0) {
-      writer.uint32(42).bytes(message.inputSnapshot);
-    }
-    if (message.leaseEpoch !== 0) {
-      writer.uint32(48).uint64(message.leaseEpoch);
-    }
-    if (message.instanceId !== "") {
-      writer.uint32(58).string(message.instanceId);
+    if (message.retry !== undefined) {
+      RetryPolicy.encode(message.retry, writer.uint32(42).fork()).join();
     }
     return writer;
   },
 
-  decode(input: BinaryReader | Uint8Array, length?: number): BeginStepRequest {
+  decode(input: BinaryReader | Uint8Array, length?: number): ResolvedCallOptions {
     const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
     const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
     if (previousRecursionDepth >= 100) {
@@ -1331,611 +4505,7 @@ export const BeginStepRequest: MessageFns<BeginStepRequest> = {
     (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
     try {
       const end = length === undefined ? reader.len : reader.pos + length;
-      const message = createBaseBeginStepRequest();
-      while (reader.pos < end) {
-        const tag = reader.uint32();
-        switch (tag >>> 3) {
-          case 1: {
-            if (tag !== 10) {
-              break;
-            }
-
-            message.runId = reader.string();
-            continue;
-          }
-          case 2: {
-            if (tag !== 18) {
-              break;
-            }
-
-            message.stepId = reader.string();
-            continue;
-          }
-          case 3: {
-            if (tag !== 26) {
-              break;
-            }
-
-            message.parentStepId = reader.string();
-            continue;
-          }
-          case 4: {
-            if (tag !== 34) {
-              break;
-            }
-
-            message.kind = reader.string();
-            continue;
-          }
-          case 5: {
-            if (tag !== 42) {
-              break;
-            }
-
-            message.inputSnapshot = Buffer.from(reader.bytes());
-            continue;
-          }
-          case 6: {
-            if (tag !== 48) {
-              break;
-            }
-
-            message.leaseEpoch = longToNumber(reader.uint64());
-            continue;
-          }
-          case 7: {
-            if (tag !== 58) {
-              break;
-            }
-
-            message.instanceId = reader.string();
-            continue;
-          }
-        }
-        if ((tag & 7) === 4 || tag === 0) {
-          break;
-        }
-        reader.skip(tag & 7);
-      }
-      return message;
-    } finally {
-      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
-    }
-  },
-
-  create<I extends Exact<DeepPartial<BeginStepRequest>, I>>(base?: I): BeginStepRequest {
-    return BeginStepRequest.fromPartial(base ?? ({} as any));
-  },
-  fromPartial<I extends Exact<DeepPartial<BeginStepRequest>, I>>(object: I): BeginStepRequest {
-    const message = createBaseBeginStepRequest();
-    message.runId = object.runId ?? "";
-    message.stepId = object.stepId ?? "";
-    message.parentStepId = object.parentStepId ?? "";
-    message.kind = object.kind ?? "";
-    message.inputSnapshot = object.inputSnapshot ?? Buffer.alloc(0);
-    message.leaseEpoch = object.leaseEpoch ?? 0;
-    message.instanceId = object.instanceId ?? "";
-    return message;
-  },
-};
-
-function createBaseBeginStepResponse(): BeginStepResponse {
-  return { cachedOutput: Buffer.alloc(0), alreadyDone: false, leaseEpoch: 0 };
-}
-
-export const BeginStepResponse: MessageFns<BeginStepResponse> = {
-  encode(message: BeginStepResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.cachedOutput.length !== 0) {
-      writer.uint32(10).bytes(message.cachedOutput);
-    }
-    if (message.alreadyDone !== false) {
-      writer.uint32(16).bool(message.alreadyDone);
-    }
-    if (message.leaseEpoch !== 0) {
-      writer.uint32(24).uint64(message.leaseEpoch);
-    }
-    return writer;
-  },
-
-  decode(input: BinaryReader | Uint8Array, length?: number): BeginStepResponse {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
-    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
-    if (previousRecursionDepth >= 100) {
-      throw new globalThis.Error("protobuf decode recursion limit exceeded");
-    }
-    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
-    try {
-      const end = length === undefined ? reader.len : reader.pos + length;
-      const message = createBaseBeginStepResponse();
-      while (reader.pos < end) {
-        const tag = reader.uint32();
-        switch (tag >>> 3) {
-          case 1: {
-            if (tag !== 10) {
-              break;
-            }
-
-            message.cachedOutput = Buffer.from(reader.bytes());
-            continue;
-          }
-          case 2: {
-            if (tag !== 16) {
-              break;
-            }
-
-            message.alreadyDone = reader.bool();
-            continue;
-          }
-          case 3: {
-            if (tag !== 24) {
-              break;
-            }
-
-            message.leaseEpoch = longToNumber(reader.uint64());
-            continue;
-          }
-        }
-        if ((tag & 7) === 4 || tag === 0) {
-          break;
-        }
-        reader.skip(tag & 7);
-      }
-      return message;
-    } finally {
-      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
-    }
-  },
-
-  create<I extends Exact<DeepPartial<BeginStepResponse>, I>>(base?: I): BeginStepResponse {
-    return BeginStepResponse.fromPartial(base ?? ({} as any));
-  },
-  fromPartial<I extends Exact<DeepPartial<BeginStepResponse>, I>>(object: I): BeginStepResponse {
-    const message = createBaseBeginStepResponse();
-    message.cachedOutput = object.cachedOutput ?? Buffer.alloc(0);
-    message.alreadyDone = object.alreadyDone ?? false;
-    message.leaseEpoch = object.leaseEpoch ?? 0;
-    return message;
-  },
-};
-
-function createBaseCompleteStepRequest(): CompleteStepRequest {
-  return { runId: "", stepId: "", output: Buffer.alloc(0), leaseEpoch: 0 };
-}
-
-export const CompleteStepRequest: MessageFns<CompleteStepRequest> = {
-  encode(message: CompleteStepRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.runId !== "") {
-      writer.uint32(10).string(message.runId);
-    }
-    if (message.stepId !== "") {
-      writer.uint32(18).string(message.stepId);
-    }
-    if (message.output.length !== 0) {
-      writer.uint32(26).bytes(message.output);
-    }
-    if (message.leaseEpoch !== 0) {
-      writer.uint32(32).uint64(message.leaseEpoch);
-    }
-    return writer;
-  },
-
-  decode(input: BinaryReader | Uint8Array, length?: number): CompleteStepRequest {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
-    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
-    if (previousRecursionDepth >= 100) {
-      throw new globalThis.Error("protobuf decode recursion limit exceeded");
-    }
-    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
-    try {
-      const end = length === undefined ? reader.len : reader.pos + length;
-      const message = createBaseCompleteStepRequest();
-      while (reader.pos < end) {
-        const tag = reader.uint32();
-        switch (tag >>> 3) {
-          case 1: {
-            if (tag !== 10) {
-              break;
-            }
-
-            message.runId = reader.string();
-            continue;
-          }
-          case 2: {
-            if (tag !== 18) {
-              break;
-            }
-
-            message.stepId = reader.string();
-            continue;
-          }
-          case 3: {
-            if (tag !== 26) {
-              break;
-            }
-
-            message.output = Buffer.from(reader.bytes());
-            continue;
-          }
-          case 4: {
-            if (tag !== 32) {
-              break;
-            }
-
-            message.leaseEpoch = longToNumber(reader.uint64());
-            continue;
-          }
-        }
-        if ((tag & 7) === 4 || tag === 0) {
-          break;
-        }
-        reader.skip(tag & 7);
-      }
-      return message;
-    } finally {
-      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
-    }
-  },
-
-  create<I extends Exact<DeepPartial<CompleteStepRequest>, I>>(base?: I): CompleteStepRequest {
-    return CompleteStepRequest.fromPartial(base ?? ({} as any));
-  },
-  fromPartial<I extends Exact<DeepPartial<CompleteStepRequest>, I>>(object: I): CompleteStepRequest {
-    const message = createBaseCompleteStepRequest();
-    message.runId = object.runId ?? "";
-    message.stepId = object.stepId ?? "";
-    message.output = object.output ?? Buffer.alloc(0);
-    message.leaseEpoch = object.leaseEpoch ?? 0;
-    return message;
-  },
-};
-
-function createBaseFailStepRequest(): FailStepRequest {
-  return { runId: "", stepId: "", errorCode: "", errorMessage: "", leaseEpoch: 0, retriable: false };
-}
-
-export const FailStepRequest: MessageFns<FailStepRequest> = {
-  encode(message: FailStepRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.runId !== "") {
-      writer.uint32(10).string(message.runId);
-    }
-    if (message.stepId !== "") {
-      writer.uint32(18).string(message.stepId);
-    }
-    if (message.errorCode !== "") {
-      writer.uint32(26).string(message.errorCode);
-    }
-    if (message.errorMessage !== "") {
-      writer.uint32(34).string(message.errorMessage);
-    }
-    if (message.leaseEpoch !== 0) {
-      writer.uint32(40).uint64(message.leaseEpoch);
-    }
-    if (message.retriable !== false) {
-      writer.uint32(48).bool(message.retriable);
-    }
-    return writer;
-  },
-
-  decode(input: BinaryReader | Uint8Array, length?: number): FailStepRequest {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
-    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
-    if (previousRecursionDepth >= 100) {
-      throw new globalThis.Error("protobuf decode recursion limit exceeded");
-    }
-    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
-    try {
-      const end = length === undefined ? reader.len : reader.pos + length;
-      const message = createBaseFailStepRequest();
-      while (reader.pos < end) {
-        const tag = reader.uint32();
-        switch (tag >>> 3) {
-          case 1: {
-            if (tag !== 10) {
-              break;
-            }
-
-            message.runId = reader.string();
-            continue;
-          }
-          case 2: {
-            if (tag !== 18) {
-              break;
-            }
-
-            message.stepId = reader.string();
-            continue;
-          }
-          case 3: {
-            if (tag !== 26) {
-              break;
-            }
-
-            message.errorCode = reader.string();
-            continue;
-          }
-          case 4: {
-            if (tag !== 34) {
-              break;
-            }
-
-            message.errorMessage = reader.string();
-            continue;
-          }
-          case 5: {
-            if (tag !== 40) {
-              break;
-            }
-
-            message.leaseEpoch = longToNumber(reader.uint64());
-            continue;
-          }
-          case 6: {
-            if (tag !== 48) {
-              break;
-            }
-
-            message.retriable = reader.bool();
-            continue;
-          }
-        }
-        if ((tag & 7) === 4 || tag === 0) {
-          break;
-        }
-        reader.skip(tag & 7);
-      }
-      return message;
-    } finally {
-      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
-    }
-  },
-
-  create<I extends Exact<DeepPartial<FailStepRequest>, I>>(base?: I): FailStepRequest {
-    return FailStepRequest.fromPartial(base ?? ({} as any));
-  },
-  fromPartial<I extends Exact<DeepPartial<FailStepRequest>, I>>(object: I): FailStepRequest {
-    const message = createBaseFailStepRequest();
-    message.runId = object.runId ?? "";
-    message.stepId = object.stepId ?? "";
-    message.errorCode = object.errorCode ?? "";
-    message.errorMessage = object.errorMessage ?? "";
-    message.leaseEpoch = object.leaseEpoch ?? 0;
-    message.retriable = object.retriable ?? false;
-    return message;
-  },
-};
-
-function createBaseFailStepResponse(): FailStepResponse {
-  return { nextAction: "", retryDelaySec: 0 };
-}
-
-export const FailStepResponse: MessageFns<FailStepResponse> = {
-  encode(message: FailStepResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.nextAction !== "") {
-      writer.uint32(10).string(message.nextAction);
-    }
-    if (message.retryDelaySec !== 0) {
-      writer.uint32(16).uint32(message.retryDelaySec);
-    }
-    return writer;
-  },
-
-  decode(input: BinaryReader | Uint8Array, length?: number): FailStepResponse {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
-    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
-    if (previousRecursionDepth >= 100) {
-      throw new globalThis.Error("protobuf decode recursion limit exceeded");
-    }
-    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
-    try {
-      const end = length === undefined ? reader.len : reader.pos + length;
-      const message = createBaseFailStepResponse();
-      while (reader.pos < end) {
-        const tag = reader.uint32();
-        switch (tag >>> 3) {
-          case 1: {
-            if (tag !== 10) {
-              break;
-            }
-
-            message.nextAction = reader.string();
-            continue;
-          }
-          case 2: {
-            if (tag !== 16) {
-              break;
-            }
-
-            message.retryDelaySec = reader.uint32();
-            continue;
-          }
-        }
-        if ((tag & 7) === 4 || tag === 0) {
-          break;
-        }
-        reader.skip(tag & 7);
-      }
-      return message;
-    } finally {
-      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
-    }
-  },
-
-  create<I extends Exact<DeepPartial<FailStepResponse>, I>>(base?: I): FailStepResponse {
-    return FailStepResponse.fromPartial(base ?? ({} as any));
-  },
-  fromPartial<I extends Exact<DeepPartial<FailStepResponse>, I>>(object: I): FailStepResponse {
-    const message = createBaseFailStepResponse();
-    message.nextAction = object.nextAction ?? "";
-    message.retryDelaySec = object.retryDelaySec ?? 0;
-    return message;
-  },
-};
-
-function createBaseParkRequest(): ParkRequest {
-  return {
-    runId: "",
-    stepId: "",
-    leaseEpoch: 0,
-    sleep: undefined,
-    eventWait: undefined,
-    signalWait: undefined,
-    nestedRun: undefined,
-  };
-}
-
-export const ParkRequest: MessageFns<ParkRequest> = {
-  encode(message: ParkRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.runId !== "") {
-      writer.uint32(10).string(message.runId);
-    }
-    if (message.stepId !== "") {
-      writer.uint32(18).string(message.stepId);
-    }
-    if (message.leaseEpoch !== 0) {
-      writer.uint32(24).uint64(message.leaseEpoch);
-    }
-    if (message.sleep !== undefined) {
-      SleepSpec.encode(message.sleep, writer.uint32(34).fork()).join();
-    }
-    if (message.eventWait !== undefined) {
-      EventWaitSpec.encode(message.eventWait, writer.uint32(42).fork()).join();
-    }
-    if (message.signalWait !== undefined) {
-      SignalWaitSpec.encode(message.signalWait, writer.uint32(50).fork()).join();
-    }
-    if (message.nestedRun !== undefined) {
-      NestedRunSpec.encode(message.nestedRun, writer.uint32(58).fork()).join();
-    }
-    return writer;
-  },
-
-  decode(input: BinaryReader | Uint8Array, length?: number): ParkRequest {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
-    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
-    if (previousRecursionDepth >= 100) {
-      throw new globalThis.Error("protobuf decode recursion limit exceeded");
-    }
-    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
-    try {
-      const end = length === undefined ? reader.len : reader.pos + length;
-      const message = createBaseParkRequest();
-      while (reader.pos < end) {
-        const tag = reader.uint32();
-        switch (tag >>> 3) {
-          case 1: {
-            if (tag !== 10) {
-              break;
-            }
-
-            message.runId = reader.string();
-            continue;
-          }
-          case 2: {
-            if (tag !== 18) {
-              break;
-            }
-
-            message.stepId = reader.string();
-            continue;
-          }
-          case 3: {
-            if (tag !== 24) {
-              break;
-            }
-
-            message.leaseEpoch = longToNumber(reader.uint64());
-            continue;
-          }
-          case 4: {
-            if (tag !== 34) {
-              break;
-            }
-
-            message.sleep = SleepSpec.decode(reader, reader.uint32());
-            continue;
-          }
-          case 5: {
-            if (tag !== 42) {
-              break;
-            }
-
-            message.eventWait = EventWaitSpec.decode(reader, reader.uint32());
-            continue;
-          }
-          case 6: {
-            if (tag !== 50) {
-              break;
-            }
-
-            message.signalWait = SignalWaitSpec.decode(reader, reader.uint32());
-            continue;
-          }
-          case 7: {
-            if (tag !== 58) {
-              break;
-            }
-
-            message.nestedRun = NestedRunSpec.decode(reader, reader.uint32());
-            continue;
-          }
-        }
-        if ((tag & 7) === 4 || tag === 0) {
-          break;
-        }
-        reader.skip(tag & 7);
-      }
-      return message;
-    } finally {
-      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
-    }
-  },
-
-  create<I extends Exact<DeepPartial<ParkRequest>, I>>(base?: I): ParkRequest {
-    return ParkRequest.fromPartial(base ?? ({} as any));
-  },
-  fromPartial<I extends Exact<DeepPartial<ParkRequest>, I>>(object: I): ParkRequest {
-    const message = createBaseParkRequest();
-    message.runId = object.runId ?? "";
-    message.stepId = object.stepId ?? "";
-    message.leaseEpoch = object.leaseEpoch ?? 0;
-    message.sleep = (object.sleep !== undefined && object.sleep !== null)
-      ? SleepSpec.fromPartial(object.sleep)
-      : undefined;
-    message.eventWait = (object.eventWait !== undefined && object.eventWait !== null)
-      ? EventWaitSpec.fromPartial(object.eventWait)
-      : undefined;
-    message.signalWait = (object.signalWait !== undefined && object.signalWait !== null)
-      ? SignalWaitSpec.fromPartial(object.signalWait)
-      : undefined;
-    message.nestedRun = (object.nestedRun !== undefined && object.nestedRun !== null)
-      ? NestedRunSpec.fromPartial(object.nestedRun)
-      : undefined;
-    return message;
-  },
-};
-
-function createBaseSleepSpec(): SleepSpec {
-  return { durationSec: 0 };
-}
-
-export const SleepSpec: MessageFns<SleepSpec> = {
-  encode(message: SleepSpec, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.durationSec !== 0) {
-      writer.uint32(8).uint32(message.durationSec);
-    }
-    return writer;
-  },
-
-  decode(input: BinaryReader | Uint8Array, length?: number): SleepSpec {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
-    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
-    if (previousRecursionDepth >= 100) {
-      throw new globalThis.Error("protobuf decode recursion limit exceeded");
-    }
-    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
-    try {
-      const end = length === undefined ? reader.len : reader.pos + length;
-      const message = createBaseSleepSpec();
+      const message = createBaseResolvedCallOptions();
       while (reader.pos < end) {
         const tag = reader.uint32();
         switch (tag >>> 3) {
@@ -1944,68 +4514,7 @@ export const SleepSpec: MessageFns<SleepSpec> = {
               break;
             }
 
-            message.durationSec = reader.uint32();
-            continue;
-          }
-        }
-        if ((tag & 7) === 4 || tag === 0) {
-          break;
-        }
-        reader.skip(tag & 7);
-      }
-      return message;
-    } finally {
-      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
-    }
-  },
-
-  create<I extends Exact<DeepPartial<SleepSpec>, I>>(base?: I): SleepSpec {
-    return SleepSpec.fromPartial(base ?? ({} as any));
-  },
-  fromPartial<I extends Exact<DeepPartial<SleepSpec>, I>>(object: I): SleepSpec {
-    const message = createBaseSleepSpec();
-    message.durationSec = object.durationSec ?? 0;
-    return message;
-  },
-};
-
-function createBaseEventWaitSpec(): EventWaitSpec {
-  return { event: "", filterJson: "", timeoutSec: 0 };
-}
-
-export const EventWaitSpec: MessageFns<EventWaitSpec> = {
-  encode(message: EventWaitSpec, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.event !== "") {
-      writer.uint32(10).string(message.event);
-    }
-    if (message.filterJson !== "") {
-      writer.uint32(18).string(message.filterJson);
-    }
-    if (message.timeoutSec !== 0) {
-      writer.uint32(24).uint32(message.timeoutSec);
-    }
-    return writer;
-  },
-
-  decode(input: BinaryReader | Uint8Array, length?: number): EventWaitSpec {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
-    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
-    if (previousRecursionDepth >= 100) {
-      throw new globalThis.Error("protobuf decode recursion limit exceeded");
-    }
-    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
-    try {
-      const end = length === undefined ? reader.len : reader.pos + length;
-      const message = createBaseEventWaitSpec();
-      while (reader.pos < end) {
-        const tag = reader.uint32();
-        switch (tag >>> 3) {
-          case 1: {
-            if (tag !== 10) {
-              break;
-            }
-
-            message.event = reader.string();
+            message.timeoutMs = longToNumber(reader.int64());
             continue;
           }
           case 2: {
@@ -2013,219 +4522,15 @@ export const EventWaitSpec: MessageFns<EventWaitSpec> = {
               break;
             }
 
-            message.filterJson = reader.string();
+            message.transport = reader.string();
             continue;
           }
           case 3: {
-            if (tag !== 24) {
+            if (tag !== 26) {
               break;
             }
 
-            message.timeoutSec = reader.uint32();
-            continue;
-          }
-        }
-        if ((tag & 7) === 4 || tag === 0) {
-          break;
-        }
-        reader.skip(tag & 7);
-      }
-      return message;
-    } finally {
-      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
-    }
-  },
-
-  create<I extends Exact<DeepPartial<EventWaitSpec>, I>>(base?: I): EventWaitSpec {
-    return EventWaitSpec.fromPartial(base ?? ({} as any));
-  },
-  fromPartial<I extends Exact<DeepPartial<EventWaitSpec>, I>>(object: I): EventWaitSpec {
-    const message = createBaseEventWaitSpec();
-    message.event = object.event ?? "";
-    message.filterJson = object.filterJson ?? "";
-    message.timeoutSec = object.timeoutSec ?? 0;
-    return message;
-  },
-};
-
-function createBaseSignalWaitSpec(): SignalWaitSpec {
-  return { signal: "", timeoutSec: 0 };
-}
-
-export const SignalWaitSpec: MessageFns<SignalWaitSpec> = {
-  encode(message: SignalWaitSpec, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.signal !== "") {
-      writer.uint32(10).string(message.signal);
-    }
-    if (message.timeoutSec !== 0) {
-      writer.uint32(16).uint32(message.timeoutSec);
-    }
-    return writer;
-  },
-
-  decode(input: BinaryReader | Uint8Array, length?: number): SignalWaitSpec {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
-    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
-    if (previousRecursionDepth >= 100) {
-      throw new globalThis.Error("protobuf decode recursion limit exceeded");
-    }
-    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
-    try {
-      const end = length === undefined ? reader.len : reader.pos + length;
-      const message = createBaseSignalWaitSpec();
-      while (reader.pos < end) {
-        const tag = reader.uint32();
-        switch (tag >>> 3) {
-          case 1: {
-            if (tag !== 10) {
-              break;
-            }
-
-            message.signal = reader.string();
-            continue;
-          }
-          case 2: {
-            if (tag !== 16) {
-              break;
-            }
-
-            message.timeoutSec = reader.uint32();
-            continue;
-          }
-        }
-        if ((tag & 7) === 4 || tag === 0) {
-          break;
-        }
-        reader.skip(tag & 7);
-      }
-      return message;
-    } finally {
-      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
-    }
-  },
-
-  create<I extends Exact<DeepPartial<SignalWaitSpec>, I>>(base?: I): SignalWaitSpec {
-    return SignalWaitSpec.fromPartial(base ?? ({} as any));
-  },
-  fromPartial<I extends Exact<DeepPartial<SignalWaitSpec>, I>>(object: I): SignalWaitSpec {
-    const message = createBaseSignalWaitSpec();
-    message.signal = object.signal ?? "";
-    message.timeoutSec = object.timeoutSec ?? 0;
-    return message;
-  },
-};
-
-function createBaseNestedRunSpec(): NestedRunSpec {
-  return { childRunId: "" };
-}
-
-export const NestedRunSpec: MessageFns<NestedRunSpec> = {
-  encode(message: NestedRunSpec, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.childRunId !== "") {
-      writer.uint32(10).string(message.childRunId);
-    }
-    return writer;
-  },
-
-  decode(input: BinaryReader | Uint8Array, length?: number): NestedRunSpec {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
-    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
-    if (previousRecursionDepth >= 100) {
-      throw new globalThis.Error("protobuf decode recursion limit exceeded");
-    }
-    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
-    try {
-      const end = length === undefined ? reader.len : reader.pos + length;
-      const message = createBaseNestedRunSpec();
-      while (reader.pos < end) {
-        const tag = reader.uint32();
-        switch (tag >>> 3) {
-          case 1: {
-            if (tag !== 10) {
-              break;
-            }
-
-            message.childRunId = reader.string();
-            continue;
-          }
-        }
-        if ((tag & 7) === 4 || tag === 0) {
-          break;
-        }
-        reader.skip(tag & 7);
-      }
-      return message;
-    } finally {
-      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
-    }
-  },
-
-  create<I extends Exact<DeepPartial<NestedRunSpec>, I>>(base?: I): NestedRunSpec {
-    return NestedRunSpec.fromPartial(base ?? ({} as any));
-  },
-  fromPartial<I extends Exact<DeepPartial<NestedRunSpec>, I>>(object: I): NestedRunSpec {
-    const message = createBaseNestedRunSpec();
-    message.childRunId = object.childRunId ?? "";
-    return message;
-  },
-};
-
-function createBaseCompleteRunRequest(): CompleteRunRequest {
-  return { runId: "", finalState: Buffer.alloc(0), leaseEpoch: 0, terminalStatus: "" };
-}
-
-export const CompleteRunRequest: MessageFns<CompleteRunRequest> = {
-  encode(message: CompleteRunRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.runId !== "") {
-      writer.uint32(10).string(message.runId);
-    }
-    if (message.finalState.length !== 0) {
-      writer.uint32(18).bytes(message.finalState);
-    }
-    if (message.leaseEpoch !== 0) {
-      writer.uint32(24).uint64(message.leaseEpoch);
-    }
-    if (message.terminalStatus !== "") {
-      writer.uint32(34).string(message.terminalStatus);
-    }
-    return writer;
-  },
-
-  decode(input: BinaryReader | Uint8Array, length?: number): CompleteRunRequest {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
-    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
-    if (previousRecursionDepth >= 100) {
-      throw new globalThis.Error("protobuf decode recursion limit exceeded");
-    }
-    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
-    try {
-      const end = length === undefined ? reader.len : reader.pos + length;
-      const message = createBaseCompleteRunRequest();
-      while (reader.pos < end) {
-        const tag = reader.uint32();
-        switch (tag >>> 3) {
-          case 1: {
-            if (tag !== 10) {
-              break;
-            }
-
-            message.runId = reader.string();
-            continue;
-          }
-          case 2: {
-            if (tag !== 18) {
-              break;
-            }
-
-            message.finalState = Buffer.from(reader.bytes());
-            continue;
-          }
-          case 3: {
-            if (tag !== 24) {
-              break;
-            }
-
-            message.leaseEpoch = longToNumber(reader.uint64());
+            message.idempotencyKey = reader.string();
             continue;
           }
           case 4: {
@@ -2233,7 +4538,15 @@ export const CompleteRunRequest: MessageFns<CompleteRunRequest> = {
               break;
             }
 
-            message.terminalStatus = reader.string();
+            message.requestId = reader.string();
+            continue;
+          }
+          case 5: {
+            if (tag !== 42) {
+              break;
+            }
+
+            message.retry = RetryPolicy.decode(reader, reader.uint32());
             continue;
           }
         }
@@ -2248,33 +4561,349 @@ export const CompleteRunRequest: MessageFns<CompleteRunRequest> = {
     }
   },
 
-  create<I extends Exact<DeepPartial<CompleteRunRequest>, I>>(base?: I): CompleteRunRequest {
-    return CompleteRunRequest.fromPartial(base ?? ({} as any));
+  create<I extends Exact<DeepPartial<ResolvedCallOptions>, I>>(base?: I): ResolvedCallOptions {
+    return ResolvedCallOptions.fromPartial(base ?? ({} as any));
   },
-  fromPartial<I extends Exact<DeepPartial<CompleteRunRequest>, I>>(object: I): CompleteRunRequest {
-    const message = createBaseCompleteRunRequest();
-    message.runId = object.runId ?? "";
-    message.finalState = object.finalState ?? Buffer.alloc(0);
-    message.leaseEpoch = object.leaseEpoch ?? 0;
-    message.terminalStatus = object.terminalStatus ?? "";
+  fromPartial<I extends Exact<DeepPartial<ResolvedCallOptions>, I>>(object: I): ResolvedCallOptions {
+    const message = createBaseResolvedCallOptions();
+    message.timeoutMs = object.timeoutMs ?? 0;
+    message.transport = object.transport ?? "";
+    message.idempotencyKey = object.idempotencyKey ?? "";
+    message.requestId = object.requestId ?? "";
+    message.retry = (object.retry !== undefined && object.retry !== null)
+      ? RetryPolicy.fromPartial(object.retry)
+      : undefined;
+    return message;
+  },
+};
+
+function createBaseResolvedPublishOptions(): ResolvedPublishOptions {
+  return { idempotencyKey: "", partitionKey: "", headers: {} };
+}
+
+export const ResolvedPublishOptions: MessageFns<ResolvedPublishOptions> = {
+  encode(message: ResolvedPublishOptions, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.idempotencyKey !== "") {
+      writer.uint32(10).string(message.idempotencyKey);
+    }
+    if (message.partitionKey !== "") {
+      writer.uint32(18).string(message.partitionKey);
+    }
+    globalThis.Object.entries(message.headers).forEach(([key, value]: [string, string]) => {
+      ResolvedPublishOptions_HeadersEntry.encode({ key: key as any, value }, writer.uint32(26).fork()).join();
+    });
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ResolvedPublishOptions {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseResolvedPublishOptions();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.idempotencyKey = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.partitionKey = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            const entry3 = ResolvedPublishOptions_HeadersEntry.decode(reader, reader.uint32());
+            if (entry3.value !== undefined) {
+              message.headers[entry3.key] = entry3.value;
+            }
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<ResolvedPublishOptions>, I>>(base?: I): ResolvedPublishOptions {
+    return ResolvedPublishOptions.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ResolvedPublishOptions>, I>>(object: I): ResolvedPublishOptions {
+    const message = createBaseResolvedPublishOptions();
+    message.idempotencyKey = object.idempotencyKey ?? "";
+    message.partitionKey = object.partitionKey ?? "";
+    message.headers = (globalThis.Object.entries(object.headers ?? {}) as [string, string][]).reduce(
+      (acc: { [key: string]: string }, [key, value]: [string, string]) => {
+        if (value !== undefined) {
+          acc[key] = globalThis.String(value);
+        }
+        return acc;
+      },
+      {},
+    );
+    return message;
+  },
+};
+
+function createBaseResolvedPublishOptions_HeadersEntry(): ResolvedPublishOptions_HeadersEntry {
+  return { key: "", value: "" };
+}
+
+export const ResolvedPublishOptions_HeadersEntry: MessageFns<ResolvedPublishOptions_HeadersEntry> = {
+  encode(message: ResolvedPublishOptions_HeadersEntry, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.key !== "") {
+      writer.uint32(10).string(message.key);
+    }
+    if (message.value !== "") {
+      writer.uint32(18).string(message.value);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ResolvedPublishOptions_HeadersEntry {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseResolvedPublishOptions_HeadersEntry();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.key = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.value = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<ResolvedPublishOptions_HeadersEntry>, I>>(
+    base?: I,
+  ): ResolvedPublishOptions_HeadersEntry {
+    return ResolvedPublishOptions_HeadersEntry.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ResolvedPublishOptions_HeadersEntry>, I>>(
+    object: I,
+  ): ResolvedPublishOptions_HeadersEntry {
+    const message = createBaseResolvedPublishOptions_HeadersEntry();
+    message.key = object.key ?? "";
+    message.value = object.value ?? "";
+    return message;
+  },
+};
+
+function createBaseCompleteTaskRequest(): CompleteTaskRequest {
+  return { taskToken: "", output: Buffer.alloc(0) };
+}
+
+export const CompleteTaskRequest: MessageFns<CompleteTaskRequest> = {
+  encode(message: CompleteTaskRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.taskToken !== "") {
+      writer.uint32(10).string(message.taskToken);
+    }
+    if (message.output.length !== 0) {
+      writer.uint32(18).bytes(message.output);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): CompleteTaskRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseCompleteTaskRequest();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.taskToken = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.output = Buffer.from(reader.bytes());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<CompleteTaskRequest>, I>>(base?: I): CompleteTaskRequest {
+    return CompleteTaskRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<CompleteTaskRequest>, I>>(object: I): CompleteTaskRequest {
+    const message = createBaseCompleteTaskRequest();
+    message.taskToken = object.taskToken ?? "";
+    message.output = object.output ?? Buffer.alloc(0);
+    return message;
+  },
+};
+
+function createBaseFailTaskRequest(): FailTaskRequest {
+  return { taskToken: "", errorCode: "", errorMessage: "", nonRetriable: false };
+}
+
+export const FailTaskRequest: MessageFns<FailTaskRequest> = {
+  encode(message: FailTaskRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.taskToken !== "") {
+      writer.uint32(10).string(message.taskToken);
+    }
+    if (message.errorCode !== "") {
+      writer.uint32(18).string(message.errorCode);
+    }
+    if (message.errorMessage !== "") {
+      writer.uint32(26).string(message.errorMessage);
+    }
+    if (message.nonRetriable !== false) {
+      writer.uint32(32).bool(message.nonRetriable);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): FailTaskRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseFailTaskRequest();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.taskToken = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.errorCode = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.errorMessage = reader.string();
+            continue;
+          }
+          case 4: {
+            if (tag !== 32) {
+              break;
+            }
+
+            message.nonRetriable = reader.bool();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<FailTaskRequest>, I>>(base?: I): FailTaskRequest {
+    return FailTaskRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<FailTaskRequest>, I>>(object: I): FailTaskRequest {
+    const message = createBaseFailTaskRequest();
+    message.taskToken = object.taskToken ?? "";
+    message.errorCode = object.errorCode ?? "";
+    message.errorMessage = object.errorMessage ?? "";
+    message.nonRetriable = object.nonRetriable ?? false;
     return message;
   },
 };
 
 function createBaseHeartbeatRequest(): HeartbeatRequest {
-  return { runId: "", instanceId: "", leaseEpoch: 0 };
+  return { taskTokens: [] };
 }
 
 export const HeartbeatRequest: MessageFns<HeartbeatRequest> = {
   encode(message: HeartbeatRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.runId !== "") {
-      writer.uint32(10).string(message.runId);
-    }
-    if (message.instanceId !== "") {
-      writer.uint32(18).string(message.instanceId);
-    }
-    if (message.leaseEpoch !== 0) {
-      writer.uint32(24).uint64(message.leaseEpoch);
+    for (const v of message.taskTokens) {
+      writer.uint32(10).string(v!);
     }
     return writer;
   },
@@ -2297,23 +4926,7 @@ export const HeartbeatRequest: MessageFns<HeartbeatRequest> = {
               break;
             }
 
-            message.runId = reader.string();
-            continue;
-          }
-          case 2: {
-            if (tag !== 18) {
-              break;
-            }
-
-            message.instanceId = reader.string();
-            continue;
-          }
-          case 3: {
-            if (tag !== 24) {
-              break;
-            }
-
-            message.leaseEpoch = longToNumber(reader.uint64());
+            message.taskTokens.push(reader.string());
             continue;
           }
         }
@@ -2333,21 +4946,80 @@ export const HeartbeatRequest: MessageFns<HeartbeatRequest> = {
   },
   fromPartial<I extends Exact<DeepPartial<HeartbeatRequest>, I>>(object: I): HeartbeatRequest {
     const message = createBaseHeartbeatRequest();
-    message.runId = object.runId ?? "";
-    message.instanceId = object.instanceId ?? "";
-    message.leaseEpoch = object.leaseEpoch ?? 0;
+    message.taskTokens = object.taskTokens?.map((e) => e) || [];
+    return message;
+  },
+};
+
+function createBaseHeartbeatResponse(): HeartbeatResponse {
+  return { lostTokens: [] };
+}
+
+export const HeartbeatResponse: MessageFns<HeartbeatResponse> = {
+  encode(message: HeartbeatResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.lostTokens) {
+      writer.uint32(10).string(v!);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): HeartbeatResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseHeartbeatResponse();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.lostTokens.push(reader.string());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  create<I extends Exact<DeepPartial<HeartbeatResponse>, I>>(base?: I): HeartbeatResponse {
+    return HeartbeatResponse.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<HeartbeatResponse>, I>>(object: I): HeartbeatResponse {
+    const message = createBaseHeartbeatResponse();
+    message.lostTokens = object.lostTokens?.map((e) => e) || [];
     return message;
   },
 };
 
 /**
- * Workflows — durable workflow execution service.
- * Caller-side RPCs: Start, Cancel, Signal, Query, Await, Replay.
- * Owner-side RPCs: Subscribe, BeginStep, CompleteStep, FailStep, Park, Heartbeat.
+ * Workflows — durable workflow execution (runtime ADR 0003).
+ *
+ * The runtime interprets the workflow DAG. SDKs declare definitions
+ * (RegisterRequest.incoming[].workflow), steer runs (caller side) and execute
+ * the step tasks the runtime leases to them (owner side).
  */
 export type WorkflowsService = typeof WorkflowsService;
 export const WorkflowsService = {
-  /** Caller-side */
+  /**
+   * Caller side. Start: bilateral workflow.run / workflow.handle policy. The
+   * rest: the owner service, the service that started the run, or a caller
+   * with an explicit workflow.run policy rule for the workflow.
+   */
   start: {
     path: "/servicebridge.v1.Workflows/Start" as const,
     requestStream: false as const,
@@ -2372,8 +5044,8 @@ export const WorkflowsService = {
     responseStream: false as const,
     requestSerialize: (value: SignalRunRequest): Buffer => Buffer.from(SignalRunRequest.encode(value).finish()),
     requestDeserialize: (value: Buffer): SignalRunRequest => SignalRunRequest.decode(value),
-    responseSerialize: (value: Empty): Buffer => Buffer.from(Empty.encode(value).finish()),
-    responseDeserialize: (value: Buffer): Empty => Empty.decode(value),
+    responseSerialize: (value: SignalRunResponse): Buffer => Buffer.from(SignalRunResponse.encode(value).finish()),
+    responseDeserialize: (value: Buffer): SignalRunResponse => SignalRunResponse.decode(value),
   },
   query: {
     path: "/servicebridge.v1.Workflows/Query" as const,
@@ -2381,9 +5053,13 @@ export const WorkflowsService = {
     responseStream: false as const,
     requestSerialize: (value: QueryRunRequest): Buffer => Buffer.from(QueryRunRequest.encode(value).finish()),
     requestDeserialize: (value: Buffer): QueryRunRequest => QueryRunRequest.decode(value),
-    responseSerialize: (value: QueryRunResponse): Buffer => Buffer.from(QueryRunResponse.encode(value).finish()),
-    responseDeserialize: (value: Buffer): QueryRunResponse => QueryRunResponse.decode(value),
+    responseSerialize: (value: RunSnapshot): Buffer => Buffer.from(RunSnapshot.encode(value).finish()),
+    responseDeserialize: (value: Buffer): RunSnapshot => RunSnapshot.decode(value),
   },
+  /**
+   * Await sends the run status on subscribe and on every change; the stream
+   * ends after the first terminal status.
+   */
   await: {
     path: "/servicebridge.v1.Workflows/Await" as const,
     requestStream: false as const,
@@ -2402,92 +5078,107 @@ export const WorkflowsService = {
     responseSerialize: (value: ReplayRunResponse): Buffer => Buffer.from(ReplayRunResponse.encode(value).finish()),
     responseDeserialize: (value: Buffer): ReplayRunResponse => ReplayRunResponse.decode(value),
   },
-  /** Owner-side */
+  /**
+   * RetryCompensation re-runs the failed compensations of a
+   * failed_compensated run.
+   */
+  retryCompensation: {
+    path: "/servicebridge.v1.Workflows/RetryCompensation" as const,
+    requestStream: false as const,
+    responseStream: false as const,
+    requestSerialize: (value: RetryCompensationRequest): Buffer =>
+      Buffer.from(RetryCompensationRequest.encode(value).finish()),
+    requestDeserialize: (value: Buffer): RetryCompensationRequest => RetryCompensationRequest.decode(value),
+    responseSerialize: (value: Empty): Buffer => Buffer.from(Empty.encode(value).finish()),
+    responseDeserialize: (value: Buffer): Empty => Empty.decode(value),
+  },
+  /**
+   * Owner side. Subscribe streams step tasks to one instance; every task is a
+   * lease on one step attempt identified by task_token.
+   */
   subscribe: {
     path: "/servicebridge.v1.Workflows/Subscribe" as const,
     requestStream: false as const,
     responseStream: true as const,
     requestSerialize: (value: SubscribeRequest): Buffer => Buffer.from(SubscribeRequest.encode(value).finish()),
     requestDeserialize: (value: Buffer): SubscribeRequest => SubscribeRequest.decode(value),
-    responseSerialize: (value: RunAssignment): Buffer => Buffer.from(RunAssignment.encode(value).finish()),
-    responseDeserialize: (value: Buffer): RunAssignment => RunAssignment.decode(value),
+    responseSerialize: (value: StepTask): Buffer => Buffer.from(StepTask.encode(value).finish()),
+    responseDeserialize: (value: Buffer): StepTask => StepTask.decode(value),
   },
-  beginStep: {
-    path: "/servicebridge.v1.Workflows/BeginStep" as const,
+  completeTask: {
+    path: "/servicebridge.v1.Workflows/CompleteTask" as const,
     requestStream: false as const,
     responseStream: false as const,
-    requestSerialize: (value: BeginStepRequest): Buffer => Buffer.from(BeginStepRequest.encode(value).finish()),
-    requestDeserialize: (value: Buffer): BeginStepRequest => BeginStepRequest.decode(value),
-    responseSerialize: (value: BeginStepResponse): Buffer => Buffer.from(BeginStepResponse.encode(value).finish()),
-    responseDeserialize: (value: Buffer): BeginStepResponse => BeginStepResponse.decode(value),
-  },
-  completeStep: {
-    path: "/servicebridge.v1.Workflows/CompleteStep" as const,
-    requestStream: false as const,
-    responseStream: false as const,
-    requestSerialize: (value: CompleteStepRequest): Buffer => Buffer.from(CompleteStepRequest.encode(value).finish()),
-    requestDeserialize: (value: Buffer): CompleteStepRequest => CompleteStepRequest.decode(value),
+    requestSerialize: (value: CompleteTaskRequest): Buffer => Buffer.from(CompleteTaskRequest.encode(value).finish()),
+    requestDeserialize: (value: Buffer): CompleteTaskRequest => CompleteTaskRequest.decode(value),
     responseSerialize: (value: Empty): Buffer => Buffer.from(Empty.encode(value).finish()),
     responseDeserialize: (value: Buffer): Empty => Empty.decode(value),
   },
-  completeRun: {
-    path: "/servicebridge.v1.Workflows/CompleteRun" as const,
+  failTask: {
+    path: "/servicebridge.v1.Workflows/FailTask" as const,
     requestStream: false as const,
     responseStream: false as const,
-    requestSerialize: (value: CompleteRunRequest): Buffer => Buffer.from(CompleteRunRequest.encode(value).finish()),
-    requestDeserialize: (value: Buffer): CompleteRunRequest => CompleteRunRequest.decode(value),
+    requestSerialize: (value: FailTaskRequest): Buffer => Buffer.from(FailTaskRequest.encode(value).finish()),
+    requestDeserialize: (value: Buffer): FailTaskRequest => FailTaskRequest.decode(value),
     responseSerialize: (value: Empty): Buffer => Buffer.from(Empty.encode(value).finish()),
     responseDeserialize: (value: Buffer): Empty => Empty.decode(value),
   },
-  failStep: {
-    path: "/servicebridge.v1.Workflows/FailStep" as const,
-    requestStream: false as const,
-    responseStream: false as const,
-    requestSerialize: (value: FailStepRequest): Buffer => Buffer.from(FailStepRequest.encode(value).finish()),
-    requestDeserialize: (value: Buffer): FailStepRequest => FailStepRequest.decode(value),
-    responseSerialize: (value: FailStepResponse): Buffer => Buffer.from(FailStepResponse.encode(value).finish()),
-    responseDeserialize: (value: Buffer): FailStepResponse => FailStepResponse.decode(value),
-  },
-  park: {
-    path: "/servicebridge.v1.Workflows/Park" as const,
-    requestStream: false as const,
-    responseStream: false as const,
-    requestSerialize: (value: ParkRequest): Buffer => Buffer.from(ParkRequest.encode(value).finish()),
-    requestDeserialize: (value: Buffer): ParkRequest => ParkRequest.decode(value),
-    responseSerialize: (value: Empty): Buffer => Buffer.from(Empty.encode(value).finish()),
-    responseDeserialize: (value: Buffer): Empty => Empty.decode(value),
-  },
+  /**
+   * Heartbeat extends the leases of the given tokens and reports the tokens
+   * the runtime no longer recognizes; the SDK aborts those executions.
+   */
   heartbeat: {
     path: "/servicebridge.v1.Workflows/Heartbeat" as const,
     requestStream: false as const,
     responseStream: false as const,
     requestSerialize: (value: HeartbeatRequest): Buffer => Buffer.from(HeartbeatRequest.encode(value).finish()),
     requestDeserialize: (value: Buffer): HeartbeatRequest => HeartbeatRequest.decode(value),
-    responseSerialize: (value: Empty): Buffer => Buffer.from(Empty.encode(value).finish()),
-    responseDeserialize: (value: Buffer): Empty => Empty.decode(value),
+    responseSerialize: (value: HeartbeatResponse): Buffer => Buffer.from(HeartbeatResponse.encode(value).finish()),
+    responseDeserialize: (value: Buffer): HeartbeatResponse => HeartbeatResponse.decode(value),
   },
 } as const;
 
 export interface WorkflowsServer extends UntypedServiceImplementation {
-  /** Caller-side */
+  /**
+   * Caller side. Start: bilateral workflow.run / workflow.handle policy. The
+   * rest: the owner service, the service that started the run, or a caller
+   * with an explicit workflow.run policy rule for the workflow.
+   */
   start: handleUnaryCall<StartRunRequest, StartRunResponse>;
   cancel: handleUnaryCall<CancelRunRequest, Empty>;
-  signal: handleUnaryCall<SignalRunRequest, Empty>;
-  query: handleUnaryCall<QueryRunRequest, QueryRunResponse>;
+  signal: handleUnaryCall<SignalRunRequest, SignalRunResponse>;
+  query: handleUnaryCall<QueryRunRequest, RunSnapshot>;
+  /**
+   * Await sends the run status on subscribe and on every change; the stream
+   * ends after the first terminal status.
+   */
   await: handleServerStreamingCall<AwaitRunRequest, RunStatusUpdate>;
   replay: handleUnaryCall<ReplayRunRequest, ReplayRunResponse>;
-  /** Owner-side */
-  subscribe: handleServerStreamingCall<SubscribeRequest, RunAssignment>;
-  beginStep: handleUnaryCall<BeginStepRequest, BeginStepResponse>;
-  completeStep: handleUnaryCall<CompleteStepRequest, Empty>;
-  completeRun: handleUnaryCall<CompleteRunRequest, Empty>;
-  failStep: handleUnaryCall<FailStepRequest, FailStepResponse>;
-  park: handleUnaryCall<ParkRequest, Empty>;
-  heartbeat: handleUnaryCall<HeartbeatRequest, Empty>;
+  /**
+   * RetryCompensation re-runs the failed compensations of a
+   * failed_compensated run.
+   */
+  retryCompensation: handleUnaryCall<RetryCompensationRequest, Empty>;
+  /**
+   * Owner side. Subscribe streams step tasks to one instance; every task is a
+   * lease on one step attempt identified by task_token.
+   */
+  subscribe: handleServerStreamingCall<SubscribeRequest, StepTask>;
+  completeTask: handleUnaryCall<CompleteTaskRequest, Empty>;
+  failTask: handleUnaryCall<FailTaskRequest, Empty>;
+  /**
+   * Heartbeat extends the leases of the given tokens and reports the tokens
+   * the runtime no longer recognizes; the SDK aborts those executions.
+   */
+  heartbeat: handleUnaryCall<HeartbeatRequest, HeartbeatResponse>;
 }
 
 export interface WorkflowsClient extends Client {
-  /** Caller-side */
+  /**
+   * Caller side. Start: bilateral workflow.run / workflow.handle policy. The
+   * rest: the owner service, the service that started the run, or a caller
+   * with an explicit workflow.run policy rule for the workflow.
+   */
   start(
     request: StartRunRequest,
     callback: (error: ServiceError | null, response: StartRunResponse) => void,
@@ -2515,33 +5206,40 @@ export interface WorkflowsClient extends Client {
     options: Partial<CallOptions>,
     callback: (error: ServiceError | null, response: Empty) => void,
   ): ClientUnaryCall;
-  signal(request: SignalRunRequest, callback: (error: ServiceError | null, response: Empty) => void): ClientUnaryCall;
+  signal(
+    request: SignalRunRequest,
+    callback: (error: ServiceError | null, response: SignalRunResponse) => void,
+  ): ClientUnaryCall;
   signal(
     request: SignalRunRequest,
     metadata: Metadata,
-    callback: (error: ServiceError | null, response: Empty) => void,
+    callback: (error: ServiceError | null, response: SignalRunResponse) => void,
   ): ClientUnaryCall;
   signal(
     request: SignalRunRequest,
     metadata: Metadata,
     options: Partial<CallOptions>,
-    callback: (error: ServiceError | null, response: Empty) => void,
+    callback: (error: ServiceError | null, response: SignalRunResponse) => void,
   ): ClientUnaryCall;
   query(
     request: QueryRunRequest,
-    callback: (error: ServiceError | null, response: QueryRunResponse) => void,
+    callback: (error: ServiceError | null, response: RunSnapshot) => void,
   ): ClientUnaryCall;
   query(
     request: QueryRunRequest,
     metadata: Metadata,
-    callback: (error: ServiceError | null, response: QueryRunResponse) => void,
+    callback: (error: ServiceError | null, response: RunSnapshot) => void,
   ): ClientUnaryCall;
   query(
     request: QueryRunRequest,
     metadata: Metadata,
     options: Partial<CallOptions>,
-    callback: (error: ServiceError | null, response: QueryRunResponse) => void,
+    callback: (error: ServiceError | null, response: RunSnapshot) => void,
   ): ClientUnaryCall;
+  /**
+   * Await sends the run status on subscribe and on every change; the stream
+   * ends after the first terminal status.
+   */
   await(request: AwaitRunRequest, options?: Partial<CallOptions>): ClientReadableStream<RunStatusUpdate>;
   await(
     request: AwaitRunRequest,
@@ -2563,99 +5261,80 @@ export interface WorkflowsClient extends Client {
     options: Partial<CallOptions>,
     callback: (error: ServiceError | null, response: ReplayRunResponse) => void,
   ): ClientUnaryCall;
-  /** Owner-side */
-  subscribe(request: SubscribeRequest, options?: Partial<CallOptions>): ClientReadableStream<RunAssignment>;
+  /**
+   * RetryCompensation re-runs the failed compensations of a
+   * failed_compensated run.
+   */
+  retryCompensation(
+    request: RetryCompensationRequest,
+    callback: (error: ServiceError | null, response: Empty) => void,
+  ): ClientUnaryCall;
+  retryCompensation(
+    request: RetryCompensationRequest,
+    metadata: Metadata,
+    callback: (error: ServiceError | null, response: Empty) => void,
+  ): ClientUnaryCall;
+  retryCompensation(
+    request: RetryCompensationRequest,
+    metadata: Metadata,
+    options: Partial<CallOptions>,
+    callback: (error: ServiceError | null, response: Empty) => void,
+  ): ClientUnaryCall;
+  /**
+   * Owner side. Subscribe streams step tasks to one instance; every task is a
+   * lease on one step attempt identified by task_token.
+   */
+  subscribe(request: SubscribeRequest, options?: Partial<CallOptions>): ClientReadableStream<StepTask>;
   subscribe(
     request: SubscribeRequest,
     metadata?: Metadata,
     options?: Partial<CallOptions>,
-  ): ClientReadableStream<RunAssignment>;
-  beginStep(
-    request: BeginStepRequest,
-    callback: (error: ServiceError | null, response: BeginStepResponse) => void,
-  ): ClientUnaryCall;
-  beginStep(
-    request: BeginStepRequest,
-    metadata: Metadata,
-    callback: (error: ServiceError | null, response: BeginStepResponse) => void,
-  ): ClientUnaryCall;
-  beginStep(
-    request: BeginStepRequest,
-    metadata: Metadata,
-    options: Partial<CallOptions>,
-    callback: (error: ServiceError | null, response: BeginStepResponse) => void,
-  ): ClientUnaryCall;
-  completeStep(
-    request: CompleteStepRequest,
+  ): ClientReadableStream<StepTask>;
+  completeTask(
+    request: CompleteTaskRequest,
     callback: (error: ServiceError | null, response: Empty) => void,
   ): ClientUnaryCall;
-  completeStep(
-    request: CompleteStepRequest,
+  completeTask(
+    request: CompleteTaskRequest,
     metadata: Metadata,
     callback: (error: ServiceError | null, response: Empty) => void,
   ): ClientUnaryCall;
-  completeStep(
-    request: CompleteStepRequest,
+  completeTask(
+    request: CompleteTaskRequest,
     metadata: Metadata,
     options: Partial<CallOptions>,
     callback: (error: ServiceError | null, response: Empty) => void,
   ): ClientUnaryCall;
-  completeRun(
-    request: CompleteRunRequest,
-    callback: (error: ServiceError | null, response: Empty) => void,
-  ): ClientUnaryCall;
-  completeRun(
-    request: CompleteRunRequest,
+  failTask(request: FailTaskRequest, callback: (error: ServiceError | null, response: Empty) => void): ClientUnaryCall;
+  failTask(
+    request: FailTaskRequest,
     metadata: Metadata,
     callback: (error: ServiceError | null, response: Empty) => void,
   ): ClientUnaryCall;
-  completeRun(
-    request: CompleteRunRequest,
+  failTask(
+    request: FailTaskRequest,
     metadata: Metadata,
     options: Partial<CallOptions>,
     callback: (error: ServiceError | null, response: Empty) => void,
   ): ClientUnaryCall;
-  failStep(
-    request: FailStepRequest,
-    callback: (error: ServiceError | null, response: FailStepResponse) => void,
-  ): ClientUnaryCall;
-  failStep(
-    request: FailStepRequest,
-    metadata: Metadata,
-    callback: (error: ServiceError | null, response: FailStepResponse) => void,
-  ): ClientUnaryCall;
-  failStep(
-    request: FailStepRequest,
-    metadata: Metadata,
-    options: Partial<CallOptions>,
-    callback: (error: ServiceError | null, response: FailStepResponse) => void,
-  ): ClientUnaryCall;
-  park(request: ParkRequest, callback: (error: ServiceError | null, response: Empty) => void): ClientUnaryCall;
-  park(
-    request: ParkRequest,
-    metadata: Metadata,
-    callback: (error: ServiceError | null, response: Empty) => void,
-  ): ClientUnaryCall;
-  park(
-    request: ParkRequest,
-    metadata: Metadata,
-    options: Partial<CallOptions>,
-    callback: (error: ServiceError | null, response: Empty) => void,
-  ): ClientUnaryCall;
+  /**
+   * Heartbeat extends the leases of the given tokens and reports the tokens
+   * the runtime no longer recognizes; the SDK aborts those executions.
+   */
   heartbeat(
     request: HeartbeatRequest,
-    callback: (error: ServiceError | null, response: Empty) => void,
+    callback: (error: ServiceError | null, response: HeartbeatResponse) => void,
   ): ClientUnaryCall;
   heartbeat(
     request: HeartbeatRequest,
     metadata: Metadata,
-    callback: (error: ServiceError | null, response: Empty) => void,
+    callback: (error: ServiceError | null, response: HeartbeatResponse) => void,
   ): ClientUnaryCall;
   heartbeat(
     request: HeartbeatRequest,
     metadata: Metadata,
     options: Partial<CallOptions>,
-    callback: (error: ServiceError | null, response: Empty) => void,
+    callback: (error: ServiceError | null, response: HeartbeatResponse) => void,
   ): ClientUnaryCall;
 }
 

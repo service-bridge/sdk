@@ -2,430 +2,164 @@ package workflow_test
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"strings"
+	"io"
 	"testing"
 
-	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1"
-	"github.com/service-bridge/sdk/go/internal/telemetry"
 	iwf "github.com/service-bridge/sdk/go/internal/workflow"
 )
 
-func newCaller(t *testing.T, client pb.WorkflowsClient) *iwf.Caller {
+func (f *fakeClient) Start(_ context.Context, r *pb.StartRunRequest, _ ...grpc.CallOption) (*pb.StartRunResponse, error) {
+	f.last = r
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &pb.StartRunResponse{RunId: "r1"}, nil
+}
+
+func (f *fakeClient) Signal(_ context.Context, r *pb.SignalRunRequest, _ ...grpc.CallOption) (*pb.SignalRunResponse, error) {
+	f.last = r
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &pb.SignalRunResponse{Duplicate: r.GetSignalId() == "dup"}, nil
+}
+
+func (f *fakeClient) Cancel(context.Context, *pb.CancelRunRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
+	return &emptypb.Empty{}, f.err
+}
+
+func (f *fakeClient) RetryCompensation(context.Context, *pb.RetryCompensationRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
+	return &emptypb.Empty{}, f.err
+}
+
+func (f *fakeClient) Replay(_ context.Context, r *pb.ReplayRunRequest, _ ...grpc.CallOption) (*pb.ReplayRunResponse, error) {
+	f.last = r
+	return &pb.ReplayRunResponse{RunId: "r2"}, f.err
+}
+
+func (f *fakeClient) Query(context.Context, *pb.QueryRunRequest, ...grpc.CallOption) (*pb.RunSnapshot, error) {
+	return f.snapshot, f.err
+}
+
+func (f *fakeClient) Await(context.Context, *pb.AwaitRunRequest, ...grpc.CallOption) (pb.Workflows_AwaitClient, error) {
+	return &awaitStream{updates: f.await}, f.err
+}
+
+type awaitStream struct {
+	grpc.ClientStream
+	updates []*pb.RunStatusUpdate
+}
+
+func (s *awaitStream) Recv() (*pb.RunStatusUpdate, error) {
+	if len(s.updates) == 0 {
+		return nil, io.EOF
+	}
+	u := s.updates[0]
+	s.updates = s.updates[1:]
+	return u, nil
+}
+
+func caller(t *testing.T, f *fakeClient) *iwf.Caller {
 	t.Helper()
-	caller, err := iwf.NewCaller(iwf.CallerConfig{Clients: staticClients{client: client}})
+	c, err := iwf.NewCaller(iwf.CallerConfig{Clients: source{f}})
 	if err != nil {
-		t.Fatalf("new caller: %v", err)
+		t.Fatal(err)
 	}
-	return caller
+	return c
 }
 
-func TestStartEncodesInputAndReturnsTheRunID(t *testing.T) {
-	t.Parallel()
-
-	srv, client := startWorkflows(t)
-	srv.onStart = func(*pb.StartRunRequest) (*pb.StartRunResponse, error) {
-		return &pb.StartRunResponse{RunId: "run-42"}, nil
+func TestCallerStartAndSignal(t *testing.T) {
+	f := newFake()
+	c := caller(t, f)
+	id, err := c.Start(context.Background(), iwf.StartArgs{Service: "orders", Workflow: "flow", Input: map[string]any{"a": 1}, IdempotencyKey: "k", TimeoutMs: 10})
+	if err != nil || id != "r1" {
+		t.Fatal(id, err)
 	}
-
-	runID, err := newCaller(t, client).Start(t.Context(), iwf.StartArgs{
-		Workflow:       "order_flow",
-		Input:          map[string]any{"id": "o-1"},
-		IdempotencyKey: "k-1",
-		TimeoutSec:     30,
-		ParentRunID:    "parent-1",
-	})
-	if err != nil {
-		t.Fatalf("start: %v", err)
+	req := f.last.(*pb.StartRunRequest)
+	if req.GetService() != "orders" || req.GetWorkflow() != "flow" || string(req.GetInput()) != `{"a":1}` || req.GetTimeoutMs() != 10 {
+		t.Fatalf("start request %+v", req)
 	}
-	if runID != "run-42" {
-		t.Fatalf("run id = %q", runID)
+	if dup, err := c.Signal(context.Background(), iwf.SignalArgs{RunID: "r", Signal: "go", SignalID: "dup"}); err != nil || !dup {
+		t.Fatalf("dup=%v err=%v", dup, err)
 	}
-
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-	req := srv.starts[0]
-	if req.GetIdempotencyKey() != "k-1" || req.GetTimeoutSec() != 30 || req.GetParentRunId() != "parent-1" {
-		t.Fatalf("start request = %#v", req)
+	if id, err := c.Replay(context.Background(), "r", "b"); err != nil || id != "r2" {
+		t.Fatal(id, err)
 	}
-	var input map[string]any
-	if err := json.Unmarshal(req.GetInput(), &input); err != nil {
-		t.Fatalf("input is not json: %v", err)
+	if err := c.Cancel(context.Background(), "r"); err != nil {
+		t.Fatal(err)
 	}
-	if input["id"] != "o-1" {
-		t.Fatalf("input = %#v", input)
+	if err := c.RetryCompensation(context.Background(), "r"); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestStartCarriesTheCallersTrace(t *testing.T) {
-	t.Parallel()
-
-	srv, client := startWorkflows(t)
-	tc := telemetry.TraceContext{TraceID: uuid.New(), ParentOpID: uuid.New()}
-	ctx := telemetry.WithTraceContext(t.Context(), tc)
-
-	if _, err := newCaller(t, client).Start(ctx, iwf.StartArgs{Workflow: "order_flow"}); err != nil {
-		t.Fatalf("start: %v", err)
+func TestCallerMapsStatusCodes(t *testing.T) {
+	cases := map[codes.Code]error{
+		codes.PermissionDenied:   iwf.ErrAccessDenied,
+		codes.NotFound:           iwf.ErrWorkflowNotFound,
+		codes.FailedPrecondition: iwf.ErrRunTerminal,
 	}
-
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-	if got := srv.starts[0].GetXSbTrace(); got != telemetry.FormatHeader(tc) {
-		t.Fatalf("trace header = %q", got)
+	for code, want := range cases {
+		f := newFake()
+		f.err = status.Error(code, "x")
+		c := caller(t, f)
+		if _, err := c.Start(context.Background(), iwf.StartArgs{Service: "s", Workflow: "w"}); !errors.Is(err, want) {
+			t.Errorf("%v: %v", code, err)
+		}
+		if err := c.Cancel(context.Background(), "r"); !errors.Is(err, want) {
+			t.Errorf("%v cancel: %v", code, err)
+		}
+	}
+	f := newFake()
+	f.err = status.Error(codes.Internal, "boom")
+	if _, err := caller(t, f).Signal(context.Background(), iwf.SignalArgs{RunID: "r"}); err == nil || errors.Is(err, iwf.ErrRunTerminal) {
+		t.Fatalf("internal: %v", err)
 	}
 }
 
-// TestStartDistinguishesItsRefusals pins the taxonomy: a policy denial, an
-// unknown workflow and anything else have opposite fixes, so a caller has to be
-// able to tell them apart without reading a message.
-func TestStartDistinguishesItsRefusals(t *testing.T) {
-	t.Parallel()
-
-	t.Run("policy denial", func(t *testing.T) {
-		t.Parallel()
-
-		srv, client := startWorkflows(t)
-		srv.onStart = func(*pb.StartRunRequest) (*pb.StartRunResponse, error) {
-			return nil, status.Error(codes.PermissionDenied, "workflow.run is not granted")
-		}
-
-		_, err := newCaller(t, client).Start(t.Context(), iwf.StartArgs{Workflow: "order_flow"})
-		var denied *iwf.AccessDeniedError
-		if !errors.As(err, &denied) {
-			t.Fatalf("want *AccessDeniedError, got %T: %v", err, err)
-		}
-		if denied.Workflow != "order_flow" || denied.Reason != "workflow.run is not granted" {
-			t.Fatalf("denial lost its detail: %#v", denied)
-		}
-		if !errors.Is(err, iwf.ErrAccessDenied) {
-			t.Fatal("the denial does not match its sentinel")
-		}
-		if errors.Is(err, iwf.ErrWorkflowNotFound) {
-			t.Fatal("a denial must not read as a missing workflow")
-		}
-	})
-
-	t.Run("unknown workflow", func(t *testing.T) {
-		t.Parallel()
-
-		srv, client := startWorkflows(t)
-		srv.onStart = func(*pb.StartRunRequest) (*pb.StartRunResponse, error) {
-			return nil, status.Error(codes.NotFound, "no definition")
-		}
-
-		_, err := newCaller(t, client).Start(t.Context(), iwf.StartArgs{Workflow: "order_flow"})
-		var missing *iwf.NotFoundError
-		if !errors.As(err, &missing) {
-			t.Fatalf("want *NotFoundError, got %T: %v", err, err)
-		}
-		if !errors.Is(err, iwf.ErrWorkflowNotFound) || errors.Is(err, iwf.ErrAccessDenied) {
-			t.Fatalf("sentinels crossed: %v", err)
-		}
-	})
-
-	t.Run("anything else", func(t *testing.T) {
-		t.Parallel()
-
-		srv, client := startWorkflows(t)
-		srv.onStart = func(*pb.StartRunRequest) (*pb.StartRunResponse, error) {
-			return nil, status.Error(codes.Unavailable, "runtime restarting")
-		}
-
-		_, err := newCaller(t, client).Start(t.Context(), iwf.StartArgs{Workflow: "order_flow"})
-		if err == nil {
-			t.Fatal("want an error")
-		}
-		if errors.Is(err, iwf.ErrAccessDenied) || errors.Is(err, iwf.ErrWorkflowNotFound) {
-			t.Fatalf("a transport failure was classified: %v", err)
-		}
-		if status.Code(err) != codes.Unavailable {
-			t.Fatalf("the status was lost: %v", err)
-		}
-	})
-}
-
-func TestSignalAgainstATerminalRunIsTyped(t *testing.T) {
-	t.Parallel()
-
-	srv, client := startWorkflows(t)
-	srv.onSignal = func(*pb.SignalRunRequest) error {
-		return status.Error(codes.FailedPrecondition, "run is already success")
+func TestCallerAwait(t *testing.T) {
+	f := newFake()
+	f.await = []*pb.RunStatusUpdate{{Status: "active"}, {Status: "success", Terminal: true, Output: []byte(`{"a":1}`)}}
+	out, err := caller(t, f).Await(context.Background(), "r")
+	if err != nil || out["a"] != float64(1) {
+		t.Fatal(out, err)
 	}
-
-	err := newCaller(t, client).Signal(t.Context(), iwf.SignalArgs{
-		RunID: "r-1", Signal: "approve", Payload: map[string]any{"by": "ops"},
-	})
-	var terminal *iwf.TerminalError
-	if !errors.As(err, &terminal) {
-		t.Fatalf("want *TerminalError, got %T: %v", err, err)
+	f.await = []*pb.RunStatusUpdate{{Status: "timed_out", Terminal: true, ErrorCode: "TIMEOUT"}}
+	_, err = caller(t, f).Await(context.Background(), "r")
+	var failed *iwf.RunFailedError
+	if !errors.As(err, &failed) || failed.Status != "timed_out" || !errors.Is(err, iwf.ErrRunFailed) {
+		t.Fatalf("failed await: %v", err)
 	}
-	if !errors.Is(err, iwf.ErrRunTerminal) {
-		t.Fatal("the terminal error does not match its sentinel")
+	f.await = nil
+	if _, err := caller(t, f).Await(context.Background(), "r"); !errors.Is(err, iwf.ErrRunTerminal) {
+		t.Fatalf("empty stream: %v", err)
 	}
 }
 
-func TestSignalAndCancelReachTheRuntime(t *testing.T) {
-	t.Parallel()
-
-	srv, client := startWorkflows(t)
-	caller := newCaller(t, client)
-
-	if err := caller.Signal(t.Context(), iwf.SignalArgs{RunID: "r-1", Signal: "approve", Payload: 7}); err != nil {
-		t.Fatalf("signal: %v", err)
+func TestCallerQuery(t *testing.T) {
+	f := newFake()
+	f.snapshot = &pb.RunSnapshot{RunId: "r", Status: "active", WaitingReason: "signal", Input: []byte(`{}`),
+		Steps:   []*pb.StepInfo{{StepId: "w", Status: "parked", WaitKey: "go", Output: []byte(`null`)}},
+		Signals: []*pb.PendingSignal{{SignalName: "x", Payload: []byte(`1`), EnqueuedAtUnixMs: 5}}}
+	snap, err := caller(t, f).Query(context.Background(), "r")
+	if err != nil || snap.WaitingReason != "signal" || snap.Steps[0].WaitKey != "go" || snap.Signals[0].Payload != float64(1) || snap.Output != nil {
+		t.Fatalf("%+v %v", snap, err)
 	}
-	if err := caller.Cancel(t.Context(), "r-1"); err != nil {
-		t.Fatalf("cancel: %v", err)
-	}
-
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-	if srv.signals[0].GetSignalName() != "approve" || string(srv.signals[0].GetPayload()) != "7" {
-		t.Fatalf("signal = %#v", srv.signals[0])
-	}
-	if srv.cancels[0].GetRunId() != "r-1" {
-		t.Fatalf("cancel = %#v", srv.cancels[0])
+	f.snapshot.Output = []byte(`{`)
+	if _, err := caller(t, f).Query(context.Background(), "r"); err == nil {
+		t.Fatal("bad output accepted")
 	}
 }
 
-// TestAwaitHandsBackStateOnlyOnSuccess pins the contract: a compensated run has
-// no result, and returning its half-built state as if it were one is how a
-// caller acts on a run that failed.
-func TestAwaitHandsBackStateOnlyOnSuccess(t *testing.T) {
-	t.Parallel()
-
-	t.Run("success", func(t *testing.T) {
-		t.Parallel()
-
-		srv, client := startWorkflows(t)
-		srv.onAwait = func(_ *pb.AwaitRunRequest, srv grpc.ServerStreamingServer[pb.RunStatusUpdate]) error {
-			if err := srv.Send(&pb.RunStatusUpdate{RunId: "r-1", Status: "running"}); err != nil {
-				return err
-			}
-			return srv.Send(&pb.RunStatusUpdate{
-				RunId: "r-1", Status: "success", State: []byte(`{"charge":{"txn":"t-1"}}`),
-			})
-		}
-
-		state, err := newCaller(t, client).Await(t.Context(), "r-1")
-		if err != nil {
-			t.Fatalf("await: %v", err)
-		}
-		charge, ok := state["charge"].(map[string]any)
-		if !ok || charge["txn"] != "t-1" {
-			t.Fatalf("final state = %#v", state)
-		}
-	})
-
-	for _, terminalStatus := range []string{"failed", "failed_compensated", "cancelled"} {
-		t.Run(terminalStatus, func(t *testing.T) {
-			t.Parallel()
-
-			srv, client := startWorkflows(t)
-			srv.onAwait = func(_ *pb.AwaitRunRequest, srv grpc.ServerStreamingServer[pb.RunStatusUpdate]) error {
-				return srv.Send(&pb.RunStatusUpdate{
-					RunId: "r-1", Status: terminalStatus, State: []byte(`{"charge":{"txn":"t-1"}}`),
-				})
-			}
-
-			state, err := newCaller(t, client).Await(t.Context(), "r-1")
-			if state != nil {
-				t.Fatalf("a non-successful run handed back state: %#v", state)
-			}
-			var terminal *iwf.TerminalError
-			if !errors.As(err, &terminal) {
-				t.Fatalf("want *TerminalError, got %T: %v", err, err)
-			}
-			if terminal.Status != terminalStatus {
-				t.Fatalf("status = %q, want %q", terminal.Status, terminalStatus)
-			}
-		})
-	}
-}
-
-func TestAwaitWithoutAnyUpdateIsAnError(t *testing.T) {
-	t.Parallel()
-
-	srv, client := startWorkflows(t)
-	srv.onAwait = func(*pb.AwaitRunRequest, grpc.ServerStreamingServer[pb.RunStatusUpdate]) error { return nil }
-
-	if _, err := newCaller(t, client).Await(t.Context(), "r-1"); err == nil {
-		t.Fatal("a stream that says nothing is not a successful run")
-	}
-}
-
-func TestAwaitWithUnreadableStateIsAnError(t *testing.T) {
-	t.Parallel()
-
-	srv, client := startWorkflows(t)
-	srv.onAwait = func(_ *pb.AwaitRunRequest, srv grpc.ServerStreamingServer[pb.RunStatusUpdate]) error {
-		return srv.Send(&pb.RunStatusUpdate{RunId: "r-1", Status: "success", State: []byte("{not json")})
-	}
-
-	if _, err := newCaller(t, client).Await(t.Context(), "r-1"); err == nil {
-		t.Fatal("state that cannot be read is not a result")
-	}
-}
-
-func TestQueryDecodesStateAndSteps(t *testing.T) {
-	t.Parallel()
-
-	srv, client := startWorkflows(t)
-	srv.onQuery = func(req *pb.QueryRunRequest) (*pb.QueryRunResponse, error) {
-		return &pb.QueryRunResponse{
-			RunId:  req.GetRunId(),
-			Status: "compensating",
-			State:  []byte(`{"charge":{"txn":"t-1"}}`),
-			Steps: []*pb.StepInfo{
-				{StepId: "charge", Status: "compensated", Output: []byte(`{"txn":"t-1"}`), CompensatedBy: "charge.compensate"},
-				{StepId: "ship", Status: "failed", LastError: "carrier down"},
-			},
-		}, nil
-	}
-
-	snapshot, err := newCaller(t, client).Query(t.Context(), "r-1")
-	if err != nil {
-		t.Fatalf("query: %v", err)
-	}
-	if snapshot.Status != "compensating" || len(snapshot.Steps) != 2 {
-		t.Fatalf("snapshot = %#v", snapshot)
-	}
-	if snapshot.State["charge"].(map[string]any)["txn"] != "t-1" {
-		t.Fatalf("state = %#v", snapshot.State)
-	}
-	if snapshot.Steps[0].CompensatedBy != "charge.compensate" {
-		t.Fatalf("step = %#v", snapshot.Steps[0])
-	}
-	if snapshot.Steps[1].Output != nil || snapshot.Steps[1].LastError != "carrier down" {
-		t.Fatalf("step = %#v", snapshot.Steps[1])
-	}
-}
-
-func TestReplayForksTheRun(t *testing.T) {
-	t.Parallel()
-
-	srv, client := startWorkflows(t)
-	srv.onReplay = func(*pb.ReplayRunRequest) (*pb.ReplayRunResponse, error) {
-		return &pb.ReplayRunResponse{RunId: "run-copy"}, nil
-	}
-
-	runID, err := newCaller(t, client).Replay(t.Context(), "r-1", "ship")
-	if err != nil {
-		t.Fatalf("replay: %v", err)
-	}
-	if runID != "run-copy" {
-		t.Fatalf("run id = %q", runID)
-	}
-
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-	if srv.replays[0].GetFromStepId() != "ship" {
-		t.Fatalf("replay = %#v", srv.replays[0])
-	}
-}
-
-func TestRunLevelRefusalsAreClassified(t *testing.T) {
-	t.Parallel()
-
-	t.Run("unknown run", func(t *testing.T) {
-		t.Parallel()
-
-		srv, client := startWorkflows(t)
-		srv.onQuery = func(*pb.QueryRunRequest) (*pb.QueryRunResponse, error) {
-			return nil, status.Error(codes.NotFound, "no such run")
-		}
-		if _, err := newCaller(t, client).Query(t.Context(), "r-1"); !errors.Is(err, iwf.ErrWorkflowNotFound) {
-			t.Fatalf("want ErrWorkflowNotFound, got %v", err)
-		}
-	})
-
-	t.Run("denied", func(t *testing.T) {
-		t.Parallel()
-
-		srv, client := startWorkflows(t)
-		srv.onSignal = func(*pb.SignalRunRequest) error {
-			return status.Error(codes.PermissionDenied, "not the owner")
-		}
-		err := newCaller(t, client).Signal(t.Context(), iwf.SignalArgs{RunID: "r-1", Signal: "go"})
-		if !errors.Is(err, iwf.ErrAccessDenied) {
-			t.Fatalf("want ErrAccessDenied, got %v", err)
-		}
-	})
-
-	t.Run("anything else", func(t *testing.T) {
-		t.Parallel()
-
-		srv, client := startWorkflows(t)
-		srv.onQuery = func(*pb.QueryRunRequest) (*pb.QueryRunResponse, error) {
-			return nil, status.Error(codes.Internal, "boom")
-		}
-		_, err := newCaller(t, client).Query(t.Context(), "r-1")
-		if err == nil || errors.Is(err, iwf.ErrRunTerminal) || errors.Is(err, iwf.ErrWorkflowNotFound) {
-			t.Fatalf("a plain failure was classified: %v", err)
-		}
-	})
-}
-
-func TestCallerErrorsNameWhatTheyRefused(t *testing.T) {
-	t.Parallel()
-
-	denied := &iwf.AccessDeniedError{Workflow: "order_flow", Reason: "not granted"}
-	if !strings.Contains(denied.Error(), "order_flow") || !strings.Contains(denied.Error(), "not granted") {
-		t.Fatalf("denial message = %q", denied.Error())
-	}
-	missing := &iwf.NotFoundError{Workflow: "order_flow"}
-	if !strings.Contains(missing.Error(), "order_flow") {
-		t.Fatalf("not-found message = %q", missing.Error())
-	}
-	terminal := &iwf.TerminalError{RunID: "r-1", Status: "cancelled"}
-	if !strings.Contains(terminal.Error(), "r-1") || !strings.Contains(terminal.Error(), "cancelled") {
-		t.Fatalf("terminal message = %q", terminal.Error())
-	}
-}
-
-func TestCallerRefusesAnIncompleteConfig(t *testing.T) {
-	t.Parallel()
-
+func TestNewCallerValidates(t *testing.T) {
 	if _, err := iwf.NewCaller(iwf.CallerConfig{}); !errors.Is(err, iwf.ErrInvalidConfig) {
-		t.Fatalf("want ErrInvalidConfig, got %v", err)
-	}
-}
-
-// brokenClients models the channel going away underneath a caller.
-type brokenClients struct{}
-
-func (brokenClients) WorkflowsClient(context.Context) (pb.WorkflowsClient, error) {
-	return nil, errors.New("channel is down")
-}
-
-func TestCallerSurfacesAMissingChannel(t *testing.T) {
-	t.Parallel()
-
-	caller, err := iwf.NewCaller(iwf.CallerConfig{Clients: brokenClients{}})
-	if err != nil {
-		t.Fatalf("new caller: %v", err)
-	}
-	if _, err := caller.Start(t.Context(), iwf.StartArgs{Workflow: "w"}); err == nil {
-		t.Fatal("want an error")
-	}
-	if err := caller.Cancel(t.Context(), "r-1"); err == nil {
-		t.Fatal("want an error")
-	}
-	if _, err := caller.Query(t.Context(), "r-1"); err == nil {
-		t.Fatal("want an error")
-	}
-	if _, err := caller.Await(t.Context(), "r-1"); err == nil {
-		t.Fatal("want an error")
-	}
-	if _, err := caller.Replay(t.Context(), "r-1", ""); err == nil {
-		t.Fatal("want an error")
-	}
-	if err := caller.Signal(t.Context(), iwf.SignalArgs{RunID: "r-1"}); err == nil {
-		t.Fatal("want an error")
+		t.Fatal(err)
 	}
 }

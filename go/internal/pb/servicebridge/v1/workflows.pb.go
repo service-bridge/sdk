@@ -22,26 +22,1785 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-type StartRunRequest struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	WorkflowName   string                 `protobuf:"bytes,1,opt,name=workflow_name,json=workflowName,proto3" json:"workflow_name,omitempty"`
-	Input          []byte                 `protobuf:"bytes,2,opt,name=input,proto3" json:"input,omitempty"` // JSON-encoded workflow input
-	IdempotencyKey string                 `protobuf:"bytes,3,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
-	TimeoutSec     uint32                 `protobuf:"varint,4,opt,name=timeout_sec,json=timeoutSec,proto3" json:"timeout_sec,omitempty"` // 0 = no global timeout override
-	// X-SB-Trace propagation from caller.
-	XSbTrace string `protobuf:"bytes,5,opt,name=x_sb_trace,json=xSbTrace,proto3" json:"x_sb_trace,omitempty"` // "traceID-parentOpID" canonical format (ADR 0006 §3)
-	// parent_run_id — when non-empty, the request originates from a workflow
-	// step on an in-flight parent run. Runtime enforces dynamic cycle
-	// detection (ADR 0003 §7) by walking the ancestor chain via this id.
-	// Empty for top-level starts initiated by external callers.
-	ParentRunId   string `protobuf:"bytes,8,opt,name=parent_run_id,json=parentRunId,proto3" json:"parent_run_id,omitempty"`
+type TaskKind int32
+
+const (
+	TaskKind_TASK_KIND_UNSPECIFIED TaskKind = 0
+	TaskKind_TASK_KIND_LOCAL       TaskKind = 1
+	TaskKind_TASK_KIND_CALL        TaskKind = 2
+	TaskKind_TASK_KIND_PUBLISH     TaskKind = 3
+)
+
+// Enum value maps for TaskKind.
+var (
+	TaskKind_name = map[int32]string{
+		0: "TASK_KIND_UNSPECIFIED",
+		1: "TASK_KIND_LOCAL",
+		2: "TASK_KIND_CALL",
+		3: "TASK_KIND_PUBLISH",
+	}
+	TaskKind_value = map[string]int32{
+		"TASK_KIND_UNSPECIFIED": 0,
+		"TASK_KIND_LOCAL":       1,
+		"TASK_KIND_CALL":        2,
+		"TASK_KIND_PUBLISH":     3,
+	}
+)
+
+func (x TaskKind) Enum() *TaskKind {
+	p := new(TaskKind)
+	*p = x
+	return p
+}
+
+func (x TaskKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (TaskKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_servicebridge_v1_workflows_proto_enumTypes[0].Descriptor()
+}
+
+func (TaskKind) Type() protoreflect.EnumType {
+	return &file_servicebridge_v1_workflows_proto_enumTypes[0]
+}
+
+func (x TaskKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use TaskKind.Descriptor instead.
+func (TaskKind) EnumDescriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{0}
+}
+
+// WorkflowDefinition is what an owner declares. The runtime validates it,
+// freezes it and computes its fingerprint.
+type WorkflowDefinition struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Name  string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// version identifies the executable code behind local steps; it is part of
+	// the fingerprint.
+	Version string `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
+	// JSON Schema of the run input; empty = any JSON.
+	InputSchemaJson []byte  `protobuf:"bytes,3,opt,name=input_schema_json,json=inputSchemaJson,proto3" json:"input_schema_json,omitempty"`
+	Steps           []*Step `protobuf:"bytes,4,rep,name=steps,proto3" json:"steps,omitempty"`
+	// Default retry policy of task steps that declare none.
+	Retry *RetryPolicy `protobuf:"bytes,5,opt,name=retry,proto3" json:"retry,omitempty"`
+	// Maximum concurrently leased task steps of one run; 0 = unlimited.
+	MaxParallelism uint32 `protobuf:"varint,6,opt,name=max_parallelism,json=maxParallelism,proto3" json:"max_parallelism,omitempty"`
+	// Run timeout; 0 = none. StartRunRequest.timeout_ms overrides it.
+	TimeoutMs     int64 `protobuf:"varint,7,opt,name=timeout_ms,json=timeoutMs,proto3" json:"timeout_ms,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
+func (x *WorkflowDefinition) Reset() {
+	*x = WorkflowDefinition{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WorkflowDefinition) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WorkflowDefinition) ProtoMessage() {}
+
+func (x *WorkflowDefinition) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WorkflowDefinition.ProtoReflect.Descriptor instead.
+func (*WorkflowDefinition) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *WorkflowDefinition) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *WorkflowDefinition) GetVersion() string {
+	if x != nil {
+		return x.Version
+	}
+	return ""
+}
+
+func (x *WorkflowDefinition) GetInputSchemaJson() []byte {
+	if x != nil {
+		return x.InputSchemaJson
+	}
+	return nil
+}
+
+func (x *WorkflowDefinition) GetSteps() []*Step {
+	if x != nil {
+		return x.Steps
+	}
+	return nil
+}
+
+func (x *WorkflowDefinition) GetRetry() *RetryPolicy {
+	if x != nil {
+		return x.Retry
+	}
+	return nil
+}
+
+func (x *WorkflowDefinition) GetMaxParallelism() uint32 {
+	if x != nil {
+		return x.MaxParallelism
+	}
+	return 0
+}
+
+func (x *WorkflowDefinition) GetTimeoutMs() int64 {
+	if x != nil {
+		return x.TimeoutMs
+	}
+	return 0
+}
+
+type Step struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Lowercase letters, digits and underscores; unique across the graph.
+	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	// Ids of sibling steps (same group) this step waits for.
+	WaitFor []string `protobuf:"bytes,2,rep,name=wait_for,json=waitFor,proto3" json:"wait_for,omitempty"`
+	// Skip the step (output null) when the predicate is false.
+	When *Predicate `protobuf:"bytes,3,opt,name=when,proto3" json:"when,omitempty"`
+	// Step deadline; on expiry the step fails and the run stops. 0 = none.
+	TimeoutMs int64 `protobuf:"varint,4,opt,name=timeout_ms,json=timeoutMs,proto3" json:"timeout_ms,omitempty"`
+	// Retry policy of a task step (call / publish / local).
+	Retry *RetryPolicy `protobuf:"bytes,5,opt,name=retry,proto3" json:"retry,omitempty"`
+	// Types that are valid to be assigned to Kind:
+	//
+	//	*Step_Call
+	//	*Step_Publish
+	//	*Step_Local
+	//	*Step_Sleep
+	//	*Step_WaitEvent
+	//	*Step_WaitSignal
+	//	*Step_Workflow
+	//	*Step_Parallel
+	//	*Step_Sequence
+	Kind          isStep_Kind `protobuf_oneof:"kind"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Step) Reset() {
+	*x = Step{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Step) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Step) ProtoMessage() {}
+
+func (x *Step) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Step.ProtoReflect.Descriptor instead.
+func (*Step) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *Step) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *Step) GetWaitFor() []string {
+	if x != nil {
+		return x.WaitFor
+	}
+	return nil
+}
+
+func (x *Step) GetWhen() *Predicate {
+	if x != nil {
+		return x.When
+	}
+	return nil
+}
+
+func (x *Step) GetTimeoutMs() int64 {
+	if x != nil {
+		return x.TimeoutMs
+	}
+	return 0
+}
+
+func (x *Step) GetRetry() *RetryPolicy {
+	if x != nil {
+		return x.Retry
+	}
+	return nil
+}
+
+func (x *Step) GetKind() isStep_Kind {
+	if x != nil {
+		return x.Kind
+	}
+	return nil
+}
+
+func (x *Step) GetCall() *CallStep {
+	if x != nil {
+		if x, ok := x.Kind.(*Step_Call); ok {
+			return x.Call
+		}
+	}
+	return nil
+}
+
+func (x *Step) GetPublish() *PublishStep {
+	if x != nil {
+		if x, ok := x.Kind.(*Step_Publish); ok {
+			return x.Publish
+		}
+	}
+	return nil
+}
+
+func (x *Step) GetLocal() *LocalStep {
+	if x != nil {
+		if x, ok := x.Kind.(*Step_Local); ok {
+			return x.Local
+		}
+	}
+	return nil
+}
+
+func (x *Step) GetSleep() *SleepStep {
+	if x != nil {
+		if x, ok := x.Kind.(*Step_Sleep); ok {
+			return x.Sleep
+		}
+	}
+	return nil
+}
+
+func (x *Step) GetWaitEvent() *WaitEventStep {
+	if x != nil {
+		if x, ok := x.Kind.(*Step_WaitEvent); ok {
+			return x.WaitEvent
+		}
+	}
+	return nil
+}
+
+func (x *Step) GetWaitSignal() *WaitSignalStep {
+	if x != nil {
+		if x, ok := x.Kind.(*Step_WaitSignal); ok {
+			return x.WaitSignal
+		}
+	}
+	return nil
+}
+
+func (x *Step) GetWorkflow() *SubWorkflowStep {
+	if x != nil {
+		if x, ok := x.Kind.(*Step_Workflow); ok {
+			return x.Workflow
+		}
+	}
+	return nil
+}
+
+func (x *Step) GetParallel() *GroupStep {
+	if x != nil {
+		if x, ok := x.Kind.(*Step_Parallel); ok {
+			return x.Parallel
+		}
+	}
+	return nil
+}
+
+func (x *Step) GetSequence() *GroupStep {
+	if x != nil {
+		if x, ok := x.Kind.(*Step_Sequence); ok {
+			return x.Sequence
+		}
+	}
+	return nil
+}
+
+type isStep_Kind interface {
+	isStep_Kind()
+}
+
+type Step_Call struct {
+	Call *CallStep `protobuf:"bytes,10,opt,name=call,proto3,oneof"`
+}
+
+type Step_Publish struct {
+	Publish *PublishStep `protobuf:"bytes,11,opt,name=publish,proto3,oneof"`
+}
+
+type Step_Local struct {
+	Local *LocalStep `protobuf:"bytes,12,opt,name=local,proto3,oneof"`
+}
+
+type Step_Sleep struct {
+	Sleep *SleepStep `protobuf:"bytes,13,opt,name=sleep,proto3,oneof"`
+}
+
+type Step_WaitEvent struct {
+	WaitEvent *WaitEventStep `protobuf:"bytes,14,opt,name=wait_event,json=waitEvent,proto3,oneof"`
+}
+
+type Step_WaitSignal struct {
+	WaitSignal *WaitSignalStep `protobuf:"bytes,15,opt,name=wait_signal,json=waitSignal,proto3,oneof"`
+}
+
+type Step_Workflow struct {
+	Workflow *SubWorkflowStep `protobuf:"bytes,16,opt,name=workflow,proto3,oneof"`
+}
+
+type Step_Parallel struct {
+	Parallel *GroupStep `protobuf:"bytes,17,opt,name=parallel,proto3,oneof"`
+}
+
+type Step_Sequence struct {
+	Sequence *GroupStep `protobuf:"bytes,18,opt,name=sequence,proto3,oneof"`
+}
+
+func (*Step_Call) isStep_Kind() {}
+
+func (*Step_Publish) isStep_Kind() {}
+
+func (*Step_Local) isStep_Kind() {}
+
+func (*Step_Sleep) isStep_Kind() {}
+
+func (*Step_WaitEvent) isStep_Kind() {}
+
+func (*Step_WaitSignal) isStep_Kind() {}
+
+func (*Step_Workflow) isStep_Kind() {}
+
+func (*Step_Parallel) isStep_Kind() {}
+
+func (*Step_Sequence) isStep_Kind() {}
+
+// Expr is a JSONPath-lite path ("$.a.b[0]", "$.list[*].field") resolved
+// against run state, a JSON literal, or an object / list whose members are
+// expressions themselves.
+type Expr struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Value:
+	//
+	//	*Expr_Path
+	//	*Expr_Literal
+	//	*Expr_Object
+	//	*Expr_List
+	Value         isExpr_Value `protobuf_oneof:"value"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Expr) Reset() {
+	*x = Expr{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Expr) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Expr) ProtoMessage() {}
+
+func (x *Expr) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Expr.ProtoReflect.Descriptor instead.
+func (*Expr) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *Expr) GetValue() isExpr_Value {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
+func (x *Expr) GetPath() string {
+	if x != nil {
+		if x, ok := x.Value.(*Expr_Path); ok {
+			return x.Path
+		}
+	}
+	return ""
+}
+
+func (x *Expr) GetLiteral() []byte {
+	if x != nil {
+		if x, ok := x.Value.(*Expr_Literal); ok {
+			return x.Literal
+		}
+	}
+	return nil
+}
+
+func (x *Expr) GetObject() *ExprMap {
+	if x != nil {
+		if x, ok := x.Value.(*Expr_Object); ok {
+			return x.Object
+		}
+	}
+	return nil
+}
+
+func (x *Expr) GetList() *ExprList {
+	if x != nil {
+		if x, ok := x.Value.(*Expr_List); ok {
+			return x.List
+		}
+	}
+	return nil
+}
+
+type isExpr_Value interface {
+	isExpr_Value()
+}
+
+type Expr_Path struct {
+	Path string `protobuf:"bytes,1,opt,name=path,proto3,oneof"`
+}
+
+type Expr_Literal struct {
+	Literal []byte `protobuf:"bytes,2,opt,name=literal,proto3,oneof"` // JSON
+}
+
+type Expr_Object struct {
+	Object *ExprMap `protobuf:"bytes,3,opt,name=object,proto3,oneof"`
+}
+
+type Expr_List struct {
+	List *ExprList `protobuf:"bytes,4,opt,name=list,proto3,oneof"`
+}
+
+func (*Expr_Path) isExpr_Value() {}
+
+func (*Expr_Literal) isExpr_Value() {}
+
+func (*Expr_Object) isExpr_Value() {}
+
+func (*Expr_List) isExpr_Value() {}
+
+type ExprMap struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Fields        map[string]*Expr       `protobuf:"bytes,1,rep,name=fields,proto3" json:"fields,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExprMap) Reset() {
+	*x = ExprMap{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExprMap) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExprMap) ProtoMessage() {}
+
+func (x *ExprMap) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExprMap.ProtoReflect.Descriptor instead.
+func (*ExprMap) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *ExprMap) GetFields() map[string]*Expr {
+	if x != nil {
+		return x.Fields
+	}
+	return nil
+}
+
+type ExprList struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Items         []*Expr                `protobuf:"bytes,1,rep,name=items,proto3" json:"items,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExprList) Reset() {
+	*x = ExprList{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExprList) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExprList) ProtoMessage() {}
+
+func (x *ExprList) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExprList.ProtoReflect.Descriptor instead.
+func (*ExprList) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *ExprList) GetItems() []*Expr {
+	if x != nil {
+		return x.Items
+	}
+	return nil
+}
+
+type Predicate struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Op:
+	//
+	//	*Predicate_Truthy
+	//	*Predicate_Not
+	//	*Predicate_Equals
+	//	*Predicate_In
+	//	*Predicate_And
+	//	*Predicate_Or
+	Op            isPredicate_Op `protobuf_oneof:"op"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Predicate) Reset() {
+	*x = Predicate{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Predicate) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Predicate) ProtoMessage() {}
+
+func (x *Predicate) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Predicate.ProtoReflect.Descriptor instead.
+func (*Predicate) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *Predicate) GetOp() isPredicate_Op {
+	if x != nil {
+		return x.Op
+	}
+	return nil
+}
+
+func (x *Predicate) GetTruthy() *Expr {
+	if x != nil {
+		if x, ok := x.Op.(*Predicate_Truthy); ok {
+			return x.Truthy
+		}
+	}
+	return nil
+}
+
+func (x *Predicate) GetNot() *Predicate {
+	if x != nil {
+		if x, ok := x.Op.(*Predicate_Not); ok {
+			return x.Not
+		}
+	}
+	return nil
+}
+
+func (x *Predicate) GetEquals() *ExprPair {
+	if x != nil {
+		if x, ok := x.Op.(*Predicate_Equals); ok {
+			return x.Equals
+		}
+	}
+	return nil
+}
+
+func (x *Predicate) GetIn() *ExprPair {
+	if x != nil {
+		if x, ok := x.Op.(*Predicate_In); ok {
+			return x.In
+		}
+	}
+	return nil
+}
+
+func (x *Predicate) GetAnd() *PredicateList {
+	if x != nil {
+		if x, ok := x.Op.(*Predicate_And); ok {
+			return x.And
+		}
+	}
+	return nil
+}
+
+func (x *Predicate) GetOr() *PredicateList {
+	if x != nil {
+		if x, ok := x.Op.(*Predicate_Or); ok {
+			return x.Or
+		}
+	}
+	return nil
+}
+
+type isPredicate_Op interface {
+	isPredicate_Op()
+}
+
+type Predicate_Truthy struct {
+	Truthy *Expr `protobuf:"bytes,1,opt,name=truthy,proto3,oneof"`
+}
+
+type Predicate_Not struct {
+	Not *Predicate `protobuf:"bytes,2,opt,name=not,proto3,oneof"`
+}
+
+type Predicate_Equals struct {
+	Equals *ExprPair `protobuf:"bytes,3,opt,name=equals,proto3,oneof"`
+}
+
+type Predicate_In struct {
+	In *ExprPair `protobuf:"bytes,4,opt,name=in,proto3,oneof"` // left is an element of right (a list)
+}
+
+type Predicate_And struct {
+	And *PredicateList `protobuf:"bytes,5,opt,name=and,proto3,oneof"`
+}
+
+type Predicate_Or struct {
+	Or *PredicateList `protobuf:"bytes,6,opt,name=or,proto3,oneof"`
+}
+
+func (*Predicate_Truthy) isPredicate_Op() {}
+
+func (*Predicate_Not) isPredicate_Op() {}
+
+func (*Predicate_Equals) isPredicate_Op() {}
+
+func (*Predicate_In) isPredicate_Op() {}
+
+func (*Predicate_And) isPredicate_Op() {}
+
+func (*Predicate_Or) isPredicate_Op() {}
+
+type ExprPair struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Left          *Expr                  `protobuf:"bytes,1,opt,name=left,proto3" json:"left,omitempty"`
+	Right         *Expr                  `protobuf:"bytes,2,opt,name=right,proto3" json:"right,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExprPair) Reset() {
+	*x = ExprPair{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExprPair) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExprPair) ProtoMessage() {}
+
+func (x *ExprPair) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExprPair.ProtoReflect.Descriptor instead.
+func (*ExprPair) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *ExprPair) GetLeft() *Expr {
+	if x != nil {
+		return x.Left
+	}
+	return nil
+}
+
+func (x *ExprPair) GetRight() *Expr {
+	if x != nil {
+		return x.Right
+	}
+	return nil
+}
+
+type PredicateList struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Items         []*Predicate           `protobuf:"bytes,1,rep,name=items,proto3" json:"items,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PredicateList) Reset() {
+	*x = PredicateList{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PredicateList) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PredicateList) ProtoMessage() {}
+
+func (x *PredicateList) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PredicateList.ProtoReflect.Descriptor instead.
+func (*PredicateList) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *PredicateList) GetItems() []*Predicate {
+	if x != nil {
+		return x.Items
+	}
+	return nil
+}
+
+type RetryPolicy struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	MaxAttempts   uint32                 `protobuf:"varint,1,opt,name=max_attempts,json=maxAttempts,proto3" json:"max_attempts,omitempty"`   // attempts including the first; 0 = 1
+	BaseDelayMs   int64                  `protobuf:"varint,2,opt,name=base_delay_ms,json=baseDelayMs,proto3" json:"base_delay_ms,omitempty"` // 0 = 200
+	Factor        float64                `protobuf:"fixed64,3,opt,name=factor,proto3" json:"factor,omitempty"`                               // 0 = 2
+	MaxDelayMs    int64                  `protobuf:"varint,4,opt,name=max_delay_ms,json=maxDelayMs,proto3" json:"max_delay_ms,omitempty"`    // 0 = 5000
+	Jitter        float64                `protobuf:"fixed64,5,opt,name=jitter,proto3" json:"jitter,omitempty"`                               // fraction in [0,1]
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RetryPolicy) Reset() {
+	*x = RetryPolicy{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RetryPolicy) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RetryPolicy) ProtoMessage() {}
+
+func (x *RetryPolicy) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RetryPolicy.ProtoReflect.Descriptor instead.
+func (*RetryPolicy) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *RetryPolicy) GetMaxAttempts() uint32 {
+	if x != nil {
+		return x.MaxAttempts
+	}
+	return 0
+}
+
+func (x *RetryPolicy) GetBaseDelayMs() int64 {
+	if x != nil {
+		return x.BaseDelayMs
+	}
+	return 0
+}
+
+func (x *RetryPolicy) GetFactor() float64 {
+	if x != nil {
+		return x.Factor
+	}
+	return 0
+}
+
+func (x *RetryPolicy) GetMaxDelayMs() int64 {
+	if x != nil {
+		return x.MaxDelayMs
+	}
+	return 0
+}
+
+func (x *RetryPolicy) GetJitter() float64 {
+	if x != nil {
+		return x.Jitter
+	}
+	return 0
+}
+
+type CallStep struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Service       *Expr                  `protobuf:"bytes,1,opt,name=service,proto3" json:"service,omitempty"`
+	Method        *Expr                  `protobuf:"bytes,2,opt,name=method,proto3" json:"method,omitempty"`
+	Input         *Expr                  `protobuf:"bytes,3,opt,name=input,proto3" json:"input,omitempty"`
+	Opts          *CallStepOptions       `protobuf:"bytes,4,opt,name=opts,proto3" json:"opts,omitempty"`
+	Compensate    *Compensation          `protobuf:"bytes,5,opt,name=compensate,proto3" json:"compensate,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CallStep) Reset() {
+	*x = CallStep{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CallStep) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CallStep) ProtoMessage() {}
+
+func (x *CallStep) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CallStep.ProtoReflect.Descriptor instead.
+func (*CallStep) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *CallStep) GetService() *Expr {
+	if x != nil {
+		return x.Service
+	}
+	return nil
+}
+
+func (x *CallStep) GetMethod() *Expr {
+	if x != nil {
+		return x.Method
+	}
+	return nil
+}
+
+func (x *CallStep) GetInput() *Expr {
+	if x != nil {
+		return x.Input
+	}
+	return nil
+}
+
+func (x *CallStep) GetOpts() *CallStepOptions {
+	if x != nil {
+		return x.Opts
+	}
+	return nil
+}
+
+func (x *CallStep) GetCompensate() *Compensation {
+	if x != nil {
+		return x.Compensate
+	}
+	return nil
+}
+
+type CallStepOptions struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	TimeoutMs      int64                  `protobuf:"varint,1,opt,name=timeout_ms,json=timeoutMs,proto3" json:"timeout_ms,omitempty"`
+	Transport      string                 `protobuf:"bytes,2,opt,name=transport,proto3" json:"transport,omitempty"` // "" | auto | direct | proxy
+	IdempotencyKey *Expr                  `protobuf:"bytes,3,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	RequestId      *Expr                  `protobuf:"bytes,4,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	Retry          *RetryPolicy           `protobuf:"bytes,5,opt,name=retry,proto3" json:"retry,omitempty"` // RPC-level retry inside the SDK client
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *CallStepOptions) Reset() {
+	*x = CallStepOptions{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CallStepOptions) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CallStepOptions) ProtoMessage() {}
+
+func (x *CallStepOptions) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CallStepOptions.ProtoReflect.Descriptor instead.
+func (*CallStepOptions) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *CallStepOptions) GetTimeoutMs() int64 {
+	if x != nil {
+		return x.TimeoutMs
+	}
+	return 0
+}
+
+func (x *CallStepOptions) GetTransport() string {
+	if x != nil {
+		return x.Transport
+	}
+	return ""
+}
+
+func (x *CallStepOptions) GetIdempotencyKey() *Expr {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return nil
+}
+
+func (x *CallStepOptions) GetRequestId() *Expr {
+	if x != nil {
+		return x.RequestId
+	}
+	return nil
+}
+
+func (x *CallStepOptions) GetRetry() *RetryPolicy {
+	if x != nil {
+		return x.Retry
+	}
+	return nil
+}
+
+type PublishStep struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Event         *Expr                  `protobuf:"bytes,1,opt,name=event,proto3" json:"event,omitempty"`
+	Input         *Expr                  `protobuf:"bytes,2,opt,name=input,proto3" json:"input,omitempty"`
+	Opts          *PublishStepOptions    `protobuf:"bytes,3,opt,name=opts,proto3" json:"opts,omitempty"`
+	Compensate    *Compensation          `protobuf:"bytes,4,opt,name=compensate,proto3" json:"compensate,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PublishStep) Reset() {
+	*x = PublishStep{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PublishStep) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PublishStep) ProtoMessage() {}
+
+func (x *PublishStep) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PublishStep.ProtoReflect.Descriptor instead.
+func (*PublishStep) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *PublishStep) GetEvent() *Expr {
+	if x != nil {
+		return x.Event
+	}
+	return nil
+}
+
+func (x *PublishStep) GetInput() *Expr {
+	if x != nil {
+		return x.Input
+	}
+	return nil
+}
+
+func (x *PublishStep) GetOpts() *PublishStepOptions {
+	if x != nil {
+		return x.Opts
+	}
+	return nil
+}
+
+func (x *PublishStep) GetCompensate() *Compensation {
+	if x != nil {
+		return x.Compensate
+	}
+	return nil
+}
+
+type PublishStepOptions struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	IdempotencyKey *Expr                  `protobuf:"bytes,1,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	PartitionKey   *Expr                  `protobuf:"bytes,2,opt,name=partition_key,json=partitionKey,proto3" json:"partition_key,omitempty"`
+	Headers        map[string]*Expr       `protobuf:"bytes,3,rep,name=headers,proto3" json:"headers,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *PublishStepOptions) Reset() {
+	*x = PublishStepOptions{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PublishStepOptions) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PublishStepOptions) ProtoMessage() {}
+
+func (x *PublishStepOptions) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PublishStepOptions.ProtoReflect.Descriptor instead.
+func (*PublishStepOptions) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *PublishStepOptions) GetIdempotencyKey() *Expr {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return nil
+}
+
+func (x *PublishStepOptions) GetPartitionKey() *Expr {
+	if x != nil {
+		return x.PartitionKey
+	}
+	return nil
+}
+
+func (x *PublishStepOptions) GetHeaders() map[string]*Expr {
+	if x != nil {
+		return x.Headers
+	}
+	return nil
+}
+
+// Compensation reverses a successful call or publish step. With neither call
+// nor publish set it mirrors the step it is attached to.
+type Compensation struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Kind:
+	//
+	//	*Compensation_Call
+	//	*Compensation_Publish
+	Kind          isCompensation_Kind `protobuf_oneof:"kind"`
+	Input         *Expr               `protobuf:"bytes,3,opt,name=input,proto3" json:"input,omitempty"`
+	Retry         *RetryPolicy        `protobuf:"bytes,4,opt,name=retry,proto3" json:"retry,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Compensation) Reset() {
+	*x = Compensation{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Compensation) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Compensation) ProtoMessage() {}
+
+func (x *Compensation) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Compensation.ProtoReflect.Descriptor instead.
+func (*Compensation) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *Compensation) GetKind() isCompensation_Kind {
+	if x != nil {
+		return x.Kind
+	}
+	return nil
+}
+
+func (x *Compensation) GetCall() *CallCompensation {
+	if x != nil {
+		if x, ok := x.Kind.(*Compensation_Call); ok {
+			return x.Call
+		}
+	}
+	return nil
+}
+
+func (x *Compensation) GetPublish() *PublishCompensation {
+	if x != nil {
+		if x, ok := x.Kind.(*Compensation_Publish); ok {
+			return x.Publish
+		}
+	}
+	return nil
+}
+
+func (x *Compensation) GetInput() *Expr {
+	if x != nil {
+		return x.Input
+	}
+	return nil
+}
+
+func (x *Compensation) GetRetry() *RetryPolicy {
+	if x != nil {
+		return x.Retry
+	}
+	return nil
+}
+
+type isCompensation_Kind interface {
+	isCompensation_Kind()
+}
+
+type Compensation_Call struct {
+	Call *CallCompensation `protobuf:"bytes,1,opt,name=call,proto3,oneof"`
+}
+
+type Compensation_Publish struct {
+	Publish *PublishCompensation `protobuf:"bytes,2,opt,name=publish,proto3,oneof"`
+}
+
+func (*Compensation_Call) isCompensation_Kind() {}
+
+func (*Compensation_Publish) isCompensation_Kind() {}
+
+type CallCompensation struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Service       *Expr                  `protobuf:"bytes,1,opt,name=service,proto3" json:"service,omitempty"` // empty = the step's service
+	Method        *Expr                  `protobuf:"bytes,2,opt,name=method,proto3" json:"method,omitempty"`
+	Opts          *CallStepOptions       `protobuf:"bytes,3,opt,name=opts,proto3" json:"opts,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CallCompensation) Reset() {
+	*x = CallCompensation{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CallCompensation) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CallCompensation) ProtoMessage() {}
+
+func (x *CallCompensation) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CallCompensation.ProtoReflect.Descriptor instead.
+func (*CallCompensation) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *CallCompensation) GetService() *Expr {
+	if x != nil {
+		return x.Service
+	}
+	return nil
+}
+
+func (x *CallCompensation) GetMethod() *Expr {
+	if x != nil {
+		return x.Method
+	}
+	return nil
+}
+
+func (x *CallCompensation) GetOpts() *CallStepOptions {
+	if x != nil {
+		return x.Opts
+	}
+	return nil
+}
+
+type PublishCompensation struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Event         *Expr                  `protobuf:"bytes,1,opt,name=event,proto3" json:"event,omitempty"` // empty = the step's event
+	Opts          *PublishStepOptions    `protobuf:"bytes,2,opt,name=opts,proto3" json:"opts,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PublishCompensation) Reset() {
+	*x = PublishCompensation{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PublishCompensation) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PublishCompensation) ProtoMessage() {}
+
+func (x *PublishCompensation) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PublishCompensation.ProtoReflect.Descriptor instead.
+func (*PublishCompensation) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *PublishCompensation) GetEvent() *Expr {
+	if x != nil {
+		return x.Event
+	}
+	return nil
+}
+
+func (x *PublishCompensation) GetOpts() *PublishStepOptions {
+	if x != nil {
+		return x.Opts
+	}
+	return nil
+}
+
+type LocalStep struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LocalStep) Reset() {
+	*x = LocalStep{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LocalStep) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LocalStep) ProtoMessage() {}
+
+func (x *LocalStep) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LocalStep.ProtoReflect.Descriptor instead.
+func (*LocalStep) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{16}
+}
+
+type SleepStep struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	DurationMs    int64                  `protobuf:"varint,1,opt,name=duration_ms,json=durationMs,proto3" json:"duration_ms,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SleepStep) Reset() {
+	*x = SleepStep{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SleepStep) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SleepStep) ProtoMessage() {}
+
+func (x *SleepStep) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SleepStep.ProtoReflect.Descriptor instead.
+func (*SleepStep) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *SleepStep) GetDurationMs() int64 {
+	if x != nil {
+		return x.DurationMs
+	}
+	return 0
+}
+
+type WaitEventStep struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Event string                 `protobuf:"bytes,1,opt,name=event,proto3" json:"event,omitempty"`
+	// Filter Expression: path → expected value (resolved against run state
+	// when the step parks). All pairs must match.
+	Filter        map[string]*Expr `protobuf:"bytes,2,rep,name=filter,proto3" json:"filter,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WaitEventStep) Reset() {
+	*x = WaitEventStep{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WaitEventStep) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WaitEventStep) ProtoMessage() {}
+
+func (x *WaitEventStep) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WaitEventStep.ProtoReflect.Descriptor instead.
+func (*WaitEventStep) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *WaitEventStep) GetEvent() string {
+	if x != nil {
+		return x.Event
+	}
+	return ""
+}
+
+func (x *WaitEventStep) GetFilter() map[string]*Expr {
+	if x != nil {
+		return x.Filter
+	}
+	return nil
+}
+
+type WaitSignalStep struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Signal        string                 `protobuf:"bytes,1,opt,name=signal,proto3" json:"signal,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WaitSignalStep) Reset() {
+	*x = WaitSignalStep{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WaitSignalStep) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WaitSignalStep) ProtoMessage() {}
+
+func (x *WaitSignalStep) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WaitSignalStep.ProtoReflect.Descriptor instead.
+func (*WaitSignalStep) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *WaitSignalStep) GetSignal() string {
+	if x != nil {
+		return x.Signal
+	}
+	return ""
+}
+
+type SubWorkflowStep struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Service        *Expr                  `protobuf:"bytes,1,opt,name=service,proto3" json:"service,omitempty"` // empty = the owner service
+	Workflow       *Expr                  `protobuf:"bytes,2,opt,name=workflow,proto3" json:"workflow,omitempty"`
+	Input          *Expr                  `protobuf:"bytes,3,opt,name=input,proto3" json:"input,omitempty"`
+	IdempotencyKey *Expr                  `protobuf:"bytes,4,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	TimeoutMs      int64                  `protobuf:"varint,5,opt,name=timeout_ms,json=timeoutMs,proto3" json:"timeout_ms,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *SubWorkflowStep) Reset() {
+	*x = SubWorkflowStep{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SubWorkflowStep) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SubWorkflowStep) ProtoMessage() {}
+
+func (x *SubWorkflowStep) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SubWorkflowStep.ProtoReflect.Descriptor instead.
+func (*SubWorkflowStep) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *SubWorkflowStep) GetService() *Expr {
+	if x != nil {
+		return x.Service
+	}
+	return nil
+}
+
+func (x *SubWorkflowStep) GetWorkflow() *Expr {
+	if x != nil {
+		return x.Workflow
+	}
+	return nil
+}
+
+func (x *SubWorkflowStep) GetInput() *Expr {
+	if x != nil {
+		return x.Input
+	}
+	return nil
+}
+
+func (x *SubWorkflowStep) GetIdempotencyKey() *Expr {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return nil
+}
+
+func (x *SubWorkflowStep) GetTimeoutMs() int64 {
+	if x != nil {
+		return x.TimeoutMs
+	}
+	return 0
+}
+
+type GroupStep struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Steps         []*Step                `protobuf:"bytes,1,rep,name=steps,proto3" json:"steps,omitempty"`
+	ForEach       *ForEach               `protobuf:"bytes,2,opt,name=for_each,json=forEach,proto3" json:"for_each,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GroupStep) Reset() {
+	*x = GroupStep{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GroupStep) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GroupStep) ProtoMessage() {}
+
+func (x *GroupStep) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GroupStep.ProtoReflect.Descriptor instead.
+func (*GroupStep) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *GroupStep) GetSteps() []*Step {
+	if x != nil {
+		return x.Steps
+	}
+	return nil
+}
+
+func (x *GroupStep) GetForEach() *ForEach {
+	if x != nil {
+		return x.ForEach
+	}
+	return nil
+}
+
+type ForEach struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	From          string                 `protobuf:"bytes,1,opt,name=from,proto3" json:"from,omitempty"` // path resolving to a JSON array
+	As            string                 `protobuf:"bytes,2,opt,name=as,proto3" json:"as,omitempty"`     // name the element is bound to inside the group
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ForEach) Reset() {
+	*x = ForEach{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ForEach) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ForEach) ProtoMessage() {}
+
+func (x *ForEach) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ForEach.ProtoReflect.Descriptor instead.
+func (*ForEach) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *ForEach) GetFrom() string {
+	if x != nil {
+		return x.From
+	}
+	return ""
+}
+
+func (x *ForEach) GetAs() string {
+	if x != nil {
+		return x.As
+	}
+	return ""
+}
+
+type StartRunRequest struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Service        string                 `protobuf:"bytes,1,opt,name=service,proto3" json:"service,omitempty"` // owner service name
+	Workflow       string                 `protobuf:"bytes,2,opt,name=workflow,proto3" json:"workflow,omitempty"`
+	Input          []byte                 `protobuf:"bytes,3,opt,name=input,proto3" json:"input,omitempty"` // JSON
+	IdempotencyKey string                 `protobuf:"bytes,4,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	TimeoutMs      int64                  `protobuf:"varint,5,opt,name=timeout_ms,json=timeoutMs,proto3" json:"timeout_ms,omitempty"` // 0 = the definition's timeout
+	XSbTrace       string                 `protobuf:"bytes,6,opt,name=x_sb_trace,json=xSbTrace,proto3" json:"x_sb_trace,omitempty"`   // "traceID-parentOpID"; empty = new trace
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
 func (x *StartRunRequest) Reset() {
 	*x = StartRunRequest{}
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[0]
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -53,7 +1812,7 @@ func (x *StartRunRequest) String() string {
 func (*StartRunRequest) ProtoMessage() {}
 
 func (x *StartRunRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[0]
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -66,12 +1825,19 @@ func (x *StartRunRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartRunRequest.ProtoReflect.Descriptor instead.
 func (*StartRunRequest) Descriptor() ([]byte, []int) {
-	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{0}
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{23}
 }
 
-func (x *StartRunRequest) GetWorkflowName() string {
+func (x *StartRunRequest) GetService() string {
 	if x != nil {
-		return x.WorkflowName
+		return x.Service
+	}
+	return ""
+}
+
+func (x *StartRunRequest) GetWorkflow() string {
+	if x != nil {
+		return x.Workflow
 	}
 	return ""
 }
@@ -90,9 +1856,9 @@ func (x *StartRunRequest) GetIdempotencyKey() string {
 	return ""
 }
 
-func (x *StartRunRequest) GetTimeoutSec() uint32 {
+func (x *StartRunRequest) GetTimeoutMs() int64 {
 	if x != nil {
-		return x.TimeoutSec
+		return x.TimeoutMs
 	}
 	return 0
 }
@@ -100,13 +1866,6 @@ func (x *StartRunRequest) GetTimeoutSec() uint32 {
 func (x *StartRunRequest) GetXSbTrace() string {
 	if x != nil {
 		return x.XSbTrace
-	}
-	return ""
-}
-
-func (x *StartRunRequest) GetParentRunId() string {
-	if x != nil {
-		return x.ParentRunId
 	}
 	return ""
 }
@@ -120,7 +1879,7 @@ type StartRunResponse struct {
 
 func (x *StartRunResponse) Reset() {
 	*x = StartRunResponse{}
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[1]
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -132,7 +1891,7 @@ func (x *StartRunResponse) String() string {
 func (*StartRunResponse) ProtoMessage() {}
 
 func (x *StartRunResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[1]
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -145,7 +1904,7 @@ func (x *StartRunResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartRunResponse.ProtoReflect.Descriptor instead.
 func (*StartRunResponse) Descriptor() ([]byte, []int) {
-	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{1}
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *StartRunResponse) GetRunId() string {
@@ -164,7 +1923,7 @@ type CancelRunRequest struct {
 
 func (x *CancelRunRequest) Reset() {
 	*x = CancelRunRequest{}
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[2]
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -176,7 +1935,7 @@ func (x *CancelRunRequest) String() string {
 func (*CancelRunRequest) ProtoMessage() {}
 
 func (x *CancelRunRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[2]
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -189,7 +1948,7 @@ func (x *CancelRunRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CancelRunRequest.ProtoReflect.Descriptor instead.
 func (*CancelRunRequest) Descriptor() ([]byte, []int) {
-	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{2}
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *CancelRunRequest) GetRunId() string {
@@ -200,17 +1959,20 @@ func (x *CancelRunRequest) GetRunId() string {
 }
 
 type SignalRunRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	RunId         string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
-	SignalName    string                 `protobuf:"bytes,2,opt,name=signal_name,json=signalName,proto3" json:"signal_name,omitempty"`
-	Payload       []byte                 `protobuf:"bytes,3,opt,name=payload,proto3" json:"payload,omitempty"`
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	RunId      string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
+	SignalName string                 `protobuf:"bytes,2,opt,name=signal_name,json=signalName,proto3" json:"signal_name,omitempty"`
+	Payload    []byte                 `protobuf:"bytes,3,opt,name=payload,proto3" json:"payload,omitempty"` // JSON
+	// Optional idempotency key: a repeated signal with the same id is accepted
+	// without enqueuing it again.
+	SignalId      string `protobuf:"bytes,4,opt,name=signal_id,json=signalId,proto3" json:"signal_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *SignalRunRequest) Reset() {
 	*x = SignalRunRequest{}
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[3]
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -222,7 +1984,7 @@ func (x *SignalRunRequest) String() string {
 func (*SignalRunRequest) ProtoMessage() {}
 
 func (x *SignalRunRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[3]
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -235,7 +1997,7 @@ func (x *SignalRunRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SignalRunRequest.ProtoReflect.Descriptor instead.
 func (*SignalRunRequest) Descriptor() ([]byte, []int) {
-	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{3}
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *SignalRunRequest) GetRunId() string {
@@ -259,6 +2021,57 @@ func (x *SignalRunRequest) GetPayload() []byte {
 	return nil
 }
 
+func (x *SignalRunRequest) GetSignalId() string {
+	if x != nil {
+		return x.SignalId
+	}
+	return ""
+}
+
+type SignalRunResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Duplicate     bool                   `protobuf:"varint,1,opt,name=duplicate,proto3" json:"duplicate,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SignalRunResponse) Reset() {
+	*x = SignalRunResponse{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[27]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SignalRunResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SignalRunResponse) ProtoMessage() {}
+
+func (x *SignalRunResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[27]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SignalRunResponse.ProtoReflect.Descriptor instead.
+func (*SignalRunResponse) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{27}
+}
+
+func (x *SignalRunResponse) GetDuplicate() bool {
+	if x != nil {
+		return x.Duplicate
+	}
+	return false
+}
+
 type QueryRunRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	RunId         string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
@@ -268,7 +2081,7 @@ type QueryRunRequest struct {
 
 func (x *QueryRunRequest) Reset() {
 	*x = QueryRunRequest{}
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[4]
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -280,7 +2093,7 @@ func (x *QueryRunRequest) String() string {
 func (*QueryRunRequest) ProtoMessage() {}
 
 func (x *QueryRunRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[4]
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -293,7 +2106,7 @@ func (x *QueryRunRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use QueryRunRequest.ProtoReflect.Descriptor instead.
 func (*QueryRunRequest) Descriptor() ([]byte, []int) {
-	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{4}
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *QueryRunRequest) GetRunId() string {
@@ -303,31 +2116,46 @@ func (x *QueryRunRequest) GetRunId() string {
 	return ""
 }
 
-type QueryRunResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	RunId         string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
-	Status        string                 `protobuf:"bytes,2,opt,name=status,proto3" json:"status,omitempty"`
-	State         []byte                 `protobuf:"bytes,3,opt,name=state,proto3" json:"state,omitempty"` // JSON-encoded run state map
-	Steps         []*StepInfo            `protobuf:"bytes,4,rep,name=steps,proto3" json:"steps,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+type RunSnapshot struct {
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	RunId       string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
+	Service     string                 `protobuf:"bytes,2,opt,name=service,proto3" json:"service,omitempty"`
+	Workflow    string                 `protobuf:"bytes,3,opt,name=workflow,proto3" json:"workflow,omitempty"`
+	Fingerprint string                 `protobuf:"bytes,4,opt,name=fingerprint,proto3" json:"fingerprint,omitempty"`
+	// active | compensating | success | failed | cancelled | timed_out | failed_compensated
+	Status string `protobuf:"bytes,5,opt,name=status,proto3" json:"status,omitempty"`
+	// ” | step_failure | cancelled | timed_out
+	StopReason string `protobuf:"bytes,6,opt,name=stop_reason,json=stopReason,proto3" json:"stop_reason,omitempty"`
+	// ” | no_instance | retry | sleep | signal | event | child
+	WaitingReason   string           `protobuf:"bytes,7,opt,name=waiting_reason,json=waitingReason,proto3" json:"waiting_reason,omitempty"`
+	Input           []byte           `protobuf:"bytes,8,opt,name=input,proto3" json:"input,omitempty"`
+	Output          []byte           `protobuf:"bytes,9,opt,name=output,proto3" json:"output,omitempty"` // JSON state map; set on success
+	ErrorCode       string           `protobuf:"bytes,10,opt,name=error_code,json=errorCode,proto3" json:"error_code,omitempty"`
+	ErrorMessage    string           `protobuf:"bytes,11,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
+	ParentRunId     string           `protobuf:"bytes,12,opt,name=parent_run_id,json=parentRunId,proto3" json:"parent_run_id,omitempty"`
+	StartedAtUnixMs int64            `protobuf:"varint,13,opt,name=started_at_unix_ms,json=startedAtUnixMs,proto3" json:"started_at_unix_ms,omitempty"`
+	EndedAtUnixMs   int64            `protobuf:"varint,14,opt,name=ended_at_unix_ms,json=endedAtUnixMs,proto3" json:"ended_at_unix_ms,omitempty"`
+	Steps           []*StepInfo      `protobuf:"bytes,15,rep,name=steps,proto3" json:"steps,omitempty"`
+	Signals         []*PendingSignal `protobuf:"bytes,16,rep,name=signals,proto3" json:"signals,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
-func (x *QueryRunResponse) Reset() {
-	*x = QueryRunResponse{}
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[5]
+func (x *RunSnapshot) Reset() {
+	*x = RunSnapshot{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *QueryRunResponse) String() string {
+func (x *RunSnapshot) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*QueryRunResponse) ProtoMessage() {}
+func (*RunSnapshot) ProtoMessage() {}
 
-func (x *QueryRunResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[5]
+func (x *RunSnapshot) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -338,53 +2166,148 @@ func (x *QueryRunResponse) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use QueryRunResponse.ProtoReflect.Descriptor instead.
-func (*QueryRunResponse) Descriptor() ([]byte, []int) {
-	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{5}
+// Deprecated: Use RunSnapshot.ProtoReflect.Descriptor instead.
+func (*RunSnapshot) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{29}
 }
 
-func (x *QueryRunResponse) GetRunId() string {
+func (x *RunSnapshot) GetRunId() string {
 	if x != nil {
 		return x.RunId
 	}
 	return ""
 }
 
-func (x *QueryRunResponse) GetStatus() string {
+func (x *RunSnapshot) GetService() string {
+	if x != nil {
+		return x.Service
+	}
+	return ""
+}
+
+func (x *RunSnapshot) GetWorkflow() string {
+	if x != nil {
+		return x.Workflow
+	}
+	return ""
+}
+
+func (x *RunSnapshot) GetFingerprint() string {
+	if x != nil {
+		return x.Fingerprint
+	}
+	return ""
+}
+
+func (x *RunSnapshot) GetStatus() string {
 	if x != nil {
 		return x.Status
 	}
 	return ""
 }
 
-func (x *QueryRunResponse) GetState() []byte {
+func (x *RunSnapshot) GetStopReason() string {
 	if x != nil {
-		return x.State
+		return x.StopReason
+	}
+	return ""
+}
+
+func (x *RunSnapshot) GetWaitingReason() string {
+	if x != nil {
+		return x.WaitingReason
+	}
+	return ""
+}
+
+func (x *RunSnapshot) GetInput() []byte {
+	if x != nil {
+		return x.Input
 	}
 	return nil
 }
 
-func (x *QueryRunResponse) GetSteps() []*StepInfo {
+func (x *RunSnapshot) GetOutput() []byte {
+	if x != nil {
+		return x.Output
+	}
+	return nil
+}
+
+func (x *RunSnapshot) GetErrorCode() string {
+	if x != nil {
+		return x.ErrorCode
+	}
+	return ""
+}
+
+func (x *RunSnapshot) GetErrorMessage() string {
+	if x != nil {
+		return x.ErrorMessage
+	}
+	return ""
+}
+
+func (x *RunSnapshot) GetParentRunId() string {
+	if x != nil {
+		return x.ParentRunId
+	}
+	return ""
+}
+
+func (x *RunSnapshot) GetStartedAtUnixMs() int64 {
+	if x != nil {
+		return x.StartedAtUnixMs
+	}
+	return 0
+}
+
+func (x *RunSnapshot) GetEndedAtUnixMs() int64 {
+	if x != nil {
+		return x.EndedAtUnixMs
+	}
+	return 0
+}
+
+func (x *RunSnapshot) GetSteps() []*StepInfo {
 	if x != nil {
 		return x.Steps
 	}
 	return nil
 }
 
+func (x *RunSnapshot) GetSignals() []*PendingSignal {
+	if x != nil {
+		return x.Signals
+	}
+	return nil
+}
+
 type StepInfo struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	StepId        string                 `protobuf:"bytes,1,opt,name=step_id,json=stepId,proto3" json:"step_id,omitempty"`
-	Status        string                 `protobuf:"bytes,2,opt,name=status,proto3" json:"status,omitempty"`
-	Output        []byte                 `protobuf:"bytes,3,opt,name=output,proto3" json:"output,omitempty"`
-	LastError     string                 `protobuf:"bytes,4,opt,name=last_error,json=lastError,proto3" json:"last_error,omitempty"`
-	CompensatedBy string                 `protobuf:"bytes,5,opt,name=compensated_by,json=compensatedBy,proto3" json:"compensated_by,omitempty"` // step_id of the compensation step, if compensated
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	StepId       string                 `protobuf:"bytes,1,opt,name=step_id,json=stepId,proto3" json:"step_id,omitempty"`
+	ParentStepId string                 `protobuf:"bytes,2,opt,name=parent_step_id,json=parentStepId,proto3" json:"parent_step_id,omitempty"`
+	// call|publish|local|sleep|wait_event|wait_signal|workflow|parallel|sequence|compensate
+	Kind string `protobuf:"bytes,3,opt,name=kind,proto3" json:"kind,omitempty"`
+	// pending | leased | parked | success | failed | compensated
+	Status            string `protobuf:"bytes,4,opt,name=status,proto3" json:"status,omitempty"`
+	Attempt           uint32 `protobuf:"varint,5,opt,name=attempt,proto3" json:"attempt,omitempty"`
+	Output            []byte `protobuf:"bytes,6,opt,name=output,proto3" json:"output,omitempty"`
+	ErrorCode         string `protobuf:"bytes,7,opt,name=error_code,json=errorCode,proto3" json:"error_code,omitempty"`
+	ErrorMessage      string `protobuf:"bytes,8,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
+	WaitingReason     string `protobuf:"bytes,9,opt,name=waiting_reason,json=waitingReason,proto3" json:"waiting_reason,omitempty"`
+	WaitKey           string `protobuf:"bytes,10,opt,name=wait_key,json=waitKey,proto3" json:"wait_key,omitempty"` // signal / event name of a wait
+	ChildRunId        string `protobuf:"bytes,11,opt,name=child_run_id,json=childRunId,proto3" json:"child_run_id,omitempty"`
+	CompensatesStepId string `protobuf:"bytes,12,opt,name=compensates_step_id,json=compensatesStepId,proto3" json:"compensates_step_id,omitempty"`
+	StartedAtUnixMs   int64  `protobuf:"varint,13,opt,name=started_at_unix_ms,json=startedAtUnixMs,proto3" json:"started_at_unix_ms,omitempty"`
+	EndedAtUnixMs     int64  `protobuf:"varint,14,opt,name=ended_at_unix_ms,json=endedAtUnixMs,proto3" json:"ended_at_unix_ms,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *StepInfo) Reset() {
 	*x = StepInfo{}
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[6]
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -396,7 +2319,7 @@ func (x *StepInfo) String() string {
 func (*StepInfo) ProtoMessage() {}
 
 func (x *StepInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[6]
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -409,12 +2332,26 @@ func (x *StepInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StepInfo.ProtoReflect.Descriptor instead.
 func (*StepInfo) Descriptor() ([]byte, []int) {
-	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{6}
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *StepInfo) GetStepId() string {
 	if x != nil {
 		return x.StepId
+	}
+	return ""
+}
+
+func (x *StepInfo) GetParentStepId() string {
+	if x != nil {
+		return x.ParentStepId
+	}
+	return ""
+}
+
+func (x *StepInfo) GetKind() string {
+	if x != nil {
+		return x.Kind
 	}
 	return ""
 }
@@ -426,6 +2363,13 @@ func (x *StepInfo) GetStatus() string {
 	return ""
 }
 
+func (x *StepInfo) GetAttempt() uint32 {
+	if x != nil {
+		return x.Attempt
+	}
+	return 0
+}
+
 func (x *StepInfo) GetOutput() []byte {
 	if x != nil {
 		return x.Output
@@ -433,18 +2377,128 @@ func (x *StepInfo) GetOutput() []byte {
 	return nil
 }
 
-func (x *StepInfo) GetLastError() string {
+func (x *StepInfo) GetErrorCode() string {
 	if x != nil {
-		return x.LastError
+		return x.ErrorCode
 	}
 	return ""
 }
 
-func (x *StepInfo) GetCompensatedBy() string {
+func (x *StepInfo) GetErrorMessage() string {
 	if x != nil {
-		return x.CompensatedBy
+		return x.ErrorMessage
 	}
 	return ""
+}
+
+func (x *StepInfo) GetWaitingReason() string {
+	if x != nil {
+		return x.WaitingReason
+	}
+	return ""
+}
+
+func (x *StepInfo) GetWaitKey() string {
+	if x != nil {
+		return x.WaitKey
+	}
+	return ""
+}
+
+func (x *StepInfo) GetChildRunId() string {
+	if x != nil {
+		return x.ChildRunId
+	}
+	return ""
+}
+
+func (x *StepInfo) GetCompensatesStepId() string {
+	if x != nil {
+		return x.CompensatesStepId
+	}
+	return ""
+}
+
+func (x *StepInfo) GetStartedAtUnixMs() int64 {
+	if x != nil {
+		return x.StartedAtUnixMs
+	}
+	return 0
+}
+
+func (x *StepInfo) GetEndedAtUnixMs() int64 {
+	if x != nil {
+		return x.EndedAtUnixMs
+	}
+	return 0
+}
+
+type PendingSignal struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	SignalName       string                 `protobuf:"bytes,1,opt,name=signal_name,json=signalName,proto3" json:"signal_name,omitempty"`
+	SignalId         string                 `protobuf:"bytes,2,opt,name=signal_id,json=signalId,proto3" json:"signal_id,omitempty"`
+	Payload          []byte                 `protobuf:"bytes,3,opt,name=payload,proto3" json:"payload,omitempty"`
+	EnqueuedAtUnixMs int64                  `protobuf:"varint,4,opt,name=enqueued_at_unix_ms,json=enqueuedAtUnixMs,proto3" json:"enqueued_at_unix_ms,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *PendingSignal) Reset() {
+	*x = PendingSignal{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[31]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PendingSignal) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PendingSignal) ProtoMessage() {}
+
+func (x *PendingSignal) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[31]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PendingSignal.ProtoReflect.Descriptor instead.
+func (*PendingSignal) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{31}
+}
+
+func (x *PendingSignal) GetSignalName() string {
+	if x != nil {
+		return x.SignalName
+	}
+	return ""
+}
+
+func (x *PendingSignal) GetSignalId() string {
+	if x != nil {
+		return x.SignalId
+	}
+	return ""
+}
+
+func (x *PendingSignal) GetPayload() []byte {
+	if x != nil {
+		return x.Payload
+	}
+	return nil
+}
+
+func (x *PendingSignal) GetEnqueuedAtUnixMs() int64 {
+	if x != nil {
+		return x.EnqueuedAtUnixMs
+	}
+	return 0
 }
 
 type AwaitRunRequest struct {
@@ -456,7 +2510,7 @@ type AwaitRunRequest struct {
 
 func (x *AwaitRunRequest) Reset() {
 	*x = AwaitRunRequest{}
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[7]
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -468,7 +2522,7 @@ func (x *AwaitRunRequest) String() string {
 func (*AwaitRunRequest) ProtoMessage() {}
 
 func (x *AwaitRunRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[7]
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -481,7 +2535,7 @@ func (x *AwaitRunRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AwaitRunRequest.ProtoReflect.Descriptor instead.
 func (*AwaitRunRequest) Descriptor() ([]byte, []int) {
-	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{7}
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *AwaitRunRequest) GetRunId() string {
@@ -495,14 +2549,18 @@ type RunStatusUpdate struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	RunId         string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
 	Status        string                 `protobuf:"bytes,2,opt,name=status,proto3" json:"status,omitempty"`
-	State         []byte                 `protobuf:"bytes,3,opt,name=state,proto3" json:"state,omitempty"` // JSON-encoded final state; non-empty only on terminal status
+	WaitingReason string                 `protobuf:"bytes,3,opt,name=waiting_reason,json=waitingReason,proto3" json:"waiting_reason,omitempty"`
+	Terminal      bool                   `protobuf:"varint,4,opt,name=terminal,proto3" json:"terminal,omitempty"`
+	Output        []byte                 `protobuf:"bytes,5,opt,name=output,proto3" json:"output,omitempty"` // JSON state map; set on success
+	ErrorCode     string                 `protobuf:"bytes,6,opt,name=error_code,json=errorCode,proto3" json:"error_code,omitempty"`
+	ErrorMessage  string                 `protobuf:"bytes,7,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RunStatusUpdate) Reset() {
 	*x = RunStatusUpdate{}
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[8]
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -514,7 +2572,7 @@ func (x *RunStatusUpdate) String() string {
 func (*RunStatusUpdate) ProtoMessage() {}
 
 func (x *RunStatusUpdate) ProtoReflect() protoreflect.Message {
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[8]
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -527,7 +2585,7 @@ func (x *RunStatusUpdate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RunStatusUpdate.ProtoReflect.Descriptor instead.
 func (*RunStatusUpdate) Descriptor() ([]byte, []int) {
-	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{8}
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *RunStatusUpdate) GetRunId() string {
@@ -544,24 +2602,54 @@ func (x *RunStatusUpdate) GetStatus() string {
 	return ""
 }
 
-func (x *RunStatusUpdate) GetState() []byte {
+func (x *RunStatusUpdate) GetWaitingReason() string {
 	if x != nil {
-		return x.State
+		return x.WaitingReason
+	}
+	return ""
+}
+
+func (x *RunStatusUpdate) GetTerminal() bool {
+	if x != nil {
+		return x.Terminal
+	}
+	return false
+}
+
+func (x *RunStatusUpdate) GetOutput() []byte {
+	if x != nil {
+		return x.Output
 	}
 	return nil
 }
 
+func (x *RunStatusUpdate) GetErrorCode() string {
+	if x != nil {
+		return x.ErrorCode
+	}
+	return ""
+}
+
+func (x *RunStatusUpdate) GetErrorMessage() string {
+	if x != nil {
+		return x.ErrorMessage
+	}
+	return ""
+}
+
 type ReplayRunRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	RunId         string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
-	FromStepId    string                 `protobuf:"bytes,2,opt,name=from_step_id,json=fromStepId,proto3" json:"from_step_id,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	RunId string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
+	// Empty = from the start; otherwise the source's successful steps that do
+	// not depend on this step are copied.
+	FromStepId    string `protobuf:"bytes,2,opt,name=from_step_id,json=fromStepId,proto3" json:"from_step_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ReplayRunRequest) Reset() {
 	*x = ReplayRunRequest{}
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[9]
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -573,7 +2661,7 @@ func (x *ReplayRunRequest) String() string {
 func (*ReplayRunRequest) ProtoMessage() {}
 
 func (x *ReplayRunRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[9]
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -586,7 +2674,7 @@ func (x *ReplayRunRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReplayRunRequest.ProtoReflect.Descriptor instead.
 func (*ReplayRunRequest) Descriptor() ([]byte, []int) {
-	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{9}
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *ReplayRunRequest) GetRunId() string {
@@ -605,14 +2693,14 @@ func (x *ReplayRunRequest) GetFromStepId() string {
 
 type ReplayRunResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	RunId         string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"` // new run id
+	RunId         string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ReplayRunResponse) Reset() {
 	*x = ReplayRunResponse{}
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[10]
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -624,7 +2712,7 @@ func (x *ReplayRunResponse) String() string {
 func (*ReplayRunResponse) ProtoMessage() {}
 
 func (x *ReplayRunResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[10]
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -637,7 +2725,7 @@ func (x *ReplayRunResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReplayRunResponse.ProtoReflect.Descriptor instead.
 func (*ReplayRunResponse) Descriptor() ([]byte, []int) {
-	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{10}
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *ReplayRunResponse) GetRunId() string {
@@ -647,17 +2735,59 @@ func (x *ReplayRunResponse) GetRunId() string {
 	return ""
 }
 
+type RetryCompensationRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RunId         string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RetryCompensationRequest) Reset() {
+	*x = RetryCompensationRequest{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[36]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RetryCompensationRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RetryCompensationRequest) ProtoMessage() {}
+
+func (x *RetryCompensationRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[36]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RetryCompensationRequest.ProtoReflect.Descriptor instead.
+func (*RetryCompensationRequest) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{36}
+}
+
+func (x *RetryCompensationRequest) GetRunId() string {
+	if x != nil {
+		return x.RunId
+	}
+	return ""
+}
+
 type SubscribeRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	ServiceId     string                 `protobuf:"bytes,1,opt,name=service_id,json=serviceId,proto3" json:"service_id,omitempty"`    // UUID
-	InstanceId    string                 `protobuf:"bytes,2,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"` // UUID
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *SubscribeRequest) Reset() {
 	*x = SubscribeRequest{}
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[11]
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -669,7 +2799,7 @@ func (x *SubscribeRequest) String() string {
 func (*SubscribeRequest) ProtoMessage() {}
 
 func (x *SubscribeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[11]
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -682,58 +2812,59 @@ func (x *SubscribeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubscribeRequest.ProtoReflect.Descriptor instead.
 func (*SubscribeRequest) Descriptor() ([]byte, []int) {
-	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{11}
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{37}
 }
 
-func (x *SubscribeRequest) GetServiceId() string {
-	if x != nil {
-		return x.ServiceId
-	}
-	return ""
-}
-
-func (x *SubscribeRequest) GetInstanceId() string {
-	if x != nil {
-		return x.InstanceId
-	}
-	return ""
-}
-
-type RunAssignment struct {
+// StepTask leases one attempt of one step to the receiving instance.
+type StepTask struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
-	RunId          string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
-	WorkflowName   string                 `protobuf:"bytes,2,opt,name=workflow_name,json=workflowName,proto3" json:"workflow_name,omitempty"`
-	Fingerprint    string                 `protobuf:"bytes,3,opt,name=fingerprint,proto3" json:"fingerprint,omitempty"`
-	FrozenPlan     []byte                 `protobuf:"bytes,4,opt,name=frozen_plan,json=frozenPlan,proto3" json:"frozen_plan,omitempty"` // canonical JSON graph
-	Input          []byte                 `protobuf:"bytes,5,opt,name=input,proto3" json:"input,omitempty"`                             // JSON-encoded workflow input
-	State          []byte                 `protobuf:"bytes,6,opt,name=state,proto3" json:"state,omitempty"`                             // JSON-encoded current state (checkpointed outputs)
-	LeaseEpoch     uint64                 `protobuf:"varint,7,opt,name=lease_epoch,json=leaseEpoch,proto3" json:"lease_epoch,omitempty"`
-	MaxParallelism uint32                 `protobuf:"varint,8,opt,name=max_parallelism,json=maxParallelism,proto3" json:"max_parallelism,omitempty"`
-	// X-SB-Trace propagation — workflow root op.
-	XSbTrace string `protobuf:"bytes,9,opt,name=x_sb_trace,json=xSbTrace,proto3" json:"x_sb_trace,omitempty"` // "traceID-parentOpID" canonical format (ADR 0006 §3)
-	// Compensation: if set, SDK must execute compensation steps.
-	Compensating bool `protobuf:"varint,12,opt,name=compensating,proto3" json:"compensating,omitempty"`
-	// cancel_reason mirrors workflow_runs.cancel_reason. Values: ” | 'user_cancel' | 'step_failure'.
-	CancelReason  string `protobuf:"bytes,13,opt,name=cancel_reason,json=cancelReason,proto3" json:"cancel_reason,omitempty"`
+	TaskToken      string                 `protobuf:"bytes,1,opt,name=task_token,json=taskToken,proto3" json:"task_token,omitempty"`
+	RunId          string                 `protobuf:"bytes,2,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
+	Workflow       string                 `protobuf:"bytes,3,opt,name=workflow,proto3" json:"workflow,omitempty"`
+	Version        string                 `protobuf:"bytes,4,opt,name=version,proto3" json:"version,omitempty"` // definition version (locates local functions)
+	Fingerprint    string                 `protobuf:"bytes,5,opt,name=fingerprint,proto3" json:"fingerprint,omitempty"`
+	StepId         string                 `protobuf:"bytes,6,opt,name=step_id,json=stepId,proto3" json:"step_id,omitempty"`                           // concrete id (forEach suffixes included)
+	TemplateStepId string                 `protobuf:"bytes,7,opt,name=template_step_id,json=templateStepId,proto3" json:"template_step_id,omitempty"` // id as declared
+	Kind           TaskKind               `protobuf:"varint,8,opt,name=kind,proto3,enum=servicebridge.v1.TaskKind" json:"kind,omitempty"`
+	Attempt        uint32                 `protobuf:"varint,9,opt,name=attempt,proto3" json:"attempt,omitempty"`
+	// call
+	Service  string               `protobuf:"bytes,10,opt,name=service,proto3" json:"service,omitempty"`
+	Method   string               `protobuf:"bytes,11,opt,name=method,proto3" json:"method,omitempty"`
+	CallOpts *ResolvedCallOptions `protobuf:"bytes,12,opt,name=call_opts,json=callOpts,proto3" json:"call_opts,omitempty"`
+	// publish
+	Event       string                  `protobuf:"bytes,13,opt,name=event,proto3" json:"event,omitempty"`
+	PublishOpts *ResolvedPublishOptions `protobuf:"bytes,14,opt,name=publish_opts,json=publishOpts,proto3" json:"publish_opts,omitempty"`
+	// call / publish body; JSON
+	Input []byte `protobuf:"bytes,15,opt,name=input,proto3" json:"input,omitempty"`
+	// local: the run state the function sees; JSON object
+	State               []byte `protobuf:"bytes,16,opt,name=state,proto3" json:"state,omitempty"`
+	IsCompensation      bool   `protobuf:"varint,17,opt,name=is_compensation,json=isCompensation,proto3" json:"is_compensation,omitempty"`
+	CompensatesStepId   string `protobuf:"bytes,18,opt,name=compensates_step_id,json=compensatesStepId,proto3" json:"compensates_step_id,omitempty"`
+	LeaseTtlMs          int64  `protobuf:"varint,19,opt,name=lease_ttl_ms,json=leaseTtlMs,proto3" json:"lease_ttl_ms,omitempty"`
+	HeartbeatIntervalMs int64  `protobuf:"varint,20,opt,name=heartbeat_interval_ms,json=heartbeatIntervalMs,proto3" json:"heartbeat_interval_ms,omitempty"`
+	// Step deadline; 0 = none. The SDK cancels the execution once it passes.
+	DeadlineUnixMs int64 `protobuf:"varint,21,opt,name=deadline_unix_ms,json=deadlineUnixMs,proto3" json:"deadline_unix_ms,omitempty"`
+	// "traceID-rootOpID" of the run.
+	XSbTrace      string `protobuf:"bytes,22,opt,name=x_sb_trace,json=xSbTrace,proto3" json:"x_sb_trace,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *RunAssignment) Reset() {
-	*x = RunAssignment{}
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[12]
+func (x *StepTask) Reset() {
+	*x = StepTask{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *RunAssignment) String() string {
+func (x *StepTask) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*RunAssignment) ProtoMessage() {}
+func (*StepTask) ProtoMessage() {}
 
-func (x *RunAssignment) ProtoReflect() protoreflect.Message {
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[12]
+func (x *StepTask) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -744,867 +2875,432 @@ func (x *RunAssignment) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use RunAssignment.ProtoReflect.Descriptor instead.
-func (*RunAssignment) Descriptor() ([]byte, []int) {
-	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{12}
+// Deprecated: Use StepTask.ProtoReflect.Descriptor instead.
+func (*StepTask) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{38}
 }
 
-func (x *RunAssignment) GetRunId() string {
+func (x *StepTask) GetTaskToken() string {
+	if x != nil {
+		return x.TaskToken
+	}
+	return ""
+}
+
+func (x *StepTask) GetRunId() string {
 	if x != nil {
 		return x.RunId
 	}
 	return ""
 }
 
-func (x *RunAssignment) GetWorkflowName() string {
+func (x *StepTask) GetWorkflow() string {
 	if x != nil {
-		return x.WorkflowName
+		return x.Workflow
 	}
 	return ""
 }
 
-func (x *RunAssignment) GetFingerprint() string {
+func (x *StepTask) GetVersion() string {
+	if x != nil {
+		return x.Version
+	}
+	return ""
+}
+
+func (x *StepTask) GetFingerprint() string {
 	if x != nil {
 		return x.Fingerprint
 	}
 	return ""
 }
 
-func (x *RunAssignment) GetFrozenPlan() []byte {
-	if x != nil {
-		return x.FrozenPlan
-	}
-	return nil
-}
-
-func (x *RunAssignment) GetInput() []byte {
-	if x != nil {
-		return x.Input
-	}
-	return nil
-}
-
-func (x *RunAssignment) GetState() []byte {
-	if x != nil {
-		return x.State
-	}
-	return nil
-}
-
-func (x *RunAssignment) GetLeaseEpoch() uint64 {
-	if x != nil {
-		return x.LeaseEpoch
-	}
-	return 0
-}
-
-func (x *RunAssignment) GetMaxParallelism() uint32 {
-	if x != nil {
-		return x.MaxParallelism
-	}
-	return 0
-}
-
-func (x *RunAssignment) GetXSbTrace() string {
-	if x != nil {
-		return x.XSbTrace
-	}
-	return ""
-}
-
-func (x *RunAssignment) GetCompensating() bool {
-	if x != nil {
-		return x.Compensating
-	}
-	return false
-}
-
-func (x *RunAssignment) GetCancelReason() string {
-	if x != nil {
-		return x.CancelReason
-	}
-	return ""
-}
-
-type BeginStepRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	RunId         string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
-	StepId        string                 `protobuf:"bytes,2,opt,name=step_id,json=stepId,proto3" json:"step_id,omitempty"`
-	ParentStepId  string                 `protobuf:"bytes,3,opt,name=parent_step_id,json=parentStepId,proto3" json:"parent_step_id,omitempty"`  // empty for top-level steps
-	Kind          string                 `protobuf:"bytes,4,opt,name=kind,proto3" json:"kind,omitempty"`                                        // call|publish|sleep|wait_event|wait_signal|workflow|parallel|sequence|local
-	InputSnapshot []byte                 `protobuf:"bytes,5,opt,name=input_snapshot,json=inputSnapshot,proto3" json:"input_snapshot,omitempty"` // JSON-encoded resolved inputs
-	LeaseEpoch    uint64                 `protobuf:"varint,6,opt,name=lease_epoch,json=leaseEpoch,proto3" json:"lease_epoch,omitempty"`
-	InstanceId    string                 `protobuf:"bytes,7,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"` // UUID of the claiming SDK instance
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *BeginStepRequest) Reset() {
-	*x = BeginStepRequest{}
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[13]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *BeginStepRequest) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*BeginStepRequest) ProtoMessage() {}
-
-func (x *BeginStepRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[13]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use BeginStepRequest.ProtoReflect.Descriptor instead.
-func (*BeginStepRequest) Descriptor() ([]byte, []int) {
-	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{13}
-}
-
-func (x *BeginStepRequest) GetRunId() string {
-	if x != nil {
-		return x.RunId
-	}
-	return ""
-}
-
-func (x *BeginStepRequest) GetStepId() string {
+func (x *StepTask) GetStepId() string {
 	if x != nil {
 		return x.StepId
 	}
 	return ""
 }
 
-func (x *BeginStepRequest) GetParentStepId() string {
+func (x *StepTask) GetTemplateStepId() string {
 	if x != nil {
-		return x.ParentStepId
+		return x.TemplateStepId
 	}
 	return ""
 }
 
-func (x *BeginStepRequest) GetKind() string {
+func (x *StepTask) GetKind() TaskKind {
 	if x != nil {
 		return x.Kind
 	}
-	return ""
+	return TaskKind_TASK_KIND_UNSPECIFIED
 }
 
-func (x *BeginStepRequest) GetInputSnapshot() []byte {
+func (x *StepTask) GetAttempt() uint32 {
 	if x != nil {
-		return x.InputSnapshot
-	}
-	return nil
-}
-
-func (x *BeginStepRequest) GetLeaseEpoch() uint64 {
-	if x != nil {
-		return x.LeaseEpoch
+		return x.Attempt
 	}
 	return 0
 }
 
-func (x *BeginStepRequest) GetInstanceId() string {
+func (x *StepTask) GetService() string {
 	if x != nil {
-		return x.InstanceId
+		return x.Service
 	}
 	return ""
 }
 
-type BeginStepResponse struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// If the step was already completed (idempotent replay), cached_output is
-	// non-nil and the SDK must use it without re-executing.
-	CachedOutput  []byte `protobuf:"bytes,1,opt,name=cached_output,json=cachedOutput,proto3" json:"cached_output,omitempty"`
-	AlreadyDone   bool   `protobuf:"varint,2,opt,name=already_done,json=alreadyDone,proto3" json:"already_done,omitempty"`
-	LeaseEpoch    uint64 `protobuf:"varint,3,opt,name=lease_epoch,json=leaseEpoch,proto3" json:"lease_epoch,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *BeginStepResponse) Reset() {
-	*x = BeginStepResponse{}
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[14]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *BeginStepResponse) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*BeginStepResponse) ProtoMessage() {}
-
-func (x *BeginStepResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[14]
+func (x *StepTask) GetMethod() string {
 	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
+		return x.Method
 	}
-	return mi.MessageOf(x)
+	return ""
 }
 
-// Deprecated: Use BeginStepResponse.ProtoReflect.Descriptor instead.
-func (*BeginStepResponse) Descriptor() ([]byte, []int) {
-	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{14}
-}
-
-func (x *BeginStepResponse) GetCachedOutput() []byte {
+func (x *StepTask) GetCallOpts() *ResolvedCallOptions {
 	if x != nil {
-		return x.CachedOutput
+		return x.CallOpts
 	}
 	return nil
 }
 
-func (x *BeginStepResponse) GetAlreadyDone() bool {
-	if x != nil {
-		return x.AlreadyDone
-	}
-	return false
-}
-
-func (x *BeginStepResponse) GetLeaseEpoch() uint64 {
-	if x != nil {
-		return x.LeaseEpoch
-	}
-	return 0
-}
-
-type CompleteStepRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	RunId         string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
-	StepId        string                 `protobuf:"bytes,2,opt,name=step_id,json=stepId,proto3" json:"step_id,omitempty"`
-	Output        []byte                 `protobuf:"bytes,3,opt,name=output,proto3" json:"output,omitempty"` // JSON-encoded step output
-	LeaseEpoch    uint64                 `protobuf:"varint,4,opt,name=lease_epoch,json=leaseEpoch,proto3" json:"lease_epoch,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *CompleteStepRequest) Reset() {
-	*x = CompleteStepRequest{}
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[15]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *CompleteStepRequest) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*CompleteStepRequest) ProtoMessage() {}
-
-func (x *CompleteStepRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[15]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use CompleteStepRequest.ProtoReflect.Descriptor instead.
-func (*CompleteStepRequest) Descriptor() ([]byte, []int) {
-	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{15}
-}
-
-func (x *CompleteStepRequest) GetRunId() string {
-	if x != nil {
-		return x.RunId
-	}
-	return ""
-}
-
-func (x *CompleteStepRequest) GetStepId() string {
-	if x != nil {
-		return x.StepId
-	}
-	return ""
-}
-
-func (x *CompleteStepRequest) GetOutput() []byte {
-	if x != nil {
-		return x.Output
-	}
-	return nil
-}
-
-func (x *CompleteStepRequest) GetLeaseEpoch() uint64 {
-	if x != nil {
-		return x.LeaseEpoch
-	}
-	return 0
-}
-
-type FailStepRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	RunId         string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
-	StepId        string                 `protobuf:"bytes,2,opt,name=step_id,json=stepId,proto3" json:"step_id,omitempty"`
-	ErrorCode     string                 `protobuf:"bytes,3,opt,name=error_code,json=errorCode,proto3" json:"error_code,omitempty"`
-	ErrorMessage  string                 `protobuf:"bytes,4,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
-	LeaseEpoch    uint64                 `protobuf:"varint,5,opt,name=lease_epoch,json=leaseEpoch,proto3" json:"lease_epoch,omitempty"`
-	Retriable     bool                   `protobuf:"varint,6,opt,name=retriable,proto3" json:"retriable,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *FailStepRequest) Reset() {
-	*x = FailStepRequest{}
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[16]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *FailStepRequest) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*FailStepRequest) ProtoMessage() {}
-
-func (x *FailStepRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[16]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use FailStepRequest.ProtoReflect.Descriptor instead.
-func (*FailStepRequest) Descriptor() ([]byte, []int) {
-	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{16}
-}
-
-func (x *FailStepRequest) GetRunId() string {
-	if x != nil {
-		return x.RunId
-	}
-	return ""
-}
-
-func (x *FailStepRequest) GetStepId() string {
-	if x != nil {
-		return x.StepId
-	}
-	return ""
-}
-
-func (x *FailStepRequest) GetErrorCode() string {
-	if x != nil {
-		return x.ErrorCode
-	}
-	return ""
-}
-
-func (x *FailStepRequest) GetErrorMessage() string {
-	if x != nil {
-		return x.ErrorMessage
-	}
-	return ""
-}
-
-func (x *FailStepRequest) GetLeaseEpoch() uint64 {
-	if x != nil {
-		return x.LeaseEpoch
-	}
-	return 0
-}
-
-func (x *FailStepRequest) GetRetriable() bool {
-	if x != nil {
-		return x.Retriable
-	}
-	return false
-}
-
-type FailStepResponse struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// Runtime's decision after the failure.
-	NextAction    string `protobuf:"bytes,1,opt,name=next_action,json=nextAction,proto3" json:"next_action,omitempty"` // "retry" | "compensate" | "fail_run"
-	RetryDelaySec uint32 `protobuf:"varint,2,opt,name=retry_delay_sec,json=retryDelaySec,proto3" json:"retry_delay_sec,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *FailStepResponse) Reset() {
-	*x = FailStepResponse{}
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[17]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *FailStepResponse) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*FailStepResponse) ProtoMessage() {}
-
-func (x *FailStepResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[17]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use FailStepResponse.ProtoReflect.Descriptor instead.
-func (*FailStepResponse) Descriptor() ([]byte, []int) {
-	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{17}
-}
-
-func (x *FailStepResponse) GetNextAction() string {
-	if x != nil {
-		return x.NextAction
-	}
-	return ""
-}
-
-func (x *FailStepResponse) GetRetryDelaySec() uint32 {
-	if x != nil {
-		return x.RetryDelaySec
-	}
-	return 0
-}
-
-type ParkRequest struct {
-	state      protoimpl.MessageState `protogen:"open.v1"`
-	RunId      string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
-	StepId     string                 `protobuf:"bytes,2,opt,name=step_id,json=stepId,proto3" json:"step_id,omitempty"`
-	LeaseEpoch uint64                 `protobuf:"varint,3,opt,name=lease_epoch,json=leaseEpoch,proto3" json:"lease_epoch,omitempty"`
-	// Types that are valid to be assigned to WaitSpec:
-	//
-	//	*ParkRequest_Sleep
-	//	*ParkRequest_EventWait
-	//	*ParkRequest_SignalWait
-	//	*ParkRequest_NestedRun
-	WaitSpec      isParkRequest_WaitSpec `protobuf_oneof:"wait_spec"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *ParkRequest) Reset() {
-	*x = ParkRequest{}
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[18]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ParkRequest) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ParkRequest) ProtoMessage() {}
-
-func (x *ParkRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[18]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ParkRequest.ProtoReflect.Descriptor instead.
-func (*ParkRequest) Descriptor() ([]byte, []int) {
-	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{18}
-}
-
-func (x *ParkRequest) GetRunId() string {
-	if x != nil {
-		return x.RunId
-	}
-	return ""
-}
-
-func (x *ParkRequest) GetStepId() string {
-	if x != nil {
-		return x.StepId
-	}
-	return ""
-}
-
-func (x *ParkRequest) GetLeaseEpoch() uint64 {
-	if x != nil {
-		return x.LeaseEpoch
-	}
-	return 0
-}
-
-func (x *ParkRequest) GetWaitSpec() isParkRequest_WaitSpec {
-	if x != nil {
-		return x.WaitSpec
-	}
-	return nil
-}
-
-func (x *ParkRequest) GetSleep() *SleepSpec {
-	if x != nil {
-		if x, ok := x.WaitSpec.(*ParkRequest_Sleep); ok {
-			return x.Sleep
-		}
-	}
-	return nil
-}
-
-func (x *ParkRequest) GetEventWait() *EventWaitSpec {
-	if x != nil {
-		if x, ok := x.WaitSpec.(*ParkRequest_EventWait); ok {
-			return x.EventWait
-		}
-	}
-	return nil
-}
-
-func (x *ParkRequest) GetSignalWait() *SignalWaitSpec {
-	if x != nil {
-		if x, ok := x.WaitSpec.(*ParkRequest_SignalWait); ok {
-			return x.SignalWait
-		}
-	}
-	return nil
-}
-
-func (x *ParkRequest) GetNestedRun() *NestedRunSpec {
-	if x != nil {
-		if x, ok := x.WaitSpec.(*ParkRequest_NestedRun); ok {
-			return x.NestedRun
-		}
-	}
-	return nil
-}
-
-type isParkRequest_WaitSpec interface {
-	isParkRequest_WaitSpec()
-}
-
-type ParkRequest_Sleep struct {
-	Sleep *SleepSpec `protobuf:"bytes,4,opt,name=sleep,proto3,oneof"`
-}
-
-type ParkRequest_EventWait struct {
-	EventWait *EventWaitSpec `protobuf:"bytes,5,opt,name=event_wait,json=eventWait,proto3,oneof"`
-}
-
-type ParkRequest_SignalWait struct {
-	SignalWait *SignalWaitSpec `protobuf:"bytes,6,opt,name=signal_wait,json=signalWait,proto3,oneof"`
-}
-
-type ParkRequest_NestedRun struct {
-	NestedRun *NestedRunSpec `protobuf:"bytes,7,opt,name=nested_run,json=nestedRun,proto3,oneof"`
-}
-
-func (*ParkRequest_Sleep) isParkRequest_WaitSpec() {}
-
-func (*ParkRequest_EventWait) isParkRequest_WaitSpec() {}
-
-func (*ParkRequest_SignalWait) isParkRequest_WaitSpec() {}
-
-func (*ParkRequest_NestedRun) isParkRequest_WaitSpec() {}
-
-type SleepSpec struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	DurationSec   uint32                 `protobuf:"varint,1,opt,name=duration_sec,json=durationSec,proto3" json:"duration_sec,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *SleepSpec) Reset() {
-	*x = SleepSpec{}
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[19]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *SleepSpec) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*SleepSpec) ProtoMessage() {}
-
-func (x *SleepSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[19]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use SleepSpec.ProtoReflect.Descriptor instead.
-func (*SleepSpec) Descriptor() ([]byte, []int) {
-	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{19}
-}
-
-func (x *SleepSpec) GetDurationSec() uint32 {
-	if x != nil {
-		return x.DurationSec
-	}
-	return 0
-}
-
-type EventWaitSpec struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Event         string                 `protobuf:"bytes,1,opt,name=event,proto3" json:"event,omitempty"`
-	FilterJson    string                 `protobuf:"bytes,2,opt,name=filter_json,json=filterJson,proto3" json:"filter_json,omitempty"`  // JSON-encoded {"$.path": "expected"} filter; empty = match all
-	TimeoutSec    uint32                 `protobuf:"varint,3,opt,name=timeout_sec,json=timeoutSec,proto3" json:"timeout_sec,omitempty"` // 0 = no timeout
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *EventWaitSpec) Reset() {
-	*x = EventWaitSpec{}
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[20]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *EventWaitSpec) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*EventWaitSpec) ProtoMessage() {}
-
-func (x *EventWaitSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[20]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use EventWaitSpec.ProtoReflect.Descriptor instead.
-func (*EventWaitSpec) Descriptor() ([]byte, []int) {
-	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{20}
-}
-
-func (x *EventWaitSpec) GetEvent() string {
+func (x *StepTask) GetEvent() string {
 	if x != nil {
 		return x.Event
 	}
 	return ""
 }
 
-func (x *EventWaitSpec) GetFilterJson() string {
+func (x *StepTask) GetPublishOpts() *ResolvedPublishOptions {
 	if x != nil {
-		return x.FilterJson
-	}
-	return ""
-}
-
-func (x *EventWaitSpec) GetTimeoutSec() uint32 {
-	if x != nil {
-		return x.TimeoutSec
-	}
-	return 0
-}
-
-type SignalWaitSpec struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Signal        string                 `protobuf:"bytes,1,opt,name=signal,proto3" json:"signal,omitempty"`
-	TimeoutSec    uint32                 `protobuf:"varint,2,opt,name=timeout_sec,json=timeoutSec,proto3" json:"timeout_sec,omitempty"` // 0 = no timeout
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *SignalWaitSpec) Reset() {
-	*x = SignalWaitSpec{}
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[21]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *SignalWaitSpec) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*SignalWaitSpec) ProtoMessage() {}
-
-func (x *SignalWaitSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[21]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use SignalWaitSpec.ProtoReflect.Descriptor instead.
-func (*SignalWaitSpec) Descriptor() ([]byte, []int) {
-	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{21}
-}
-
-func (x *SignalWaitSpec) GetSignal() string {
-	if x != nil {
-		return x.Signal
-	}
-	return ""
-}
-
-func (x *SignalWaitSpec) GetTimeoutSec() uint32 {
-	if x != nil {
-		return x.TimeoutSec
-	}
-	return 0
-}
-
-type NestedRunSpec struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ChildRunId    string                 `protobuf:"bytes,1,opt,name=child_run_id,json=childRunId,proto3" json:"child_run_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *NestedRunSpec) Reset() {
-	*x = NestedRunSpec{}
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[22]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *NestedRunSpec) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*NestedRunSpec) ProtoMessage() {}
-
-func (x *NestedRunSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[22]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use NestedRunSpec.ProtoReflect.Descriptor instead.
-func (*NestedRunSpec) Descriptor() ([]byte, []int) {
-	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{22}
-}
-
-func (x *NestedRunSpec) GetChildRunId() string {
-	if x != nil {
-		return x.ChildRunId
-	}
-	return ""
-}
-
-type CompleteRunRequest struct {
-	state      protoimpl.MessageState `protogen:"open.v1"`
-	RunId      string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
-	FinalState []byte                 `protobuf:"bytes,2,opt,name=final_state,json=finalState,proto3" json:"final_state,omitempty"` // JSON-encoded final state map (output of last step)
-	LeaseEpoch uint64                 `protobuf:"varint,3,opt,name=lease_epoch,json=leaseEpoch,proto3" json:"lease_epoch,omitempty"`
-	// terminal_status: 'success' | 'failed_compensated' | 'cancelled'.
-	// If empty, defaults to 'success'.
-	TerminalStatus string `protobuf:"bytes,4,opt,name=terminal_status,json=terminalStatus,proto3" json:"terminal_status,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
-}
-
-func (x *CompleteRunRequest) Reset() {
-	*x = CompleteRunRequest{}
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[23]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *CompleteRunRequest) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*CompleteRunRequest) ProtoMessage() {}
-
-func (x *CompleteRunRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[23]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use CompleteRunRequest.ProtoReflect.Descriptor instead.
-func (*CompleteRunRequest) Descriptor() ([]byte, []int) {
-	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{23}
-}
-
-func (x *CompleteRunRequest) GetRunId() string {
-	if x != nil {
-		return x.RunId
-	}
-	return ""
-}
-
-func (x *CompleteRunRequest) GetFinalState() []byte {
-	if x != nil {
-		return x.FinalState
+		return x.PublishOpts
 	}
 	return nil
 }
 
-func (x *CompleteRunRequest) GetLeaseEpoch() uint64 {
+func (x *StepTask) GetInput() []byte {
 	if x != nil {
-		return x.LeaseEpoch
+		return x.Input
 	}
-	return 0
+	return nil
 }
 
-func (x *CompleteRunRequest) GetTerminalStatus() string {
+func (x *StepTask) GetState() []byte {
 	if x != nil {
-		return x.TerminalStatus
+		return x.State
+	}
+	return nil
+}
+
+func (x *StepTask) GetIsCompensation() bool {
+	if x != nil {
+		return x.IsCompensation
+	}
+	return false
+}
+
+func (x *StepTask) GetCompensatesStepId() string {
+	if x != nil {
+		return x.CompensatesStepId
 	}
 	return ""
 }
 
+func (x *StepTask) GetLeaseTtlMs() int64 {
+	if x != nil {
+		return x.LeaseTtlMs
+	}
+	return 0
+}
+
+func (x *StepTask) GetHeartbeatIntervalMs() int64 {
+	if x != nil {
+		return x.HeartbeatIntervalMs
+	}
+	return 0
+}
+
+func (x *StepTask) GetDeadlineUnixMs() int64 {
+	if x != nil {
+		return x.DeadlineUnixMs
+	}
+	return 0
+}
+
+func (x *StepTask) GetXSbTrace() string {
+	if x != nil {
+		return x.XSbTrace
+	}
+	return ""
+}
+
+type ResolvedCallOptions struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	TimeoutMs      int64                  `protobuf:"varint,1,opt,name=timeout_ms,json=timeoutMs,proto3" json:"timeout_ms,omitempty"`
+	Transport      string                 `protobuf:"bytes,2,opt,name=transport,proto3" json:"transport,omitempty"`
+	IdempotencyKey string                 `protobuf:"bytes,3,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	RequestId      string                 `protobuf:"bytes,4,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	Retry          *RetryPolicy           `protobuf:"bytes,5,opt,name=retry,proto3" json:"retry,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *ResolvedCallOptions) Reset() {
+	*x = ResolvedCallOptions{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[39]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResolvedCallOptions) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResolvedCallOptions) ProtoMessage() {}
+
+func (x *ResolvedCallOptions) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[39]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResolvedCallOptions.ProtoReflect.Descriptor instead.
+func (*ResolvedCallOptions) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{39}
+}
+
+func (x *ResolvedCallOptions) GetTimeoutMs() int64 {
+	if x != nil {
+		return x.TimeoutMs
+	}
+	return 0
+}
+
+func (x *ResolvedCallOptions) GetTransport() string {
+	if x != nil {
+		return x.Transport
+	}
+	return ""
+}
+
+func (x *ResolvedCallOptions) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return ""
+}
+
+func (x *ResolvedCallOptions) GetRequestId() string {
+	if x != nil {
+		return x.RequestId
+	}
+	return ""
+}
+
+func (x *ResolvedCallOptions) GetRetry() *RetryPolicy {
+	if x != nil {
+		return x.Retry
+	}
+	return nil
+}
+
+type ResolvedPublishOptions struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	IdempotencyKey string                 `protobuf:"bytes,1,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	PartitionKey   string                 `protobuf:"bytes,2,opt,name=partition_key,json=partitionKey,proto3" json:"partition_key,omitempty"`
+	Headers        map[string]string      `protobuf:"bytes,3,rep,name=headers,proto3" json:"headers,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *ResolvedPublishOptions) Reset() {
+	*x = ResolvedPublishOptions{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[40]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResolvedPublishOptions) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResolvedPublishOptions) ProtoMessage() {}
+
+func (x *ResolvedPublishOptions) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[40]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResolvedPublishOptions.ProtoReflect.Descriptor instead.
+func (*ResolvedPublishOptions) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{40}
+}
+
+func (x *ResolvedPublishOptions) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return ""
+}
+
+func (x *ResolvedPublishOptions) GetPartitionKey() string {
+	if x != nil {
+		return x.PartitionKey
+	}
+	return ""
+}
+
+func (x *ResolvedPublishOptions) GetHeaders() map[string]string {
+	if x != nil {
+		return x.Headers
+	}
+	return nil
+}
+
+type CompleteTaskRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	TaskToken     string                 `protobuf:"bytes,1,opt,name=task_token,json=taskToken,proto3" json:"task_token,omitempty"`
+	Output        []byte                 `protobuf:"bytes,2,opt,name=output,proto3" json:"output,omitempty"` // JSON
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CompleteTaskRequest) Reset() {
+	*x = CompleteTaskRequest{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[41]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CompleteTaskRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CompleteTaskRequest) ProtoMessage() {}
+
+func (x *CompleteTaskRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[41]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CompleteTaskRequest.ProtoReflect.Descriptor instead.
+func (*CompleteTaskRequest) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{41}
+}
+
+func (x *CompleteTaskRequest) GetTaskToken() string {
+	if x != nil {
+		return x.TaskToken
+	}
+	return ""
+}
+
+func (x *CompleteTaskRequest) GetOutput() []byte {
+	if x != nil {
+		return x.Output
+	}
+	return nil
+}
+
+type FailTaskRequest struct {
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	TaskToken    string                 `protobuf:"bytes,1,opt,name=task_token,json=taskToken,proto3" json:"task_token,omitempty"`
+	ErrorCode    string                 `protobuf:"bytes,2,opt,name=error_code,json=errorCode,proto3" json:"error_code,omitempty"`
+	ErrorMessage string                 `protobuf:"bytes,3,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
+	// non_retriable fails the step at once regardless of its retry policy.
+	NonRetriable  bool `protobuf:"varint,4,opt,name=non_retriable,json=nonRetriable,proto3" json:"non_retriable,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FailTaskRequest) Reset() {
+	*x = FailTaskRequest{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[42]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FailTaskRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FailTaskRequest) ProtoMessage() {}
+
+func (x *FailTaskRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[42]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FailTaskRequest.ProtoReflect.Descriptor instead.
+func (*FailTaskRequest) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{42}
+}
+
+func (x *FailTaskRequest) GetTaskToken() string {
+	if x != nil {
+		return x.TaskToken
+	}
+	return ""
+}
+
+func (x *FailTaskRequest) GetErrorCode() string {
+	if x != nil {
+		return x.ErrorCode
+	}
+	return ""
+}
+
+func (x *FailTaskRequest) GetErrorMessage() string {
+	if x != nil {
+		return x.ErrorMessage
+	}
+	return ""
+}
+
+func (x *FailTaskRequest) GetNonRetriable() bool {
+	if x != nil {
+		return x.NonRetriable
+	}
+	return false
+}
+
 type HeartbeatRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	RunId         string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
-	InstanceId    string                 `protobuf:"bytes,2,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"` // UUID
-	LeaseEpoch    uint64                 `protobuf:"varint,3,opt,name=lease_epoch,json=leaseEpoch,proto3" json:"lease_epoch,omitempty"`
+	TaskTokens    []string               `protobuf:"bytes,1,rep,name=task_tokens,json=taskTokens,proto3" json:"task_tokens,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *HeartbeatRequest) Reset() {
 	*x = HeartbeatRequest{}
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[24]
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1616,7 +3312,7 @@ func (x *HeartbeatRequest) String() string {
 func (*HeartbeatRequest) ProtoMessage() {}
 
 func (x *HeartbeatRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_servicebridge_v1_workflows_proto_msgTypes[24]
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1629,188 +3325,359 @@ func (x *HeartbeatRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HeartbeatRequest.ProtoReflect.Descriptor instead.
 func (*HeartbeatRequest) Descriptor() ([]byte, []int) {
-	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{24}
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{43}
 }
 
-func (x *HeartbeatRequest) GetRunId() string {
+func (x *HeartbeatRequest) GetTaskTokens() []string {
 	if x != nil {
-		return x.RunId
+		return x.TaskTokens
 	}
-	return ""
+	return nil
 }
 
-func (x *HeartbeatRequest) GetInstanceId() string {
-	if x != nil {
-		return x.InstanceId
-	}
-	return ""
+type HeartbeatResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Tokens whose lease is gone (expired, stopped, completed).
+	LostTokens    []string `protobuf:"bytes,1,rep,name=lost_tokens,json=lostTokens,proto3" json:"lost_tokens,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
-func (x *HeartbeatRequest) GetLeaseEpoch() uint64 {
+func (x *HeartbeatResponse) Reset() {
+	*x = HeartbeatResponse{}
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[44]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HeartbeatResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HeartbeatResponse) ProtoMessage() {}
+
+func (x *HeartbeatResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_servicebridge_v1_workflows_proto_msgTypes[44]
 	if x != nil {
-		return x.LeaseEpoch
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
 	}
-	return 0
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HeartbeatResponse.ProtoReflect.Descriptor instead.
+func (*HeartbeatResponse) Descriptor() ([]byte, []int) {
+	return file_servicebridge_v1_workflows_proto_rawDescGZIP(), []int{44}
+}
+
+func (x *HeartbeatResponse) GetLostTokens() []string {
+	if x != nil {
+		return x.LostTokens
+	}
+	return nil
 }
 
 var File_servicebridge_v1_workflows_proto protoreflect.FileDescriptor
 
 const file_servicebridge_v1_workflows_proto_rawDesc = "" +
 	"\n" +
-	" servicebridge/v1/workflows.proto\x12\x10servicebridge.v1\x1a\x1bgoogle/protobuf/empty.proto\"\xd8\x01\n" +
-	"\x0fStartRunRequest\x12#\n" +
-	"\rworkflow_name\x18\x01 \x01(\tR\fworkflowName\x12\x14\n" +
-	"\x05input\x18\x02 \x01(\fR\x05input\x12'\n" +
-	"\x0fidempotency_key\x18\x03 \x01(\tR\x0eidempotencyKey\x12\x1f\n" +
-	"\vtimeout_sec\x18\x04 \x01(\rR\n" +
-	"timeoutSec\x12\x1c\n" +
+	" servicebridge/v1/workflows.proto\x12\x10servicebridge.v1\x1a\x1bgoogle/protobuf/empty.proto\"\x99\x02\n" +
+	"\x12WorkflowDefinition\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
+	"\aversion\x18\x02 \x01(\tR\aversion\x12*\n" +
+	"\x11input_schema_json\x18\x03 \x01(\fR\x0finputSchemaJson\x12,\n" +
+	"\x05steps\x18\x04 \x03(\v2\x16.servicebridge.v1.StepR\x05steps\x123\n" +
+	"\x05retry\x18\x05 \x01(\v2\x1d.servicebridge.v1.RetryPolicyR\x05retry\x12'\n" +
+	"\x0fmax_parallelism\x18\x06 \x01(\rR\x0emaxParallelism\x12\x1d\n" +
 	"\n" +
-	"x_sb_trace\x18\x05 \x01(\tR\bxSbTrace\x12\"\n" +
-	"\rparent_run_id\x18\b \x01(\tR\vparentRunId\")\n" +
+	"timeout_ms\x18\a \x01(\x03R\ttimeoutMs\"\xd3\x05\n" +
+	"\x04Step\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12\x19\n" +
+	"\bwait_for\x18\x02 \x03(\tR\awaitFor\x12/\n" +
+	"\x04when\x18\x03 \x01(\v2\x1b.servicebridge.v1.PredicateR\x04when\x12\x1d\n" +
+	"\n" +
+	"timeout_ms\x18\x04 \x01(\x03R\ttimeoutMs\x123\n" +
+	"\x05retry\x18\x05 \x01(\v2\x1d.servicebridge.v1.RetryPolicyR\x05retry\x120\n" +
+	"\x04call\x18\n" +
+	" \x01(\v2\x1a.servicebridge.v1.CallStepH\x00R\x04call\x129\n" +
+	"\apublish\x18\v \x01(\v2\x1d.servicebridge.v1.PublishStepH\x00R\apublish\x123\n" +
+	"\x05local\x18\f \x01(\v2\x1b.servicebridge.v1.LocalStepH\x00R\x05local\x123\n" +
+	"\x05sleep\x18\r \x01(\v2\x1b.servicebridge.v1.SleepStepH\x00R\x05sleep\x12@\n" +
+	"\n" +
+	"wait_event\x18\x0e \x01(\v2\x1f.servicebridge.v1.WaitEventStepH\x00R\twaitEvent\x12C\n" +
+	"\vwait_signal\x18\x0f \x01(\v2 .servicebridge.v1.WaitSignalStepH\x00R\n" +
+	"waitSignal\x12?\n" +
+	"\bworkflow\x18\x10 \x01(\v2!.servicebridge.v1.SubWorkflowStepH\x00R\bworkflow\x129\n" +
+	"\bparallel\x18\x11 \x01(\v2\x1b.servicebridge.v1.GroupStepH\x00R\bparallel\x129\n" +
+	"\bsequence\x18\x12 \x01(\v2\x1b.servicebridge.v1.GroupStepH\x00R\bsequenceB\x06\n" +
+	"\x04kind\"\xa8\x01\n" +
+	"\x04Expr\x12\x14\n" +
+	"\x04path\x18\x01 \x01(\tH\x00R\x04path\x12\x1a\n" +
+	"\aliteral\x18\x02 \x01(\fH\x00R\aliteral\x123\n" +
+	"\x06object\x18\x03 \x01(\v2\x19.servicebridge.v1.ExprMapH\x00R\x06object\x120\n" +
+	"\x04list\x18\x04 \x01(\v2\x1a.servicebridge.v1.ExprListH\x00R\x04listB\a\n" +
+	"\x05value\"\x9b\x01\n" +
+	"\aExprMap\x12=\n" +
+	"\x06fields\x18\x01 \x03(\v2%.servicebridge.v1.ExprMap.FieldsEntryR\x06fields\x1aQ\n" +
+	"\vFieldsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12,\n" +
+	"\x05value\x18\x02 \x01(\v2\x16.servicebridge.v1.ExprR\x05value:\x028\x01\"8\n" +
+	"\bExprList\x12,\n" +
+	"\x05items\x18\x01 \x03(\v2\x16.servicebridge.v1.ExprR\x05items\"\xc0\x02\n" +
+	"\tPredicate\x120\n" +
+	"\x06truthy\x18\x01 \x01(\v2\x16.servicebridge.v1.ExprH\x00R\x06truthy\x12/\n" +
+	"\x03not\x18\x02 \x01(\v2\x1b.servicebridge.v1.PredicateH\x00R\x03not\x124\n" +
+	"\x06equals\x18\x03 \x01(\v2\x1a.servicebridge.v1.ExprPairH\x00R\x06equals\x12,\n" +
+	"\x02in\x18\x04 \x01(\v2\x1a.servicebridge.v1.ExprPairH\x00R\x02in\x123\n" +
+	"\x03and\x18\x05 \x01(\v2\x1f.servicebridge.v1.PredicateListH\x00R\x03and\x121\n" +
+	"\x02or\x18\x06 \x01(\v2\x1f.servicebridge.v1.PredicateListH\x00R\x02orB\x04\n" +
+	"\x02op\"d\n" +
+	"\bExprPair\x12*\n" +
+	"\x04left\x18\x01 \x01(\v2\x16.servicebridge.v1.ExprR\x04left\x12,\n" +
+	"\x05right\x18\x02 \x01(\v2\x16.servicebridge.v1.ExprR\x05right\"B\n" +
+	"\rPredicateList\x121\n" +
+	"\x05items\x18\x01 \x03(\v2\x1b.servicebridge.v1.PredicateR\x05items\"\xa6\x01\n" +
+	"\vRetryPolicy\x12!\n" +
+	"\fmax_attempts\x18\x01 \x01(\rR\vmaxAttempts\x12\"\n" +
+	"\rbase_delay_ms\x18\x02 \x01(\x03R\vbaseDelayMs\x12\x16\n" +
+	"\x06factor\x18\x03 \x01(\x01R\x06factor\x12 \n" +
+	"\fmax_delay_ms\x18\x04 \x01(\x03R\n" +
+	"maxDelayMs\x12\x16\n" +
+	"\x06jitter\x18\x05 \x01(\x01R\x06jitter\"\x91\x02\n" +
+	"\bCallStep\x120\n" +
+	"\aservice\x18\x01 \x01(\v2\x16.servicebridge.v1.ExprR\aservice\x12.\n" +
+	"\x06method\x18\x02 \x01(\v2\x16.servicebridge.v1.ExprR\x06method\x12,\n" +
+	"\x05input\x18\x03 \x01(\v2\x16.servicebridge.v1.ExprR\x05input\x125\n" +
+	"\x04opts\x18\x04 \x01(\v2!.servicebridge.v1.CallStepOptionsR\x04opts\x12>\n" +
+	"\n" +
+	"compensate\x18\x05 \x01(\v2\x1e.servicebridge.v1.CompensationR\n" +
+	"compensate\"\xfb\x01\n" +
+	"\x0fCallStepOptions\x12\x1d\n" +
+	"\n" +
+	"timeout_ms\x18\x01 \x01(\x03R\ttimeoutMs\x12\x1c\n" +
+	"\ttransport\x18\x02 \x01(\tR\ttransport\x12?\n" +
+	"\x0fidempotency_key\x18\x03 \x01(\v2\x16.servicebridge.v1.ExprR\x0eidempotencyKey\x125\n" +
+	"\n" +
+	"request_id\x18\x04 \x01(\v2\x16.servicebridge.v1.ExprR\trequestId\x123\n" +
+	"\x05retry\x18\x05 \x01(\v2\x1d.servicebridge.v1.RetryPolicyR\x05retry\"\xe3\x01\n" +
+	"\vPublishStep\x12,\n" +
+	"\x05event\x18\x01 \x01(\v2\x16.servicebridge.v1.ExprR\x05event\x12,\n" +
+	"\x05input\x18\x02 \x01(\v2\x16.servicebridge.v1.ExprR\x05input\x128\n" +
+	"\x04opts\x18\x03 \x01(\v2$.servicebridge.v1.PublishStepOptionsR\x04opts\x12>\n" +
+	"\n" +
+	"compensate\x18\x04 \x01(\v2\x1e.servicebridge.v1.CompensationR\n" +
+	"compensate\"\xb3\x02\n" +
+	"\x12PublishStepOptions\x12?\n" +
+	"\x0fidempotency_key\x18\x01 \x01(\v2\x16.servicebridge.v1.ExprR\x0eidempotencyKey\x12;\n" +
+	"\rpartition_key\x18\x02 \x01(\v2\x16.servicebridge.v1.ExprR\fpartitionKey\x12K\n" +
+	"\aheaders\x18\x03 \x03(\v21.servicebridge.v1.PublishStepOptions.HeadersEntryR\aheaders\x1aR\n" +
+	"\fHeadersEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12,\n" +
+	"\x05value\x18\x02 \x01(\v2\x16.servicebridge.v1.ExprR\x05value:\x028\x01\"\xf6\x01\n" +
+	"\fCompensation\x128\n" +
+	"\x04call\x18\x01 \x01(\v2\".servicebridge.v1.CallCompensationH\x00R\x04call\x12A\n" +
+	"\apublish\x18\x02 \x01(\v2%.servicebridge.v1.PublishCompensationH\x00R\apublish\x12,\n" +
+	"\x05input\x18\x03 \x01(\v2\x16.servicebridge.v1.ExprR\x05input\x123\n" +
+	"\x05retry\x18\x04 \x01(\v2\x1d.servicebridge.v1.RetryPolicyR\x05retryB\x06\n" +
+	"\x04kind\"\xab\x01\n" +
+	"\x10CallCompensation\x120\n" +
+	"\aservice\x18\x01 \x01(\v2\x16.servicebridge.v1.ExprR\aservice\x12.\n" +
+	"\x06method\x18\x02 \x01(\v2\x16.servicebridge.v1.ExprR\x06method\x125\n" +
+	"\x04opts\x18\x03 \x01(\v2!.servicebridge.v1.CallStepOptionsR\x04opts\"}\n" +
+	"\x13PublishCompensation\x12,\n" +
+	"\x05event\x18\x01 \x01(\v2\x16.servicebridge.v1.ExprR\x05event\x128\n" +
+	"\x04opts\x18\x02 \x01(\v2$.servicebridge.v1.PublishStepOptionsR\x04opts\"\v\n" +
+	"\tLocalStep\",\n" +
+	"\tSleepStep\x12\x1f\n" +
+	"\vduration_ms\x18\x01 \x01(\x03R\n" +
+	"durationMs\"\xbd\x01\n" +
+	"\rWaitEventStep\x12\x14\n" +
+	"\x05event\x18\x01 \x01(\tR\x05event\x12C\n" +
+	"\x06filter\x18\x02 \x03(\v2+.servicebridge.v1.WaitEventStep.FilterEntryR\x06filter\x1aQ\n" +
+	"\vFilterEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12,\n" +
+	"\x05value\x18\x02 \x01(\v2\x16.servicebridge.v1.ExprR\x05value:\x028\x01\"(\n" +
+	"\x0eWaitSignalStep\x12\x16\n" +
+	"\x06signal\x18\x01 \x01(\tR\x06signal\"\x85\x02\n" +
+	"\x0fSubWorkflowStep\x120\n" +
+	"\aservice\x18\x01 \x01(\v2\x16.servicebridge.v1.ExprR\aservice\x122\n" +
+	"\bworkflow\x18\x02 \x01(\v2\x16.servicebridge.v1.ExprR\bworkflow\x12,\n" +
+	"\x05input\x18\x03 \x01(\v2\x16.servicebridge.v1.ExprR\x05input\x12?\n" +
+	"\x0fidempotency_key\x18\x04 \x01(\v2\x16.servicebridge.v1.ExprR\x0eidempotencyKey\x12\x1d\n" +
+	"\n" +
+	"timeout_ms\x18\x05 \x01(\x03R\ttimeoutMs\"o\n" +
+	"\tGroupStep\x12,\n" +
+	"\x05steps\x18\x01 \x03(\v2\x16.servicebridge.v1.StepR\x05steps\x124\n" +
+	"\bfor_each\x18\x02 \x01(\v2\x19.servicebridge.v1.ForEachR\aforEach\"-\n" +
+	"\aForEach\x12\x12\n" +
+	"\x04from\x18\x01 \x01(\tR\x04from\x12\x0e\n" +
+	"\x02as\x18\x02 \x01(\tR\x02as\"\xc3\x01\n" +
+	"\x0fStartRunRequest\x12\x18\n" +
+	"\aservice\x18\x01 \x01(\tR\aservice\x12\x1a\n" +
+	"\bworkflow\x18\x02 \x01(\tR\bworkflow\x12\x14\n" +
+	"\x05input\x18\x03 \x01(\fR\x05input\x12'\n" +
+	"\x0fidempotency_key\x18\x04 \x01(\tR\x0eidempotencyKey\x12\x1d\n" +
+	"\n" +
+	"timeout_ms\x18\x05 \x01(\x03R\ttimeoutMs\x12\x1c\n" +
+	"\n" +
+	"x_sb_trace\x18\x06 \x01(\tR\bxSbTrace\")\n" +
 	"\x10StartRunResponse\x12\x15\n" +
 	"\x06run_id\x18\x01 \x01(\tR\x05runId\")\n" +
 	"\x10CancelRunRequest\x12\x15\n" +
-	"\x06run_id\x18\x01 \x01(\tR\x05runId\"d\n" +
+	"\x06run_id\x18\x01 \x01(\tR\x05runId\"\x81\x01\n" +
 	"\x10SignalRunRequest\x12\x15\n" +
 	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12\x1f\n" +
 	"\vsignal_name\x18\x02 \x01(\tR\n" +
 	"signalName\x12\x18\n" +
-	"\apayload\x18\x03 \x01(\fR\apayload\"(\n" +
+	"\apayload\x18\x03 \x01(\fR\apayload\x12\x1b\n" +
+	"\tsignal_id\x18\x04 \x01(\tR\bsignalId\"1\n" +
+	"\x11SignalRunResponse\x12\x1c\n" +
+	"\tduplicate\x18\x01 \x01(\bR\tduplicate\"(\n" +
 	"\x0fQueryRunRequest\x12\x15\n" +
-	"\x06run_id\x18\x01 \x01(\tR\x05runId\"\x89\x01\n" +
-	"\x10QueryRunResponse\x12\x15\n" +
-	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12\x16\n" +
-	"\x06status\x18\x02 \x01(\tR\x06status\x12\x14\n" +
-	"\x05state\x18\x03 \x01(\fR\x05state\x120\n" +
-	"\x05steps\x18\x04 \x03(\v2\x1a.servicebridge.v1.StepInfoR\x05steps\"\x99\x01\n" +
-	"\bStepInfo\x12\x17\n" +
-	"\astep_id\x18\x01 \x01(\tR\x06stepId\x12\x16\n" +
-	"\x06status\x18\x02 \x01(\tR\x06status\x12\x16\n" +
-	"\x06output\x18\x03 \x01(\fR\x06output\x12\x1d\n" +
+	"\x06run_id\x18\x01 \x01(\tR\x05runId\"\xb5\x04\n" +
+	"\vRunSnapshot\x12\x15\n" +
+	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12\x18\n" +
+	"\aservice\x18\x02 \x01(\tR\aservice\x12\x1a\n" +
+	"\bworkflow\x18\x03 \x01(\tR\bworkflow\x12 \n" +
+	"\vfingerprint\x18\x04 \x01(\tR\vfingerprint\x12\x16\n" +
+	"\x06status\x18\x05 \x01(\tR\x06status\x12\x1f\n" +
+	"\vstop_reason\x18\x06 \x01(\tR\n" +
+	"stopReason\x12%\n" +
+	"\x0ewaiting_reason\x18\a \x01(\tR\rwaitingReason\x12\x14\n" +
+	"\x05input\x18\b \x01(\fR\x05input\x12\x16\n" +
+	"\x06output\x18\t \x01(\fR\x06output\x12\x1d\n" +
 	"\n" +
-	"last_error\x18\x04 \x01(\tR\tlastError\x12%\n" +
-	"\x0ecompensated_by\x18\x05 \x01(\tR\rcompensatedBy\"(\n" +
+	"error_code\x18\n" +
+	" \x01(\tR\terrorCode\x12#\n" +
+	"\rerror_message\x18\v \x01(\tR\ferrorMessage\x12\"\n" +
+	"\rparent_run_id\x18\f \x01(\tR\vparentRunId\x12+\n" +
+	"\x12started_at_unix_ms\x18\r \x01(\x03R\x0fstartedAtUnixMs\x12'\n" +
+	"\x10ended_at_unix_ms\x18\x0e \x01(\x03R\rendedAtUnixMs\x120\n" +
+	"\x05steps\x18\x0f \x03(\v2\x1a.servicebridge.v1.StepInfoR\x05steps\x129\n" +
+	"\asignals\x18\x10 \x03(\v2\x1f.servicebridge.v1.PendingSignalR\asignals\"\xd5\x03\n" +
+	"\bStepInfo\x12\x17\n" +
+	"\astep_id\x18\x01 \x01(\tR\x06stepId\x12$\n" +
+	"\x0eparent_step_id\x18\x02 \x01(\tR\fparentStepId\x12\x12\n" +
+	"\x04kind\x18\x03 \x01(\tR\x04kind\x12\x16\n" +
+	"\x06status\x18\x04 \x01(\tR\x06status\x12\x18\n" +
+	"\aattempt\x18\x05 \x01(\rR\aattempt\x12\x16\n" +
+	"\x06output\x18\x06 \x01(\fR\x06output\x12\x1d\n" +
+	"\n" +
+	"error_code\x18\a \x01(\tR\terrorCode\x12#\n" +
+	"\rerror_message\x18\b \x01(\tR\ferrorMessage\x12%\n" +
+	"\x0ewaiting_reason\x18\t \x01(\tR\rwaitingReason\x12\x19\n" +
+	"\bwait_key\x18\n" +
+	" \x01(\tR\awaitKey\x12 \n" +
+	"\fchild_run_id\x18\v \x01(\tR\n" +
+	"childRunId\x12.\n" +
+	"\x13compensates_step_id\x18\f \x01(\tR\x11compensatesStepId\x12+\n" +
+	"\x12started_at_unix_ms\x18\r \x01(\x03R\x0fstartedAtUnixMs\x12'\n" +
+	"\x10ended_at_unix_ms\x18\x0e \x01(\x03R\rendedAtUnixMs\"\x96\x01\n" +
+	"\rPendingSignal\x12\x1f\n" +
+	"\vsignal_name\x18\x01 \x01(\tR\n" +
+	"signalName\x12\x1b\n" +
+	"\tsignal_id\x18\x02 \x01(\tR\bsignalId\x12\x18\n" +
+	"\apayload\x18\x03 \x01(\fR\apayload\x12-\n" +
+	"\x13enqueued_at_unix_ms\x18\x04 \x01(\x03R\x10enqueuedAtUnixMs\"(\n" +
 	"\x0fAwaitRunRequest\x12\x15\n" +
-	"\x06run_id\x18\x01 \x01(\tR\x05runId\"V\n" +
+	"\x06run_id\x18\x01 \x01(\tR\x05runId\"\xdf\x01\n" +
 	"\x0fRunStatusUpdate\x12\x15\n" +
 	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12\x16\n" +
-	"\x06status\x18\x02 \x01(\tR\x06status\x12\x14\n" +
-	"\x05state\x18\x03 \x01(\fR\x05state\"K\n" +
+	"\x06status\x18\x02 \x01(\tR\x06status\x12%\n" +
+	"\x0ewaiting_reason\x18\x03 \x01(\tR\rwaitingReason\x12\x1a\n" +
+	"\bterminal\x18\x04 \x01(\bR\bterminal\x12\x16\n" +
+	"\x06output\x18\x05 \x01(\fR\x06output\x12\x1d\n" +
+	"\n" +
+	"error_code\x18\x06 \x01(\tR\terrorCode\x12#\n" +
+	"\rerror_message\x18\a \x01(\tR\ferrorMessage\"K\n" +
 	"\x10ReplayRunRequest\x12\x15\n" +
 	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12 \n" +
 	"\ffrom_step_id\x18\x02 \x01(\tR\n" +
 	"fromStepId\"*\n" +
 	"\x11ReplayRunResponse\x12\x15\n" +
-	"\x06run_id\x18\x01 \x01(\tR\x05runId\"R\n" +
-	"\x10SubscribeRequest\x12\x1d\n" +
+	"\x06run_id\x18\x01 \x01(\tR\x05runId\"1\n" +
+	"\x18RetryCompensationRequest\x12\x15\n" +
+	"\x06run_id\x18\x01 \x01(\tR\x05runId\"\x12\n" +
+	"\x10SubscribeRequest\"\xa1\x06\n" +
+	"\bStepTask\x12\x1d\n" +
 	"\n" +
-	"service_id\x18\x01 \x01(\tR\tserviceId\x12\x1f\n" +
-	"\vinstance_id\x18\x02 \x01(\tR\n" +
-	"instanceId\"\xeb\x02\n" +
-	"\rRunAssignment\x12\x15\n" +
-	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12#\n" +
-	"\rworkflow_name\x18\x02 \x01(\tR\fworkflowName\x12 \n" +
-	"\vfingerprint\x18\x03 \x01(\tR\vfingerprint\x12\x1f\n" +
-	"\vfrozen_plan\x18\x04 \x01(\fR\n" +
-	"frozenPlan\x12\x14\n" +
-	"\x05input\x18\x05 \x01(\fR\x05input\x12\x14\n" +
-	"\x05state\x18\x06 \x01(\fR\x05state\x12\x1f\n" +
-	"\vlease_epoch\x18\a \x01(\x04R\n" +
-	"leaseEpoch\x12'\n" +
-	"\x0fmax_parallelism\x18\b \x01(\rR\x0emaxParallelism\x12\x1c\n" +
+	"task_token\x18\x01 \x01(\tR\ttaskToken\x12\x15\n" +
+	"\x06run_id\x18\x02 \x01(\tR\x05runId\x12\x1a\n" +
+	"\bworkflow\x18\x03 \x01(\tR\bworkflow\x12\x18\n" +
+	"\aversion\x18\x04 \x01(\tR\aversion\x12 \n" +
+	"\vfingerprint\x18\x05 \x01(\tR\vfingerprint\x12\x17\n" +
+	"\astep_id\x18\x06 \x01(\tR\x06stepId\x12(\n" +
+	"\x10template_step_id\x18\a \x01(\tR\x0etemplateStepId\x12.\n" +
+	"\x04kind\x18\b \x01(\x0e2\x1a.servicebridge.v1.TaskKindR\x04kind\x12\x18\n" +
+	"\aattempt\x18\t \x01(\rR\aattempt\x12\x18\n" +
+	"\aservice\x18\n" +
+	" \x01(\tR\aservice\x12\x16\n" +
+	"\x06method\x18\v \x01(\tR\x06method\x12B\n" +
+	"\tcall_opts\x18\f \x01(\v2%.servicebridge.v1.ResolvedCallOptionsR\bcallOpts\x12\x14\n" +
+	"\x05event\x18\r \x01(\tR\x05event\x12K\n" +
+	"\fpublish_opts\x18\x0e \x01(\v2(.servicebridge.v1.ResolvedPublishOptionsR\vpublishOpts\x12\x14\n" +
+	"\x05input\x18\x0f \x01(\fR\x05input\x12\x14\n" +
+	"\x05state\x18\x10 \x01(\fR\x05state\x12'\n" +
+	"\x0fis_compensation\x18\x11 \x01(\bR\x0eisCompensation\x12.\n" +
+	"\x13compensates_step_id\x18\x12 \x01(\tR\x11compensatesStepId\x12 \n" +
+	"\flease_ttl_ms\x18\x13 \x01(\x03R\n" +
+	"leaseTtlMs\x122\n" +
+	"\x15heartbeat_interval_ms\x18\x14 \x01(\x03R\x13heartbeatIntervalMs\x12(\n" +
+	"\x10deadline_unix_ms\x18\x15 \x01(\x03R\x0edeadlineUnixMs\x12\x1c\n" +
 	"\n" +
-	"x_sb_trace\x18\t \x01(\tR\bxSbTrace\x12\"\n" +
-	"\fcompensating\x18\f \x01(\bR\fcompensating\x12#\n" +
-	"\rcancel_reason\x18\r \x01(\tR\fcancelReason\"\xe5\x01\n" +
-	"\x10BeginStepRequest\x12\x15\n" +
-	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12\x17\n" +
-	"\astep_id\x18\x02 \x01(\tR\x06stepId\x12$\n" +
-	"\x0eparent_step_id\x18\x03 \x01(\tR\fparentStepId\x12\x12\n" +
-	"\x04kind\x18\x04 \x01(\tR\x04kind\x12%\n" +
-	"\x0einput_snapshot\x18\x05 \x01(\fR\rinputSnapshot\x12\x1f\n" +
-	"\vlease_epoch\x18\x06 \x01(\x04R\n" +
-	"leaseEpoch\x12\x1f\n" +
-	"\vinstance_id\x18\a \x01(\tR\n" +
-	"instanceId\"|\n" +
-	"\x11BeginStepResponse\x12#\n" +
-	"\rcached_output\x18\x01 \x01(\fR\fcachedOutput\x12!\n" +
-	"\falready_done\x18\x02 \x01(\bR\valreadyDone\x12\x1f\n" +
-	"\vlease_epoch\x18\x03 \x01(\x04R\n" +
-	"leaseEpoch\"~\n" +
-	"\x13CompleteStepRequest\x12\x15\n" +
-	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12\x17\n" +
-	"\astep_id\x18\x02 \x01(\tR\x06stepId\x12\x16\n" +
-	"\x06output\x18\x03 \x01(\fR\x06output\x12\x1f\n" +
-	"\vlease_epoch\x18\x04 \x01(\x04R\n" +
-	"leaseEpoch\"\xc4\x01\n" +
-	"\x0fFailStepRequest\x12\x15\n" +
-	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12\x17\n" +
-	"\astep_id\x18\x02 \x01(\tR\x06stepId\x12\x1d\n" +
+	"x_sb_trace\x18\x16 \x01(\tR\bxSbTrace\"\xcf\x01\n" +
+	"\x13ResolvedCallOptions\x12\x1d\n" +
 	"\n" +
-	"error_code\x18\x03 \x01(\tR\terrorCode\x12#\n" +
-	"\rerror_message\x18\x04 \x01(\tR\ferrorMessage\x12\x1f\n" +
-	"\vlease_epoch\x18\x05 \x01(\x04R\n" +
-	"leaseEpoch\x12\x1c\n" +
-	"\tretriable\x18\x06 \x01(\bR\tretriable\"[\n" +
-	"\x10FailStepResponse\x12\x1f\n" +
-	"\vnext_action\x18\x01 \x01(\tR\n" +
-	"nextAction\x12&\n" +
-	"\x0fretry_delay_sec\x18\x02 \x01(\rR\rretryDelaySec\"\xe9\x02\n" +
-	"\vParkRequest\x12\x15\n" +
-	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12\x17\n" +
-	"\astep_id\x18\x02 \x01(\tR\x06stepId\x12\x1f\n" +
-	"\vlease_epoch\x18\x03 \x01(\x04R\n" +
-	"leaseEpoch\x123\n" +
-	"\x05sleep\x18\x04 \x01(\v2\x1b.servicebridge.v1.SleepSpecH\x00R\x05sleep\x12@\n" +
+	"timeout_ms\x18\x01 \x01(\x03R\ttimeoutMs\x12\x1c\n" +
+	"\ttransport\x18\x02 \x01(\tR\ttransport\x12'\n" +
+	"\x0fidempotency_key\x18\x03 \x01(\tR\x0eidempotencyKey\x12\x1d\n" +
 	"\n" +
-	"event_wait\x18\x05 \x01(\v2\x1f.servicebridge.v1.EventWaitSpecH\x00R\teventWait\x12C\n" +
-	"\vsignal_wait\x18\x06 \x01(\v2 .servicebridge.v1.SignalWaitSpecH\x00R\n" +
-	"signalWait\x12@\n" +
+	"request_id\x18\x04 \x01(\tR\trequestId\x123\n" +
+	"\x05retry\x18\x05 \x01(\v2\x1d.servicebridge.v1.RetryPolicyR\x05retry\"\xf3\x01\n" +
+	"\x16ResolvedPublishOptions\x12'\n" +
+	"\x0fidempotency_key\x18\x01 \x01(\tR\x0eidempotencyKey\x12#\n" +
+	"\rpartition_key\x18\x02 \x01(\tR\fpartitionKey\x12O\n" +
+	"\aheaders\x18\x03 \x03(\v25.servicebridge.v1.ResolvedPublishOptions.HeadersEntryR\aheaders\x1a:\n" +
+	"\fHeadersEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"L\n" +
+	"\x13CompleteTaskRequest\x12\x1d\n" +
 	"\n" +
-	"nested_run\x18\a \x01(\v2\x1f.servicebridge.v1.NestedRunSpecH\x00R\tnestedRunB\v\n" +
-	"\twait_spec\".\n" +
-	"\tSleepSpec\x12!\n" +
-	"\fduration_sec\x18\x01 \x01(\rR\vdurationSec\"g\n" +
-	"\rEventWaitSpec\x12\x14\n" +
-	"\x05event\x18\x01 \x01(\tR\x05event\x12\x1f\n" +
-	"\vfilter_json\x18\x02 \x01(\tR\n" +
-	"filterJson\x12\x1f\n" +
-	"\vtimeout_sec\x18\x03 \x01(\rR\n" +
-	"timeoutSec\"I\n" +
-	"\x0eSignalWaitSpec\x12\x16\n" +
-	"\x06signal\x18\x01 \x01(\tR\x06signal\x12\x1f\n" +
-	"\vtimeout_sec\x18\x02 \x01(\rR\n" +
-	"timeoutSec\"1\n" +
-	"\rNestedRunSpec\x12 \n" +
-	"\fchild_run_id\x18\x01 \x01(\tR\n" +
-	"childRunId\"\x96\x01\n" +
-	"\x12CompleteRunRequest\x12\x15\n" +
-	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12\x1f\n" +
-	"\vfinal_state\x18\x02 \x01(\fR\n" +
-	"finalState\x12\x1f\n" +
-	"\vlease_epoch\x18\x03 \x01(\x04R\n" +
-	"leaseEpoch\x12'\n" +
-	"\x0fterminal_status\x18\x04 \x01(\tR\x0eterminalStatus\"k\n" +
-	"\x10HeartbeatRequest\x12\x15\n" +
-	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12\x1f\n" +
-	"\vinstance_id\x18\x02 \x01(\tR\n" +
-	"instanceId\x12\x1f\n" +
-	"\vlease_epoch\x18\x03 \x01(\x04R\n" +
-	"leaseEpoch2\xfc\a\n" +
+	"task_token\x18\x01 \x01(\tR\ttaskToken\x12\x16\n" +
+	"\x06output\x18\x02 \x01(\fR\x06output\"\x99\x01\n" +
+	"\x0fFailTaskRequest\x12\x1d\n" +
+	"\n" +
+	"task_token\x18\x01 \x01(\tR\ttaskToken\x12\x1d\n" +
+	"\n" +
+	"error_code\x18\x02 \x01(\tR\terrorCode\x12#\n" +
+	"\rerror_message\x18\x03 \x01(\tR\ferrorMessage\x12#\n" +
+	"\rnon_retriable\x18\x04 \x01(\bR\fnonRetriable\"3\n" +
+	"\x10HeartbeatRequest\x12\x1f\n" +
+	"\vtask_tokens\x18\x01 \x03(\tR\n" +
+	"taskTokens\"4\n" +
+	"\x11HeartbeatResponse\x12\x1f\n" +
+	"\vlost_tokens\x18\x01 \x03(\tR\n" +
+	"lostTokens*e\n" +
+	"\bTaskKind\x12\x19\n" +
+	"\x15TASK_KIND_UNSPECIFIED\x10\x00\x12\x13\n" +
+	"\x0fTASK_KIND_LOCAL\x10\x01\x12\x12\n" +
+	"\x0eTASK_KIND_CALL\x10\x02\x12\x15\n" +
+	"\x11TASK_KIND_PUBLISH\x10\x032\xf7\x06\n" +
 	"\tWorkflows\x12N\n" +
 	"\x05Start\x12!.servicebridge.v1.StartRunRequest\x1a\".servicebridge.v1.StartRunResponse\x12D\n" +
-	"\x06Cancel\x12\".servicebridge.v1.CancelRunRequest\x1a\x16.google.protobuf.Empty\x12D\n" +
-	"\x06Signal\x12\".servicebridge.v1.SignalRunRequest\x1a\x16.google.protobuf.Empty\x12N\n" +
-	"\x05Query\x12!.servicebridge.v1.QueryRunRequest\x1a\".servicebridge.v1.QueryRunResponse\x12O\n" +
+	"\x06Cancel\x12\".servicebridge.v1.CancelRunRequest\x1a\x16.google.protobuf.Empty\x12Q\n" +
+	"\x06Signal\x12\".servicebridge.v1.SignalRunRequest\x1a#.servicebridge.v1.SignalRunResponse\x12I\n" +
+	"\x05Query\x12!.servicebridge.v1.QueryRunRequest\x1a\x1d.servicebridge.v1.RunSnapshot\x12O\n" +
 	"\x05Await\x12!.servicebridge.v1.AwaitRunRequest\x1a!.servicebridge.v1.RunStatusUpdate0\x01\x12Q\n" +
-	"\x06Replay\x12\".servicebridge.v1.ReplayRunRequest\x1a#.servicebridge.v1.ReplayRunResponse\x12R\n" +
-	"\tSubscribe\x12\".servicebridge.v1.SubscribeRequest\x1a\x1f.servicebridge.v1.RunAssignment0\x01\x12T\n" +
-	"\tBeginStep\x12\".servicebridge.v1.BeginStepRequest\x1a#.servicebridge.v1.BeginStepResponse\x12M\n" +
-	"\fCompleteStep\x12%.servicebridge.v1.CompleteStepRequest\x1a\x16.google.protobuf.Empty\x12K\n" +
-	"\vCompleteRun\x12$.servicebridge.v1.CompleteRunRequest\x1a\x16.google.protobuf.Empty\x12Q\n" +
-	"\bFailStep\x12!.servicebridge.v1.FailStepRequest\x1a\".servicebridge.v1.FailStepResponse\x12=\n" +
-	"\x04Park\x12\x1d.servicebridge.v1.ParkRequest\x1a\x16.google.protobuf.Empty\x12G\n" +
-	"\tHeartbeat\x12\".servicebridge.v1.HeartbeatRequest\x1a\x16.google.protobuf.Emptyb\x06proto3"
+	"\x06Replay\x12\".servicebridge.v1.ReplayRunRequest\x1a#.servicebridge.v1.ReplayRunResponse\x12W\n" +
+	"\x11RetryCompensation\x12*.servicebridge.v1.RetryCompensationRequest\x1a\x16.google.protobuf.Empty\x12M\n" +
+	"\tSubscribe\x12\".servicebridge.v1.SubscribeRequest\x1a\x1a.servicebridge.v1.StepTask0\x01\x12M\n" +
+	"\fCompleteTask\x12%.servicebridge.v1.CompleteTaskRequest\x1a\x16.google.protobuf.Empty\x12E\n" +
+	"\bFailTask\x12!.servicebridge.v1.FailTaskRequest\x1a\x16.google.protobuf.Empty\x12T\n" +
+	"\tHeartbeat\x12\".servicebridge.v1.HeartbeatRequest\x1a#.servicebridge.v1.HeartbeatResponseb\x06proto3"
 
 var (
 	file_servicebridge_v1_workflows_proto_rawDescOnce sync.Once
@@ -1824,72 +3691,156 @@ func file_servicebridge_v1_workflows_proto_rawDescGZIP() []byte {
 	return file_servicebridge_v1_workflows_proto_rawDescData
 }
 
-var file_servicebridge_v1_workflows_proto_msgTypes = make([]protoimpl.MessageInfo, 25)
+var file_servicebridge_v1_workflows_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_servicebridge_v1_workflows_proto_msgTypes = make([]protoimpl.MessageInfo, 49)
 var file_servicebridge_v1_workflows_proto_goTypes = []any{
-	(*StartRunRequest)(nil),     // 0: servicebridge.v1.StartRunRequest
-	(*StartRunResponse)(nil),    // 1: servicebridge.v1.StartRunResponse
-	(*CancelRunRequest)(nil),    // 2: servicebridge.v1.CancelRunRequest
-	(*SignalRunRequest)(nil),    // 3: servicebridge.v1.SignalRunRequest
-	(*QueryRunRequest)(nil),     // 4: servicebridge.v1.QueryRunRequest
-	(*QueryRunResponse)(nil),    // 5: servicebridge.v1.QueryRunResponse
-	(*StepInfo)(nil),            // 6: servicebridge.v1.StepInfo
-	(*AwaitRunRequest)(nil),     // 7: servicebridge.v1.AwaitRunRequest
-	(*RunStatusUpdate)(nil),     // 8: servicebridge.v1.RunStatusUpdate
-	(*ReplayRunRequest)(nil),    // 9: servicebridge.v1.ReplayRunRequest
-	(*ReplayRunResponse)(nil),   // 10: servicebridge.v1.ReplayRunResponse
-	(*SubscribeRequest)(nil),    // 11: servicebridge.v1.SubscribeRequest
-	(*RunAssignment)(nil),       // 12: servicebridge.v1.RunAssignment
-	(*BeginStepRequest)(nil),    // 13: servicebridge.v1.BeginStepRequest
-	(*BeginStepResponse)(nil),   // 14: servicebridge.v1.BeginStepResponse
-	(*CompleteStepRequest)(nil), // 15: servicebridge.v1.CompleteStepRequest
-	(*FailStepRequest)(nil),     // 16: servicebridge.v1.FailStepRequest
-	(*FailStepResponse)(nil),    // 17: servicebridge.v1.FailStepResponse
-	(*ParkRequest)(nil),         // 18: servicebridge.v1.ParkRequest
-	(*SleepSpec)(nil),           // 19: servicebridge.v1.SleepSpec
-	(*EventWaitSpec)(nil),       // 20: servicebridge.v1.EventWaitSpec
-	(*SignalWaitSpec)(nil),      // 21: servicebridge.v1.SignalWaitSpec
-	(*NestedRunSpec)(nil),       // 22: servicebridge.v1.NestedRunSpec
-	(*CompleteRunRequest)(nil),  // 23: servicebridge.v1.CompleteRunRequest
-	(*HeartbeatRequest)(nil),    // 24: servicebridge.v1.HeartbeatRequest
-	(*emptypb.Empty)(nil),       // 25: google.protobuf.Empty
+	(TaskKind)(0),                    // 0: servicebridge.v1.TaskKind
+	(*WorkflowDefinition)(nil),       // 1: servicebridge.v1.WorkflowDefinition
+	(*Step)(nil),                     // 2: servicebridge.v1.Step
+	(*Expr)(nil),                     // 3: servicebridge.v1.Expr
+	(*ExprMap)(nil),                  // 4: servicebridge.v1.ExprMap
+	(*ExprList)(nil),                 // 5: servicebridge.v1.ExprList
+	(*Predicate)(nil),                // 6: servicebridge.v1.Predicate
+	(*ExprPair)(nil),                 // 7: servicebridge.v1.ExprPair
+	(*PredicateList)(nil),            // 8: servicebridge.v1.PredicateList
+	(*RetryPolicy)(nil),              // 9: servicebridge.v1.RetryPolicy
+	(*CallStep)(nil),                 // 10: servicebridge.v1.CallStep
+	(*CallStepOptions)(nil),          // 11: servicebridge.v1.CallStepOptions
+	(*PublishStep)(nil),              // 12: servicebridge.v1.PublishStep
+	(*PublishStepOptions)(nil),       // 13: servicebridge.v1.PublishStepOptions
+	(*Compensation)(nil),             // 14: servicebridge.v1.Compensation
+	(*CallCompensation)(nil),         // 15: servicebridge.v1.CallCompensation
+	(*PublishCompensation)(nil),      // 16: servicebridge.v1.PublishCompensation
+	(*LocalStep)(nil),                // 17: servicebridge.v1.LocalStep
+	(*SleepStep)(nil),                // 18: servicebridge.v1.SleepStep
+	(*WaitEventStep)(nil),            // 19: servicebridge.v1.WaitEventStep
+	(*WaitSignalStep)(nil),           // 20: servicebridge.v1.WaitSignalStep
+	(*SubWorkflowStep)(nil),          // 21: servicebridge.v1.SubWorkflowStep
+	(*GroupStep)(nil),                // 22: servicebridge.v1.GroupStep
+	(*ForEach)(nil),                  // 23: servicebridge.v1.ForEach
+	(*StartRunRequest)(nil),          // 24: servicebridge.v1.StartRunRequest
+	(*StartRunResponse)(nil),         // 25: servicebridge.v1.StartRunResponse
+	(*CancelRunRequest)(nil),         // 26: servicebridge.v1.CancelRunRequest
+	(*SignalRunRequest)(nil),         // 27: servicebridge.v1.SignalRunRequest
+	(*SignalRunResponse)(nil),        // 28: servicebridge.v1.SignalRunResponse
+	(*QueryRunRequest)(nil),          // 29: servicebridge.v1.QueryRunRequest
+	(*RunSnapshot)(nil),              // 30: servicebridge.v1.RunSnapshot
+	(*StepInfo)(nil),                 // 31: servicebridge.v1.StepInfo
+	(*PendingSignal)(nil),            // 32: servicebridge.v1.PendingSignal
+	(*AwaitRunRequest)(nil),          // 33: servicebridge.v1.AwaitRunRequest
+	(*RunStatusUpdate)(nil),          // 34: servicebridge.v1.RunStatusUpdate
+	(*ReplayRunRequest)(nil),         // 35: servicebridge.v1.ReplayRunRequest
+	(*ReplayRunResponse)(nil),        // 36: servicebridge.v1.ReplayRunResponse
+	(*RetryCompensationRequest)(nil), // 37: servicebridge.v1.RetryCompensationRequest
+	(*SubscribeRequest)(nil),         // 38: servicebridge.v1.SubscribeRequest
+	(*StepTask)(nil),                 // 39: servicebridge.v1.StepTask
+	(*ResolvedCallOptions)(nil),      // 40: servicebridge.v1.ResolvedCallOptions
+	(*ResolvedPublishOptions)(nil),   // 41: servicebridge.v1.ResolvedPublishOptions
+	(*CompleteTaskRequest)(nil),      // 42: servicebridge.v1.CompleteTaskRequest
+	(*FailTaskRequest)(nil),          // 43: servicebridge.v1.FailTaskRequest
+	(*HeartbeatRequest)(nil),         // 44: servicebridge.v1.HeartbeatRequest
+	(*HeartbeatResponse)(nil),        // 45: servicebridge.v1.HeartbeatResponse
+	nil,                              // 46: servicebridge.v1.ExprMap.FieldsEntry
+	nil,                              // 47: servicebridge.v1.PublishStepOptions.HeadersEntry
+	nil,                              // 48: servicebridge.v1.WaitEventStep.FilterEntry
+	nil,                              // 49: servicebridge.v1.ResolvedPublishOptions.HeadersEntry
+	(*emptypb.Empty)(nil),            // 50: google.protobuf.Empty
 }
 var file_servicebridge_v1_workflows_proto_depIdxs = []int32{
-	6,  // 0: servicebridge.v1.QueryRunResponse.steps:type_name -> servicebridge.v1.StepInfo
-	19, // 1: servicebridge.v1.ParkRequest.sleep:type_name -> servicebridge.v1.SleepSpec
-	20, // 2: servicebridge.v1.ParkRequest.event_wait:type_name -> servicebridge.v1.EventWaitSpec
-	21, // 3: servicebridge.v1.ParkRequest.signal_wait:type_name -> servicebridge.v1.SignalWaitSpec
-	22, // 4: servicebridge.v1.ParkRequest.nested_run:type_name -> servicebridge.v1.NestedRunSpec
-	0,  // 5: servicebridge.v1.Workflows.Start:input_type -> servicebridge.v1.StartRunRequest
-	2,  // 6: servicebridge.v1.Workflows.Cancel:input_type -> servicebridge.v1.CancelRunRequest
-	3,  // 7: servicebridge.v1.Workflows.Signal:input_type -> servicebridge.v1.SignalRunRequest
-	4,  // 8: servicebridge.v1.Workflows.Query:input_type -> servicebridge.v1.QueryRunRequest
-	7,  // 9: servicebridge.v1.Workflows.Await:input_type -> servicebridge.v1.AwaitRunRequest
-	9,  // 10: servicebridge.v1.Workflows.Replay:input_type -> servicebridge.v1.ReplayRunRequest
-	11, // 11: servicebridge.v1.Workflows.Subscribe:input_type -> servicebridge.v1.SubscribeRequest
-	13, // 12: servicebridge.v1.Workflows.BeginStep:input_type -> servicebridge.v1.BeginStepRequest
-	15, // 13: servicebridge.v1.Workflows.CompleteStep:input_type -> servicebridge.v1.CompleteStepRequest
-	23, // 14: servicebridge.v1.Workflows.CompleteRun:input_type -> servicebridge.v1.CompleteRunRequest
-	16, // 15: servicebridge.v1.Workflows.FailStep:input_type -> servicebridge.v1.FailStepRequest
-	18, // 16: servicebridge.v1.Workflows.Park:input_type -> servicebridge.v1.ParkRequest
-	24, // 17: servicebridge.v1.Workflows.Heartbeat:input_type -> servicebridge.v1.HeartbeatRequest
-	1,  // 18: servicebridge.v1.Workflows.Start:output_type -> servicebridge.v1.StartRunResponse
-	25, // 19: servicebridge.v1.Workflows.Cancel:output_type -> google.protobuf.Empty
-	25, // 20: servicebridge.v1.Workflows.Signal:output_type -> google.protobuf.Empty
-	5,  // 21: servicebridge.v1.Workflows.Query:output_type -> servicebridge.v1.QueryRunResponse
-	8,  // 22: servicebridge.v1.Workflows.Await:output_type -> servicebridge.v1.RunStatusUpdate
-	10, // 23: servicebridge.v1.Workflows.Replay:output_type -> servicebridge.v1.ReplayRunResponse
-	12, // 24: servicebridge.v1.Workflows.Subscribe:output_type -> servicebridge.v1.RunAssignment
-	14, // 25: servicebridge.v1.Workflows.BeginStep:output_type -> servicebridge.v1.BeginStepResponse
-	25, // 26: servicebridge.v1.Workflows.CompleteStep:output_type -> google.protobuf.Empty
-	25, // 27: servicebridge.v1.Workflows.CompleteRun:output_type -> google.protobuf.Empty
-	17, // 28: servicebridge.v1.Workflows.FailStep:output_type -> servicebridge.v1.FailStepResponse
-	25, // 29: servicebridge.v1.Workflows.Park:output_type -> google.protobuf.Empty
-	25, // 30: servicebridge.v1.Workflows.Heartbeat:output_type -> google.protobuf.Empty
-	18, // [18:31] is the sub-list for method output_type
-	5,  // [5:18] is the sub-list for method input_type
-	5,  // [5:5] is the sub-list for extension type_name
-	5,  // [5:5] is the sub-list for extension extendee
-	0,  // [0:5] is the sub-list for field type_name
+	2,  // 0: servicebridge.v1.WorkflowDefinition.steps:type_name -> servicebridge.v1.Step
+	9,  // 1: servicebridge.v1.WorkflowDefinition.retry:type_name -> servicebridge.v1.RetryPolicy
+	6,  // 2: servicebridge.v1.Step.when:type_name -> servicebridge.v1.Predicate
+	9,  // 3: servicebridge.v1.Step.retry:type_name -> servicebridge.v1.RetryPolicy
+	10, // 4: servicebridge.v1.Step.call:type_name -> servicebridge.v1.CallStep
+	12, // 5: servicebridge.v1.Step.publish:type_name -> servicebridge.v1.PublishStep
+	17, // 6: servicebridge.v1.Step.local:type_name -> servicebridge.v1.LocalStep
+	18, // 7: servicebridge.v1.Step.sleep:type_name -> servicebridge.v1.SleepStep
+	19, // 8: servicebridge.v1.Step.wait_event:type_name -> servicebridge.v1.WaitEventStep
+	20, // 9: servicebridge.v1.Step.wait_signal:type_name -> servicebridge.v1.WaitSignalStep
+	21, // 10: servicebridge.v1.Step.workflow:type_name -> servicebridge.v1.SubWorkflowStep
+	22, // 11: servicebridge.v1.Step.parallel:type_name -> servicebridge.v1.GroupStep
+	22, // 12: servicebridge.v1.Step.sequence:type_name -> servicebridge.v1.GroupStep
+	4,  // 13: servicebridge.v1.Expr.object:type_name -> servicebridge.v1.ExprMap
+	5,  // 14: servicebridge.v1.Expr.list:type_name -> servicebridge.v1.ExprList
+	46, // 15: servicebridge.v1.ExprMap.fields:type_name -> servicebridge.v1.ExprMap.FieldsEntry
+	3,  // 16: servicebridge.v1.ExprList.items:type_name -> servicebridge.v1.Expr
+	3,  // 17: servicebridge.v1.Predicate.truthy:type_name -> servicebridge.v1.Expr
+	6,  // 18: servicebridge.v1.Predicate.not:type_name -> servicebridge.v1.Predicate
+	7,  // 19: servicebridge.v1.Predicate.equals:type_name -> servicebridge.v1.ExprPair
+	7,  // 20: servicebridge.v1.Predicate.in:type_name -> servicebridge.v1.ExprPair
+	8,  // 21: servicebridge.v1.Predicate.and:type_name -> servicebridge.v1.PredicateList
+	8,  // 22: servicebridge.v1.Predicate.or:type_name -> servicebridge.v1.PredicateList
+	3,  // 23: servicebridge.v1.ExprPair.left:type_name -> servicebridge.v1.Expr
+	3,  // 24: servicebridge.v1.ExprPair.right:type_name -> servicebridge.v1.Expr
+	6,  // 25: servicebridge.v1.PredicateList.items:type_name -> servicebridge.v1.Predicate
+	3,  // 26: servicebridge.v1.CallStep.service:type_name -> servicebridge.v1.Expr
+	3,  // 27: servicebridge.v1.CallStep.method:type_name -> servicebridge.v1.Expr
+	3,  // 28: servicebridge.v1.CallStep.input:type_name -> servicebridge.v1.Expr
+	11, // 29: servicebridge.v1.CallStep.opts:type_name -> servicebridge.v1.CallStepOptions
+	14, // 30: servicebridge.v1.CallStep.compensate:type_name -> servicebridge.v1.Compensation
+	3,  // 31: servicebridge.v1.CallStepOptions.idempotency_key:type_name -> servicebridge.v1.Expr
+	3,  // 32: servicebridge.v1.CallStepOptions.request_id:type_name -> servicebridge.v1.Expr
+	9,  // 33: servicebridge.v1.CallStepOptions.retry:type_name -> servicebridge.v1.RetryPolicy
+	3,  // 34: servicebridge.v1.PublishStep.event:type_name -> servicebridge.v1.Expr
+	3,  // 35: servicebridge.v1.PublishStep.input:type_name -> servicebridge.v1.Expr
+	13, // 36: servicebridge.v1.PublishStep.opts:type_name -> servicebridge.v1.PublishStepOptions
+	14, // 37: servicebridge.v1.PublishStep.compensate:type_name -> servicebridge.v1.Compensation
+	3,  // 38: servicebridge.v1.PublishStepOptions.idempotency_key:type_name -> servicebridge.v1.Expr
+	3,  // 39: servicebridge.v1.PublishStepOptions.partition_key:type_name -> servicebridge.v1.Expr
+	47, // 40: servicebridge.v1.PublishStepOptions.headers:type_name -> servicebridge.v1.PublishStepOptions.HeadersEntry
+	15, // 41: servicebridge.v1.Compensation.call:type_name -> servicebridge.v1.CallCompensation
+	16, // 42: servicebridge.v1.Compensation.publish:type_name -> servicebridge.v1.PublishCompensation
+	3,  // 43: servicebridge.v1.Compensation.input:type_name -> servicebridge.v1.Expr
+	9,  // 44: servicebridge.v1.Compensation.retry:type_name -> servicebridge.v1.RetryPolicy
+	3,  // 45: servicebridge.v1.CallCompensation.service:type_name -> servicebridge.v1.Expr
+	3,  // 46: servicebridge.v1.CallCompensation.method:type_name -> servicebridge.v1.Expr
+	11, // 47: servicebridge.v1.CallCompensation.opts:type_name -> servicebridge.v1.CallStepOptions
+	3,  // 48: servicebridge.v1.PublishCompensation.event:type_name -> servicebridge.v1.Expr
+	13, // 49: servicebridge.v1.PublishCompensation.opts:type_name -> servicebridge.v1.PublishStepOptions
+	48, // 50: servicebridge.v1.WaitEventStep.filter:type_name -> servicebridge.v1.WaitEventStep.FilterEntry
+	3,  // 51: servicebridge.v1.SubWorkflowStep.service:type_name -> servicebridge.v1.Expr
+	3,  // 52: servicebridge.v1.SubWorkflowStep.workflow:type_name -> servicebridge.v1.Expr
+	3,  // 53: servicebridge.v1.SubWorkflowStep.input:type_name -> servicebridge.v1.Expr
+	3,  // 54: servicebridge.v1.SubWorkflowStep.idempotency_key:type_name -> servicebridge.v1.Expr
+	2,  // 55: servicebridge.v1.GroupStep.steps:type_name -> servicebridge.v1.Step
+	23, // 56: servicebridge.v1.GroupStep.for_each:type_name -> servicebridge.v1.ForEach
+	31, // 57: servicebridge.v1.RunSnapshot.steps:type_name -> servicebridge.v1.StepInfo
+	32, // 58: servicebridge.v1.RunSnapshot.signals:type_name -> servicebridge.v1.PendingSignal
+	0,  // 59: servicebridge.v1.StepTask.kind:type_name -> servicebridge.v1.TaskKind
+	40, // 60: servicebridge.v1.StepTask.call_opts:type_name -> servicebridge.v1.ResolvedCallOptions
+	41, // 61: servicebridge.v1.StepTask.publish_opts:type_name -> servicebridge.v1.ResolvedPublishOptions
+	9,  // 62: servicebridge.v1.ResolvedCallOptions.retry:type_name -> servicebridge.v1.RetryPolicy
+	49, // 63: servicebridge.v1.ResolvedPublishOptions.headers:type_name -> servicebridge.v1.ResolvedPublishOptions.HeadersEntry
+	3,  // 64: servicebridge.v1.ExprMap.FieldsEntry.value:type_name -> servicebridge.v1.Expr
+	3,  // 65: servicebridge.v1.PublishStepOptions.HeadersEntry.value:type_name -> servicebridge.v1.Expr
+	3,  // 66: servicebridge.v1.WaitEventStep.FilterEntry.value:type_name -> servicebridge.v1.Expr
+	24, // 67: servicebridge.v1.Workflows.Start:input_type -> servicebridge.v1.StartRunRequest
+	26, // 68: servicebridge.v1.Workflows.Cancel:input_type -> servicebridge.v1.CancelRunRequest
+	27, // 69: servicebridge.v1.Workflows.Signal:input_type -> servicebridge.v1.SignalRunRequest
+	29, // 70: servicebridge.v1.Workflows.Query:input_type -> servicebridge.v1.QueryRunRequest
+	33, // 71: servicebridge.v1.Workflows.Await:input_type -> servicebridge.v1.AwaitRunRequest
+	35, // 72: servicebridge.v1.Workflows.Replay:input_type -> servicebridge.v1.ReplayRunRequest
+	37, // 73: servicebridge.v1.Workflows.RetryCompensation:input_type -> servicebridge.v1.RetryCompensationRequest
+	38, // 74: servicebridge.v1.Workflows.Subscribe:input_type -> servicebridge.v1.SubscribeRequest
+	42, // 75: servicebridge.v1.Workflows.CompleteTask:input_type -> servicebridge.v1.CompleteTaskRequest
+	43, // 76: servicebridge.v1.Workflows.FailTask:input_type -> servicebridge.v1.FailTaskRequest
+	44, // 77: servicebridge.v1.Workflows.Heartbeat:input_type -> servicebridge.v1.HeartbeatRequest
+	25, // 78: servicebridge.v1.Workflows.Start:output_type -> servicebridge.v1.StartRunResponse
+	50, // 79: servicebridge.v1.Workflows.Cancel:output_type -> google.protobuf.Empty
+	28, // 80: servicebridge.v1.Workflows.Signal:output_type -> servicebridge.v1.SignalRunResponse
+	30, // 81: servicebridge.v1.Workflows.Query:output_type -> servicebridge.v1.RunSnapshot
+	34, // 82: servicebridge.v1.Workflows.Await:output_type -> servicebridge.v1.RunStatusUpdate
+	36, // 83: servicebridge.v1.Workflows.Replay:output_type -> servicebridge.v1.ReplayRunResponse
+	50, // 84: servicebridge.v1.Workflows.RetryCompensation:output_type -> google.protobuf.Empty
+	39, // 85: servicebridge.v1.Workflows.Subscribe:output_type -> servicebridge.v1.StepTask
+	50, // 86: servicebridge.v1.Workflows.CompleteTask:output_type -> google.protobuf.Empty
+	50, // 87: servicebridge.v1.Workflows.FailTask:output_type -> google.protobuf.Empty
+	45, // 88: servicebridge.v1.Workflows.Heartbeat:output_type -> servicebridge.v1.HeartbeatResponse
+	78, // [78:89] is the sub-list for method output_type
+	67, // [67:78] is the sub-list for method input_type
+	67, // [67:67] is the sub-list for extension type_name
+	67, // [67:67] is the sub-list for extension extendee
+	0,  // [0:67] is the sub-list for field type_name
 }
 
 func init() { file_servicebridge_v1_workflows_proto_init() }
@@ -1897,24 +3848,48 @@ func file_servicebridge_v1_workflows_proto_init() {
 	if File_servicebridge_v1_workflows_proto != nil {
 		return
 	}
-	file_servicebridge_v1_workflows_proto_msgTypes[18].OneofWrappers = []any{
-		(*ParkRequest_Sleep)(nil),
-		(*ParkRequest_EventWait)(nil),
-		(*ParkRequest_SignalWait)(nil),
-		(*ParkRequest_NestedRun)(nil),
+	file_servicebridge_v1_workflows_proto_msgTypes[1].OneofWrappers = []any{
+		(*Step_Call)(nil),
+		(*Step_Publish)(nil),
+		(*Step_Local)(nil),
+		(*Step_Sleep)(nil),
+		(*Step_WaitEvent)(nil),
+		(*Step_WaitSignal)(nil),
+		(*Step_Workflow)(nil),
+		(*Step_Parallel)(nil),
+		(*Step_Sequence)(nil),
+	}
+	file_servicebridge_v1_workflows_proto_msgTypes[2].OneofWrappers = []any{
+		(*Expr_Path)(nil),
+		(*Expr_Literal)(nil),
+		(*Expr_Object)(nil),
+		(*Expr_List)(nil),
+	}
+	file_servicebridge_v1_workflows_proto_msgTypes[5].OneofWrappers = []any{
+		(*Predicate_Truthy)(nil),
+		(*Predicate_Not)(nil),
+		(*Predicate_Equals)(nil),
+		(*Predicate_In)(nil),
+		(*Predicate_And)(nil),
+		(*Predicate_Or)(nil),
+	}
+	file_servicebridge_v1_workflows_proto_msgTypes[13].OneofWrappers = []any{
+		(*Compensation_Call)(nil),
+		(*Compensation_Publish)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_servicebridge_v1_workflows_proto_rawDesc), len(file_servicebridge_v1_workflows_proto_rawDesc)),
-			NumEnums:      0,
-			NumMessages:   25,
+			NumEnums:      1,
+			NumMessages:   49,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
 		GoTypes:           file_servicebridge_v1_workflows_proto_goTypes,
 		DependencyIndexes: file_servicebridge_v1_workflows_proto_depIdxs,
+		EnumInfos:         file_servicebridge_v1_workflows_proto_enumTypes,
 		MessageInfos:      file_servicebridge_v1_workflows_proto_msgTypes,
 	}.Build()
 	File_servicebridge_v1_workflows_proto = out.File

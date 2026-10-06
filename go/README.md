@@ -238,7 +238,7 @@ sb.SubscribeEventRaw(c, name, fn)
 Everything that needs no type parameter stays a method on the domain it belongs to:
 
 ```
-c.Job.Handle(...)        c.Workflow.Handle/Start/Signal/Cancel/Await/Query/Replay(...)
+c.Job.Handle(...)        c.Workflow.Handle/Start/Signal/Cancel/Await/Query/Replay/RetryCompensation(...)
 c.Telemetry.StartOp/Logger/Counter/Gauge/Histogram(...)
 c.Identity()  c.ServiceMap()  c.PolicyEvaluation()  c.Start(ctx)  c.Stop(ctx)
 ```
@@ -417,7 +417,7 @@ err := c.Workflow.Handle("checkout", wf.Definition{
 			Input:   wf.Path("$.input"),
 		},
 		wf.Call{
-			Control: wf.Control{ID: "charge", WaitFor: []string{"reserve"}, TimeoutSec: 30},
+			Control: wf.Control{ID: "charge", WaitFor: []string{"reserve"}, Timeout: 30 * time.Second},
 			Service: wf.Name("payment-svc"),
 			Method:  wf.Name("Charge"),
 			Input:   wf.Path("$.input"),
@@ -435,31 +435,32 @@ err := c.Workflow.Handle("checkout", wf.Definition{
 })
 ```
 
-Top-level steps start in parallel; `WaitFor` declares the dependencies that define the execution levels. Step kinds: `Call`, `Publish`, `Sleep`, `WaitEvent`, `WaitSignal`, `SubWorkflow`, `Parallel`, `Sequence`, `Local`. The set is closed — the marker method is unexported — so a graph can never carry a kind the runtime does not know.
+Top-level steps start in parallel; `WaitFor` declares the dependencies. The runtime interprets the graph — readiness, timers, waits, child runs, retries with backoff and compensation — and leases task steps (`Local`, `Call`, `Publish`, compensations) to an instance of the owner service, which renews the lease by heartbeat. Step kinds: `Call`, `Publish`, `Sleep`, `WaitEvent`, `WaitSignal`, `SubWorkflow`, `Parallel`, `Sequence`, `Local`. The set is closed — the marker method is unexported — so a graph can never carry a kind the runtime does not know.
 
 A `wf.Call` step reaches an ordinary `sb.Handle[Req, Resp]` handler, so the method it names must also be declared with `sb.NewMethod`: run state is JSON while the callee takes protobuf, and the declared pair of types is both the encoding and the contract hash the step routes at. The step's `Input` is written as the message's JSON mirror — 64-bit integers are strings, enums are value names — and the reply lands in run state in the same form. A target named literally and never declared is refused at `Start`, with the workflow, the step and the missing declaration in the message; a target computed from run state fails the same way inside the run, because its name does not exist any earlier.
 
 Two string types keep expressions and data apart: `wf.Path("$.reserve.id")` is read from run state when the step executes, `wf.Name("payment-svc")` is a literal written at declaration. A literal that happens to look like a path needs no escaping here; the type says which is which.
 
-`wf.Local` runs a Go closure in the declaring process. The closure is not part of the frozen graph or the fingerprint — the step is identified by its `ID`, and the locally declared graph supplies the function the assignment cannot carry.
+`wf.Local` runs a Go closure in the declaring process. The closure never reaches the runtime: a task names the step `ID` and the `Definition.Version`, and the locally declared graph supplies the function — bump `Version` whenever a closure changes. Its `ctx` is cancelled when the lease is lost, the step deadline passes or the client stops.
 
 Driving a run:
 
 ```go
-runID, err := c.Workflow.Start(ctx, "checkout",
+runID, err := c.Workflow.Start(ctx, "orders-svc", "checkout",
 	map[string]any{"orderId": "o-1"},
 	sb.WithRunIdempotencyKey("checkout-o-1"),
-	sb.WithRunTimeoutSec(600),
+	sb.WithRunTimeout(10*time.Minute),
 )
 
-state, err := c.Workflow.Await(ctx, runID)   // blocks until terminal
-snap, err := c.Workflow.Query(ctx, runID)    // RunSnapshot: Status, State, Steps
-err = c.Workflow.Signal(ctx, runID, "approval", map[string]any{"ok": true})
-err = c.Workflow.Cancel(ctx, runID)          // compensates in reverse
+out, err := c.Workflow.Await(ctx, runID)     // output on success; *sb.RunFailedError otherwise
+snap, err := c.Workflow.Query(ctx, runID)    // Status, WaitingReason, Steps, Signals
+dup, err := c.Workflow.Signal(ctx, runID, "approval", map[string]any{"ok": true}, sb.WithSignalID("approve-o-1"))
+err = c.Workflow.Cancel(ctx, runID)          // compensates in reverse, ends cancelled
 forked, err := c.Workflow.Replay(ctx, runID, "charge")
+err = c.Workflow.RetryCompensation(ctx, runID) // re-run failed compensations of a failed_compensated run
 ```
 
-An unknown workflow name is `CodeNotFound`, a refusal by the access policy is `CodeAccessDenied`, and signalling or cancelling a finished run is `CodeTerminal`. Run state is JSON throughout (that is what `Path` reads and what `Await` returns), so step inputs and outputs are plain Go values, not protobuf messages.
+An unknown workflow is `CodeNotFound`, a refusal by the access policy (or a caller that is neither the owner, the starter nor explicitly granted `workflow.run`) is `CodeAccessDenied`, and signalling or cancelling a finished run is `CodeTerminal`. Run statuses: `active`, `compensating`, `success`, `failed`, `cancelled`, `timed_out`, `failed_compensated`. Run state is JSON throughout (that is what `Path` reads and what `Await` returns), so step inputs and outputs are plain Go values, not protobuf messages.
 
 The full vocabulary — predicates, `ForEach`, compensation, retry policies — is in [`workflow/README.md`](./workflow/README.md).
 
@@ -691,7 +692,7 @@ The `job`, `sbhttp` and `sbtest` packages carry their own sentinels for what the
 
 Everything on the wire is `int64` **unix milliseconds** for instants and `int64` **milliseconds** for durations. In Go you write a `time.Duration` (`WithTimeout`, `WithLeaseTTL`, `CallOpts.Timeout`) and the SDK converts; where a field is already a number, its name says the unit — `OccurredAtMs`, `ScheduledAtUnixMs`, `UnhealthySinceMs`.
 
-Seconds appear in exactly one place and are always spelled out: the workflow contract's `TimeoutSec`, `DurationSec` and `WithRunTimeoutSec`. That is the runtime's unit for those fields, not a typo.
+Workflow durations are `time.Duration` too (`Control.Timeout`, `Definition.Timeout`, `Sleep.Duration`, `WithRunTimeout`).
 
 ---
 
@@ -788,11 +789,11 @@ Issues and feedback are welcome.
 
 Licensed under the **MIT License** — see [LICENSE](../LICENSE). Free for any use, including commercial; you only need to keep the copyright and license notice (attribution to esurkov1 <esurkovv@yandex.ru>).
 
-Production delivery and lifecycle contracts: RPC automatic retries are limited to locally proven pre-dispatch selection failures. A key or an ambiguous gRPC status cannot prove an effect did not happen. Jobs require WithVersion; local workflows require Definition.Version. Retained versions are advertised old→new; deploy old executable versions while frozen work remains, or drain before removing them. Unknown assigned fingerprints report terminal unsupported_version.
+Production delivery and lifecycle contracts: RPC automatic retries are limited to locally proven pre-dispatch selection failures. A key or an ambiguous gRPC status cannot prove an effect did not happen. Jobs require WithVersion; local workflow steps are located by Definition.Version — keep an old version deployed while its runs remain; a task for a version no instance has fails with UNSUPPORTED_VERSION.
 
 Event handlers can inspect `DeliveryFromContext(ctx)` for Attempt, DeliveryID, EventID, EventName and the opaque LeaseToken. Token ownership prevents stale ACKs from acknowledging another delivery attempt. Public outbox recovery uses `FailedOutboxEvents(ctx,limit,cursor)`, `RetryFailedEvent(ctx,id)` and `DiscardFailedEvent(ctx,id)`; retries preserve event identity. Zero row cap explicitly disables the row limit.
 
-Telemetry ACK confirms runtime ingress acceptance or disposal, not database persistence; drops are observable. Causal ACK sequences and a 1024-item in-flight bound protect replay. Metrics have bounded series/metadata/layout sizes and old instance series retire on rotation. Workflow default parallelism is64 (maximum1024), job default concurrency32, assignment queues1024, and expanded workflow budget10000 units.
+Telemetry ACK confirms runtime ingress acceptance or disposal, not database persistence; drops are observable. Causal ACK sequences and a 1024-item in-flight bound protect replay. Metrics have bounded series/metadata/layout sizes and old instance series retire on rotation. Workflow maxParallelism is enforced by the runtime (0 = unlimited, maximum 1024) and forEach expansion is capped at 10000 steps per run; job default concurrency is 32.
 
 Start has a 30-second initial deadline and rolls back resources after any failure. Stop first cancels execution, closes owned channels/storage, and waits up to its caller deadline (five seconds when absent). Go cannot terminate arbitrary application code that ignores context cancellation; Stop reports deadline expiry, and that handler must eventually unwind. Stream loss or superseded lease cancels active work and suppresses stale results. Revoked bootstrap credentials require deployment of the new key; terminal auth failures stop reconnecting.
 

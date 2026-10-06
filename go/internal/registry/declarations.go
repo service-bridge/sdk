@@ -30,6 +30,8 @@ type IncomingSpec struct {
 	OutputSchemaJSON []byte
 	Streaming        bool
 	ContractHash     string
+	// Workflow is the definition of a METHOD_TYPE_WORKFLOW handler.
+	Workflow *pb.WorkflowDefinition
 }
 
 type outgoingDepKey struct {
@@ -95,6 +97,7 @@ func (d *Declarations) AddIncoming(spec IncomingSpec) error {
 		OutputSchemaJson: spec.OutputSchemaJSON,
 		Streaming:        spec.Streaming,
 		ContractHash:     spec.ContractHash,
+		Workflow:         spec.Workflow,
 	})
 	return nil
 }

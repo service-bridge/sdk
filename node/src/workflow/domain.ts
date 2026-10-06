@@ -1,38 +1,34 @@
+// WorkflowDomain — `sb.workflow`: declare workflows (owner side) and steer runs
+// (caller side). The runtime interprets the DAG; this class only encodes
+// definitions and speaks the Workflows RPCs.
+//
 // @public — см. ./README.md
+
 import type {
-	QueryRunResponse,
+	RunSnapshot as PbRunSnapshot,
 	RunStatusUpdate,
 	WorkflowsClient,
 } from "../pb/servicebridge/v1/workflows";
-import type { Registry, WorkflowHandlerOpts } from "../registry/registry";
+import type { Registry } from "../registry/registry";
 import { currentTraceContext } from "../telemetry/context";
 import { formatXSbTrace } from "../telemetry/wire-trace";
-import { canonicalize, fingerprint } from "./canonical";
+import { encodeDefinition, type LocalFns } from "./encode";
 import {
 	WorkflowAccessDeniedError,
 	WorkflowNotFoundError,
+	WorkflowRunFailedError,
 	WorkflowTerminalError,
 } from "./errors";
-import type { Step, WorkflowDef, WorkflowStartOpts } from "./types";
-import { validate } from "./validate";
+import type {
+	RunSnapshot,
+	RunStatus,
+	StepStatus,
+	WorkflowDef,
+	WorkflowSignalOpts,
+	WorkflowStartOpts,
+} from "./types";
 
-export type { WorkflowDef } from "./types";
-
-// CanonicalGraph is the on-wire shape that runtime persists in
-// `workflow_definitions.graph` (ADR-W-002).
-interface CanonicalGraph {
-	version?: string;
-	graph: WorkflowDef["steps"];
-	retry?: WorkflowDef["retry"];
-	maxParallelism?: number;
-	timeoutSec?: number;
-	// Per ADR-W-009: the JSON Schema for run input lives inside the canonical
-	// graph and is what the runtime stores in workflow_definitions.input_schema.
-	inputSchema?: WorkflowDef["input"];
-}
-
-// gRPC status codes — match @grpc/grpc-js numeric values; kept numeric to
-// avoid the dynamic import.
+// gRPC status codes (numeric, as grpc-js reports them).
 const GRPC_NOT_FOUND = 5;
 const GRPC_PERMISSION_DENIED = 7;
 const GRPC_FAILED_PRECONDITION = 9;
@@ -43,8 +39,7 @@ interface GrpcLikeError {
 	message: string;
 }
 
-// Sink for call-time policy denials; the owner wires it to emit
-// `policy_violation`. Structural type avoids importing from connection.
+// Sink for call-time policy denials (emits `policy_violation`).
 type PolicyViolationSink = (v: {
 	declaration: string;
 	value: string;
@@ -52,9 +47,16 @@ type PolicyViolationSink = (v: {
 	reason: string;
 }) => void;
 
+// LocalDefinition is what the executor needs to run a local step.
+// @internal
+export interface LocalDefinition {
+	version: string;
+	locals: LocalFns;
+}
+
 export class WorkflowDomain {
-	// rpc is set by ServiceBridge.start(); until then caller-side ops throw.
 	private rpc: WorkflowsClient | null = null;
+	private readonly definitions = new Map<string, LocalDefinition>();
 
 	constructor(
 		private readonly registry: Registry,
@@ -66,181 +68,142 @@ export class WorkflowDomain {
 		this.rpc = rpc;
 	}
 
-	handle(name: string, def: WorkflowDef, opts?: WorkflowHandlerOpts): void {
-		validate(def, { workflowName: name });
-
-		const inputSchema = opts?.input ?? def.input;
-		const steps = def.retry
-			? withRetryDefault(def.steps, def.retry)
-			: def.steps;
-		const frozenSteps = snapshotSteps(steps);
-		const canonical: CanonicalGraph = {
-			graph: steps,
-			version: def.version,
-			retry: def.retry,
-			maxParallelism: def.maxParallelism,
-			timeoutSec: def.timeoutSec,
-			inputSchema,
-		};
-		const canonicalJson = canonicalize(canonical);
-		const fp = fingerprint(canonical);
-		const graphBuf = Buffer.from(canonicalJson, "utf8");
-
-		this.registry._handle.workflow(
-			name,
-			frozenSteps,
-			inputSchema ? { input: inputSchema } : undefined,
-			graphBuf,
-			fp,
-		);
+	// @internal — the executor's lookup of local functions.
+	_definition(name: string): LocalDefinition | undefined {
+		return this.definitions.get(name);
 	}
 
-	// start — schedule a new run. Per ADR-W-016 gate #5 PermissionDenied
-	// surfaces as WorkflowAccessDeniedError.
+	// @internal — number of declared workflows.
+	_size(): number {
+		return this.definitions.size;
+	}
+
+	// handle declares a workflow owned by this service. The runtime validates
+	// the definition at registration and refuses an invalid one.
+	handle(name: string, def: WorkflowDef): void {
+		if (this.definitions.has(name))
+			throw new Error(`workflow "${name}" is already declared`);
+		const { definition, locals } = encodeDefinition(name, def);
+		this.definitions.set(name, { version: definition.version, locals });
+		this.registry._handle.workflow(name, definition);
+	}
+
+	// start creates a run of `service`'s workflow `name`.
 	async start(
+		service: string,
 		name: string,
 		input: unknown,
 		opts?: WorkflowStartOpts,
 	): Promise<{ runId: string }> {
 		const rpc = this.requireRpc();
-		// Trace context propagation (ADR 0006 §3 X-SB-Trace): when an active trace
-		// context exists in ALS, format it into x_sb_trace so a nested workflow
-		// run inherits the parent trace and root-op linkage. Empty string when
-		// no scope is active — runtime mints a fresh root in that case.
 		const ctx = currentTraceContext();
 		const xSbTrace = ctx ? formatXSbTrace(ctx.traceId, ctx.parentOpId) : "";
+		const target = `${service}/${name}`;
 		return new Promise((resolve, reject) => {
 			rpc.start(
 				{
-					workflowName: name,
-					input: Buffer.from(JSON.stringify(input ?? null), "utf8"),
+					service,
+					workflow: name,
+					input: json(input),
 					idempotencyKey: opts?.idempotencyKey ?? "",
-					timeoutSec: opts?.timeoutSec ?? 0,
-					parentRunId: opts?.parentRunId ?? "",
+					timeoutMs: opts?.timeoutMs ?? 0,
 					xSbTrace,
 				},
-				(err: GrpcLikeError | null, resp: { runId: string }) => {
-					if (err)
-						return reject(mapStartError(name, err, this.onPolicyViolation));
+				(err, resp) => {
+					if (err) return reject(this.mapError(target, err));
 					resolve({ runId: resp.runId });
 				},
 			);
 		});
 	}
 
-	// signal — deliver an external signal to a parked wait_signal step.
+	// signal enqueues a signal for the run (FIFO). With `signalId`, a repeat of
+	// the same id is accepted without enqueuing — `duplicate` reports it.
 	async signal(
 		runId: string,
 		signalName: string,
 		payload: unknown,
-	): Promise<void> {
+		opts?: WorkflowSignalOpts,
+	): Promise<{ duplicate: boolean }> {
 		const rpc = this.requireRpc();
 		return new Promise((resolve, reject) => {
 			rpc.signal(
 				{
 					runId,
 					signalName,
-					payload: Buffer.from(JSON.stringify(payload ?? null), "utf8"),
+					payload: json(payload),
+					signalId: opts?.signalId ?? "",
 				},
-				(err) => {
-					if (err)
-						return reject(mapRunError(runId, err, this.onPolicyViolation));
-					resolve();
+				(err, resp) => {
+					if (err) return reject(this.mapError(runId, err));
+					resolve({ duplicate: resp.duplicate });
 				},
 			);
 		});
 	}
 
-	// cancel — request cooperative cancellation; runtime moves the run to
-	// `compensating` and dispatches compensation steps in reverse order.
+	// cancel stops the run; its compensations run before it ends cancelled.
 	async cancel(runId: string): Promise<void> {
 		const rpc = this.requireRpc();
 		return new Promise((resolve, reject) => {
 			rpc.cancel({ runId }, (err) => {
-				if (err) return reject(mapRunError(runId, err, this.onPolicyViolation));
+				if (err) return reject(this.mapError(runId, err));
 				resolve();
 			});
 		});
 	}
 
-	// await — block until the run reaches a terminal status. Returns the
-	// final state map as parsed JSON.
+	// await resolves with the run output (the state map) once the run succeeds
+	// and rejects with WorkflowRunFailedError on any other terminal status.
 	async await(runId: string): Promise<Record<string, unknown>> {
 		const rpc = this.requireRpc();
 		return new Promise((resolve, reject) => {
 			const stream = rpc.await({ runId });
-			let final: RunStatusUpdate | null = null;
+			let last: RunStatusUpdate | null = null;
 			stream.on("data", (u: RunStatusUpdate) => {
-				final = u;
+				last = u;
 			});
 			stream.on("error", (err: GrpcLikeError) =>
-				reject(mapRunError(runId, err, this.onPolicyViolation)),
+				reject(this.mapError(runId, err)),
 			);
 			stream.on("end", () => {
-				if (!final) {
+				const u = last as RunStatusUpdate | null;
+				if (!u?.terminal)
 					return reject(
-						new Error(`workflow.await(${runId}): stream ended with no update`),
-					);
-				}
-				const f = final as RunStatusUpdate;
-				const stateJson =
-					f.state.length > 0 ? Buffer.from(f.state).toString("utf8") : "{}";
-				if (f.status !== "success") {
-					return reject(
-						new Error(
-							`workflow.await(${runId}): terminal status "${f.status}"`,
+						new WorkflowTerminalError(
+							runId,
+							"await stream ended before a terminal status",
 						),
 					);
-				}
-				try {
-					resolve(JSON.parse(stateJson) as Record<string, unknown>);
-				} catch (parseErr) {
-					reject(parseErr);
-				}
+				if (u.status !== "success")
+					return reject(
+						new WorkflowRunFailedError(
+							runId,
+							u.status,
+							u.errorCode,
+							u.errorMessage,
+						),
+					);
+				resolve((parse(u.output) ?? {}) as Record<string, unknown>);
 			});
 		});
 	}
 
-	// query — point-in-time snapshot of run status, state, and per-step info.
-	async query(runId: string): Promise<{
-		status: string;
-		state: Record<string, unknown>;
-		steps: Array<{
-			stepId: string;
-			status: string;
-			output: unknown;
-			lastError: string;
-			compensatedBy?: string;
-		}>;
-	}> {
+	// query returns a point-in-time snapshot of the run, its steps and the
+	// signals still queued.
+	async query(runId: string): Promise<RunSnapshot> {
 		const rpc = this.requireRpc();
 		return new Promise((resolve, reject) => {
-			rpc.query({ runId }, (err, resp: QueryRunResponse) => {
-				if (err) return reject(mapRunError(runId, err, this.onPolicyViolation));
-				const stateJson =
-					resp.state.length > 0
-						? Buffer.from(resp.state).toString("utf8")
-						: "{}";
-				resolve({
-					status: resp.status,
-					state: JSON.parse(stateJson) as Record<string, unknown>,
-					steps: resp.steps.map((s) => ({
-						stepId: s.stepId,
-						status: s.status,
-						output:
-							s.output.length > 0
-								? JSON.parse(Buffer.from(s.output).toString("utf8"))
-								: null,
-						lastError: s.lastError,
-						compensatedBy: s.compensatedBy || undefined,
-					})),
-				});
+			rpc.query({ runId }, (err, resp) => {
+				if (err) return reject(this.mapError(runId, err));
+				resolve(toSnapshot(resp));
 			});
 		});
 	}
 
-	// replay — create a new run forked from `runId` at `fromStepId`. Reuses
-	// the source frozen_plan and re-executes from the named step.
+	// replay starts a new run from the source's frozen definition and input;
+	// with `fromStepId` (a top-level step) the steps that do not depend on it
+	// are copied instead of re-executed.
 	async replay(
 		runId: string,
 		opts?: { fromStepId?: string },
@@ -248,104 +211,97 @@ export class WorkflowDomain {
 		const rpc = this.requireRpc();
 		return new Promise((resolve, reject) => {
 			rpc.replay({ runId, fromStepId: opts?.fromStepId ?? "" }, (err, resp) => {
-				if (err) return reject(mapRunError(runId, err, this.onPolicyViolation));
+				if (err) return reject(this.mapError(runId, err));
 				resolve({ runId: resp.runId });
 			});
 		});
 	}
 
+	// retryCompensation re-runs the failed compensations of a
+	// failed_compensated run.
+	async retryCompensation(runId: string): Promise<void> {
+		const rpc = this.requireRpc();
+		return new Promise((resolve, reject) => {
+			rpc.retryCompensation({ runId }, (err) => {
+				if (err) return reject(this.mapError(runId, err));
+				resolve();
+			});
+		});
+	}
+
 	private requireRpc(): WorkflowsClient {
-		if (!this.rpc) {
+		if (!this.rpc)
 			throw new Error(
-				"workflow: caller-side ops require ServiceBridge.start() to have completed (RPC channel not yet attached)",
+				"workflow: caller-side operations need ServiceBridge.start() to have completed",
 			);
-		}
 		return this.rpc;
 	}
-}
 
-// Step types a retry policy can apply to. A group is not an operation — its
-// failure is one of its children's, already retried on its own budget — and a
-// parked step is resumed by the runtime rather than re-executed.
-const RETRIABLE_STEP_TYPES: ReadonlySet<Step["type"]> = new Set([
-	"call",
-	"publish",
-	"workflow",
-	"local",
-]);
-
-// withRetryDefault pushes the workflow-level retry policy down onto every
-// operation step that did not declare its own. The runtime seeds
-// workflow_steps.max_attempts from the per-step `retry` block only
-// (runtime/internal/workflow/register.go), so a policy that stays at the top of
-// the graph is a declaration nothing reads.
-function withRetryDefault(
-	steps: Step[],
-	retry: NonNullable<WorkflowDef["retry"]>,
-): Step[] {
-	return steps.map((step) => {
-		if (step.type === "parallel" || step.type === "sequence") {
-			return { ...step, steps: withRetryDefault(step.steps, retry) };
+	private mapError(target: string, err: GrpcLikeError): Error {
+		const detail = err.details || err.message;
+		switch (err.code) {
+			case GRPC_PERMISSION_DENIED:
+				this.onPolicyViolation?.({
+					declaration: "workflow.run",
+					value: target,
+					denySide: "self_egress",
+					reason: detail,
+				});
+				return new WorkflowAccessDeniedError(target, detail);
+			case GRPC_NOT_FOUND:
+				return new WorkflowNotFoundError(target);
+			case GRPC_FAILED_PRECONDITION:
+				return new WorkflowTerminalError(target, detail);
 		}
-		if (!RETRIABLE_STEP_TYPES.has(step.type) || step.retry !== undefined) {
-			return step;
-		}
-		return { ...step, retry };
-	});
+		return err as unknown as Error;
+	}
 }
 
-function mapStartError(
-	name: string,
-	err: GrpcLikeError,
-	onPolicyViolation?: PolicyViolationSink,
-): Error {
-	if (err.code === GRPC_PERMISSION_DENIED) {
-		const reason = err.details ?? err.message;
-		onPolicyViolation?.({
-			declaration: "workflow.run",
-			value: name,
-			denySide: "self_egress",
-			reason,
-		});
-		return new WorkflowAccessDeniedError(name, reason);
-	}
-	if (err.code === GRPC_NOT_FOUND) {
-		return new WorkflowNotFoundError(name);
-	}
-	return err as unknown as Error;
+function json(v: unknown): Buffer {
+	return Buffer.from(JSON.stringify(v ?? null), "utf8");
 }
 
-function mapRunError(
-	runId: string,
-	err: GrpcLikeError,
-	onPolicyViolation?: PolicyViolationSink,
-): Error {
-	if (err.code === GRPC_FAILED_PRECONDITION) {
-		return new WorkflowTerminalError(runId, err.details ?? err.message);
-	}
-	if (err.code === GRPC_PERMISSION_DENIED) {
-		const reason = err.details ?? err.message;
-		onPolicyViolation?.({
-			declaration: "workflow.run",
-			value: runId,
-			denySide: "self_egress",
-			reason,
-		});
-		return new WorkflowAccessDeniedError(runId, reason);
-	}
-	return err as unknown as Error;
+function parse(b: Uint8Array | undefined): unknown {
+	if (!b || b.length === 0) return null;
+	return JSON.parse(Buffer.from(b).toString("utf8"));
 }
 
-function snapshotSteps(steps: Step[]): Step[] {
-	const clone = (value: unknown): unknown => {
-		if (Array.isArray(value)) return Object.freeze(value.map(clone));
-		if (value && typeof value === "object")
-			return Object.freeze(
-				Object.fromEntries(
-					Object.entries(value).map(([key, item]) => [key, clone(item)]),
-				),
-			);
-		return value;
+function toSnapshot(r: PbRunSnapshot): RunSnapshot {
+	return {
+		runId: r.runId,
+		service: r.service,
+		workflow: r.workflow,
+		status: r.status as RunStatus,
+		stopReason: r.stopReason,
+		waitingReason: r.waitingReason,
+		input: parse(r.input),
+		output: parse(r.output) as Record<string, unknown> | null,
+		errorCode: r.errorCode,
+		errorMessage: r.errorMessage,
+		parentRunId: r.parentRunId,
+		startedAtMs: r.startedAtUnixMs,
+		endedAtMs: r.endedAtUnixMs,
+		steps: r.steps.map((s) => ({
+			stepId: s.stepId,
+			parentStepId: s.parentStepId,
+			kind: s.kind,
+			status: s.status as StepStatus,
+			attempt: s.attempt,
+			output: parse(s.output),
+			errorCode: s.errorCode,
+			errorMessage: s.errorMessage,
+			waitingReason: s.waitingReason,
+			waitKey: s.waitKey,
+			childRunId: s.childRunId,
+			compensatesStepId: s.compensatesStepId,
+			startedAtMs: s.startedAtUnixMs,
+			endedAtMs: s.endedAtUnixMs,
+		})),
+		signals: r.signals.map((s) => ({
+			signalName: s.signalName,
+			signalId: s.signalId,
+			payload: parse(s.payload),
+			enqueuedAtMs: s.enqueuedAtUnixMs,
+		})),
 	};
-	return clone(steps) as Step[];
 }

@@ -1,20 +1,22 @@
 # Workflows — Go SDK reference
 
-Durable DAGs. Declare the graph once; the runtime executes it, persists state between steps, survives restarts and compensates on failure or cancel.
+Durable DAGs. Declare the graph once; the runtime interprets it — readiness, timers, waits, child runs, retries with backoff and compensation — and leases task steps (`Local`, `Call`, `Publish`, compensations) to an instance of the owner service.
 
 ## Signatures
 
 ```go signature
 func (d *WorkflowDomain) Handle(name string, def wf.Definition) error
-func (d *WorkflowDomain) Start(ctx context.Context, name string, input any, opts ...StartOption) (string, error)
-func (d *WorkflowDomain) Signal(ctx context.Context, runID, signal string, payload any) error
+func (d *WorkflowDomain) Start(ctx context.Context, service, name string, input any, opts ...StartOption) (string, error)
+func (d *WorkflowDomain) Signal(ctx context.Context, runID, signal string, payload any, opts ...SignalOption) (duplicate bool, err error)
 func (d *WorkflowDomain) Cancel(ctx context.Context, runID string) error
 func (d *WorkflowDomain) Await(ctx context.Context, runID string) (map[string]any, error)
 func (d *WorkflowDomain) Query(ctx context.Context, runID string) (RunSnapshot, error)
 func (d *WorkflowDomain) Replay(ctx context.Context, runID, fromStepID string) (string, error)
+func (d *WorkflowDomain) RetryCompensation(ctx context.Context, runID string) error
 
 func WithRunIdempotencyKey(key string) StartOption
-func WithRunTimeoutSec(sec int) StartOption
+func WithRunTimeout(d time.Duration) StartOption
+func WithSignalID(id string) SignalOption
 ```
 
 Import: `wf "github.com/service-bridge/sdk/go/workflow"`.
@@ -25,7 +27,8 @@ Import: `wf "github.com/service-bridge/sdk/go/workflow"`.
 - **A `call` step reaches an ordinary typed handler.** Its JSON tree is read into the callee's protobuf request and its reply comes back as JSON, through the pair of types declared with `NewMethod`. See "Call steps need a declared dependency".
 - **Top-level steps start in parallel.** `WaitFor` declares the dependencies that create the execution levels.
 - **The step set is closed** — the `wf.Step` marker method is unexported, so a graph can never carry a kind the runtime does not know.
-- **The graph executes in the declaring process.** The runtime assigns a step; the body comes from the locally declared graph. That is what makes `wf.Local` possible.
+- **The runtime holds the run.** Sleeps, waits and child runs are runtime-held; an instance crash loses nothing. A task is leased per attempt and renewed by heartbeat; a lost instance's task goes to another one when the lease expires.
+- **`wf.Local` is found by `ID` and `Definition.Version`.** The closure never reaches the runtime — bump `Version` when it changes.
 
 ## Step kinds
 
@@ -33,17 +36,17 @@ Import: `wf "github.com/service-bridge/sdk/go/workflow"`.
 |---|---|
 | `wf.Call` | `Service`, `Method` (`Target`), `Input`, `Opts *CallOpts` |
 | `wf.Publish` | `Event` (`Target`), `Input`, `Opts *PublishOpts` |
-| `wf.Sleep` | `DurationSec int64` (runtime-held durable timer) |
-| `wf.WaitEvent` | `Event` (`Target`), `Filter map[string]any` |
+| `wf.Sleep` | `Duration time.Duration` (runtime-held durable timer) |
+| `wf.WaitEvent` | `Event string`, `Filter map[string]any` (payload path → value or `Path`) |
 | `wf.WaitSignal` | `Signal string` |
-| `wf.SubWorkflow` | `Workflow` (`Target`), `Input`, `Opts *StartOpts` |
+| `wf.SubWorkflow` | `Service` (`Target`, nil = own), `Workflow` (`Target`), `Input`, `IdempotencyKey`, `Timeout` |
 | `wf.Parallel` | `Steps []Step`, `ForEach *ForEach` |
 | `wf.Sequence` | `Steps []Step`, `ForEach *ForEach` |
 | `wf.Local` | `Fn LocalFunc` |
 
-Every kind embeds `wf.Control{ID, WaitFor, When, Compensate, TimeoutSec, Retry}`.
+Every kind embeds `wf.Control{ID, WaitFor, When, Compensate, Timeout, Retry}`.
 
-`Control.TimeoutSec` bounds the **step** (expiry starts compensation). `CallOpts.Timeout` bounds the underlying RPC. They are different things.
+`Control.Timeout` is the **step** deadline (expiry fails the step and stops the run). `CallOpts.Timeout` bounds the underlying RPC. `Control.Retry` (else `Definition.Retry`) is applied by the runtime between task attempts.
 
 ## Call steps need a declared dependency
 
@@ -75,7 +78,7 @@ Two string types keep expressions and data apart, so a literal that looks like a
 - `wf.Path("$.charge.transactionId")` — read from run state when the step executes.
 - `wf.Name("payment-svc")` — a literal written at declaration.
 
-Grammar: `$` followed by any number of `.field`, `[N]` and `[*]`. `[*].field` collects that field from every element into an array. A path that leads nowhere resolves to `nil`, not an error — a step skipped by its condition leaves nothing behind.
+Grammar: `$` followed by any number of `.field`, `[N]` and `[*]`. `[*].field` collects that field from every element into an array. The runtime resolves paths when the step activates. A path that leads nowhere is "no value" — a step skipped by its condition has output `nil`. Inside a `ForEach` iteration the `As` name and iteration siblings' plain ids are in scope.
 
 `Path` resolves at any depth inside a value tree, so `Input` can be a `map[string]any` mixing literals and paths.
 
@@ -93,6 +96,7 @@ import (
 	"errors"
 	"log"
 	"os"
+	"time"
 
 	sb "github.com/service-bridge/sdk/go"
 	wf "github.com/service-bridge/sdk/go/workflow"
@@ -114,18 +118,20 @@ func main() {
 			},
 			"required": []any{"orderId"},
 		},
-		TimeoutSec: 900,
+		Version: "1",
+		Timeout: 15 * time.Minute,
 		Steps: []wf.Step{
 			// Compensated call: the reverse action reads THIS step's output.
 			wf.Call{
 				Control: wf.Control{
 					ID: "reserve",
 					Compensate: &wf.Compensation{
-						Kind:           wf.CompensateCall,
-						Service:        wf.Name("inventory-svc"),
-						Method:         wf.Name("Release"),
-						Input:          wf.Path("$.reserve"),
-						IdempotencyKey: wf.Path("$.input.orderId"),
+						Kind:     wf.CompensateCall,
+						Service:  wf.Name("inventory-svc"),
+						Method:   wf.Name("Release"),
+						Input:    wf.Path("$.reserve"),
+						Retry:    &wf.RetryPolicy{MaxAttempts: 3, BaseDelay: time.Second},
+						CallOpts: &wf.CallOpts{IdempotencyKey: wf.Path("$.input.orderId")},
 					},
 				},
 				Service: wf.Name("inventory-svc"),
@@ -133,13 +139,12 @@ func main() {
 				Input:   wf.Path("$.input"),
 			},
 			wf.Call{
-				Control: wf.Control{ID: "charge", WaitFor: []string{"reserve"}, TimeoutSec: 30},
+				Control: wf.Control{ID: "charge", WaitFor: []string{"reserve"}, Timeout: 30 * time.Second},
 				Service: wf.Name("payment-svc"),
 				Method:  wf.Name("Charge"),
 				Input:   wf.Path("$.input"),
 			},
-			// A Go closure that runs in THIS process. Not part of the frozen
-			// graph or the fingerprint — the step is identified by its ID.
+			// A Go closure that runs in THIS process, found by ID and Version.
 			wf.Local{
 				Control: wf.Control{ID: "score", WaitFor: []string{"charge"}},
 				Fn: func(ctx context.Context, state map[string]any) (any, error) {
@@ -178,8 +183,8 @@ func main() {
 			},
 			// Park on a durable timer, then wait for a human.
 			wf.Sleep{
-				Control:     wf.Control{ID: "cooldown", WaitFor: []string{"notify_all"}},
-				DurationSec: 300,
+				Control:  wf.Control{ID: "cooldown", WaitFor: []string{"notify_all"}},
+				Duration: 5 * time.Minute,
 			},
 			wf.WaitSignal{
 				Control: wf.Control{ID: "await_approval", WaitFor: []string{"cooldown"}},
@@ -187,7 +192,7 @@ func main() {
 			},
 		},
 	}); err != nil {
-		log.Fatal(err) // CodeValidation names the step and the field
+		log.Fatal(err) // only what cannot be encoded; the runtime validates at Start
 	}
 
 	ctx := context.Background()
@@ -196,10 +201,10 @@ func main() {
 	}
 	defer func() { _ = c.Stop(ctx) }()
 
-	runID, err := c.Workflow.Start(ctx, "checkout",
+	runID, err := c.Workflow.Start(ctx, "orders-svc", "checkout",
 		map[string]any{"orderId": "o-1", "recipients": []any{"a@example.com"}},
 		sb.WithRunIdempotencyKey("checkout-o-1"), // a repeat returns the same run
-		sb.WithRunTimeoutSec(600),
+		sb.WithRunTimeout(10*time.Minute),
 	)
 	if err != nil {
 		log.Fatal(err)
@@ -209,22 +214,23 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Println("status:", snap.Status, "steps:", len(snap.Steps))
+	log.Println("status:", snap.Status, "waiting:", snap.WaitingReason)
 
-	if err := c.Workflow.Signal(ctx, runID, "approval", map[string]any{"ok": true}); err != nil {
+	if _, err := c.Workflow.Signal(ctx, runID, "approval", map[string]any{"ok": true}, sb.WithSignalID("approve-o-1")); err != nil {
 		log.Fatal(err)
 	}
 
-	// Await returns state ONLY for a successful run. Cancelled or compensated
-	// comes back as CodeTerminal — there is no result to hand back.
+	// Await returns the output ONLY for a successful run; any other end is an
+	// error wrapping *sb.RunFailedError.
 	state, err := c.Workflow.Await(ctx, runID)
+	var failed *sb.RunFailedError
 	switch {
-	case errors.Is(err, sb.ErrTerminal):
-		log.Println("run ended without success")
+	case errors.As(err, &failed):
+		log.Println("run ended", failed.Status, failed.ErrorCode)
 	case err != nil:
 		log.Fatal(err)
 	default:
-		log.Println("final state:", state)
+		log.Println("output:", state)
 	}
 }
 ```
@@ -233,23 +239,26 @@ func main() {
 
 | Call | Behaviour |
 |---|---|
-| `Start` | Returns the run id. `WithRunIdempotencyKey` makes a repeat return the existing run. |
-| `Query` | One request, no waiting: `RunSnapshot{RunID, Status, State, Steps}`; each `StepSnapshot` has `StepID`, `Status`, `Output`, `LastError`, `CompensatedBy`. Status strings come from the runtime. |
-| `Signal` | Delivers to a run parked on a matching `WaitSignal`. |
-| `Cancel` | Compensates what was already done, in reverse. |
-| `Await` | Blocks until terminal. **No SDK-side timeout** — only your `ctx` bounds it. Returns state on success, `CodeTerminal` otherwise. |
-| `Replay` | Forks a finished run into a **new** one from `fromStepID` onward; an empty id replays the whole run. Returns the new run id. |
+| `Start` | Returns the run id of `(service, name)`. `WithRunIdempotencyKey` makes a repeat return the existing run; `WithRunTimeout` ends it `timed_out`. |
+| `Query` | `RunSnapshot`: `Status`, `StopReason`, `WaitingReason` (`no_instance`, `retry`, `sleep`, `signal`, `event`, `child`), `Output`, steps (`Status`, `Attempt`, `ErrorCode`, `ErrorMessage`, `WaitKey`, `ChildRunID`, `CompensatesStepID`) and queued signals. |
+| `Signal` | FIFO queue per run; `WithSignalID` dedups a resend (`duplicate == true`). At most 1000 unconsumed signals. |
+| `Cancel` | Compensates what was already done, in reverse; ends `cancelled`. |
+| `Await` | Blocks until terminal (only `ctx` bounds it). Output on success, `*sb.RunFailedError` (code `CodeTerminal`) otherwise. |
+| `Replay` | A **new** run from the frozen plan and input; with `fromStepID` (top-level step) the successful steps that do not depend on it are copied. |
+| `RetryCompensation` | Re-runs the failed compensations of a `failed_compensated` run. |
 
-Codes: `CodeNotFound` (unknown workflow), `CodeAccessDenied`, `CodeTerminal` (signal/cancel on a finished run, or a non-success `Await`), `CodeValidation` (refused declaration).
+Run statuses: `active`, `compensating`, `success`, `failed`, `cancelled`, `timed_out`, `failed_compensated`. Signal/Query/Await/Cancel/Replay/RetryCompensation are allowed for the owner, the starter and callers with an explicit `workflow.run` rule.
 
-## Validation at declaration
+Codes: `CodeNotFound`, `CodeAccessDenied`, `CodeTerminal` (signal/cancel on a finished run, retry of a run that is not `failed_compensated`, non-success `Await`).
 
-`c.Workflow.Handle` freezes the graph and refuses an invalid one before anything reaches the runtime. Checked: non-empty name and at least one step; `ID` matching `^[a-z0-9_]+$` and unique across the whole graph including nesting; `WaitFor` resolving with no cycle; compensation only on `Call` and `Publish`; non-empty targets; every `Path` parsing (in values, filters, options and predicates); no self-referencing `SubWorkflow`; non-negative `Sleep.DurationSec`; non-nil `Local.Fn`; non-empty groups; `ForEach.As` in the step-id alphabet; depth ≤ 10; ≤ 500 steps.
+## Validation
+
+`c.Workflow.Handle` only encodes the graph; the runtime validates it at registration and `c.Start` returns its refusal (`InvalidArgument` naming the step and the rule). Checked by the runtime: `ID` matching `^[a-z0-9_]+$`, not `input`, unique across the graph; `WaitFor` naming siblings with no cycle; compensation only on `Call` / `Publish`; every `Path` parsing; no direct self-referencing `SubWorkflow`; positive `Sleep.Duration`; `MaxParallelism` ≤ 1024; depth ≤ 10; ≤ 500 steps. A workflow name another live service declares is refused (`AlreadyExists`).
 
 ## Gotchas
 
 - `c.Workflow.Handle` after `Start` → `CodeState`.
-- Compensation on anything but `Call` / `Publish` → validation error.
 - Step ids allow only `[a-z0-9_]` — no dashes, no camelCase.
 - Do not put a protobuf message into a step input: run state is JSON.
-- `wf.Local` bodies must be declared in every process that may execute the run.
+- Keep every `Definition.Version` with live runs deployed somewhere; a task for a missing version fails with `UNSUPPORTED_VERSION`.
+- `wf.Local` must stop on `ctx.Done()`: a lost lease or step deadline cancels it.

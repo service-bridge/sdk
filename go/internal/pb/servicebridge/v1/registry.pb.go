@@ -241,7 +241,11 @@ type IncomingMethod struct {
 	Streaming        bool                   `protobuf:"varint,5,opt,name=streaming,proto3" json:"streaming,omitempty"`
 	// SDK-supplied contract hash (hex SHA-256). Runtime stores opaque,
 	// does not recompute. Empty for non-RPC method types (event/workflow/job/http).
-	ContractHash  string `protobuf:"bytes,6,opt,name=contract_hash,json=contractHash,proto3" json:"contract_hash,omitempty"`
+	ContractHash string `protobuf:"bytes,6,opt,name=contract_hash,json=contractHash,proto3" json:"contract_hash,omitempty"`
+	// Workflow definition of a METHOD_TYPE_WORKFLOW method. The runtime
+	// validates it and computes its fingerprint (input/output schema and
+	// contract_hash are unused for workflows).
+	Workflow      *WorkflowDefinition `protobuf:"bytes,7,opt,name=workflow,proto3" json:"workflow,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -316,6 +320,13 @@ func (x *IncomingMethod) GetContractHash() string {
 		return x.ContractHash
 	}
 	return ""
+}
+
+func (x *IncomingMethod) GetWorkflow() *WorkflowDefinition {
+	if x != nil {
+		return x.Workflow
+	}
+	return nil
 }
 
 type PublishedEvent struct {
@@ -1487,21 +1498,22 @@ var File_servicebridge_v1_registry_proto protoreflect.FileDescriptor
 
 const file_servicebridge_v1_registry_proto_rawDesc = "" +
 	"\n" +
-	"\x1fservicebridge/v1/registry.proto\x12\x10servicebridge.v1\"\xc6\x02\n" +
+	"\x1fservicebridge/v1/registry.proto\x12\x10servicebridge.v1\x1a servicebridge/v1/workflows.proto\"\xc6\x02\n" +
 	"\fCaptureModes\x12/\n" +
 	"\x03rpc\x18\x01 \x01(\x0e2\x1d.servicebridge.v1.CaptureModeR\x03rpc\x121\n" +
 	"\x04http\x18\x02 \x01(\x0e2\x1d.servicebridge.v1.CaptureModeR\x04http\x123\n" +
 	"\x05event\x18\x03 \x01(\x0e2\x1d.servicebridge.v1.CaptureModeR\x05event\x129\n" +
 	"\bworkflow\x18\x04 \x01(\x0e2\x1d.servicebridge.v1.CaptureModeR\bworkflow\x12+\n" +
 	"\x11telemetry_enabled\x18\x06 \x01(\bR\x10telemetryEnabled\x12*\n" +
-	"\x11payload_max_bytes\x18\a \x01(\x05R\x0fpayloadMaxBytesJ\x04\b\x05\x10\x06R\x03job\"\xf3\x01\n" +
+	"\x11payload_max_bytes\x18\a \x01(\x05R\x0fpayloadMaxBytesJ\x04\b\x05\x10\x06R\x03job\"\xb5\x02\n" +
 	"\x0eIncomingMethod\x120\n" +
 	"\x04type\x18\x01 \x01(\x0e2\x1c.servicebridge.v1.MethodTypeR\x04type\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12*\n" +
 	"\x11input_schema_json\x18\x03 \x01(\fR\x0finputSchemaJson\x12,\n" +
 	"\x12output_schema_json\x18\x04 \x01(\fR\x10outputSchemaJson\x12\x1c\n" +
 	"\tstreaming\x18\x05 \x01(\bR\tstreaming\x12#\n" +
-	"\rcontract_hash\x18\x06 \x01(\tR\fcontractHash\"j\n" +
+	"\rcontract_hash\x18\x06 \x01(\tR\fcontractHash\x12@\n" +
+	"\bworkflow\x18\a \x01(\v2$.servicebridge.v1.WorkflowDefinitionR\bworkflow\"j\n" +
 	"\x0ePublishedEvent\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1f\n" +
 	"\vschema_json\x18\x02 \x01(\fR\n" +
@@ -1654,6 +1666,7 @@ var file_servicebridge_v1_registry_proto_goTypes = []any{
 	(*PolicyEvaluation)(nil),            // 15: servicebridge.v1.PolicyEvaluation
 	(*PolicyRule)(nil),                  // 16: servicebridge.v1.PolicyRule
 	(*PolicyViolation)(nil),             // 17: servicebridge.v1.PolicyViolation
+	(*WorkflowDefinition)(nil),          // 18: servicebridge.v1.WorkflowDefinition
 }
 var file_servicebridge_v1_registry_proto_depIdxs = []int32{
 	1,  // 0: servicebridge.v1.CaptureModes.rpc:type_name -> servicebridge.v1.CaptureMode
@@ -1661,37 +1674,38 @@ var file_servicebridge_v1_registry_proto_depIdxs = []int32{
 	1,  // 2: servicebridge.v1.CaptureModes.event:type_name -> servicebridge.v1.CaptureMode
 	1,  // 3: servicebridge.v1.CaptureModes.workflow:type_name -> servicebridge.v1.CaptureMode
 	0,  // 4: servicebridge.v1.IncomingMethod.type:type_name -> servicebridge.v1.MethodType
-	0,  // 5: servicebridge.v1.OutgoingDep.type:type_name -> servicebridge.v1.MethodType
-	3,  // 6: servicebridge.v1.RegisterRequest.incoming:type_name -> servicebridge.v1.IncomingMethod
-	4,  // 7: servicebridge.v1.RegisterRequest.published:type_name -> servicebridge.v1.PublishedEvent
-	5,  // 8: servicebridge.v1.RegisterRequest.outgoing:type_name -> servicebridge.v1.OutgoingDep
-	6,  // 9: servicebridge.v1.RegisterRequest.event_subscriptions:type_name -> servicebridge.v1.EventSubscription
-	0,  // 10: servicebridge.v1.MethodDescriptor.type:type_name -> servicebridge.v1.MethodType
-	8,  // 11: servicebridge.v1.RegistrySnapshot.methods:type_name -> servicebridge.v1.MethodDescriptor
-	9,  // 12: servicebridge.v1.RegistrySnapshot.instances:type_name -> servicebridge.v1.ServiceInstanceInfo
-	13, // 13: servicebridge.v1.RegistrySnapshot.event_subscriptions:type_name -> servicebridge.v1.EventSubscriptionDescriptor
-	14, // 14: servicebridge.v1.RegistrySnapshot.outgoing_calls:type_name -> servicebridge.v1.OutgoingCallDescriptor
-	15, // 15: servicebridge.v1.RegistrySnapshot.policy:type_name -> servicebridge.v1.PolicyEvaluation
-	2,  // 16: servicebridge.v1.RegistrySnapshot.capture_modes:type_name -> servicebridge.v1.CaptureModes
-	8,  // 17: servicebridge.v1.RegistryUpdate.added:type_name -> servicebridge.v1.MethodDescriptor
-	8,  // 18: servicebridge.v1.RegistryUpdate.removed:type_name -> servicebridge.v1.MethodDescriptor
-	9,  // 19: servicebridge.v1.RegistryUpdate.added_instances:type_name -> servicebridge.v1.ServiceInstanceInfo
-	9,  // 20: servicebridge.v1.RegistryUpdate.removed_instances:type_name -> servicebridge.v1.ServiceInstanceInfo
-	15, // 21: servicebridge.v1.RegistryUpdate.policy:type_name -> servicebridge.v1.PolicyEvaluation
-	2,  // 22: servicebridge.v1.RegistryUpdate.capture_modes:type_name -> servicebridge.v1.CaptureModes
-	10, // 23: servicebridge.v1.RegistryEvent.snapshot:type_name -> servicebridge.v1.RegistrySnapshot
-	11, // 24: servicebridge.v1.RegistryEvent.update:type_name -> servicebridge.v1.RegistryUpdate
-	0,  // 25: servicebridge.v1.OutgoingCallDescriptor.target_type:type_name -> servicebridge.v1.MethodType
-	16, // 26: servicebridge.v1.PolicyEvaluation.egress:type_name -> servicebridge.v1.PolicyRule
-	16, // 27: servicebridge.v1.PolicyEvaluation.acceptance:type_name -> servicebridge.v1.PolicyRule
-	17, // 28: servicebridge.v1.PolicyEvaluation.warnings:type_name -> servicebridge.v1.PolicyViolation
-	7,  // 29: servicebridge.v1.Registry.RegisterAndWatch:input_type -> servicebridge.v1.RegisterRequest
-	12, // 30: servicebridge.v1.Registry.RegisterAndWatch:output_type -> servicebridge.v1.RegistryEvent
-	30, // [30:31] is the sub-list for method output_type
-	29, // [29:30] is the sub-list for method input_type
-	29, // [29:29] is the sub-list for extension type_name
-	29, // [29:29] is the sub-list for extension extendee
-	0,  // [0:29] is the sub-list for field type_name
+	18, // 5: servicebridge.v1.IncomingMethod.workflow:type_name -> servicebridge.v1.WorkflowDefinition
+	0,  // 6: servicebridge.v1.OutgoingDep.type:type_name -> servicebridge.v1.MethodType
+	3,  // 7: servicebridge.v1.RegisterRequest.incoming:type_name -> servicebridge.v1.IncomingMethod
+	4,  // 8: servicebridge.v1.RegisterRequest.published:type_name -> servicebridge.v1.PublishedEvent
+	5,  // 9: servicebridge.v1.RegisterRequest.outgoing:type_name -> servicebridge.v1.OutgoingDep
+	6,  // 10: servicebridge.v1.RegisterRequest.event_subscriptions:type_name -> servicebridge.v1.EventSubscription
+	0,  // 11: servicebridge.v1.MethodDescriptor.type:type_name -> servicebridge.v1.MethodType
+	8,  // 12: servicebridge.v1.RegistrySnapshot.methods:type_name -> servicebridge.v1.MethodDescriptor
+	9,  // 13: servicebridge.v1.RegistrySnapshot.instances:type_name -> servicebridge.v1.ServiceInstanceInfo
+	13, // 14: servicebridge.v1.RegistrySnapshot.event_subscriptions:type_name -> servicebridge.v1.EventSubscriptionDescriptor
+	14, // 15: servicebridge.v1.RegistrySnapshot.outgoing_calls:type_name -> servicebridge.v1.OutgoingCallDescriptor
+	15, // 16: servicebridge.v1.RegistrySnapshot.policy:type_name -> servicebridge.v1.PolicyEvaluation
+	2,  // 17: servicebridge.v1.RegistrySnapshot.capture_modes:type_name -> servicebridge.v1.CaptureModes
+	8,  // 18: servicebridge.v1.RegistryUpdate.added:type_name -> servicebridge.v1.MethodDescriptor
+	8,  // 19: servicebridge.v1.RegistryUpdate.removed:type_name -> servicebridge.v1.MethodDescriptor
+	9,  // 20: servicebridge.v1.RegistryUpdate.added_instances:type_name -> servicebridge.v1.ServiceInstanceInfo
+	9,  // 21: servicebridge.v1.RegistryUpdate.removed_instances:type_name -> servicebridge.v1.ServiceInstanceInfo
+	15, // 22: servicebridge.v1.RegistryUpdate.policy:type_name -> servicebridge.v1.PolicyEvaluation
+	2,  // 23: servicebridge.v1.RegistryUpdate.capture_modes:type_name -> servicebridge.v1.CaptureModes
+	10, // 24: servicebridge.v1.RegistryEvent.snapshot:type_name -> servicebridge.v1.RegistrySnapshot
+	11, // 25: servicebridge.v1.RegistryEvent.update:type_name -> servicebridge.v1.RegistryUpdate
+	0,  // 26: servicebridge.v1.OutgoingCallDescriptor.target_type:type_name -> servicebridge.v1.MethodType
+	16, // 27: servicebridge.v1.PolicyEvaluation.egress:type_name -> servicebridge.v1.PolicyRule
+	16, // 28: servicebridge.v1.PolicyEvaluation.acceptance:type_name -> servicebridge.v1.PolicyRule
+	17, // 29: servicebridge.v1.PolicyEvaluation.warnings:type_name -> servicebridge.v1.PolicyViolation
+	7,  // 30: servicebridge.v1.Registry.RegisterAndWatch:input_type -> servicebridge.v1.RegisterRequest
+	12, // 31: servicebridge.v1.Registry.RegisterAndWatch:output_type -> servicebridge.v1.RegistryEvent
+	31, // [31:32] is the sub-list for method output_type
+	30, // [30:31] is the sub-list for method input_type
+	30, // [30:30] is the sub-list for extension type_name
+	30, // [30:30] is the sub-list for extension extendee
+	0,  // [0:30] is the sub-list for field type_name
 }
 
 func init() { file_servicebridge_v1_registry_proto_init() }
@@ -1699,6 +1713,7 @@ func file_servicebridge_v1_registry_proto_init() {
 	if File_servicebridge_v1_registry_proto != nil {
 		return
 	}
+	file_servicebridge_v1_workflows_proto_init()
 	file_servicebridge_v1_registry_proto_msgTypes[10].OneofWrappers = []any{
 		(*RegistryEvent_Snapshot)(nil),
 		(*RegistryEvent_Update)(nil),

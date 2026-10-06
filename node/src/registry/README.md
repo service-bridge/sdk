@@ -15,7 +15,6 @@
 | `MethodType` | enum (re-export из pb) | — | Тип метода: RPC / EVENT / WORKFLOW / JOB / HTTP |
 | `MethodDescriptor` | type (re-export из pb) | — | Дескриптор видимого метода в snapshot'е `sb.serviceMap()` |
 | `RpcHandlerOpts` | interface | — | Опции RPC/stream-хендлера (см. ниже) |
-| `WorkflowHandlerOpts` | interface | — | Опции workflow-хендлера (см. ниже) |
 | `ServiceDeps` | interface | — | Декларация исходящих зависимостей для `sb.service(name, deps)` |
 
 `RpcHandlerOpts`:
@@ -24,12 +23,6 @@
 |------|-----|--------------|------------|
 | `schema` | `SchemaSpec` | — (обязательно) | `.proto`-файл + имена сообщений (или `.schema.json`) для input и output; нужен для decode/encode и contract-hash (ADR 0001) |
 | `captureMode?` | `CaptureMode` (`"all"\|"errors"\|"none"`) | runtime-pushed режим RPC-канала | Per-handler override payload-capture. Может только СУЖАТЬ runtime-режим (`none < errors < all`), не расширять |
-
-`WorkflowHandlerOpts`:
-
-| Поле | Тип | По умолчанию | Что делает |
-|------|-----|--------------|------------|
-| `input?` | `Record<string, unknown>` | нет | JSON-схема стартового state. Финального output у workflow нет: каждый step возвращает обновлённый state |
 
 `ServiceDeps`:
 
@@ -58,7 +51,7 @@
 | `Handle.event(pattern, fn)` | — | — | Регистрирует обработчик Durable Event; `pattern` — точное имя или AMQP wildcard. Схема payload-а живёт у publisher'а (`publishEvent`) |
 | `Handle.publishEvent(name, spec?)` | — | `spec` undefined | Объявляет published event (publisher-side). `spec` — `SchemaSpec`; async-загрузка в общий `pending[]`. `contractHash` считается через `computeEventContractHash(pair.input)`: у события нет ответа, объявленный в spec output в идентичность не входит. Idempotent re-define по reference identity `spec`; иной spec — throws (ADR-0002) |
 | `Handle.getPublishedEvent(name)` | `{contractHash, pair} \| undefined` | — | Schema-lookup для Publisher / Subscriber. undefined для schema-less event или до finalize() |
-| `Handle.workflow(name, steps, opts?, graphJson?, contractHash?)` | — | — | Регистрирует workflow. `graphJson` (ADR-W-002) перекрывает schema-derived input; `contractHash` едет как `IncomingMethod.contract_hash` |
+| `Handle.workflow(name, definition)` | — | — | Регистрирует workflow: структурированный `WorkflowDefinition` едет как `IncomingMethod.workflow`; fingerprint считает runtime. |
 | `Handle.job(name, contractHash, specJson, fn)` | — | — | Регистрирует scheduled job. `specJson` — canonical spec (CanonicalJobSpec); `fn` хранится локально, не едет по wire |
 | `Handle.finalize()` | `Promise<void>` | — | Ожидает async-загрузок `SchemaPair` (rpc/stream + publishEvent). Вызывается `ServiceBridge.start()` до `buildRegisterRequest()` |
 | `Handle.incomingMethods()` | `PbIncomingMethod[]` | — | Все типы КРОМЕ EVENT (события едут только через `event_subscriptions`); contract_hash из override или из `SchemaPair` |
@@ -121,6 +114,6 @@
 Используется в:
 - `src/connection/service-bridge.ts` — `Registry`, `WatchStream`, `Handle` встроены в `ServiceBridge`
 - `src/connection/session.ts`, `src/rpc/instance-cache.ts` — типы `WatchStream`
-- `src/events/subscriber.ts`, `src/job/subscriber.ts`, `src/workflow/subscriber.ts` — `StreamSupervisor`
-- `src/{rpc,events,workflow,job}/domain.ts` — типы `Registry`, `RpcHandlerFn`, `RpcStreamHandlerFn`, `WorkflowHandlerOpts`
-- top-level `index.ts` (через `ServiceBridge`) — re-export `MethodType`, `MethodDescriptor`, `RpcHandlerOpts`, `WorkflowHandlerOpts`, `ServiceDeps`
+- `src/events/subscriber.ts`, `src/job/subscriber.ts`, `src/workflow/executor.ts` — `StreamSupervisor`
+- `src/{rpc,events,workflow,job}/domain.ts` — типы `Registry`, `RpcHandlerFn`, `RpcStreamHandlerFn`
+- top-level `index.ts` (через `ServiceBridge`) — re-export `MethodType`, `MethodDescriptor`, `RpcHandlerOpts`, `ServiceDeps`

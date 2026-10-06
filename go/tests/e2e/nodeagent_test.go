@@ -371,50 +371,6 @@ func (a *nodeAgent) awaitWorkflow(ctx context.Context, runID string) (map[string
 	return out, nil
 }
 
-// nodeWorkflowFingerprint runs nodeagent/workflow-fingerprint.ts once, out of
-// process, and returns the Node SDK's own canonical JSON + fingerprint for
-// graph. It needs no runtime connection: canonicalize/fingerprint are pure
-// functions of the graph, so this is the fastest, most direct way to prove the
-// two SDKs render byte-identical bytes for the same workflow — a runtime round
-// trip would only prove the graph parses, not that the bytes matched.
-func nodeWorkflowFingerprint(ctx context.Context, t *testing.T, graph any) (canonicalJSON, fingerprint string) {
-	t.Helper()
-
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Fatalf("bun is not on PATH: %v", err)
-	}
-	root, err := repoDir()
-	if err != nil {
-		t.Fatalf("resolve package directory: %v", err)
-	}
-	script := filepath.Join(root, "nodeagent", "workflow-fingerprint.ts")
-	nodeSrc := filepath.Join(suite.sdkRepo, "node", "src")
-
-	graphJSON, err := json.Marshal(graph)
-	if err != nil {
-		t.Fatalf("encode graph: %v", err)
-	}
-
-	cmd := exec.CommandContext(ctx, bun, "run", script, nodeSrc, string(graphJSON))
-	cmd.Dir = filepath.Join(suite.sdkRepo, "node")
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("workflow-fingerprint.ts failed: %v\nstderr:\n%s", err, stderr.String())
-	}
-
-	var out struct {
-		Canonical   string `json:"canonical"`
-		Fingerprint string `json:"fingerprint"`
-	}
-	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &out); err != nil {
-		t.Fatalf("decode workflow-fingerprint.ts output %s: %v", stdout.String(), err)
-	}
-	return out.Canonical, out.Fingerprint
-}
-
 // stop asks the agent to close its client, then makes sure the process is gone:
 // a surviving agent keeps the identity's Events.Subscribe stream and the next
 // test on it would be refused.

@@ -80,8 +80,7 @@ import {
   WorkflowAccessDeniedError, // workflow.start denied by policy
   WorkflowNotFoundError,     // workflow.start on unknown name
   WorkflowTerminalError,     // signal/cancel on a terminal run
-  WorkflowValidationError,   // workflow.handle on an invalid graph
-  JsonPathError,             // bad $. expression during a run
+  WorkflowRunFailedError,    // workflow.await on a run that did not succeed
   InvalidEventNameError,     // bad event name
   OutboxFullError,           // event outbox at cap
 } from "service-bridge";

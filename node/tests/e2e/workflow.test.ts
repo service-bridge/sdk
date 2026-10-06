@@ -24,20 +24,26 @@ import {
 import { addRule, allServiceIDs, withDb } from "./_helpers/policy-db";
 import {
 	addWorkflowRule,
+	awaitParked,
 	awaitPolicyLive,
 	awaitRunStatus,
+	isParked,
 	startWorkflowWhenAllowed,
+	stateOf,
+	svcName,
 } from "./_helpers/wf.ts";
 
 const COMP_PROTO = join(import.meta.dir, "_helpers", "compensation.proto");
 
 const TERMINAL = (s: string) =>
-	s === "success" || s === "failed" || s === "cancelled";
-const TERMINAL_WITH_COMP = (s: string) =>
-	s === "success" ||
-	s === "failed" ||
-	s === "cancelled" ||
-	s === "failed_compensated";
+	[
+		"success",
+		"failed",
+		"cancelled",
+		"timed_out",
+		"failed_compensated",
+	].includes(s);
+const TERMINAL_WITH_COMP = TERMINAL;
 
 async function runFingerprint(runId: string): Promise<string> {
 	return withDb(async (sql) => {
@@ -134,7 +140,7 @@ async function awaitAllWaiting(
 		const states = await Promise.all(
 			runs.map((r) => caller.workflow.query(r.runId)),
 		);
-		if (states.every((s) => s.status === "waiting")) return;
+		if (states.every(isParked)) return;
 		await new Promise((r) => setTimeout(r, 50));
 	}
 	throw new Error("timeout waiting for: all runs parked on wait_event");
@@ -191,7 +197,7 @@ describe("workflow", () => {
 		const callerID = caller.identity()!.serviceId;
 		await addWorkflowRule(callerID, ownerID, wfName);
 
-		const { runId } = await startWorkflowWhenAllowed(caller, wfName, {
+		const { runId } = await startWorkflowWhenAllowed(caller, owner!, wfName, {
 			hello: "world",
 		});
 		expect(runId).toMatch(/^[0-9a-f-]{36}$/);
@@ -201,9 +207,9 @@ describe("workflow", () => {
 
 		const q = await caller.workflow.query(runId);
 		expect(q.status).toBe("success");
-		expect(q.state.step_one).toEqual({ value: 1 });
-		expect(q.state.step_two).toEqual({ value: 2 });
-		expect(q.state.step_three).toEqual({ value: 3 });
+		expect(stateOf(q).step_one).toEqual({ value: 1 });
+		expect(stateOf(q).step_two).toEqual({ value: 2 });
+		expect(stateOf(q).step_three).toEqual({ value: 3 });
 		const byId = new Map(q.steps.map((s) => [s.stepId, s]));
 		expect(byId.get("step_one")?.status).toBe("success");
 		expect(byId.get("step_two")?.status).toBe("success");
@@ -235,7 +241,9 @@ describe("workflow", () => {
 		expect(callerID).not.toBe(ownerID);
 		await addWorkflowRule(callerID, ownerID, wfName);
 
-		const { runId } = await startWorkflowWhenAllowed(caller, wfName, { n: 21 });
+		const { runId } = await startWorkflowWhenAllowed(caller, owner!, wfName, {
+			n: 21,
+		});
 
 		// DB: owner_service_id is the OWNER, not the caller.
 		await awaitRunStatus(caller, runId, TERMINAL, 20_000);
@@ -335,7 +343,7 @@ describe("workflow", () => {
 
 		// Valid input first settles registration/policy propagation (it retries
 		// WorkflowNotFound/AccessDenied) and proves valid input still starts a run.
-		const { runId } = await startWorkflowWhenAllowed(caller, wfName, {
+		const { runId } = await startWorkflowWhenAllowed(caller, owner!, wfName, {
 			userId: "u-1",
 		});
 		expect(runId).toMatch(/^[0-9a-f-]{36}$/);
@@ -343,7 +351,7 @@ describe("workflow", () => {
 		// Missing required `userId` — runtime validates BEFORE allocating a run.
 		let err: Error | null = null;
 		try {
-			await caller.workflow.start(wfName, { otherField: "x" });
+			await caller.workflow.start(svcName(owner!), wfName, { otherField: "x" });
 		} catch (e) {
 			err = e as Error;
 		}
@@ -382,7 +390,7 @@ describe("workflow", () => {
 		await addWorkflowRule(callerID, ownerID, wfName);
 
 		// feature "off" makes the `when` predicate false → maybe is skipped.
-		const { runId } = await startWorkflowWhenAllowed(caller, wfName, {
+		const { runId } = await startWorkflowWhenAllowed(caller, owner!, wfName, {
 			feature: "off",
 		});
 		const finalStatus = await awaitRunStatus(caller, runId, TERMINAL, 20_000);
@@ -390,10 +398,10 @@ describe("workflow", () => {
 
 		const q = await caller.workflow.query(runId);
 		expect(q.status).toBe("success");
-		expect(q.state.always).toEqual({ ran: true });
-		expect(q.state.maybe).toBeNull();
+		expect(stateOf(q).always).toEqual({ ran: true });
+		expect(stateOf(q).maybe).toBeNull();
 		// Descendant observed `state.maybe === null`.
-		expect(q.state.tail).toEqual({ maybeSeen: null });
+		expect(stateOf(q).tail).toEqual({ maybeSeen: null });
 	}, 30_000);
 
 	test("publish step writes event_log row with publisher_service=owner", async () => {
@@ -428,7 +436,7 @@ describe("workflow", () => {
 		const callerID = caller.identity()!.serviceId;
 		await addWorkflowRule(callerID, ownerID, wfName);
 
-		const { runId } = await startWorkflowWhenAllowed(caller, wfName, {
+		const { runId } = await startWorkflowWhenAllowed(caller, owner!, wfName, {
 			orderId: "order-7",
 			amount: 12.5,
 			currency: "USD",
@@ -440,7 +448,7 @@ describe("workflow", () => {
 		expect(q.status).toBe("success");
 		const emit = q.steps.find((s) => s.stepId === "emit");
 		expect(emit?.status).toBe("success");
-		const stateEmit = q.state.emit as { eventId?: string } | undefined;
+		const stateEmit = stateOf(q).emit as { eventId?: string } | undefined;
 		expect(stateEmit?.eventId).toMatch(/^[0-9a-f-]{36}$/);
 
 		// DB: event_log row exists with publisher_service = owner.
@@ -505,7 +513,12 @@ describe("workflow", () => {
 		const callerID = caller.identity()!.serviceId;
 		await addWorkflowRule(callerID, ownerID, wfName);
 
-		const { runId } = await startWorkflowWhenAllowed(caller, wfName, {});
+		const { runId } = await startWorkflowWhenAllowed(
+			caller,
+			owner!,
+			wfName,
+			{},
+		);
 		const first = await awaitRunStatus(caller, runId, TERMINAL, 15_000);
 		expect(first).toBe("success");
 		expect(calls).toEqual({ a: 1, b: 1, c: 1 });
@@ -523,9 +536,9 @@ describe("workflow", () => {
 		expect(calls).toEqual({ a: 1, b: 2, c: 2 });
 
 		const q = await owner.workflow.query(replayId);
-		expect(q.state.a).toEqual({ which: "a", call: 1 });
-		expect(q.state.b).toEqual({ which: "b", call: 2 });
-		expect(q.state.c).toEqual({ which: "c", call: 2 });
+		expect(stateOf(q).a).toEqual({ which: "a", call: 1 });
+		expect(stateOf(q).b).toEqual({ which: "b", call: 2 });
+		expect(stateOf(q).c).toEqual({ which: "c", call: 2 });
 	}, 40_000);
 
 	test("static parallel group overlaps — siblings run at the same instant", async () => {
@@ -570,7 +583,12 @@ describe("workflow", () => {
 		const callerID = caller.identity()!.serviceId;
 		await addWorkflowRule(callerID, ownerID, wfName);
 
-		const { runId } = await startWorkflowWhenAllowed(caller, wfName, {});
+		const { runId } = await startWorkflowWhenAllowed(
+			caller,
+			owner!,
+			wfName,
+			{},
+		);
 		const finalStatus = await awaitRunStatus(caller, runId, TERMINAL, 20_000);
 		expect(finalStatus).toBe("success");
 
@@ -579,7 +597,7 @@ describe("workflow", () => {
 		// whether or not the group overlapped, and fails on a loaded one that
 		// overlapped perfectly well.
 		const q = await caller.workflow.query(runId);
-		const g1 = q.state.g1 as Record<
+		const g1 = stateOf(q).g1 as Record<
 			string,
 			{ startedAt: number; doneAt: number }
 		>;
@@ -628,7 +646,7 @@ describe("workflow", () => {
 		const callerID = caller.identity()!.serviceId;
 		await addWorkflowRule(callerID, ownerID, wfName);
 
-		const { runId } = await startWorkflowWhenAllowed(caller, wfName, {
+		const { runId } = await startWorkflowWhenAllowed(caller, owner!, wfName, {
 			items: [1, 2, 3, 4, 5],
 		});
 		const finalStatus = await awaitRunStatus(caller, runId, TERMINAL, 30_000);
@@ -636,7 +654,7 @@ describe("workflow", () => {
 
 		const q = await caller.workflow.query(runId);
 		expect(q.status).toBe("success");
-		const fanout = q.state.track_each as Record<
+		const fanout = stateOf(q).track_each as Record<
 			string,
 			{ item: number; doubled: number }
 		>;
@@ -683,7 +701,7 @@ describe("workflow", () => {
 		const callerID = caller.identity()!.serviceId;
 		await addWorkflowRule(callerID, ownerID, wfName);
 
-		const { runId } = await startWorkflowWhenAllowed(caller, wfName, {
+		const { runId } = await startWorkflowWhenAllowed(caller, owner!, wfName, {
 			items: [],
 		});
 		const finalStatus = await awaitRunStatus(caller, runId, TERMINAL, 20_000);
@@ -692,8 +710,8 @@ describe("workflow", () => {
 		const q = await caller.workflow.query(runId);
 		expect(q.status).toBe("success");
 		// fanout completes with empty group output; tail saw the empty group.
-		expect(q.state.fanout).toEqual({});
-		expect(q.state.tail).toEqual({ fanout: {} });
+		expect(stateOf(q).fanout).toEqual({});
+		expect(stateOf(q).tail).toEqual({ fanout: {} });
 		const fanoutStep = q.steps.find((s) => s.stepId === "fanout");
 		expect(fanoutStep?.status).toBe("success");
 	}, 30_000);
@@ -765,7 +783,12 @@ describe("workflow", () => {
 		await awaitPolicyLive(owner, "egress", "rpc.call", method);
 		await awaitPolicyLive(callee, "acceptance", "rpc.handle", method);
 
-		const { runId } = await startWorkflowWhenAllowed(callee, wfName, {});
+		const { runId } = await startWorkflowWhenAllowed(
+			callee,
+			owner!,
+			wfName,
+			{},
+		);
 		expect(runId).toMatch(/^[0-9a-f-]{36}$/);
 
 		const finalStatus = await awaitRunStatus(
@@ -778,12 +801,12 @@ describe("workflow", () => {
 
 		const q = await callee.workflow.query(runId);
 		expect(q.status).toBe("success");
-		const listOut = q.state.list_items as
+		const listOut = stateOf(q).list_items as
 			| { items?: Array<{ id: number }> }
 			| undefined;
 		expect(listOut?.items).toHaveLength(3);
 		// collect step received the wildcard-aggregated ids and echoed them back.
-		const collectOut = q.state.collect as
+		const collectOut = stateOf(q).collect as
 			| { received?: number[]; count?: number }
 			| undefined;
 		expect(collectOut?.received).toEqual([1, 2, 3]);
@@ -815,7 +838,7 @@ describe("workflow", () => {
 		await addWorkflowRule(ownerID, ownerID, wfX);
 		await addWorkflowRule(ownerID, ownerID, wfY);
 
-		const { runId } = await startWorkflowWhenAllowed(caller, wfX, {});
+		const { runId } = await startWorkflowWhenAllowed(caller, owner!, wfX, {});
 		const final = await awaitRunStatus(caller, runId, TERMINAL, 20_000);
 		expect(final).toBe("failed");
 
@@ -841,7 +864,12 @@ describe("workflow", () => {
 		const callerID = caller.identity()!.serviceId;
 		await addWorkflowRule(callerID, ownerID, wfName);
 
-		const { runId: runA } = await startWorkflowWhenAllowed(caller, wfName, {});
+		const { runId: runA } = await startWorkflowWhenAllowed(
+			caller,
+			owner!,
+			wfName,
+			{},
+		);
 		await awaitRunStatus(caller, runA, TERMINAL, 10_000);
 
 		const fpF1 = await runFingerprint(runA);
@@ -868,7 +896,12 @@ describe("workflow", () => {
 		await awaitDefinitionFingerprint(ownerID, wfName, fpF1);
 
 		// Start run-B — binds to F2.
-		const { runId: runB } = await startWorkflowWhenAllowed(caller, wfName, {});
+		const { runId: runB } = await startWorkflowWhenAllowed(
+			caller,
+			owner!,
+			wfName,
+			{},
+		);
 		await awaitRunStatus(caller, runB, TERMINAL, 10_000);
 
 		const fpF2 = await runFingerprint(runB);
@@ -892,7 +925,7 @@ describe("workflow", () => {
 					type: "wait_signal",
 					id: "approve",
 					signal: signalName,
-					timeoutSec: 60,
+					timeoutMs: 1000 * 60,
 					waitFor: ["pre"],
 				},
 				{
@@ -910,15 +943,15 @@ describe("workflow", () => {
 		const callerID = caller.identity()!.serviceId;
 		await addWorkflowRule(callerID, ownerID, wfName);
 
-		const { runId } = await startWorkflowWhenAllowed(caller, wfName, {});
+		const { runId } = await startWorkflowWhenAllowed(
+			caller,
+			owner!,
+			wfName,
+			{},
+		);
 
 		// Wait until parked on the wait_signal step.
-		await awaitRunStatus(
-			caller,
-			runId,
-			(s) => s === "waiting" || s === "running",
-			10_000,
-		);
+		await awaitParked(caller, runId);
 
 		await caller.workflow.signal(runId, signalName, {
 			approver: "alice",
@@ -930,8 +963,8 @@ describe("workflow", () => {
 
 		const q = await caller.workflow.query(runId);
 		expect(q.status).toBe("success");
-		expect(q.state.approve).toEqual({ approver: "alice", ok: true });
-		expect(q.state.tail).toEqual({ got: { approver: "alice", ok: true } });
+		expect(stateOf(q).approve).toEqual({ approver: "alice", ok: true });
+		expect(stateOf(q).tail).toEqual({ got: { approver: "alice", ok: true } });
 	}, 40_000);
 
 	test("wait_event: non-matching publish ignored, matching publish wakes run with payload", async () => {
@@ -950,7 +983,7 @@ describe("workflow", () => {
 					type: "wait_event",
 					id: "evt",
 					event: eventName,
-					timeoutSec: 60,
+					timeoutMs: 1000 * 60,
 					filter: { "$.orderId": "$.input.orderId" },
 				},
 				{
@@ -973,11 +1006,11 @@ describe("workflow", () => {
 		const callerID = caller.identity()!.serviceId;
 		await addWorkflowRule(callerID, ownerID, wfName);
 
-		const { runId } = await startWorkflowWhenAllowed(caller, wfName, {
+		const { runId } = await startWorkflowWhenAllowed(caller, owner!, wfName, {
 			orderId: "order-match",
 		});
 
-		await awaitRunStatus(caller, runId, (s) => s === "waiting", 10_000);
+		await awaitParked(caller, runId);
 
 		// Non-matching event — must NOT wake the run.
 		await caller.event.publish(eventName, {
@@ -987,7 +1020,7 @@ describe("workflow", () => {
 		});
 		await new Promise((r) => setTimeout(r, 500));
 		const stillWaiting = await caller.workflow.query(runId);
-		expect(stillWaiting.status).toBe("waiting");
+		expect(isParked(stillWaiting)).toBe(true);
 
 		// Matching event — wakes the run.
 		await caller.event.publish(eventName, {
@@ -1001,7 +1034,7 @@ describe("workflow", () => {
 
 		const q = await caller.workflow.query(runId);
 		expect(q.status).toBe("success");
-		const evt = q.state.evt as {
+		const evt = stateOf(q).evt as {
 			orderId?: string;
 			amount?: number;
 			currency?: string;
@@ -1009,7 +1042,7 @@ describe("workflow", () => {
 		expect(evt?.orderId).toBe("order-match");
 		expect(evt?.amount).toBe(99.5);
 		expect(evt?.currency).toBe("USD");
-		expect((q.state.tail as { matched: unknown }).matched).toEqual(evt);
+		expect((stateOf(q).tail as { matched: unknown }).matched).toEqual(evt);
 	}, 40_000);
 
 	test("wait_event fan-out: one publish wakes N parked runs on same event+filter", async () => {
@@ -1028,7 +1061,7 @@ describe("workflow", () => {
 					type: "wait_event",
 					id: "evt",
 					event: eventName,
-					timeoutSec: 60,
+					timeoutMs: 1000 * 60,
 					filter: { "$.currency": "USD" },
 				},
 			],
@@ -1045,10 +1078,12 @@ describe("workflow", () => {
 		await addWorkflowRule(callerID, ownerID, wfName);
 
 		// First run gates registration/policy propagation; the rest start clean.
-		const first = await startWorkflowWhenAllowed(caller, wfName, { idx: 0 });
+		const first = await startWorkflowWhenAllowed(caller, owner!, wfName, {
+			idx: 0,
+		});
 		const rest = await Promise.all([
-			caller.workflow.start(wfName, { idx: 1 }),
-			caller.workflow.start(wfName, { idx: 2 }),
+			caller.workflow.start(svcName(owner!), wfName, { idx: 1 }),
+			caller.workflow.start(svcName(owner!), wfName, { idx: 2 }),
 		]);
 		const runs = [first, ...rest];
 
@@ -1076,7 +1111,7 @@ describe("workflow", () => {
 		for (const r of runs) {
 			const q = await caller.workflow.query(r.runId);
 			expect(q.status).toBe("success");
-			const evt = q.state.evt as { currency?: string };
+			const evt = stateOf(q).evt as { currency?: string };
 			expect(evt?.currency).toBe("USD");
 		}
 	}, 45_000);
@@ -1130,7 +1165,7 @@ describe("workflow", () => {
 		await awaitPolicyLive(owner, "egress", "rpc.call", method);
 		await awaitPolicyLive(callee, "acceptance", "rpc.handle", method);
 
-		const { runId } = await startWorkflowWhenAllowed(callee, wfName, {
+		const { runId } = await startWorkflowWhenAllowed(callee, owner!, wfName, {
 			amount: 99.0,
 		});
 
@@ -1241,7 +1276,7 @@ describe("workflow", () => {
 			await awaitPolicyLive(callee, "acceptance", "rpc.handle", method);
 		}
 
-		const { runId } = await startWorkflowWhenAllowed(callee, wfName, {
+		const { runId } = await startWorkflowWhenAllowed(callee, owner!, wfName, {
 			item_id: "widget-99",
 			quantity: 2,
 			amount: 49.0,
@@ -1253,14 +1288,15 @@ describe("workflow", () => {
 			TERMINAL_WITH_COMP,
 			30_000,
 		);
-		expect(finalStatus).toBe("failed_compensated");
+		// Every compensation succeeded: the run ends failed, not failed_compensated.
+		expect(finalStatus).toBe("failed");
 
 		const q = await callee.workflow.query(runId);
-		expect(q.status).toBe("failed_compensated");
+		expect(q.status).toBe("failed");
 		const byId = new Map(q.steps.map((s) => [s.stepId, s]));
 		// reserve: compensated (has compensate spec).
 		expect(byId.get("reserve")?.status).toBe("compensated");
-		expect(byId.get("reserve")?.compensatedBy).toBe("reserve.compensate");
+		expect(byId.get("reserve.compensate")?.compensatesStepId).toBe("reserve");
 		// log_event: success (local, no compensate spec — runner skips it).
 		expect(byId.get("log_event")?.status).toBe("success");
 		// charge: failed.

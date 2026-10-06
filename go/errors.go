@@ -146,7 +146,7 @@ func classify(err error) Code {
 	case errors.Is(err, wfi.ErrWorkflowNotFound):
 		return CodeNotFound
 
-	case errors.Is(err, wfi.ErrRunTerminal):
+	case errors.Is(err, wfi.ErrRunTerminal), errors.Is(err, wfi.ErrRunFailed):
 		return CodeTerminal
 
 	case errors.Is(err, outbox.ErrFull), errors.Is(err, events.ErrOutboxFull):
@@ -168,8 +168,7 @@ func classify(err error) Code {
 		errors.Is(err, rpc.ErrNoFunc),
 		errors.Is(err, rpc.ErrDuplicate),
 		errors.Is(err, serde.ErrTreeShape),
-		errors.Is(err, registry.ErrSchemaConflict),
-		isValidation(err):
+		errors.Is(err, registry.ErrSchemaConflict):
 		return CodeValidation
 
 	case errors.Is(err, rpc.ErrSealed),
@@ -179,8 +178,7 @@ func classify(err error) Code {
 		return CodeState
 
 	case errors.Is(err, rpc.ErrNoLease),
-		errors.Is(err, wfi.ErrNoIdentity),
-		errors.Is(err, wfi.ErrLeaseLost):
+		errors.Is(err, wfi.ErrNoIdentity):
 		return CodeConnection
 	}
 
@@ -188,17 +186,5 @@ func classify(err error) Code {
 	if errors.As(err, &handlerErr) {
 		return CodeHandler
 	}
-	var validation *wfi.ValidationError
-	if errors.As(err, &validation) {
-		return CodeValidation
-	}
 	return CodeInternal
-}
-
-// isValidation covers the declaration errors the registry and the job layer
-// raise. They all mean the same thing to a caller: the thing you wrote would be
-// refused by the runtime, and it was caught where you wrote it.
-func isValidation(err error) bool {
-	var pathErr *wfi.PathError
-	return errors.As(err, &pathErr)
 }

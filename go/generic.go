@@ -2,6 +2,7 @@ package servicebridge
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -437,31 +438,41 @@ func (d *JobDomain) Handle(name string, spec job.Spec, fn job.Handler) error {
 	}))
 }
 
-// WorkflowDomain declares workflows and steers their runs.
+// WorkflowDomain declares workflows and steers their runs. The runtime
+// interprets the graph; this process executes the task steps it is handed.
 type WorkflowDomain struct{ c *Client }
 
-// Handle freezes a declared graph and registers it. Freezing is the only path
-// onto the wire: an invalid graph cannot be registered, and the steps the
-// runner executes are the same steps the registered bytes describe.
+// Handle declares a workflow owned by this service. The runtime validates the
+// definition when the service registers and refuses an invalid one.
 func (d *WorkflowDomain) Handle(name string, def wf.Definition) error {
 	const op = "Workflow.Handle"
 	if d.c.isStarted() {
 		return newError(CodeState, op, "workflows must be declared before Start", nil)
 	}
-	frozen, err := wfi.Freeze(name, def)
+	encoded, err := wfi.Encode(name, def)
 	if err != nil {
-		return wrap(op, err)
+		return newError(CodeValidation, op, err.Error(), err)
 	}
 	d.c.graphMu.Lock()
-	d.c.graphs[name+":"+frozen.Fingerprint] = frozen.Steps
+	if _, dup := d.c.graphs[name]; dup {
+		d.c.graphMu.Unlock()
+		return newError(CodeValidation, op, fmt.Sprintf("workflow %q is already declared", name), nil)
+	}
+	d.c.graphs[name] = localWorkflow{version: def.Version, steps: def.Steps, locals: encoded.Locals}
 	d.c.graphMu.Unlock()
 
 	return wrap(op, d.c.decls.AddIncoming(registry.IncomingSpec{
-		Type:            pb.MethodType_METHOD_TYPE_WORKFLOW,
-		Name:            name,
-		InputSchemaJSON: frozen.JSON,
-		ContractHash:    frozen.Fingerprint,
+		Type:     pb.MethodType_METHOD_TYPE_WORKFLOW,
+		Name:     name,
+		Workflow: encoded.Definition,
 	}))
+}
+
+// localWorkflow is what this process keeps of a declared workflow.
+type localWorkflow struct {
+	version string
+	steps   []wf.Step
+	locals  map[string]wf.LocalFunc
 }
 
 // StartOption tunes one run.
@@ -469,7 +480,7 @@ type StartOption func(*startOpts)
 
 type startOpts struct {
 	idempotencyKey string
-	timeoutSec     int
+	timeout        time.Duration
 }
 
 // WithRunIdempotencyKey makes a repeated Start return the existing run instead
@@ -478,42 +489,60 @@ func WithRunIdempotencyKey(key string) StartOption {
 	return func(o *startOpts) { o.idempotencyKey = key }
 }
 
-// WithRunTimeoutSec bounds the whole run. Seconds, because that is the unit the
-// workflow contract carries.
-func WithRunTimeoutSec(sec int) StartOption {
-	return func(o *startOpts) { o.timeoutSec = sec }
+// WithRunTimeout bounds the whole run; on expiry it ends timed_out.
+func WithRunTimeout(d time.Duration) StartOption {
+	return func(o *startOpts) { o.timeout = d }
 }
 
-// Start begins a run and returns its identifier.
-func (d *WorkflowDomain) Start(ctx context.Context, name string, input any, opts ...StartOption) (string, error) {
+// Start begins a run of the service's workflow and returns its identifier.
+func (d *WorkflowDomain) Start(ctx context.Context, service, name string, input any, opts ...StartOption) (string, error) {
 	var o startOpts
 	for _, opt := range opts {
 		opt(&o)
 	}
 	id, err := d.c.wfCall.Start(ctx, wfi.StartArgs{
+		Service:        service,
 		Workflow:       name,
 		Input:          input,
 		IdempotencyKey: o.idempotencyKey,
-		TimeoutSec:     o.timeoutSec,
+		TimeoutMs:      o.timeout.Milliseconds(),
 	})
 	return id, wrap("Workflow.Start", err)
 }
 
-// Signal delivers a signal to a parked run.
-func (d *WorkflowDomain) Signal(ctx context.Context, runID, signal string, payload any) error {
-	return wrap("Workflow.Signal", d.c.wfCall.Signal(ctx, wfi.SignalArgs{
-		RunID:   runID,
-		Signal:  signal,
-		Payload: payload,
-	}))
+// SignalOption tunes one signal.
+type SignalOption func(*wfi.SignalArgs)
+
+// WithSignalID makes a resend of the same signal a no-op: Signal reports it as
+// a duplicate instead of queuing it twice.
+func WithSignalID(id string) SignalOption {
+	return func(a *wfi.SignalArgs) { a.SignalID = id }
 }
 
-// Cancel stops a run.
+// Signal queues a signal for the run. Signals are delivered in order; the
+// returned flag reports a duplicate signal id.
+func (d *WorkflowDomain) Signal(ctx context.Context, runID, signal string, payload any, opts ...SignalOption) (bool, error) {
+	args := wfi.SignalArgs{RunID: runID, Signal: signal, Payload: payload}
+	for _, opt := range opts {
+		opt(&args)
+	}
+	dup, err := d.c.wfCall.Signal(ctx, args)
+	return dup, wrap("Workflow.Signal", err)
+}
+
+// Cancel stops a run; its compensations run before it ends cancelled.
 func (d *WorkflowDomain) Cancel(ctx context.Context, runID string) error {
 	return wrap("Workflow.Cancel", d.c.wfCall.Cancel(ctx, runID))
 }
 
-// Await blocks until the run finishes and returns its final state.
+// RetryCompensation re-runs the failed compensations of a failed_compensated
+// run.
+func (d *WorkflowDomain) RetryCompensation(ctx context.Context, runID string) error {
+	return wrap("Workflow.RetryCompensation", d.c.wfCall.RetryCompensation(ctx, runID))
+}
+
+// Await blocks until the run finishes. It returns the run output (the state
+// map) on success and an error wrapping *RunFailedError otherwise.
 func (d *WorkflowDomain) Await(ctx context.Context, runID string) (map[string]any, error) {
 	state, err := d.c.wfCall.Await(ctx, runID)
 	return state, wrap("Workflow.Await", err)
@@ -522,60 +551,38 @@ func (d *WorkflowDomain) Await(ctx context.Context, runID string) (map[string]an
 // Query reads a run back without waiting for it.
 func (d *WorkflowDomain) Query(ctx context.Context, runID string) (RunSnapshot, error) {
 	snap, err := d.c.wfCall.Query(ctx, runID)
-	if err != nil {
-		return RunSnapshot{}, wrap("Workflow.Query", err)
-	}
-	out := RunSnapshot{RunID: snap.RunID, Status: snap.Status, State: snap.State}
-	for _, s := range snap.Steps {
-		out.Steps = append(out.Steps, StepSnapshot{
-			StepID:        s.StepID,
-			Status:        s.Status,
-			Output:        s.Output,
-			LastError:     s.LastError,
-			CompensatedBy: s.CompensatedBy,
-		})
-	}
-	return out, nil
+	return snap, wrap("Workflow.Query", err)
 }
 
-// Replay restarts a finished run from one step onward and returns the new run.
+// Replay starts a new run from a run's frozen definition and input. A
+// non-empty fromStepID (a top-level step) keeps the steps that do not depend on
+// it instead of executing them again.
 func (d *WorkflowDomain) Replay(ctx context.Context, runID, fromStepID string) (string, error) {
 	id, err := d.c.wfCall.Replay(ctx, runID, fromStepID)
 	return id, wrap("Workflow.Replay", err)
 }
 
-// RunSnapshot is a point-in-time view of a run.
-type RunSnapshot struct {
-	RunID  string
-	Status string
-	State  map[string]any
-	Steps  []StepSnapshot
-}
+// RunSnapshot is a point-in-time view of a run: status, why it waits, its
+// steps and the signals still queued.
+type RunSnapshot = wfi.RunSnapshot
 
 // StepSnapshot is what one step of a run reports.
-type StepSnapshot struct {
-	StepID        string
-	Status        string
-	Output        any
-	LastError     string
-	CompensatedBy string
-}
+type StepSnapshot = wfi.StepSnapshot
 
-// executor performs what a workflow step declares. It is a distinct type so the
-// three method names — Call, Publish, StartRun — do not land on the client,
-// where they would compete with the API an application actually calls.
+// PendingSignal is a signal queued for a run and not consumed yet.
+type PendingSignal = wfi.PendingSignal
+
+// RunFailedError is what Await returns (wrapped) for a run that ended failed,
+// cancelled, timed_out or failed_compensated.
+type RunFailedError = wfi.RunFailedError
+
+// executor performs the effects of workflow tasks. It is a distinct type so
+// Call and Publish do not land on the client's own API.
 type executor Client
 
-// Call dispatches a call step. The step holds a JSON tree — run state is JSON
-// by construction (ADR-0002) — while the callee is an ordinary typed handler,
-// and the dependency declared with NewMethod is what joins the two: the tree is
-// read into the request message, and the reply comes back as the JSON mirror of
-// the response message, which is the same form the rest of the state is in.
-//
-// The declaration is also what makes the step routable. Version routing matches
-// the caller's contract hash exactly, and the pair of types is the only place
-// that hash can come from; an undeclared target is refused here rather than
-// called at the empty hash, which matches no typed handler at all.
+// Call dispatches a call task. The task holds a JSON tree while the callee is
+// a typed handler: the dependency declared with NewMethod joins the two and
+// supplies the contract hash version routing matches.
 func (e *executor) Call(ctx context.Context, spec wfi.CallSpec) (any, error) {
 	const op = "workflow.call"
 	c := (*Client)(e)
@@ -621,7 +628,7 @@ func undeclaredDependency(service, method string) string {
 		service, method, service, method)
 }
 
-// Publish dispatches a publish step and answers with the event identifier, so
+// Publish dispatches a publish task and answers with the event identifier, so
 // the run state records what was emitted.
 func (e *executor) Publish(ctx context.Context, spec wfi.PublishSpec) (any, error) {
 	c := (*Client)(e)
@@ -635,14 +642,8 @@ func (e *executor) Publish(ctx context.Context, spec wfi.PublishSpec) (any, erro
 	if spec.PartitionKey != "" {
 		opts = append(opts, events.WithPartitionKey(spec.PartitionKey))
 	}
-	if spec.FireAndForget {
-		opts = append(opts, events.WithFireAndForget())
-	}
 	if len(spec.Headers) > 0 {
 		opts = append(opts, events.WithHeaders(spec.Headers))
-	}
-	if spec.OccurredAtMs != 0 {
-		opts = append(opts, events.WithOccurredAt(spec.OccurredAtMs))
 	}
 	id, err := c.publisher.Publish(ctx, spec.Event, spec.Payload, opts...)
 	if err != nil {
@@ -651,26 +652,36 @@ func (e *executor) Publish(ctx context.Context, spec wfi.PublishSpec) (any, erro
 	return map[string]any{"eventId": id}, nil
 }
 
-// StartRun starts a nested run. The runner parks afterwards rather than waiting
-// in process, so this returns as soon as the child exists.
-func (e *executor) StartRun(ctx context.Context, spec wfi.StartSpec) (string, error) {
-	return (*Client)(e).wfCall.Start(ctx, wfi.StartArgs{
-		Workflow:       spec.Workflow,
-		Input:          spec.Input,
-		IdempotencyKey: spec.IdempotencyKey,
-		TimeoutSec:     spec.TimeoutSec,
-		ParentRunID:    spec.ParentRunID,
-	})
+// Local finds the function of a local step of a declared workflow version.
+func (e *executor) Local(workflow, version, stepID string) (wf.LocalFunc, bool) {
+	c := (*Client)(e)
+	c.graphMu.RLock()
+	defer c.graphMu.RUnlock()
+	w, ok := c.graphs[workflow]
+	if !ok || w.version != version {
+		return nil, false
+	}
+	fn, ok := w.locals[stepID]
+	return fn, ok
 }
 
-// wrapStep opens one user sub-operation around every unit the runner executes,
-// so the call and publish operations of a step hang under the step and not
-// under the run root. The runtime owns the WORKFLOW.RUN operation itself.
-func (c *Client) wrapStep(ctx context.Context, span wfi.StepSpan, fn func(context.Context) (any, error)) (any, error) {
+// wrapSpan opens one user sub-operation around a local step or a
+// compensation. Call and publish steps are traced by their own operation.
+func (c *Client) wrapSpan(ctx context.Context, span wfi.Span, fn func(context.Context) (any, error)) (any, error) {
+	meta := map[string]any{"step_id": span.StepID, "workflow_run_id": span.RunID}
+	subject := "step:" + span.StepID
+	if span.IsCompensation {
+		meta["is_compensation"] = true
+		meta["compensates_for_step_id"] = span.CompensatesStepID
+		subject = "compensate:" + span.CompensatesStepID
+	}
+	metaJSON, _ := json.Marshal(meta)
 	ctx, op, err := c.recorder.Start(ctx, telemetry.OpSpec{
-		Channel: pb.Channel_USER,
-		Kind:    telemetry.OpKindUserSubOp,
-		Subject: span.Name,
+		Channel:     pb.Channel_USER,
+		Kind:        telemetry.OpKindUserSubOp,
+		Subject:     subject,
+		BusinessKey: span.RunID,
+		MetaJSON:    metaJSON,
 	})
 	if err != nil {
 		// The only way an operation fails to start is a broken entropy source.
@@ -685,6 +696,16 @@ func (c *Client) wrapStep(ctx context.Context, span wfi.StepSpan, fn func(contex
 	}
 	op.End(pb.Status_SUCCESS, "")
 	return out, nil
+}
+
+// taskErrorCode is the code a failed task reports: the SDK error code when
+// there is one.
+func taskErrorCode(err error) string {
+	var sbErr *Error
+	if errors.As(err, &sbErr) && sbErr.Code != "" {
+		return string(sbErr.Code)
+	}
+	return ""
 }
 
 // TelemetryDomain opens operations, keeps metrics and bridges application logs.

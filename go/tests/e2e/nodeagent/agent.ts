@@ -167,7 +167,7 @@ if (config.workflowName) {
 				service: config.workflowCallService,
 				method: config.workflowCallMethod,
 				input: { text: "from-node-workflow", n: 77 },
-				opts: { transport: "proxy", timeout: "20s" },
+				opts: { transport: "proxy", timeoutMs: 20_000 },
 			},
 		],
 	});
@@ -275,7 +275,11 @@ async function run(cmd: Command): Promise<unknown> {
 				cmd.partitionKey ? { partitionKey: cmd.partitionKey } : undefined,
 			);
 		case "startWorkflow": {
-			const { runId } = await sb.workflow.start(cmd.name, cmd.payload ?? {});
+			const { runId } = await sb.workflow.start(
+				sb.identity()!.serviceName,
+				cmd.name,
+				cmd.payload ?? {},
+			);
 			return { runId };
 		}
 		case "awaitWorkflow":

@@ -332,7 +332,7 @@ function registerSurfaces(b: Bridges): void {
 							{
 								type: "sleep",
 								id: "wait_15s",
-								durationSec: 15,
+								durationMs: 15_000,
 							},
 							{
 								type: "publish",
@@ -355,7 +355,7 @@ function registerSurfaces(b: Bridges): void {
 								type: "wait_signal",
 								id: "manager_approval",
 								signal: "manager_approval",
-								timeoutSec: 10,
+								timeoutMs: 10_000,
 							},
 							{
 								type: "call",
@@ -501,12 +501,16 @@ function buildHttpApp(showcase: ServiceBridge): {
 
 	app.post("/run-showcase", async (_req: Request, res: Response) => {
 		try {
-			const { runId } = await showcase.workflow.start(WORKFLOW_NAME, {
-				orderId: `ord-${Date.now()}`,
-				amount: 49.99,
-				itemId: "widget-7",
-				quantity: 1,
-			});
+			const { runId } = await showcase.workflow.start(
+				showcase.identity()!.serviceName,
+				WORKFLOW_NAME,
+				{
+					orderId: `ord-${Date.now()}`,
+					amount: 49.99,
+					itemId: "widget-7",
+					quantity: 1,
+				},
+			);
 			lastRunId.value = runId;
 			res.json({ runId });
 		} catch (err) {
@@ -601,12 +605,16 @@ export async function runShowcase(opts?: {
 
 	try {
 		if (opts?.skipHttp) {
-			const r = await bridges.showcase.workflow.start(WORKFLOW_NAME, {
-				orderId: `ord-${Date.now()}`,
-				amount: 49.99,
-				itemId: "widget-7",
-				quantity: 1,
-			});
+			const r = await bridges.showcase.workflow.start(
+				bridges.showcase.identity()!.serviceName,
+				WORKFLOW_NAME,
+				{
+					orderId: `ord-${Date.now()}`,
+					amount: 49.99,
+					itemId: "widget-7",
+					quantity: 1,
+				},
+			);
 			runId = r.runId;
 		} else {
 			const { listen } = buildHttpApp(bridges.showcase);

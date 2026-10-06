@@ -2,6 +2,7 @@ package workflow_test
 
 import (
 	"testing"
+	"time"
 
 	iwf "github.com/service-bridge/sdk/go/internal/workflow"
 	wf "github.com/service-bridge/sdk/go/workflow"
@@ -142,7 +143,7 @@ func TestStaticCallTargetsReadsTheCompensationKind(t *testing.T) {
 
 func TestStaticCallTargetsOfAGraphWithoutCalls(t *testing.T) {
 	assertTargets(t, []wf.Step{
-		wf.Sleep{Control: wf.Control{ID: "wait"}, DurationSec: 1},
+		wf.Sleep{Control: wf.Control{ID: "wait"}, Duration: 1 * time.Second},
 		wf.WaitSignal{Control: wf.Control{ID: "hold"}, Signal: "go"},
 	})
 }

@@ -4,12 +4,13 @@ import (
 	"context"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/service-bridge/sdk/go/workflow"
 )
 
 // TestKindsMatchTheRuntimeDiscriminators pins the strings the runtime switches
-// on when it walks a registered graph (runtime/internal/workflow/register.go).
+// on when it walks a registered graph (runtime/internal/workflow/plan.go).
 func TestKindsMatchTheRuntimeDiscriminators(t *testing.T) {
 	cases := []struct {
 		step wf
@@ -41,9 +42,9 @@ type wf = workflow.Step
 
 func TestEveryKindCarriesTheCommonFields(t *testing.T) {
 	control := workflow.Control{
-		ID:         "charge",
-		WaitFor:    []string{"validate"},
-		TimeoutSec: 30,
+		ID:      "charge",
+		WaitFor: []string{"validate"},
+		Timeout: 30 * time.Second,
 	}
 	steps := []workflow.Step{
 		workflow.Call{Control: control},
@@ -58,7 +59,7 @@ func TestEveryKindCarriesTheCommonFields(t *testing.T) {
 	}
 	for _, step := range steps {
 		got := step.Common()
-		if got.ID != "charge" || got.TimeoutSec != 30 || len(got.WaitFor) != 1 {
+		if got.ID != "charge" || got.Timeout != 30*time.Second || len(got.WaitFor) != 1 {
 			t.Errorf("%T common = %+v, want the declared control fields", step, got)
 		}
 	}
@@ -119,5 +120,15 @@ func TestPathIsNotAString(t *testing.T) {
 
 	if reflect.TypeOf(workflow.Path("")) == reflect.TypeOf(workflow.Name("")) {
 		t.Error("Path and Name are the same type")
+	}
+}
+
+func TestTaskTravelsInTheContext(t *testing.T) {
+	if _, ok := workflow.TaskOf(context.Background()); ok {
+		t.Fatal("a bare context carries no task")
+	}
+	ctx := workflow.WithTask(context.Background(), workflow.Task{RunID: "r", StepID: "s", Attempt: 2})
+	if got, ok := workflow.TaskOf(ctx); !ok || got.Attempt != 2 || got.StepID != "s" {
+		t.Fatalf("task = %+v, %v", got, ok)
 	}
 }

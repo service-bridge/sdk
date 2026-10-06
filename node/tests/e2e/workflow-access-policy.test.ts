@@ -21,13 +21,17 @@ import {
 	awaitRunStatus,
 	FAST_WF_OPTS,
 	startWorkflowWhenAllowed,
+	svcName,
 } from "./_helpers/wf.ts";
 
 const TERMINAL_WITH_COMP = (s: string) =>
-	s === "success" ||
-	s === "failed" ||
-	s === "cancelled" ||
-	s === "failed_compensated";
+	[
+		"success",
+		"failed",
+		"cancelled",
+		"timed_out",
+		"failed_compensated",
+	].includes(s);
 
 // A run stopped by a denied step lands in one of these. `cancelled` is an
 // operator action and must never be accepted as evidence of a policy denial.
@@ -96,7 +100,7 @@ describe("workflow-access-policy", () => {
 
 		let denied = false;
 		try {
-			await caller.workflow.start(wfName, {});
+			await caller.workflow.start(svcName(owner), wfName, {});
 		} catch (e) {
 			denied = true;
 			expect(String(e)).toMatch(
@@ -137,7 +141,11 @@ describe("workflow-access-policy", () => {
 		await addRule(ownerID, "A", "workflow.handle", callerID, wfDenied);
 		await sleep(800);
 
-		const { runId: allowedRunId } = await caller.workflow.start(wfAllowed, {});
+		const { runId: allowedRunId } = await caller.workflow.start(
+			svcName(owner),
+			wfAllowed,
+			{},
+		);
 		const allowedStatus = await awaitRunStatus(
 			caller,
 			allowedRunId,
@@ -148,7 +156,7 @@ describe("workflow-access-policy", () => {
 
 		let denied = false;
 		try {
-			await caller.workflow.start(wfDenied, {});
+			await caller.workflow.start(svcName(owner), wfDenied, {});
 		} catch (e) {
 			denied = true;
 			expect(String(e)).toMatch(
@@ -177,7 +185,15 @@ describe("workflow-access-policy", () => {
 		const parentOwner = dedicated("primary");
 		parentOwner.workflow.handle(parentWf, {
 			version: "test-v1",
-			steps: [{ type: "workflow", id: "sub", workflow: subWf, input: {} }],
+			steps: [
+				{
+					type: "workflow",
+					id: "sub",
+					service: svcName(subOwner),
+					workflow: subWf,
+					input: {},
+				},
+			],
 		});
 		await connect(parentOwner);
 		clients.push(parentOwner);
@@ -209,6 +225,7 @@ describe("workflow-access-policy", () => {
 		const deadline = Date.now() + 90_000;
 		for (;;) {
 			const { runId } = await startWorkflowWhenAllowed(
+				parentOwner,
 				parentOwner,
 				parentWf,
 				{},
@@ -247,7 +264,11 @@ describe("workflow-access-policy", () => {
 		let status2 = "";
 		const denyDeadline = Date.now() + 20_000;
 		for (;;) {
-			const { runId: runId2 } = await parentOwner.workflow.start(parentWf, {});
+			const { runId: runId2 } = await parentOwner.workflow.start(
+				svcName(parentOwner),
+				parentWf,
+				{},
+			);
 			status2 = await awaitRunStatus(
 				parentOwner,
 				runId2,
@@ -267,7 +288,7 @@ describe("workflow-access-policy", () => {
 		const owner = dedicated("primary");
 		owner.workflow.handle(wfName, {
 			version: "test-v1",
-			steps: [{ type: "sleep", id: "long_pause", durationSec: 60 }],
+			steps: [{ type: "sleep", id: "long_pause", durationMs: 60_000 }],
 		});
 		await connect(owner);
 		clients.push(owner);

@@ -208,29 +208,31 @@ interface PublishOpts {
 ### Workflows (`sb.workflow`)
 
 ```ts
-sb.workflow.handle(name: string, def: WorkflowDef, opts?: WorkflowHandlerOpts): void
+sb.workflow.handle(name: string, def: WorkflowDef): void
 
-sb.workflow.start(name: string, input: unknown, opts?: WorkflowStartOpts): Promise<{ runId: string }>
-sb.workflow.signal(runId: string, signalName: string, payload: unknown): Promise<void>
+sb.workflow.start(service: string, name: string, input: unknown, opts?: { idempotencyKey?: string; timeoutMs?: number }): Promise<{ runId: string }>
+sb.workflow.signal(runId: string, signalName: string, payload: unknown, opts?: { signalId?: string }): Promise<{ duplicate: boolean }>
 sb.workflow.cancel(runId: string): Promise<void>
-sb.workflow.await(runId: string): Promise<Record<string, unknown>>   // ждёт терминального статуса; reject если статус != "success"
-sb.workflow.query(runId: string): Promise<{ status: string; state: Record<string, unknown>; steps: Array<{ stepId; status; output; lastError; compensatedBy? }> }>
+sb.workflow.await(runId: string): Promise<Record<string, unknown>>   // выход при "success"; иначе WorkflowRunFailedError
+sb.workflow.query(runId: string): Promise<RunSnapshot>              // status, stopReason, waitingReason, output, steps, signals
 sb.workflow.replay(runId: string, opts?: { fromStepId?: string }): Promise<{ runId: string }>
+sb.workflow.retryCompensation(runId: string): Promise<void>
 ```
 
-`def` — это `WorkflowDef` (DAG из `steps`), а не массив `{name, fn}`. У workflow нет финального output как сущности: каждый step возвращает обновлённый `state`. Полная модель шагов и DAG — [Workflows](./workflows.md).
+`def` — `WorkflowDef` (DAG из `steps`); DAG интерпретирует runtime, SDK исполняет задачи (`local`, `call`, `publish`, компенсации). Полная модель — [Workflows](./workflows.md).
 
 ```ts
 interface WorkflowDef {
   steps: Step[];
-  input?: Record<string, unknown>;   // JSON Schema для входа (ADR-W-009)
-  retry?: Partial<RetryOpts>;
-  maxParallelism?: number;
-  timeoutSec?: number;
+  version?: string;                  // версия кода local-шагов
+  input?: Record<string, unknown>;   // JSON Schema входа
+  retry?: RetryPolicy;               // повторы задач по умолчанию
+  maxParallelism?: number;           // одновременных задач прогона, 0 — без лимита
+  timeoutMs?: number;                // таймаут прогона → timed_out
 }
 ```
 
-Caller-side операции (`start`/`signal`/…) требуют завершённого `start()`. `start` бросает `WorkflowAccessDeniedError` при denial политики; терминальный статус успеха — строка `"success"`.
+Caller-side операции требуют завершённого `start()`. Статусы прогона: `active`, `compensating`, `success`, `failed`, `cancelled`, `timed_out`, `failed_compensated`.
 
 ### Jobs (`sb.job`)
 
