@@ -67,8 +67,6 @@ func (r *refreshRuntime) handle(n int, req *pb.RefreshCertRequest) (*pb.RefreshC
 		CertDer:    der,
 		CaChainDer: r.ca.der,
 		InstanceId: instanceID,
-		// not_after_unix is seconds, unlike the unix-ms of every other wire time
-		// field (ADR-0006).
 		NotAfterUnixMs: notAfter.UnixMilli(),
 	}, nil
 }
@@ -208,7 +206,7 @@ func TestRotationUpdatesEveryCredentialConsumer(t *testing.T) {
 		}
 		creds, _ := consumer.last()
 		if want := notAfter.Truncate(time.Second).UTC(); !creds.Lease.NotAfter.Equal(want) {
-			t.Errorf("consumer %s got expiry %s, want %s: not_after_unix is seconds",
+			t.Errorf("consumer %s got expiry %s, want the leaf's %s",
 				name, creds.Lease.NotAfter, want)
 		}
 	}

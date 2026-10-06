@@ -143,7 +143,7 @@ sb-policy acceptance remove --dsn=... --service=payments --kind=rpc.handle --cal
 
 ## Глобальный граф для UI
 
-UI-дашборду доступен runtime endpoint `UI.GetServiceGraph` (отдельный gRPC сервис). Возвращает полный граф всех активных сервисов с handlers, instances, outgoing decls, event subs, policy rules. **Не** экспортируется через обычный SDK — UI-консумер отдельный.
+Полный граф сервисов строит консоль рантайма из своей базы; через SDK-порт (`:14445`) он недоступен.
 
 ## Ссылки
 

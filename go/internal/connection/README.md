@@ -18,7 +18,6 @@
 | `ProvisionResult` | struct | — | `Identity`, `ServiceName`, `CertDER`, `CAChainDER`, `PrivateKey`, `NotAfter`, `TLSCert`. |
 | `NewCSR() (*ecdsa.PrivateKey, []byte, error)` | функция | — | Новая пара P-256 и PKCS#10 CSR к ней. |
 | `NewTLSCertificate(certDER, caChainDER []byte, priv *ecdsa.PrivateKey) (tls.Certificate, error)` | функция | — | Собирает клиентский credential из выданного leaf, цепочки и приватного ключа. |
-| `NotAfterFromUnixSeconds(sec int64) time.Time` | функция | — | Конвертирует `not_after_unix` — единственное поле протокола в СЕКУНДАХ. |
 | `PinnedTLSConfig(ca *x509.Certificate) *tls.Config` | функция | — | TLS 1.3, доверие ровно одному корню, проверка цепочки в `VerifyConnection`. |
 | `MutualTLSConfig(ca *x509.Certificate, clientCert tls.Certificate) *tls.Config` | функция | — | То же плюс клиентский сертификат. |
 | `Identity` | struct | — | `ServiceID` + `InstanceID` из URI SAN. |
@@ -141,7 +140,7 @@
 
 **Почему не `stream.Supervisor`.** Супервизор владеет ровно одним поколением потока и рвёт старое до открытия нового — это исключает перекрытие, без которого ротация теряет сессию на время дозвона. Лестница (`stream.Backoff`) при этом переиспользуется как есть, своей нет.
 
-**Единицы времени.** Всё на проводе — `int64` unix-ms (ADR-0006), кроме `not_after_unix` в `ProvisionResponse` и `RefreshCertResponse`: там СЕКУНДЫ. Конвертация одна — `NotAfterFromUnixSeconds`; прочтение как миллисекунд отправляет срок в 1970 и запускает продление в горячем цикле.
+**Единицы времени.** Всё на проводе — `int64` unix-ms (ADR-0006), включая срок сертификата `not_after_unix_ms` в `ProvisionResponse` и `RefreshCertResponse` (`time.UnixMilli`).
 
 **Синхронный первый коннект.** `Start` возвращает ошибку первой попытки, а не прячет её за лестницей: отклонённый bootstrap-ключ не должен выглядеть как медленный старт.
 
