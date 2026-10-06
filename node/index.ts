@@ -3,6 +3,7 @@ export {
 	type CallOpts,
 	type ConnectedEvent,
 	type DisconnectedEvent,
+	type DrainingEvent,
 	type Identity,
 	type MethodDescriptor,
 	type MethodType,
@@ -19,9 +20,19 @@ export {
 	type WorkflowHandlerOpts,
 } from "./src/connection/service-bridge";
 export { ConnectionError } from "./src/connection/service-bridge-error";
-export { ConfigurationError, ServiceBridgeError } from "./src/errors";
+export {
+	AccessDeniedError,
+	ConfigurationError,
+	type ErrorCode,
+	HandlerError,
+	NoLiveInstanceError,
+	ServiceBridgeError,
+	StateError,
+	TimeoutError,
+	ValidationError,
+} from "./src/errors";
 export type { EventDomain } from "./src/events/domain";
-export { InvalidEventNameError, OutboxFullError } from "./src/events/errors";
+export { InvalidEventNameError } from "./src/events/errors";
 export type { PublishOpts } from "./src/events/publisher";
 export type {
 	CatchupPolicy,
@@ -37,13 +48,18 @@ export type {
 	Trigger,
 } from "./src/job/index";
 export { JobDomain } from "./src/job/index";
-export type { EventHandlerContext } from "./src/registry/registry";
+export type { LogAttrs, Logger } from "./src/logger";
+export type {
+	EventHandlerContext,
+	EventHandlerFn,
+	EventHandlerOpts,
+	RpcHandlerFn,
+	RpcStreamHandlerFn,
+} from "./src/registry/registry";
 export type { RetryOpts } from "./src/rpc/client";
+export type { RpcHandlerContext } from "./src/rpc/dispatch-port";
 export type { RpcDomain } from "./src/rpc/domain";
-export { RpcAccessDeniedError } from "./src/rpc/errors";
-export { NoLiveInstanceError } from "./src/rpc/lb";
 export type { TypedClient } from "./src/rpc/typed-client";
-export type { FailedOutboxEvent } from "./src/sqlite/storage";
 // Everything needed to call sb.telemetry.startOp(): the params type names
 // Channel, and the kind is a per-channel numeric constant. Wrap the work in
 // the returned handle's run(fn) to make it the parent of everything inside.
@@ -59,6 +75,7 @@ export {
 	UserSubOp,
 	WorkflowRun,
 } from "./src/telemetry/index";
+export type { DropObserver } from "./src/telemetry/transport";
 export type { WorkflowDomain } from "./src/workflow/domain";
 export {
 	WorkflowAccessDeniedError,

@@ -5,6 +5,7 @@ import {
 	type ClientUnaryCall,
 	Metadata,
 } from "@grpc/grpc-js";
+import type { Logger } from "../logger";
 import type { JobExecution, JobsClient } from "../pb/servicebridge/v1/jobs";
 import { StreamSupervisor } from "../registry/stream-supervisor";
 import type { ReconnectDelayOptions } from "../utils/reconnect-ladder";
@@ -12,6 +13,8 @@ import { Semaphore, SemaphoreAbortedError } from "../utils/semaphore";
 import type { JobDomain } from "./domain";
 import type { JobHandler, JobHandlerCtx, JobOpts } from "./types";
 
+// First heartbeat cadence; afterwards the runtime's heartbeat_interval_ms.
+// Every heartbeat extends the lease of all executions this instance holds.
 const HEARTBEAT_INTERVAL_MS = 5_000;
 const HEARTBEAT_FAIL_THRESHOLD = 3;
 
@@ -20,11 +23,6 @@ const HEARTBEAT_FAIL_THRESHOLD = 3;
 // the replacement cannot overlap a handler that has not honored cancellation.
 const domainSemaphores = new WeakMap<JobDomain, Map<string, Semaphore>>();
 
-export interface Logger {
-	warn(msg: string): void;
-	error(msg: string): void;
-}
-
 export interface IdentityProvider {
 	serviceId: string;
 	instanceId: string;
@@ -32,7 +30,8 @@ export interface IdentityProvider {
 
 // @public — см. ./README.md
 export interface SubscriberDeps {
-	rpcClient: JobsClient;
+	// The jobs channel; null until the bridge has one.
+	client: () => JobsClient | null;
 	identity: () => IdentityProvider | null;
 	domain: JobDomain;
 	logger: Logger;
@@ -51,6 +50,8 @@ export interface SubscriberDeps {
 
 export class JobSubscriber {
 	private _closed = false;
+	private _draining = false;
+	private readonly _running = new Set<Promise<void>>();
 	// Released on stop() so executions still queued on a per-job semaphore are
 	// dropped instead of starting a handler after shutdown.
 	private _stopping = new AbortController();
@@ -83,21 +84,48 @@ export class JobSubscriber {
 		this.supervisor = new StreamSupervisor({
 			open: () => this.openStream(),
 			onData: (exec) => {
-				void this.dispatch(exec).catch((err) => {
-					this.d.logger.error(
-						`jobs: dispatch error for execution ${exec.executionId}: ${(err as Error).message}`,
-					);
+				// A draining instance leaves new executions alone: the runtime
+				// reassigns them once this instance disconnects.
+				if (this._draining) return;
+				const run = this.dispatch(exec).catch((err) => {
+					this.d.logger.error("jobs: dispatch failed", {
+						executionId: exec.executionId,
+						error: (err as Error).message,
+					});
 				});
+				this._running.add(run);
+				void run.finally(() => this._running.delete(run));
 			},
 			onDisconnect: () => {
 				this._stopping.abort();
 				if (!this._closed) this._stopping = new AbortController();
 			},
 			onError: (err) =>
-				this.d.logger.warn(`jobs subscriber: stream error: ${err.message}`),
+				this.d.logger.warn("jobs: subscribe stream failed", {
+					error: err.message,
+				}),
 			reconnectOpts: d.reconnectOpts,
 			onSchedule: d.onSchedule,
 		});
+	}
+
+	/** Reopens the stream at once (recovered channel). */
+	restart(): void {
+		this.supervisor.restart();
+	}
+
+	/**
+	 * Stops taking new executions and waits for the running ones (up to
+	 * timeoutMs). Heartbeats continue meanwhile so their leases stay alive.
+	 */
+	async drain(timeoutMs: number): Promise<void> {
+		this._draining = true;
+		const running = [...this._running];
+		if (running.length === 0) return;
+		await Promise.race([
+			Promise.allSettled(running),
+			new Promise((r) => setTimeout(r, timeoutMs)),
+		]);
 	}
 
 	start(): void {
@@ -116,8 +144,9 @@ export class JobSubscriber {
 
 	private openStream(): ClientReadableStream<JobExecution> | null {
 		const id = this.d.identity();
-		if (!id) return null;
-		return this.d.rpcClient.subscribe({
+		const client = this.d.client();
+		if (!id || !client) return null;
+		return client.subscribe({
 			serviceId: id.serviceId,
 			instanceId: id.instanceId,
 		});
@@ -126,16 +155,19 @@ export class JobSubscriber {
 	private async dispatch(exec: JobExecution): Promise<void> {
 		const id = this.d.identity();
 		if (!id) {
-			this.d.logger.warn(
-				`jobs: no identity, dropping execution ${exec.executionId}`,
-			);
+			this.d.logger.warn("jobs: no identity, dropping execution", {
+				executionId: exec.executionId,
+			});
 			return;
 		}
 
 		const reg = this.d.domain.lookup(exec.jobName, exec.fingerprint);
 		if (!reg) {
 			const message = `unsupported_version: ${exec.jobName}/${exec.fingerprint}`;
-			this.d.logger.warn(`jobs: ${message}`);
+			this.d.logger.warn("jobs: execution for an unknown handler version", {
+				job: exec.jobName,
+				fingerprint: exec.fingerprint,
+			});
 			this.sendResult(exec, id.instanceId, false, {
 				errorMessage: message,
 				retryable: false,
@@ -166,9 +198,9 @@ export class JobSubscriber {
 				// its slot after stop() and run the handler on a subscriber that is
 				// already shut down. Dropping it is safe: the lease expires and the
 				// runtime re-assigns the execution.
-				this.d.logger.warn(
-					`jobs: stopped while queued, dropping execution ${exec.executionId}`,
-				);
+				this.d.logger.warn("jobs: stopped while queued, dropping execution", {
+					executionId: exec.executionId,
+				});
 				return;
 			}
 			try {
@@ -256,12 +288,14 @@ export class JobSubscriber {
 					},
 				};
 
-		if (this._closed || this._stopping.signal.aborted) return;
-		this.d.rpcClient.jobResult(request, (err) => {
+		const client = this.d.client();
+		if (this._closed || this._stopping.signal.aborted || !client) return;
+		client.jobResult(request, (err) => {
 			if (err) {
-				this.d.logger.warn(
-					`jobs: failed to send result for execution ${exec.executionId}: ${err.message}`,
-				);
+				this.d.logger.warn("jobs: result not delivered", {
+					executionId: exec.executionId,
+					error: err.message,
+				});
 			}
 		});
 	}
@@ -292,12 +326,13 @@ export class JobSubscriber {
 		const beat = (interval: number) => {
 			if (this._closed || generation !== this._heartbeatGeneration) return;
 			const id = this.d.identity();
-			if (!id) {
+			const client = this.d.client();
+			if (!id || !client) {
 				schedule(interval);
 				return;
 			}
 			try {
-				this._heartbeatCall = this.d.rpcClient.heartbeat(
+				this._heartbeatCall = client.heartbeat(
 					{ serviceId: id.serviceId, instanceId: id.instanceId },
 					new Metadata(),
 					{ deadline: Date.now() + interval },
@@ -307,11 +342,7 @@ export class JobSubscriber {
 						if (err) this.onHeartbeatFailure(err.message);
 						else this._heartbeatFailures = 0;
 						const hint = response?.heartbeatIntervalMs ?? 0;
-						schedule(
-							Number.isFinite(hint) && hint > 0
-								? Math.min(HEARTBEAT_INTERVAL_MS, Math.max(1, hint))
-								: interval,
-						);
+						schedule(Number.isFinite(hint) && hint > 0 ? hint : interval);
 					},
 				);
 			} catch (err) {
@@ -324,9 +355,11 @@ export class JobSubscriber {
 
 	private onHeartbeatFailure(reason: string): void {
 		this._heartbeatFailures++;
-		this.d.logger.warn(
-			`jobs: heartbeat failed (${this._heartbeatFailures}/${HEARTBEAT_FAIL_THRESHOLD}): ${reason}`,
-		);
+		this.d.logger.warn("jobs: heartbeat failed", {
+			failures: this._heartbeatFailures,
+			threshold: HEARTBEAT_FAIL_THRESHOLD,
+			error: reason,
+		});
 		if (this._heartbeatFailures < HEARTBEAT_FAIL_THRESHOLD) return;
 		this.d.logger.warn("jobs: heartbeat threshold reached, reconnecting");
 		this._heartbeatFailures = 0;

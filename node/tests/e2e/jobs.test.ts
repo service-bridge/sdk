@@ -498,13 +498,18 @@ describe("jobs", () => {
 
 		// Service 2 — event consumer, subscribe before connect.
 		const sb2 = track(dedicated("second"));
-		sb2.event.handle(eventName, async (payload) => {
-			received.push(payload);
-		});
-		sb2.event.define(eventName, {
-			protoFile: ORDER_EVENT_PROTO,
-			method: "orders_created",
-		});
+		sb2.event.handle(
+			eventName,
+			async (payload) => {
+				received.push(payload);
+			},
+			{
+				schema: {
+					protoFile: ORDER_EVENT_PROTO,
+					method: "orders_created",
+				},
+			},
+		);
 		await connect(sb2);
 
 		// Service 1 — job owner + event publisher.

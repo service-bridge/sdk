@@ -3,9 +3,6 @@
  * См. ../README.md и ./README.md.
  */
 
-export type {
-	HttpRateLimitOptions,
-	HttpSecurityOptions,
-} from "../_common/security";
+export type { HttpIntegrationOptions } from "../_common/http-op";
 export type { SbFastifyOptions } from "./plugin";
 export { sbFastify } from "./plugin";

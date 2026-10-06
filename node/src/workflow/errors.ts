@@ -11,7 +11,10 @@ export class WorkflowAccessDeniedError extends ServiceBridgeError {
 		public readonly workflowName: string,
 		public readonly reason: string,
 	) {
-		super(`workflow.start("${workflowName}"): access denied — ${reason}`);
+		super(
+			"ACCESS_DENIED",
+			`workflow.start("${workflowName}"): access denied — ${reason}`,
+		);
 		this.name = "WorkflowAccessDeniedError";
 	}
 }
@@ -20,7 +23,7 @@ export class WorkflowAccessDeniedError extends ServiceBridgeError {
 // fingerprint resolution).
 export class WorkflowNotFoundError extends ServiceBridgeError {
 	constructor(public readonly workflowName: string) {
-		super(`workflow.start("${workflowName}"): not found`);
+		super("NOT_FOUND", `workflow.start("${workflowName}"): not found`);
 		this.name = "WorkflowNotFoundError";
 	}
 }
@@ -32,7 +35,7 @@ export class WorkflowTerminalError extends ServiceBridgeError {
 		public readonly runId: string,
 		public readonly status: string,
 	) {
-		super(`workflow run ${runId}: already terminal (${status})`);
+		super("TERMINAL", `workflow run ${runId}: already terminal (${status})`);
 		this.name = "WorkflowTerminalError";
 	}
 }

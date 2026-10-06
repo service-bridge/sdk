@@ -1,15 +1,9 @@
 import type {
 	ControlClient,
-	OpenRequest as OpenRequestType,
 	ServerControl,
 	Welcome,
 } from "../pb/servicebridge/v1/control";
 import { OpenRequest } from "../pb/servicebridge/v1/control";
-import type {
-	RegisterRequest,
-	RegistryClient,
-} from "../pb/servicebridge/v1/registry";
-import type { WatchStream } from "../registry/watch";
 import { PROTOCOL_VERSION, SDK_LANGUAGE, SDK_VERSION } from "./handshake";
 
 export type ServerStream = ReturnType<ControlClient["open"]>;
@@ -22,99 +16,60 @@ export interface SessionCallbacks {
 }
 
 /**
- * Wraps a single live SDK→runtime connection. Owns both server-streams used by
- * the connection lifecycle:
- *   - `Control.Open` — server-streamed Welcome/Drain signals (identity by mTLS).
- *   - `Registry.RegisterAndWatch` — push-based registry view; restartable via
- *     `updateRegistration(req)` when local state (e.g. HTTP endpoint) changes.
+ * One Control.Open stream: the runtime's Welcome (the session is live) and
+ * Drain (the runtime is shutting down). The registry stream is separate and
+ * owned by the bridge. A stream that the bridge closes on purpose reports
+ * nothing.
  *
- * Heartbeats moved out of Control entirely (now part of the Telemetry stream),
- * so the SDK side of `Control.Open` is read-only here.
+ * @internal — см. ./README.md
  */
 export class Session {
-	private readonly stream: ServerStream;
-	private readonly callbacks: SessionCallbacks;
-	private readonly watch: WatchStream;
-	private readonly registryClient: RegistryClient;
 	private closed = false;
-	private expectedClose = false;
 
 	constructor(
-		stream: ServerStream,
+		private readonly stream: ServerStream,
 		callbacks: SessionCallbacks,
-		watch: WatchStream,
-		registryClient: RegistryClient,
 	) {
-		this.stream = stream;
-		this.callbacks = callbacks;
-		this.watch = watch;
-		this.registryClient = registryClient;
-
-		stream.on("data", (msg: ServerControl) => this.handleMessage(msg));
-		stream.on("end", () => this.onEnd());
+		stream.on("data", (msg: ServerControl) => {
+			if (this.closed) return;
+			if (msg.welcome) callbacks.onWelcome(msg.welcome);
+			else if (msg.drain) callbacks.onDrain(msg.drain.reason);
+		});
+		stream.on("end", () => {
+			if (this.closed) return;
+			this.closed = true;
+			callbacks.onEnd();
+		});
 		stream.on("error", (err: Error) => {
-			if (this.expectedClose) return;
+			if (this.closed) return;
+			this.closed = true;
 			callbacks.onError(err);
 		});
 	}
 
-	/**
-	 * Restarts the Registry.RegisterAndWatch stream with a fresh RegisterRequest.
-	 * Used when local registration state changes after `start()` (HTTP endpoint
-	 * publishHttp from integrations). Safe to call after close() — becomes no-op.
-	 */
-	updateRegistration(req: RegisterRequest): void {
-		if (this.closed) return;
-		this.watch.restart(req, this.registryClient, (_err) => {});
-	}
-
-	/**
-	 * close() cancels the server stream and suppresses subsequent onEnd /
-	 * onError callbacks. The caller knows the close is expected and reconnect
-	 * logic must NOT fire.
-	 */
+	/** Cancels the stream; no callback fires afterwards. */
 	close(): void {
 		if (this.closed) return;
 		this.closed = true;
-		this.expectedClose = true;
-		const cancellable = this.stream as unknown as { cancel?: () => void };
-		if (typeof cancellable.cancel === "function") {
-			try {
-				cancellable.cancel();
-			} catch {
-				// stream may already be done — fine.
-			}
+		try {
+			this.stream.cancel();
+		} catch {
+			// Already finished.
 		}
 	}
 
 	isClosed(): boolean {
 		return this.closed;
 	}
-
-	private handleMessage(msg: ServerControl): void {
-		if (msg.welcome) {
-			this.callbacks.onWelcome(msg.welcome);
-		} else if (msg.drain) {
-			this.callbacks.onDrain(msg.drain.reason);
-		}
-	}
-
-	private onEnd(): void {
-		const expected = this.expectedClose;
-		this.closed = true;
-		if (expected) return;
-		this.callbacks.onEnd();
-	}
 }
 
-// openControlStream is the canonical way callers construct the server-stream.
-// Kept separate so tests can stub it without binding to the proto-generated
-// ControlClient interface.
+// openControlStream opens Control.Open with this SDK's handshake identity.
 export function openControlStream(client: ControlClient): ServerStream {
-	const req: OpenRequestType = OpenRequest.create({
-		protocolVersion: PROTOCOL_VERSION,
-		sdkLanguage: SDK_LANGUAGE,
-		sdkVersion: SDK_VERSION,
-	});
-	return client.open(req);
+	return client.open(
+		OpenRequest.create({
+			protocolVersion: PROTOCOL_VERSION,
+			sdkLanguage: SDK_LANGUAGE,
+			sdkVersion: SDK_VERSION,
+		}),
+	);
 }

@@ -46,7 +46,7 @@ export class JsonPathError extends ServiceBridgeError {
 		message: string,
 		public readonly expr: string,
 	) {
-		super(`workflow/jsonpath: ${message}: "${expr}"`);
+		super("VALIDATION", `workflow/jsonpath: ${message}: "${expr}"`);
 		this.name = "JsonPathError";
 	}
 }

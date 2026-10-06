@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { join } from "node:path";
+import { NoLiveInstanceError } from "../errors";
 import type {
 	MethodDescriptor,
 	ServiceInstanceInfo,
@@ -12,7 +13,7 @@ import { CircuitBreakerRegistry } from "./circuit-breaker";
 import { RpcClient, SchemaRegistry } from "./client";
 import type { DirectTransport } from "./direct-transport";
 import { InstanceCache } from "./instance-cache";
-import { LoadBalancer, NoLiveInstanceError } from "./lb";
+import { LoadBalancer } from "./lb";
 import type { ProxyTransport } from "./proxy-transport";
 import { makeStubSb } from "./test-helpers";
 
@@ -67,6 +68,8 @@ function mkInstanceCache(
 			),
 		onInstancesChange: () => () => {},
 		onMethodsChange: () => () => {},
+		onRevoked: () => () => {},
+		isRevoked: () => false,
 	} as unknown as WatchStream;
 
 	const cache = new InstanceCache();
@@ -77,8 +80,12 @@ function mkInstanceCache(
 // Mock ProxyTransport that records the call for assertions.
 class FakeProxy {
 	calls: { service: string; method: string }[] = [];
-	async callUnary(service: string, method: string): Promise<Uint8Array> {
-		this.calls.push({ service, method });
+	async callUnary(
+		service: string,
+		_hash: Buffer,
+		call: { method: string },
+	): Promise<Uint8Array> {
+		this.calls.push({ service, method: call.method });
 		return new Uint8Array(0);
 	}
 	async *callStream(): AsyncIterable<Uint8Array> {}
@@ -113,16 +120,16 @@ describe("contract-version routing", () => {
 		const schemas = new SchemaRegistry();
 		schemas.set("payment-svc", "charge", pair);
 
-		const client = new RpcClient(
-			proxy as unknown as ProxyTransport,
-			null as unknown as DirectTransport,
-			instances,
-			schemas.asResolver(),
-			() => "caller-svc-id",
-			cb,
-			lb,
-			makeStubSb(),
-		);
+		const client = new RpcClient({
+			proxy: proxy as unknown as ProxyTransport,
+			direct: null as unknown as DirectTransport,
+			instances: instances,
+			resolveSchema: schemas.asResolver(),
+			cb: cb,
+			lb: lb,
+			callDefaults: () => ({}),
+			sb: makeStubSb(),
+		});
 
 		// Override output.decode to return an object (avoid real bytes round-trip).
 		const origDecode = pair.output.decode.bind(pair.output);
@@ -157,16 +164,16 @@ describe("contract-version routing", () => {
 		const schemas = new SchemaRegistry();
 		schemas.set("payment-svc", "charge", pair);
 
-		const client = new RpcClient(
-			new FakeProxy() as unknown as ProxyTransport,
-			null as unknown as DirectTransport,
-			instances,
-			schemas.asResolver(),
-			() => "caller-svc-id",
-			cb,
-			lb,
-			makeStubSb(),
-		);
+		const client = new RpcClient({
+			proxy: new FakeProxy() as unknown as ProxyTransport,
+			direct: null as unknown as DirectTransport,
+			instances: instances,
+			resolveSchema: schemas.asResolver(),
+			cb: cb,
+			lb: lb,
+			callDefaults: () => ({}),
+			sb: makeStubSb(),
+		});
 
 		await expect(
 			client.call(
@@ -175,10 +182,10 @@ describe("contract-version routing", () => {
 				{ userId: "u", amount: 1 },
 				{ transport: "proxy", retry: { maxAttempts: 1 } },
 			),
-		).rejects.toThrow(/no instance.*matches caller contract/);
+		).rejects.toThrow(/no live instance.*matches caller contract/);
 	});
 
-	it("surfaces an empty callee fleet as NoLiveInstanceError with UNAVAILABLE", async () => {
+	it("surfaces an empty callee fleet as a retryable NoLiveInstanceError", async () => {
 		const pair = await buildSchemaPair({
 			protoFile,
 			input: "ChargeRequest",
@@ -195,16 +202,16 @@ describe("contract-version routing", () => {
 		const schemas = new SchemaRegistry();
 		schemas.set("payment-svc", "charge", pair);
 
-		const client = new RpcClient(
-			new FakeProxy() as unknown as ProxyTransport,
-			null as unknown as DirectTransport,
-			instances,
-			schemas.asResolver(),
-			() => "caller-svc-id",
-			cb,
-			lb,
-			makeStubSb(),
-		);
+		const client = new RpcClient({
+			proxy: new FakeProxy() as unknown as ProxyTransport,
+			direct: null as unknown as DirectTransport,
+			instances: instances,
+			resolveSchema: schemas.asResolver(),
+			cb: cb,
+			lb: lb,
+			callDefaults: () => ({}),
+			sb: makeStubSb(),
+		});
 
 		const err = await client
 			.call(
@@ -221,7 +228,8 @@ describe("contract-version routing", () => {
 		// The type survives the caller path: "callee fleet is empty" stays
 		// distinguishable from "callee answered UNAVAILABLE" without regex on text.
 		expect(err).toBeInstanceOf(NoLiveInstanceError);
-		expect((err as { code?: number }).code).toBe(14);
+		expect((err as NoLiveInstanceError).code).toBe("NO_LIVE_INSTANCE");
+		expect((err as NoLiveInstanceError).retryable).toBe(true);
 	});
 
 	it('transport="direct" with no matching instance throws', async () => {
@@ -239,16 +247,16 @@ describe("contract-version routing", () => {
 		const schemas = new SchemaRegistry();
 		schemas.set("payment-svc", "charge", pair);
 
-		const client = new RpcClient(
-			new FakeProxy() as unknown as ProxyTransport,
-			{} as unknown as DirectTransport, // direct enabled but never used
+		const client = new RpcClient({
+			proxy: new FakeProxy() as unknown as ProxyTransport,
+			direct: {} as unknown as DirectTransport, // never reached
 			instances,
-			schemas.asResolver(),
-			() => "caller-svc-id",
+			resolveSchema: schemas.asResolver(),
 			cb,
 			lb,
-			makeStubSb(),
-		);
+			callDefaults: () => ({}),
+			sb: makeStubSb(),
+		});
 
 		await expect(
 			client.call(
@@ -257,8 +265,6 @@ describe("contract-version routing", () => {
 				{ userId: "u", amount: 1 },
 				{ transport: "direct", retry: { maxAttempts: 1 } },
 			),
-		).rejects.toThrow(
-			/no endpoint.*matching contract|no instance.*matches caller contract/,
-		);
+		).rejects.toThrow(/no live instance.*matches caller contract/);
 	});
 });

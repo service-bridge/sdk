@@ -1,4 +1,4 @@
-import { ServiceBridgeError } from "../errors";
+import { NoLiveInstanceError } from "../errors";
 import type {
 	MethodDescriptor,
 	ServiceInstanceInfo,
@@ -24,13 +24,6 @@ export interface Candidate {
 	// instance unhealthy through the watch snapshot (ADR 0001). Null when
 	// the runtime has no opinion or has not yet wired the hint.
 	isUnhealthyAt: Date | null;
-}
-
-export class NoLiveInstanceError extends ServiceBridgeError {
-	constructor(message?: string) {
-		super(message ?? "rpc: no live instance");
-		this.name = "NoLiveInstanceError";
-	}
 }
 
 export class LoadBalancer {
@@ -70,15 +63,38 @@ export class LoadBalancer {
 	// pods that is the dominant garbage the RPC path produces.
 	pick(candidates: Candidate[]): Candidate {
 		const now = this.now();
+		const winner =
+			this.sample(candidates, now, true) ??
+			// Fail-open (OBS-02): when the runtime marked every otherwise eligible
+			// instance unhealthy, the hint is more likely wrong than the whole
+			// fleet — route among them instead of failing every call.
+			this.sample(candidates, now, false);
+		if (winner === undefined)
+			throw new NoLiveInstanceError("rpc: no live instance");
+		// Claim the HALF_OPEN probe slot on the winner only. CLOSED instances
+		// always return true here without side effects.
+		this.cb.canCall(cbKey(winner.instance));
+		return winner;
+	}
+
+	// sample runs eligibility and P2C sampling in one pass with a two-slot
+	// reservoir; materialising the eligible subset would allocate per call.
+	private sample(
+		candidates: Candidate[],
+		now: number,
+		honourHint: boolean,
+	): Candidate | undefined {
 		let eligible = 0;
 		let a: Candidate | undefined;
 		let b: Candidate | undefined;
 		for (const c of candidates) {
 			if (!c.instance.callEndpoint) continue;
-			const hintActive =
+			if (
+				honourHint &&
 				c.isUnhealthyAt !== null &&
-				now - c.isUnhealthyAt.getTime() < HEALTH_HINT_TTL_MS;
-			if (hintActive) continue;
+				now - c.isUnhealthyAt.getTime() < HEALTH_HINT_TTL_MS
+			)
+				continue;
 			if (!this.cb.probeAvailable(cbKey(c.instance))) continue;
 
 			eligible++;
@@ -88,27 +104,18 @@ export class LoadBalancer {
 				b = c;
 			} else {
 				// Reservoir sampling, k=2: the n-th eligible candidate takes a
-				// uniformly chosen slot with probability 2/n, which leaves every
-				// eligible pair equally likely without holding the whole subset.
+				// uniformly chosen slot with probability 2/n.
 				const slot = Math.floor(this.random() * eligible);
 				if (slot === 0) a = c;
 				else if (slot === 1) b = c;
 			}
 		}
-		if (a === undefined) throw new NoLiveInstanceError();
-		let winner = a;
-		if (b !== undefined) {
-			// Reservoir sampling picks the pair uniformly but not its order: the
-			// second eligible candidate can only ever land in slot B. Since a tie
-			// on inflight resolves to slot A, an unshuffled reservoir would starve
-			// that candidate on an idle fleet. One coin flip restores uniformity.
-			winner =
-				this.random() < 0.5 ? this.leastLoaded(a, b) : this.leastLoaded(b, a);
-		}
-		// Claim the HALF_OPEN probe slot on the winner only. CLOSED instances
-		// always return true here without side effects.
-		this.cb.canCall(cbKey(winner.instance));
-		return winner;
+		if (a === undefined || b === undefined) return a;
+		// Reservoir sampling picks the pair uniformly but not its order; one coin
+		// flip keeps a tie on inflight from always favouring slot A.
+		return this.random() < 0.5
+			? this.leastLoaded(a, b)
+			: this.leastLoaded(b, a);
 	}
 
 	private leastLoaded(a: Candidate, b: Candidate): Candidate {

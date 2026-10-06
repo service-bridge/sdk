@@ -99,6 +99,8 @@ export interface TelemetryTransportOptions {
 }
 
 const DEFAULT_FLUSH_INTERVAL_MS = 250;
+// How long stop() waits for the runtime to acknowledge the final flush.
+const STOP_ACK_TIMEOUT_MS = 2_000;
 const DEFAULT_MAX_BATCH_ITEMS = 256;
 
 /** One in-flight item plus the stream sequence of its batch. */
@@ -149,7 +151,9 @@ export class TelemetryTransport {
 	private readonly maxInflightItems: number;
 	// Last drop counts we reported via onDrop, to fire only on increase.
 	private lastServerDrops = 0;
+	private lastServerDropsSeen = 0;
 	private lastRingDrops = 0;
+	private ackWaiter: (() => void) | null = null;
 
 	constructor(opts: TelemetryTransportOptions) {
 		this.client = opts.client;
@@ -172,8 +176,11 @@ export class TelemetryTransport {
 		this.flushTimer = timer;
 	}
 
-	async stop(): Promise<void> {
-		this.stopped = true;
+	/**
+	 * Final flush: writes what the ring holds, half-closes the stream and waits
+	 * up to `timeoutMs` for the runtime to acknowledge it before cancelling.
+	 */
+	async stop(timeoutMs = STOP_ACK_TIMEOUT_MS): Promise<void> {
 		if (this.flushTimer) {
 			clearInterval(this.flushTimer);
 			this.flushTimer = null;
@@ -182,17 +189,35 @@ export class TelemetryTransport {
 			clearTimeout(this.reconnectTimer);
 			this.reconnectTimer = null;
 		}
-		if (this.stream) {
+		const stream = this.stream;
+		const wasStopped = this.stopped;
+		// Set first: a stream that dies during the final flush must not be
+		// reopened.
+		this.stopped = true;
+		if (stream && !wasStopped) {
 			try {
-				// Best-effort final flush so in-flight ops reach the runtime on shutdown.
 				this.pump();
-				this.stream.end();
 			} catch {
-				// Stream already torn down — nothing to do.
+				// Stream already torn down.
 			}
-			this.stream?.cancel?.();
-			this.stream = null;
+			if (this.inflight.length > 0)
+				await new Promise<void>((resolve) => {
+					const timer = setTimeout(resolve, timeoutMs);
+					this.ackWaiter = () => {
+						if (this.inflight.length > 0) return;
+						clearTimeout(timer);
+						resolve();
+					};
+				});
+			this.ackWaiter = null;
+			try {
+				stream.end();
+			} catch {
+				// Already torn down.
+			}
 		}
+		this.stream?.cancel?.();
+		this.stream = null;
 	}
 
 	/**
@@ -204,6 +229,7 @@ export class TelemetryTransport {
 	 */
 	async flushNow(): Promise<void> {
 		if (this.stopped) return;
+		this.reportDrops();
 		if (!this.stream) return;
 		this.pump();
 	}
@@ -321,7 +347,9 @@ export class TelemetryTransport {
 		this.backpressureLevel = ack.backpressureLevel;
 
 		this.releaseConfirmed(ack.acknowledgedSequence);
-		this.reportDrops(ack);
+		this.lastServerDropsSeen = Number(ack.dropCountServerSide);
+		this.reportDrops();
+		this.ackWaiter?.();
 
 		// Credit-based pipelining: an ack is the cheapest signal that the runtime
 		// is keeping up, so refill the wire immediately instead of idling until the
@@ -358,9 +386,12 @@ export class TelemetryTransport {
 		for (const item of confirmed) this.inflightIds.delete(item.id);
 	}
 
-	private reportDrops(ack: TelemetryAck): void {
+	// reportDrops fires onDrop when either drop count rose since the last
+	// report. Runs on every ack and every flush tick, so ring drops are reported
+	// even while the stream is down.
+	private reportDrops(): void {
 		if (!this.onDrop) return;
-		const serverDrops = Number(ack.dropCountServerSide);
+		const serverDrops = this.lastServerDropsSeen;
 		const ringDrops = this.ring.totalDropCount();
 		if (serverDrops > this.lastServerDrops || ringDrops > this.lastRingDrops) {
 			this.lastServerDrops = serverDrops;
@@ -368,7 +399,7 @@ export class TelemetryTransport {
 			this.onDrop({
 				serverDrops,
 				ringDrops,
-				backpressureLevel: ack.backpressureLevel,
+				backpressureLevel: this.backpressureLevel,
 			});
 		}
 	}
@@ -378,6 +409,7 @@ export class TelemetryTransport {
 		// ring. They are re-peeked and resent on the next stream (at-least-once).
 		this.inflight = [];
 		this.inflightIds.clear();
+		this.ackWaiter?.();
 		this.draining = false;
 		this.writeBlocked = false;
 		const retired = this.stream;

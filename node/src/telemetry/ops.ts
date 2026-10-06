@@ -283,14 +283,15 @@ export class OpHandle {
 
 	/**
 	 * End the operation, enqueue the END frame.
-	 * Idempotent — calling end() twice is a no-op.
+	 * Idempotent — calling end() twice is a no-op. `metaJson` (a JSON object)
+	 * is merged into the op's meta by the runtime.
 	 */
-	end(status: Status, statusMessage?: string): void {
+	end(status: Status, statusMessage?: string, metaJson?: Buffer): void {
 		if (this.ended) return;
 		this.ended = true;
 		this.finalStatus = status;
 		this.flushBufferedPayloads(status);
-		this.enqueueEndFrame(status, statusMessage ?? "");
+		this.enqueueEndFrame(status, statusMessage ?? "", metaJson);
 	}
 
 	// flushBufferedPayloads emits "errors"-mode buffered attachments when the op
@@ -325,7 +326,11 @@ export class OpHandle {
 		this.ring.push("ops", report);
 	}
 
-	private enqueueEndFrame(status: Status, statusMessage: string): void {
+	private enqueueEndFrame(
+		status: Status,
+		statusMessage: string,
+		metaJson?: Buffer,
+	): void {
 		// END delta: only fields that change from START. Runtime upserts finished op.
 		const report: OpReport = {
 			traceId: this.params.traceId,
@@ -341,7 +346,7 @@ export class OpHandle {
 			finishedAtMs: Date.now(),
 			status,
 			statusMessage,
-			metaJson: Buffer.alloc(0),
+			metaJson: metaJson ?? Buffer.alloc(0),
 			attrsJson: Buffer.alloc(0),
 		};
 		this.ring.push("ops", report);

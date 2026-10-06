@@ -1,13 +1,12 @@
 import type { Express, NextFunction, Request, Response } from "express";
 import type { ServiceBridge } from "../../connection/service-bridge";
 import { runWithTrace } from "../../telemetry/context";
-import { Status } from "../../telemetry/ops";
 import { bodyToBytes, RAW_JSON_CONTRACT } from "../_common/body-capture";
-import { startHttpOp, statusForHttpCode } from "../_common/http-op";
 import {
-	HttpRequestGuard,
-	type HttpSecurityOptions,
-} from "../_common/security";
+	type HttpIntegrationOptions,
+	startHttpOp,
+	UNMATCHED_ROUTE,
+} from "../_common/http-op";
 import { resolveHttpAdvertiseHost } from "../endpoint";
 
 /**
@@ -17,6 +16,9 @@ import { resolveHttpAdvertiseHost } from "../endpoint";
 type RouteLike = {
 	path?: string | RegExp;
 	methods?: Record<string, boolean>;
+	// Express 5 / Express 4 spelling of the same check.
+	_handlesMethod?: (method: string) => boolean;
+	_handles_method?: (method: string) => boolean;
 };
 
 type LayerLike = {
@@ -24,6 +26,8 @@ type LayerLike = {
 	name?: string;
 	handle?: { stack?: LayerLike[] };
 	regexp?: RegExp;
+	path?: string;
+	match?: (path: string) => boolean;
 };
 
 function getRootRouter(app: Express): { stack: LayerLike[] } | null {
@@ -84,10 +88,9 @@ function collect(
  *
  * @public — см. ./README.md
  */
-export interface ExpressEndpoint {
+export interface ExpressEndpoint extends HttpIntegrationOptions {
 	host?: string;
 	port: number;
-	security?: HttpSecurityOptions;
 }
 
 /**
@@ -121,7 +124,42 @@ export function attachExpress(
 	const host = resolveHttpAdvertiseHost(endpoint.host);
 	sb.routes.publishHttp({ host, port: endpoint.port });
 
-	installTraceMiddleware(app, sb, endpoint.security);
+	installTraceMiddleware(app, sb, endpoint);
+}
+
+/**
+ * Finds the template of the route Express will dispatch the request to, by
+ * asking each layer the way Express's own router does (layer.match). Runs
+ * before routing, so the op can carry the template from its first frame.
+ * A mount prefix contributes the path it matched.
+ */
+export function matchExpressRoute(
+	stack: LayerLike[],
+	path: string,
+	method: string,
+	prefix = "",
+): string | null {
+	for (const layer of stack) {
+		if (typeof layer.match !== "function" || !layer.match(path)) continue;
+		const route = layer.route;
+		if (route) {
+			const handles =
+				route._handlesMethod?.(method) ?? route._handles_method?.(method);
+			if (handles) return `${prefix}${String(route.path)}`;
+			continue;
+		}
+		if (layer.handle?.stack) {
+			const consumed = layer.path ?? "";
+			const found = matchExpressRoute(
+				layer.handle.stack,
+				path.slice(consumed.length) || "/",
+				method,
+				`${prefix}${consumed}`,
+			);
+			if (found) return found;
+		}
+	}
+	return null;
 }
 
 const TRACE_FLAG = "__servicebridge_trace__";
@@ -135,43 +173,33 @@ const TRACE_FLAG = "__servicebridge_trace__";
 function installTraceMiddleware(
 	app: Express,
 	sb: ServiceBridge,
-	security?: HttpSecurityOptions,
+	opts: HttpIntegrationOptions,
 ): void {
 	// biome-ignore lint/suspicious/noExplicitAny: app не хранит произвольные поля в типах
 	const tagged = app as any;
 	if (tagged[TRACE_FLAG]) return;
 	tagged[TRACE_FLAG] = true;
-	const guard = new HttpRequestGuard(security);
 
 	app.use((req: Request, res: Response, next: NextFunction) => {
-		const decision = guard.check({
-			method: req.method,
-			pathname: req.originalUrl || req.url,
-			remoteAddress: req.socket.remoteAddress,
-			forwardedFor: req.headers["x-forwarded-for"]?.toString(),
-		});
-		if (!decision.allowed) {
-			if (decision.retryAfterSeconds) {
-				res.setHeader("Retry-After", String(decision.retryAfterSeconds));
-			}
-			res.status(decision.status).json({
-				error: decision.status === 429 ? "Too Many Requests" : "Not Found",
-			});
-			return;
-		}
-		const op = startHttpOp(sb, {
-			method: req.method,
-			subjectPath: req.path,
-			keyPath: req.path,
-			traceHeader: req.headers["x-sb-trace"],
-			idempotencyKey: req.headers["idempotency-key"],
-		});
-		const handle = op.handle;
+		const router = getRootRouter(app);
+		const route =
+			(router &&
+				matchExpressRoute(router.stack, req.path, req.method.toLowerCase())) ||
+			UNMATCHED_ROUTE;
+		const op = startHttpOp(
+			sb,
+			{
+				method: req.method,
+				route,
+				traceHeader: req.headers["x-sb-trace"],
+				idempotencyKey: req.headers["idempotency-key"],
+			},
+			opts,
+		);
 		runWithTrace(op.scope, () => {
 			// Capture the response body (OUT) by tapping res.json/res.send. The
-			// request body (IN) is read in finalize, by when any body-parser ran.
-			// Both are skipped while capture is off: the tap and the serialization
-			// exist only to feed OpHandle, which would drop the bytes anyway.
+			// request body (IN) is read when the op ends, after any body parser ran.
+			// Both are skipped while capture is off.
 			let outBody: unknown;
 			let outSet = false;
 			if (op.capturing) {
@@ -191,25 +219,26 @@ function installTraceMiddleware(
 				}) as typeof res.send;
 			}
 			let ended = false;
-			const finalize = (status: Status, msg?: string) => {
-				if (ended) return;
-				ended = true;
-				if (op.capturing) {
-					const inBytes = bodyToBytes((req as { body?: unknown }).body);
-					if (inBytes) handle.captureIn(inBytes, RAW_JSON_CONTRACT);
-					if (outSet) {
-						const outBytes = bodyToBytes(outBody);
-						if (outBytes) handle.captureOut(outBytes, RAW_JSON_CONTRACT);
-					}
+			const capture = () => {
+				if (!op.capturing) return;
+				const inBytes = bodyToBytes((req as { body?: unknown }).body);
+				if (inBytes) op.handle.captureIn(inBytes, RAW_JSON_CONTRACT);
+				if (outSet) {
+					const outBytes = bodyToBytes(outBody);
+					if (outBytes) op.handle.captureOut(outBytes, RAW_JSON_CONTRACT);
 				}
-				handle.end(status, msg);
 			};
 			res.once("finish", () => {
-				const { status, message } = statusForHttpCode(res.statusCode);
-				finalize(status, message);
+				if (ended) return;
+				ended = true;
+				capture();
+				op.finish(res.statusCode);
 			});
 			res.once("close", () => {
-				if (!res.writableEnded) finalize(Status.TIMEOUT, "client abort");
+				if (ended || res.writableEnded) return;
+				ended = true;
+				capture();
+				op.abort();
 			});
 			next();
 		});

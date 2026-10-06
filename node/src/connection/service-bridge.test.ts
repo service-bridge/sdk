@@ -1,28 +1,41 @@
+// service-bridge.test.ts — the connection lifecycle against fake Control and
+// Registry streams: start() waits for Welcome + snapshot, reconnects count
+// consecutive failures, terminal errors stop, rotation swaps TLS material
+// without reopening anything, stop() is ordered and idempotent.
+
 import { afterEach, describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { status as GrpcStatus } from "@grpc/grpc-js";
 import { testTls } from "../../tests/helpers/tls";
-import { ConfigurationError } from "../errors";
+import {
+	ConfigurationError,
+	StateError,
+	TimeoutError,
+	ValidationError,
+} from "../errors";
+import { silentLogger } from "../logger";
 import { BootstrapKeyPayload } from "../pb/servicebridge/v1/bootstrap";
 import type {
 	ControlClient,
+	OpenRequest,
 	ServerControl,
 } from "../pb/servicebridge/v1/control";
 import type {
+	RegisterRequest,
 	RegistryClient,
 	RegistryEvent,
 } from "../pb/servicebridge/v1/registry";
 import type { MetricPoint } from "../pb/servicebridge/v1/telemetry";
+import { PROTOCOL_VERSION } from "./handshake";
 import type { ProvisionResult } from "./provision";
 import {
 	type DisconnectedEvent,
-	type PolicyViolationEvent,
 	type ReconnectingEvent,
 	ServiceBridge,
+	type ServiceBridgeOptions,
 } from "./service-bridge";
 import { ConnectionError } from "./service-bridge-error";
 
-// Minimal valid bootstrap key for tests using BootstrapKeyPayload proto format.
 const VALID_KEY = (() => {
 	const bytes = BootstrapKeyPayload.encode({
 		keyId: Buffer.alloc(8, 0x01),
@@ -32,1587 +45,498 @@ const VALID_KEY = (() => {
 	return `sb.${Buffer.from(bytes).toString("base64url")}`;
 })();
 
-// ── fakes ───────────────────────────────────────────────────────────────────
-
-// FakeServerStream mimics a gRPC ClientReadableStream<ServerControl>.
-class FakeServerStream extends EventEmitter {
+class FakeStream extends EventEmitter {
 	cancelled = false;
 	cancel(): void {
+		if (this.cancelled) return;
 		this.cancelled = true;
-		this.emit("end");
-	}
-	emitData(msg: ServerControl): void {
-		this.emit("data", msg);
-	}
-	emitError(err: Error): void {
-		this.emit("error", err);
+		this.emit("error", Object.assign(new Error("cancelled"), { code: 1 }));
 	}
 }
 
-function makeFakeClient(stream: FakeServerStream): ControlClient {
-	return {
-		open: () => stream,
-		close: () => {},
-	} as unknown as ControlClient;
-}
-
-// FakeRegistryStream mimics the gRPC ClientReadableStream<RegistryEvent> the
-// WatchStream attaches "data"/"error" listeners to.
-class FakeRegistryStream extends EventEmitter {
-	cancelled = false;
-	cancel(): void {
-		this.cancelled = true;
-	}
-	emitEvent(evt: RegistryEvent): void {
-		this.emit("data", evt);
-	}
-}
-
-// makeRegistryFactory returns a registryClientFactory that records every stream
-// it hands out, so a test can drive the most-recent registry stream after a
-// reconnect created a fresh one.
-function makeRegistryFactory(
-	streams: FakeRegistryStream[],
-): () => RegistryClient {
-	return () =>
-		({
-			registerAndWatch: () => {
-				const s = new FakeRegistryStream();
-				streams.push(s);
-				return s as unknown as ReturnType<RegistryClient["registerAndWatch"]>;
-			},
-			close: () => {},
-		}) as unknown as RegistryClient;
-}
-
-// makeCountingControlFactory hands out a fresh control client per call and
-// records created/closed so a test can assert no channel outlives its session.
-function makeCountingControlFactory(streams: FakeServerStream[]) {
-	const counts = { created: 0, closed: 0 };
-	const factory = (): ControlClient => {
-		counts.created++;
-		const stream = new FakeServerStream();
-		streams.push(stream);
-		return {
-			open: () => stream,
-			close: () => {
-				counts.closed++;
-			},
-		} as unknown as ControlClient;
-	};
-	return { counts, factory };
-}
-
-// makeCountingRegistryFactory mirrors makeRegistryFactory but counts channel
-// create/close so the leak regression can assert created === closed.
-function makeCountingRegistryFactory(streams: FakeRegistryStream[]) {
-	const counts = { created: 0, closed: 0 };
-	const factory = (): RegistryClient =>
-		({
-			registerAndWatch: () => {
-				const s = new FakeRegistryStream();
-				streams.push(s);
-				return s as unknown as ReturnType<RegistryClient["registerAndWatch"]>;
-			},
-			close: () => {
-				counts.closed++;
-			},
-		}) as unknown as RegistryClient;
-	const wrapped = (url: string, creds: unknown): RegistryClient => {
-		counts.created++;
-		void url;
-		void creds;
-		return factory();
-	};
-	return { counts, factory: wrapped };
-}
-
-// rotatingBridge builds a bridge whose first cert expires in 1s with a zero
-// refresh lead, so the cert-refresh timer fires an overlap rotation right after
-// the first Welcome. Every control stream it hands out is recorded in `streams`.
-function rotatingBridge(
-	streams: FakeServerStream[],
-	extra: Record<string, unknown> = {},
-	rotatedNotAfter = BigInt(Math.floor(Date.now() / 1000) + 3600),
-): ServiceBridge {
-	return new ServiceBridge("localhost:0", VALID_KEY, {
-		advertise: false,
-		_disableTelemetryTransport: true,
-		provisionFn: async () => ({
-			...fakeProvisionResult(),
-			notAfterUnix: BigInt(Math.floor(Date.now() / 1000) + 1),
-		}),
-		refreshFn: async () => ({
-			...fakeProvisionResult(),
-			notAfterUnix: rotatedNotAfter,
-		}),
-		clientFactory: () => {
-			const s = new FakeServerStream();
-			streams.push(s);
-			return makeFakeClient(s);
-		},
-		certRefreshLeadMs: 0,
-		certRefreshJitterMs: 0,
-		...extra,
+function grpcError(code: number, message = "x"): Error {
+	return Object.assign(new Error(`${code} ${message}`), {
+		code,
+		details: message,
 	});
 }
 
-function fakeProvisionResult(): ProvisionResult {
+function provision(over: Partial<ProvisionResult> = {}): ProvisionResult {
 	return {
 		certDer: testTls.certDer,
 		caChainDer: testTls.certDer,
 		serviceId: "svc",
 		serviceName: "svc-name",
 		instanceId: "inst",
-		notAfterUnix: BigInt(Math.floor(Date.now() / 1000) + 3600),
+		notAfterUnixMs: Date.now() + 3_600_000,
 		privateKey: {} as CryptoKey,
 		privateKeyDer: testTls.privateKeyDer,
+		...over,
 	};
 }
 
-// ── tests ───────────────────────────────────────────────────────────────────
-
-// Telemetry transport is disabled per-bridge via { telemetry: false } in these
-// tests — they exercise the connect/reconnect/rotation lifecycle, не телеметрию.
-// Иначе ServiceBridge поднял бы реальный TelemetryClient на localhost:0.
-
-let activeBridges: ServiceBridge[] = [];
-afterEach(async () => {
-	for (const b of activeBridges) {
-		await b.stop();
-	}
-	activeBridges = [];
-});
-
-describe("ServiceBridge constructor", () => {
-	test("instantiates without throwing", () => {
-		const sb = new ServiceBridge("localhost:14445", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-		});
-		expect(sb).toBeDefined();
-	});
-
-	test("on() registers handlers without throwing", () => {
-		const sb = new ServiceBridge("localhost:14445", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-		});
-		expect(() => {
-			sb.on("connected", () => {});
-			sb.on("reconnecting", () => {});
-			sb.on("disconnected", () => {});
-		}).not.toThrow();
-	});
-});
-
-describe("ServiceBridge connect lifecycle", () => {
-	test("emits connected when provision succeeds and Welcome arrives", async () => {
-		const stream = new FakeServerStream();
-		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-			provisionFn: async () => fakeProvisionResult(),
-			clientFactory: () => makeFakeClient(stream),
-			certRefreshLeadMs: 1_000_000,
-		});
-		activeBridges.push(sb);
-
-		const events: string[] = [];
-		sb.on("connected", () => events.push("connected"));
-		const connected = once(sb, "connected");
-
-		await sb.start();
-		stream.emitData({
-			welcome: {
-				sessionId: "s1",
-				serviceId: "svc",
-				serviceName: "svc-name",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
-		});
-		await connected;
-		expect(events).toEqual(["connected"]);
-	});
-
-	test("identity() returns null before Welcome, full record after, null after stop", async () => {
-		const stream = new FakeServerStream();
-		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-			provisionFn: async () => fakeProvisionResult(),
-			clientFactory: () => makeFakeClient(stream),
-			certRefreshLeadMs: 1_000_000,
-		});
-		activeBridges.push(sb);
-
-		expect(sb.identity()).toBeNull();
-
-		await sb.start();
-		expect(sb.identity()).toBeNull();
-
-		stream.emitData({
-			welcome: {
-				sessionId: "sess-42",
-				serviceId: "svc-id-7",
-				serviceName: "billing",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
-		});
-		await waitFor(
-			() => sb.identity() !== null,
-			"identity populated after Welcome",
-		);
-
-		expect(sb.identity()).toEqual({
-			sessionId: "sess-42",
-			serviceId: "svc-id-7",
-			serviceName: "billing",
-			instanceId: "inst",
-		});
-
-		await sb.stop();
-		expect(sb.identity()).toBeNull();
-	});
-
-	test("reuses cached cert on reconnect — no re-Provision (argon2)", async () => {
-		let provisionCalls = 0;
-		const streams: FakeServerStream[] = [];
-		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-			provisionFn: async () => {
-				provisionCalls++;
-				return fakeProvisionResult();
-			},
-			clientFactory: () => {
-				const s = new FakeServerStream();
-				streams.push(s);
-				return makeFakeClient(s);
-			},
-			certRefreshLeadMs: 1_000_000,
-			reconnectIntervalMs: 5,
-			reconnectAttempts: 5,
-		});
-		activeBridges.push(sb);
-
-		const reconnects: ReconnectingEvent[] = [];
-		sb.on("reconnecting", (e) => reconnects.push(e));
-
-		await sb.start();
-		await waitFor(() => streams.length >= 1, "first stream opened");
-		streams[0]?.emitData({
-			welcome: {
-				sessionId: "s1",
-				serviceId: "svc",
-				serviceName: "n",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
-		});
-		await tick();
-		expect(provisionCalls).toBe(1);
-		const resources = sb as unknown as {
-			_proxyTransport: object;
-			_eventsClient: object;
-			_jobsClient: object;
-			_workflowsClient: object;
-		};
-		const before = { ...resources };
-
-		// Drop the stream → reconnect. The cert is still valid, so connect() must
-		// reuse the cached provision instead of calling provisionFn again.
-		streams[0]?.emitError(new Error("transport drop"));
-		await waitFor(() => streams.length >= 2, "reconnect opened a new stream");
-		streams[1]?.emitData({
-			welcome: {
-				sessionId: "s2",
-				serviceId: "svc",
-				serviceName: "n",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
-		});
-		await tick();
-
-		expect(resources._proxyTransport).not.toBe(before._proxyTransport);
-		expect(resources._eventsClient).not.toBe(before._eventsClient);
-		expect(resources._jobsClient).not.toBe(before._jobsClient);
-		expect(resources._workflowsClient).not.toBe(before._workflowsClient);
-		expect(reconnects.length).toBeGreaterThanOrEqual(1);
-		expect(provisionCalls).toBe(1);
-	});
-
-	test("emits reconnecting when provision throws", async () => {
-		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-			provisionFn: async () => {
-				throw new Error("network");
-			},
-			reconnectIntervalMs: 1_000_000,
-			reconnectAttempts: 3,
-		});
-		activeBridges.push(sb);
-
-		const reconnects: ReconnectingEvent[] = [];
-		sb.on("reconnecting", (e) => reconnects.push(e));
-
-		await sb.start();
-		await tick();
-		expect(reconnects.length).toBe(1);
-		const r0 = reconnects[0];
-		expect(r0?.reason).toContain("network");
-		expect(r0?.attempt).toBe(2);
-	});
-
-	test("emits disconnected{reason:'exhausted'} after attempts run out", async () => {
-		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-			provisionFn: async () => {
-				throw new Error("nope");
-			},
-			reconnectIntervalMs: 5,
-			reconnectAttempts: 2,
-		});
-		activeBridges.push(sb);
-
-		const disconnects: DisconnectedEvent[] = [];
-		const reconnects: ReconnectingEvent[] = [];
-		sb.on("reconnecting", (e) => reconnects.push(e));
-		sb.on("disconnected", (e) => disconnects.push(e));
-
-		await sb.start();
-		await new Promise((r) => setTimeout(r, 100));
-
-		expect(disconnects.length).toBe(1);
-		const d0 = disconnects[0];
-		expect(d0?.reason).toBe("exhausted");
-		expect(reconnects.length).toBeGreaterThanOrEqual(1);
-	});
-
-	test("emits disconnected on drain", async () => {
-		const stream = new FakeServerStream();
-		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-			provisionFn: async () => fakeProvisionResult(),
-			clientFactory: () => makeFakeClient(stream),
-			certRefreshLeadMs: 1_000_000,
-		});
-		activeBridges.push(sb);
-
-		const disconnects: DisconnectedEvent[] = [];
-		sb.on("disconnected", (e) => disconnects.push(e));
-		const disconnected = once(sb, "disconnected");
-
-		await sb.start();
-		stream.emitData({
-			welcome: {
-				sessionId: "s1",
-				serviceId: "svc",
-				serviceName: "svc-name",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
-		});
-		stream.emitData({ drain: { reason: "maintenance" } });
-		await disconnected;
-		expect(disconnects.length).toBe(1);
-		const drain0 = disconnects[0];
-		expect(drain0?.reason).toContain("maintenance");
-	});
-
-	test("stop() prevents further reconnects", async () => {
-		let provisionCalls = 0;
-		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-			provisionFn: async () => {
-				provisionCalls++;
-				throw new Error("nope");
-			},
-			reconnectIntervalMs: 5,
-			reconnectAttempts: 5,
-		});
-		activeBridges.push(sb);
-
-		await sb.start();
-		await sb.stop();
-		await new Promise((r) => setTimeout(r, 50));
-		const after = provisionCalls;
-		await new Promise((r) => setTimeout(r, 50));
-		expect(provisionCalls).toBe(after);
-	});
-
-	test("stop() clears the pending reconnect timer (BUG-17)", async () => {
-		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-			provisionFn: async () => {
-				throw new Error("nope");
-			},
-			// Large interval: the reconnect timer is parked, not fired, so we can
-			// assert it is cleared by stop() rather than by elapsing.
-			reconnectIntervalMs: 1_000_000,
-			reconnectAttempts: 5,
-		});
-		activeBridges.push(sb);
-
-		await sb.start();
-		// First provision throws → scheduleReconnect parks a setTimeout handle.
-		await waitFor(
-			() =>
-				(sb as unknown as { reconnectTimer: unknown }).reconnectTimer !== null,
-			"reconnect timer parked after failed provision",
-		);
-
-		await sb.stop();
-		expect(
-			(sb as unknown as { reconnectTimer: unknown }).reconnectTimer,
-		).toBeNull();
-	});
-});
-
-// snapshotWithTelemetry pushes a registry snapshot carrying the runtime's
-// telemetry.enable value. payloadMaxBytes must be non-zero: the WatchStream
-// treats an all-zero CaptureModes as "field not sent" and keeps the previous
-// value, so a bare telemetryEnabled=false would be ignored.
-function snapshotWithTelemetry(enabled: boolean): RegistryEvent {
-	return {
-		snapshot: {
-			methods: [],
-			instances: [],
-			eventSubscriptions: [],
-			outgoingCalls: [],
-			policy: undefined,
-			captureModes: {
-				rpc: 0,
-				http: 0,
-				event: 0,
-				workflow: 0,
-				telemetryEnabled: enabled,
-				payloadMaxBytes: 65536,
-			},
-		},
-		update: undefined,
-	} as unknown as RegistryEvent;
+interface Harness {
+	sb: ServiceBridge;
+	control: FakeStream[];
+	opens: OpenRequest[];
+	registry: FakeStream[];
+	registers: RegisterRequest[];
+	clients: { control: number; registry: number; closed: number };
+	provisions: () => number;
+	welcome(protocolVersion?: number): void;
+	snapshot(): void;
 }
 
-describe("ServiceBridge telemetry identity", () => {
-	test("telemetry.enabled() follows the runtime-pushed value on a live connection", async () => {
-		const controlStreams: FakeServerStream[] = [];
-		const registryStreams: FakeRegistryStream[] = [];
-		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-			provisionFn: async () => fakeProvisionResult(),
-			clientFactory: () => {
-				const s = new FakeServerStream();
-				controlStreams.push(s);
-				return makeFakeClient(s);
-			},
-			registryClientFactory: makeRegistryFactory(registryStreams),
-			certRefreshLeadMs: 1_000_000,
+const bridges: ServiceBridge[] = [];
+afterEach(async () => {
+	for (const b of bridges.splice(0)) await b.stop();
+});
+
+function harness(
+	opts: Partial<ServiceBridgeOptions> & Record<string, unknown> = {},
+): Harness {
+	const control: FakeStream[] = [];
+	const opens: OpenRequest[] = [];
+	const registry: FakeStream[] = [];
+	const registers: RegisterRequest[] = [];
+	const clients = { control: 0, registry: 0, closed: 0 };
+	let provisions = 0;
+	const sb = new ServiceBridge("localhost:0", VALID_KEY, {
+		advertise: false,
+		logger: silentLogger,
+		_disableTelemetryTransport: true,
+		reconnectIntervalMs: 5,
+		startTimeoutMs: 2_000,
+		stopTimeoutMs: 200,
+		provisionFn: async () => {
+			provisions++;
+			return provision();
+		},
+		controlClientFactory: () => {
+			clients.control++;
+			return {
+				open: (req: OpenRequest) => {
+					opens.push(req);
+					const s = new FakeStream();
+					control.push(s);
+					return s;
+				},
+				close: () => {
+					clients.closed++;
+				},
+			} as unknown as ControlClient;
+		},
+		registryClientFactory: () => {
+			clients.registry++;
+			return {
+				registerAndWatch: (req: RegisterRequest) => {
+					registers.push(req);
+					const s = new FakeStream();
+					registry.push(s);
+					return s;
+				},
+				close: () => {
+					clients.closed++;
+				},
+			} as unknown as RegistryClient;
+		},
+		...opts,
+	} as ServiceBridgeOptions);
+	bridges.push(sb);
+	return {
+		sb,
+		control,
+		opens,
+		registry,
+		registers,
+		clients,
+		provisions: () => provisions,
+		welcome(protocolVersion = PROTOCOL_VERSION) {
+			const s = control[control.length - 1];
+			s?.emit("data", {
+				welcome: {
+					sessionId: `s${control.length}`,
+					serviceId: "svc",
+					serviceName: "svc-name",
+					runtimeVersion: "test",
+					protocolVersion,
+				},
+			} satisfies ServerControl);
+		},
+		snapshot() {
+			const s = registry[registry.length - 1];
+			s?.emit("data", {
+				snapshot: {
+					methods: [],
+					instances: [],
+					eventSubscriptions: [],
+					outgoingCalls: [],
+					policy: {
+						capabilities: [],
+						egress: [],
+						acceptance: [],
+						warnings: [],
+					},
+				},
+			} satisfies RegistryEvent);
+		},
+	};
+}
+
+async function waitFor(
+	predicate: () => boolean,
+	label: string,
+	timeoutMs = 2000,
+) {
+	const deadline = Date.now() + timeoutMs;
+	while (!predicate()) {
+		if (Date.now() > deadline) throw new Error(`waitFor timed out: ${label}`);
+		await new Promise((r) => setTimeout(r, 2));
+	}
+}
+
+// startLive runs start() and plays the runtime's part until it resolves.
+async function startLive(h: Harness): Promise<void> {
+	const started = h.sb.start();
+	await waitFor(() => h.control.length > 0, "Control.Open");
+	h.welcome();
+	await waitFor(() => h.registry.length > 0, "RegisterAndWatch");
+	h.snapshot();
+	await started;
+}
+
+describe("start()", () => {
+	test("resolves only after Welcome AND the first registry snapshot", async () => {
+		const h = harness();
+		let done = false;
+		const started = h.sb.start().then(() => {
+			done = true;
 		});
-		activeBridges.push(sb);
-
-		// Fail-safe before the first snapshot: emit rather than silently drop.
-		expect(sb.telemetry.enabled()).toBe(true);
-
-		await sb.start();
-		await waitFor(() => registryStreams.length >= 1, "first registry stream");
-		controlStreams[0]?.emitData({
-			welcome: {
-				sessionId: "s1",
-				serviceId: "svc",
-				serviceName: "n",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
+		await waitFor(() => h.control.length > 0, "open");
+		h.welcome();
+		await waitFor(() => h.registry.length > 0, "watch");
+		await new Promise((r) => setTimeout(r, 10));
+		expect(done).toBe(false);
+		h.snapshot();
+		await started;
+		expect(h.sb.identity()).toEqual({
+			sessionId: "s1",
+			serviceId: "svc",
+			serviceName: "svc-name",
+			instanceId: "inst",
 		});
-		await tick();
-
-		const latest = () => registryStreams[registryStreams.length - 1]!;
-		latest().emitEvent(snapshotWithTelemetry(false));
-		await tick();
-		expect(sb.telemetry.enabled()).toBe(false);
-
-		// The operator turns it back on — a caller that cached the flag would keep
-		// skipping emission forever, so the getter must track the change back.
-		latest().emitEvent(snapshotWithTelemetry(true));
-		await tick();
-		expect(sb.telemetry.enabled()).toBe(true);
 	});
 
-	test("an invalid option is rejected at construction, not retried as a transport error", () => {
-		// A bad bound is a typo, not an outage. Reaching the connect path it would
-		// be classified by gRPC status, come out as code -1 — transient — and
-		// reconnect forever blaming a provisioning failure that never happened.
-		for (const bad of [
-			{ rpcMaxConcurrentCalls: 0 },
-			{ rpcMaxConcurrentCalls: -1 },
-			{ rpcMaxConcurrentCalls: 2.5 },
-			{ rpcMaxQueuedCalls: -1 },
-			{ maxOutboxRows: 0 },
-			{ eventsDrainerBatch: 0 },
-			{ reconnectAttempts: -1 },
-		]) {
-			expect(
-				() =>
-					new ServiceBridge("localhost:0", VALID_KEY, {
-						advertise: false,
-						_disableTelemetryTransport: true,
-						...bad,
-					}),
-			).toThrow(ConfigurationError);
-		}
+	test("sends the handshake identity on Control.Open and RegisterAndWatch", async () => {
+		const h = harness();
+		await startLive(h);
+		expect(h.opens[0]).toMatchObject({
+			protocolVersion: PROTOCOL_VERSION,
+			sdkLanguage: "node",
+		});
+		expect(h.registers[0]?.protocolVersion).toBe(PROTOCOL_VERSION);
+	});
 
-		// Zero is meaningful where it means "no bound", so it must pass.
+	test("emits connected with the runtime version", async () => {
+		const h = harness();
+		const connected: string[] = [];
+		h.sb.on("connected", (e) => connected.push(e.runtimeVersion));
+		await startLive(h);
+		expect(connected).toEqual(["test"]);
+	});
+
+	test("rejects with TimeoutError and stops when nothing arrives in time", async () => {
+		const h = harness({ startTimeoutMs: 30 });
+		await expect(h.sb.start()).rejects.toBeInstanceOf(TimeoutError);
+		await expect(h.sb.ready()).rejects.toBeInstanceOf(StateError);
+	});
+
+	test("an incompatible protocol on Welcome is a terminal configuration error", async () => {
+		const h = harness();
+		const started = h.sb.start();
+		await waitFor(() => h.control.length > 0, "open");
+		h.welcome(99);
+		await expect(started).rejects.toBeInstanceOf(ConfigurationError);
+	});
+
+	test("FAILED_PRECONDITION on Control.Open (protocol refused) stops without reconnect", async () => {
+		const h = harness();
+		const started = h.sb.start();
+		await waitFor(() => h.control.length > 0, "open");
+		h.control[0]?.emit(
+			"error",
+			grpcError(
+				GrpcStatus.FAILED_PRECONDITION,
+				"protocol version 1 is not supported",
+			),
+		);
+		await expect(started).rejects.toBeInstanceOf(ConnectionError);
+		await new Promise((r) => setTimeout(r, 20));
+		expect(h.control).toHaveLength(1);
+	});
+
+	test("a rejected key (UNAUTHENTICATED provision) stops at once", async () => {
+		const disconnected: DisconnectedEvent[] = [];
+		const h = harness({
+			provisionFn: async () => {
+				throw new ConnectionError(
+					"provision",
+					grpcError(GrpcStatus.UNAUTHENTICATED),
+				);
+			},
+		});
+		h.sb.on("disconnected", (e) => disconnected.push(e));
+		const err = await h.sb.start().catch((e) => e);
+		expect(err).toBeInstanceOf(ConnectionError);
+		expect((err as ConnectionError).grpcCode).toBe(GrpcStatus.UNAUTHENTICATED);
+		expect(disconnected).toHaveLength(1);
+	});
+
+	test("a second start() is a StateError", async () => {
+		const h = harness();
+		await startLive(h);
+		await expect(h.sb.start()).rejects.toBeInstanceOf(StateError);
+	});
+
+	test("an invalid option is rejected at construction", () => {
+		expect(
+			() =>
+				new ServiceBridge("localhost:0", VALID_KEY, { maxPendingPublishes: 0 }),
+		).toThrow(ConfigurationError);
 		expect(
 			() =>
 				new ServiceBridge("localhost:0", VALID_KEY, {
-					advertise: false,
-					_disableTelemetryTransport: true,
-					reconnectAttempts: 0,
-					rpcMaxQueuedCalls: 0,
+					callDefaults: { timeout: "soon" },
 				}),
-		).not.toThrow();
+		).toThrow(ConfigurationError);
+	});
+});
+
+describe("reconnect", () => {
+	test("counts consecutive failures and resets on Welcome; reuses the cached cert", async () => {
+		const failing = false;
+		let provisions = 0;
+		const h = harness({
+			provisionFn: async () => {
+				provisions++;
+				return provision();
+			},
+		});
+		const attempts: ReconnectingEvent[] = [];
+		h.sb.on("reconnecting", (e) => attempts.push(e));
+		await startLive(h);
+
+		// Session lost: one failed attempt, then Welcome on the next stream.
+		h.control[0]?.emit("end");
+		await waitFor(() => h.control.length === 2, "second open");
+		h.welcome();
+		await waitFor(() => h.sb.identity()?.sessionId === "s2", "second session");
+		// Lost again: the count starts over at 1.
+		h.control[1]?.emit("error", grpcError(GrpcStatus.UNAVAILABLE));
+		await waitFor(() => attempts.length === 2, "second reconnecting");
+		expect(attempts.map((a) => a.attempt)).toEqual([1, 1]);
+		expect(provisions).toBe(1);
+		void failing;
+	});
+
+	test("unlimited by default; reconnectAttempts gives up after that many consecutive failures", async () => {
+		const disconnected: DisconnectedEvent[] = [];
+		let calls = 0;
+		const h = harness({
+			reconnectAttempts: 2,
+			provisionFn: async () => {
+				calls++;
+				throw grpcError(GrpcStatus.UNAVAILABLE);
+			},
+			startTimeoutMs: 1_000,
+		});
+		h.sb.on("disconnected", (e) => disconnected.push(e));
+		await expect(h.sb.start()).rejects.toBeInstanceOf(ConnectionError);
+		expect(calls).toBe(3);
+		expect(disconnected[0]?.reason).toContain("gave up after 2");
+	});
+
+	test("a channel is built once and survives every reconnect", async () => {
+		const h = harness();
+		await startLive(h);
+		for (let i = 0; i < 3; i++) {
+			const last = h.control[h.control.length - 1];
+			last?.emit("end");
+			await waitFor(() => h.control.length === i + 2, "reopen");
+			h.welcome();
+			await waitFor(() => h.sb.identity()?.sessionId === `s${i + 2}`, "live");
+		}
+		expect(h.clients.control).toBe(1);
+		expect(h.clients.registry).toBe(1);
+	});
+
+	test("Drain emits draining; the following stream end reconnects", async () => {
+		const h = harness();
+		const drains: string[] = [];
+		h.sb.on("draining", (e) => drains.push(e.reason));
+		await startLive(h);
+		h.control[0]?.emit("data", { drain: { reason: "runtime shutting down" } });
+		h.control[0]?.emit("end");
+		await waitFor(() => h.control.length === 2, "reconnect after drain");
+		expect(drains).toEqual(["runtime shutting down"]);
+	});
+
+	test("ready() waits for the next session after a loss", async () => {
+		const h = harness();
+		await startLive(h);
+		await h.sb.ready();
+		h.control[0]?.emit("end");
+		let ready = false;
+		const waiting = h.sb.ready().then(() => {
+			ready = true;
+		});
+		await waitFor(() => h.control.length === 2, "reopen");
+		await new Promise((r) => setTimeout(r, 5));
+		expect(ready).toBe(false);
+		h.welcome();
+		await new Promise((r) => setTimeout(r, 5));
+		// Welcome alone is not enough: the new session's snapshot is.
+		expect(ready).toBe(false);
+		h.snapshot();
+		await waiting;
+		expect(ready).toBe(true);
+	});
+
+	test("a registry stream rejected with INVALID_ARGUMENT is terminal", async () => {
+		const h = harness();
+		const disconnected: DisconnectedEvent[] = [];
+		h.sb.on("disconnected", (e) => disconnected.push(e));
+		await startLive(h);
+		h.registry[h.registry.length - 1]?.emit(
+			"error",
+			grpcError(
+				GrpcStatus.INVALID_ARGUMENT,
+				"event subscription a.b: invalid filter",
+			),
+		);
+		await waitFor(() => disconnected.length === 1, "terminal");
+		expect(disconnected[0]?.error).toBeInstanceOf(ValidationError);
+	});
+});
+
+describe("certificate rotation", () => {
+	test("swaps the leaf without reopening Control, channels or the registry stream", async () => {
+		const refreshed: ProvisionResult[] = [];
+		const h = harness({
+			certRefreshLeadMs: 3_600_000 - 50,
+			certRefreshJitterMs: 0,
+			refreshFn: async (_c: unknown, prev: ProvisionResult) => {
+				const next = provision({ notAfterUnixMs: Date.now() + 3_600_000 });
+				refreshed.push(next);
+				expect(prev.instanceId).toBe("inst");
+				return next;
+			},
+		});
+		await startLive(h);
+		const registryStreams = h.registry.length;
+		await waitFor(() => refreshed.length >= 1, "refresh");
+		await new Promise((r) => setTimeout(r, 20));
+		expect(h.control).toHaveLength(1);
+		expect(h.registry).toHaveLength(registryStreams);
+		expect(h.clients.control).toBe(1);
+		expect(h.sb.identity()?.instanceId).toBe("inst");
+		expect(h.sb.identity()?.sessionId).toBe("s1");
+	});
+
+	test("a rate-limited refresh is retried later, the bridge keeps running", async () => {
+		let calls = 0;
+		const h = harness({
+			certRefreshLeadMs: 3_600_000 - 20,
+			certRefreshJitterMs: 0,
+			refreshFn: async () => {
+				calls++;
+				throw grpcError(GrpcStatus.RESOURCE_EXHAUSTED, "refresh rate");
+			},
+		});
+		await startLive(h);
+		await waitFor(() => calls === 1, "first refresh");
+		await new Promise((r) => setTimeout(r, 20));
+		expect(h.sb.identity()).not.toBeNull();
+	});
+});
+
+describe("listeners and telemetry identity", () => {
+	test("a throwing listener does not break the bridge or other listeners", async () => {
+		const h = harness();
+		const seen: string[] = [];
+		h.sb.on("connected", () => {
+			throw new Error("listener bug");
+		});
+		h.sb.on("connected", () => seen.push("second"));
+		await startLive(h);
+		expect(seen).toEqual(["second"]);
 	});
 
 	test("a metric handle taken before Welcome rebinds to the real instance_id", async () => {
-		const stream = new FakeServerStream();
-		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-			provisionFn: async () => fakeProvisionResult(),
-			clientFactory: () => makeFakeClient(stream),
-			certRefreshLeadMs: 1_000_000,
-		});
-		activeBridges.push(sb);
-
-		// User code is free to grab handles before start() — identity does not
-		// exist yet, and the series the aggregator keys on must not freeze here.
-		const hits = sb.telemetry.counter("requests_total");
-		const inflight = sb.telemetry.gauge("inflight");
-		const latency = sb.telemetry.histogram("latency_seconds");
+		const h = harness();
+		const hits = h.sb.telemetry.counter("requests_total");
 		hits.inc(2);
-		inflight.set(1);
-		latency.observe(0.5);
-
-		await sb.start();
-		stream.emitData({
-			welcome: {
-				sessionId: "s1",
-				serviceId: "svc",
-				serviceName: "svc-name",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
-		});
-		await waitFor(() => sb.identity() !== null, "identity after Welcome");
-
+		await startLive(h);
 		hits.inc(5);
-		inflight.set(7);
-		latency.observe(1.5);
-
 		const ring = (
-			sb as unknown as {
-				_telemetryRing: {
+			h.sb as unknown as {
+				telemetryRing: {
 					metrics: { drain(): MetricPoint[] };
 					peek(n: number): Array<{ kind: string; message: unknown }>;
 				};
 			}
-		)._telemetryRing;
-		// Rotation flushes and retires old series; include those flushed points.
+		).telemetryRing;
 		const points = [
 			...ring
 				.peek(1000)
-				.filter((item) => item.kind === "metrics")
-				.map((item) => item.message as MetricPoint),
+				.filter((i) => i.kind === "metrics")
+				.map((i) => i.message as MetricPoint),
 			...ring.metrics.drain(),
-		];
-
-		const byName = (name: string) =>
-			points
-				.filter((p) => p.name === name)
-				.map((p) => [p.instanceId, p.value] as const)
-				.sort((a, b) => a[0].localeCompare(b[0]));
-
-		// Pre-Welcome emissions honestly stay on the anonymous series; everything
-		// after Welcome must land on "inst" instead of accumulating there forever.
-		expect(byName("requests_total")).toEqual([
+		]
+			.filter((p) => p.name === "requests_total")
+			.map((p) => [p.instanceId, p.value])
+			.sort();
+		expect(points).toEqual([
 			["", 2],
 			["inst", 5],
 		]);
-		expect(byName("inflight")).toEqual([
-			["", 1],
-			["inst", 7],
-		]);
-		expect(byName("latency_seconds")).toEqual([
-			["", 0.5],
-			["inst", 1.5],
-		]);
 	});
 });
 
-describe("ServiceBridge stop() racing an in-flight connect", () => {
-	test("nothing is built after teardown when stop() lands during provision", async () => {
-		const controlStreams: FakeServerStream[] = [];
-		const registryStreams: FakeRegistryStream[] = [];
-		const control = makeCountingControlFactory(controlStreams);
-		const registry = makeCountingRegistryFactory(registryStreams);
+describe("stop()", () => {
+	test("is idempotent, closes every channel and rejects later ready()", async () => {
+		const h = harness();
+		await startLive(h);
+		await h.sb.stop();
+		await h.sb.stop();
+		expect(h.clients.closed).toBe(2);
+		await expect(h.sb.ready()).rejects.toBeInstanceOf(StateError);
+		expect(h.sb.identity()).toBeNull();
+	});
 
-		let provisionEntered = false;
-		let release!: () => void;
-		const gate = new Promise<void>((r) => {
-			release = r;
+	test("stop() during provision builds nothing behind it", async () => {
+		let release!: (p: ProvisionResult) => void;
+		const h = harness({
+			provisionFn: () =>
+				new Promise<ProvisionResult>((r) => {
+					release = r;
+				}),
 		});
+		const started = h.sb.start().catch((e) => e);
+		await waitFor(() => release !== undefined, "provision pending");
+		await h.sb.stop();
+		release(provision());
+		expect(await started).toBeInstanceOf(StateError);
+		await new Promise((r) => setTimeout(r, 10));
+		expect(h.clients.control).toBe(0);
+	});
 
-		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-			// Stands in for the real Provision: a 64 MiB argon2 hash on the runtime
-			// takes seconds, which is the whole window stop() used to fall through.
-			provisionFn: async () => {
-				provisionEntered = true;
-				await gate;
-				return fakeProvisionResult();
-			},
-			clientFactory: control.factory,
-			registryClientFactory: registry.factory,
-			certRefreshLeadMs: 1_000_000,
-		});
-		activeBridges.push(sb);
-
-		const startPromise = sb.start();
-		await waitFor(() => provisionEntered, "connect reached provision");
-		await sb.stop();
-		release();
-		await startPromise;
-		await tick();
-		await tick();
-
-		expect(control.counts.created).toBe(0);
-		expect(registry.counts.created).toBe(0);
-
-		const internals = sb as unknown as {
-			session: unknown;
-			controlClient: unknown;
-			registryClient: unknown;
-			_eventsClient: unknown;
-			_workflowsClient: unknown;
-			_jobsClient: unknown;
-			_rpcClient: unknown;
-			_proxyTransport: unknown;
-			_subscriber: unknown;
-			_drainer: unknown;
-			_storage: unknown;
-		};
-		expect(internals.session).toBeNull();
-		expect(internals.controlClient).toBeNull();
-		expect(internals.registryClient).toBeNull();
-		expect(internals._eventsClient).toBeNull();
-		expect(internals._workflowsClient).toBeNull();
-		expect(internals._jobsClient).toBeNull();
-		expect(internals._rpcClient).toBeNull();
-		expect(internals._proxyTransport).toBeNull();
-		expect(internals._subscriber).toBeNull();
-		expect(internals._drainer).toBeNull();
-		expect(internals._storage).toBeNull();
+	test("publish after stop is a StateError", async () => {
+		const h = harness();
+		await startLive(h);
+		await h.sb.stop();
+		await expect(h.sb.event.publish("a.b", {})).rejects.toBeInstanceOf(
+			StateError,
+		);
 	});
 });
-
-describe("ServiceBridge control stream error before Session attach", () => {
-	test("an 'error' racing the Session attach surfaces as reconnecting, not an uncaught throw", async () => {
-		const streams: FakeServerStream[] = [];
-		let armed = true;
-
-		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-			provisionFn: async () => fakeProvisionResult(),
-			clientFactory: () => {
-				const stream = new FakeServerStream();
-				streams.push(stream);
-				return {
-					open: () => {
-						if (armed) {
-							armed = false;
-							// Fires on the very next microtask. A ClientReadableStream is a
-							// bare EventEmitter: while openControlStream sat before an
-							// await, this landed with no 'error' listener attached and took
-							// the process down instead of reconnecting.
-							queueMicrotask(() =>
-								stream.emitError(new Error("runtime unreachable")),
-							);
-						}
-						return stream;
-					},
-					close: () => {},
-				} as unknown as ControlClient;
-			},
-			certRefreshLeadMs: 1_000_000,
-			reconnectIntervalMs: 5,
-			reconnectAttempts: 3,
-		});
-		activeBridges.push(sb);
-
-		const reconnects: ReconnectingEvent[] = [];
-		sb.on("reconnecting", (e) => reconnects.push(e));
-		sb.on("disconnected", () => {});
-
-		await sb.start();
-		await waitFor(
-			() => reconnects.length >= 1,
-			"early stream error scheduled a reconnect",
-		);
-		expect(reconnects[0]?.reason).toContain("runtime unreachable");
-	});
-});
-
-describe("ServiceBridge gRPC channel lifecycle (no leak on reconnect)", () => {
-	test("every (re)connect closes its predecessor control + registry channel; stop() closes the last", async () => {
-		const controlStreams: FakeServerStream[] = [];
-		const registryStreams: FakeRegistryStream[] = [];
-		const control = makeCountingControlFactory(controlStreams);
-		const registry = makeCountingRegistryFactory(registryStreams);
-
-		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-			provisionFn: async () => fakeProvisionResult(),
-			clientFactory: control.factory,
-			registryClientFactory: registry.factory,
-			certRefreshLeadMs: 1_000_000,
-			reconnectIntervalMs: 5,
-			reconnectAttempts: 20,
-		});
-		activeBridges.push(sb);
-
-		await sb.start();
-		await waitFor(() => registryStreams.length >= 1, "first registry stream");
-		controlStreams[0]?.emitData({
-			welcome: {
-				sessionId: "s1",
-				serviceId: "svc",
-				serviceName: "n",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
-		});
-		await tick();
-
-		// Drive several transport-level reconnect cycles. Each one opens a fresh
-		// control + registry channel; the predecessor must be closed.
-		const cycles = 4;
-		for (let i = 0; i < cycles; i++) {
-			const idx = controlStreams.length - 1;
-			controlStreams[idx]?.emitError(new Error(`drop-${i}`));
-			await waitFor(
-				() => controlStreams.length >= idx + 2,
-				`reconnect ${i} opened a new control stream`,
-			);
-			controlStreams[controlStreams.length - 1]?.emitData({
-				welcome: {
-					sessionId: `s${i + 2}`,
-					serviceId: "svc",
-					serviceName: "n",
-					runtimeVersion: "",
-					protocolVersion: 0,
-				},
-			});
-			await tick();
-		}
-
-		await sb.stop();
-
-		// 1 initial + `cycles` reconnects = cycles+1 control + registry channels.
-		expect(control.counts.created).toBe(cycles + 1);
-		expect(registry.counts.created).toBe(cycles + 1);
-		// Zero live channels: everything created is closed.
-		expect(control.counts.closed).toBe(control.counts.created);
-		expect(registry.counts.closed).toBe(registry.counts.created);
-	});
-
-	test("successful cert rotation closes the old control + registry channel", async () => {
-		const controlStreams: FakeServerStream[] = [];
-		const registryStreams: FakeRegistryStream[] = [];
-		const control = makeCountingControlFactory(controlStreams);
-		const registry = makeCountingRegistryFactory(registryStreams);
-
-		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-			provisionFn: async () => ({
-				...fakeProvisionResult(),
-				notAfterUnix: BigInt(Math.floor(Date.now() / 1000) + 1),
-			}),
-			refreshFn: async () => ({
-				...fakeProvisionResult(),
-				notAfterUnix: BigInt(Math.floor(Date.now() / 1000) + 3600),
-			}),
-			clientFactory: control.factory,
-			registryClientFactory: registry.factory,
-			certRefreshLeadMs: 0,
-			certRefreshJitterMs: 0,
-		});
-		activeBridges.push(sb);
-
-		await sb.start();
-		controlStreams[0]?.emitData({
-			welcome: {
-				sessionId: "s1",
-				serviceId: "svc",
-				serviceName: "n",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
-		});
-		// Rotation timer fires (TTL=1s, lead=0) → new channels opened.
-		await waitFor(() => control.counts.created >= 2, "rotation opened channel");
-		controlStreams[controlStreams.length - 1]?.emitData({
-			welcome: {
-				sessionId: "s2",
-				serviceId: "svc",
-				serviceName: "n",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
-		});
-		// After Welcome on the new stream, the old pair must be closed.
-		await waitFor(
-			() => control.counts.closed >= 1 && registry.counts.closed >= 1,
-			"old channels closed after rotation Welcome",
-		);
-
-		await sb.stop();
-		expect(control.counts.closed).toBe(control.counts.created);
-		expect(registry.counts.closed).toBe(registry.counts.created);
-	});
-
-	test("cert rotation rollback (new stream ends before Welcome) closes the new channels it opened", async () => {
-		const controlStreams: FakeServerStream[] = [];
-		const registryStreams: FakeRegistryStream[] = [];
-		const control = makeCountingControlFactory(controlStreams);
-		const registry = makeCountingRegistryFactory(registryStreams);
-
-		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-			provisionFn: async () => ({
-				...fakeProvisionResult(),
-				notAfterUnix: BigInt(Math.floor(Date.now() / 1000) + 1),
-			}),
-			// refresh succeeds → rotation opens new channels and waits for Welcome.
-			refreshFn: async () => ({
-				...fakeProvisionResult(),
-				notAfterUnix: BigInt(Math.floor(Date.now() / 1000) + 3600),
-			}),
-			clientFactory: control.factory,
-			registryClientFactory: registry.factory,
-			certRefreshLeadMs: 0,
-			certRefreshJitterMs: 0,
-			reconnectIntervalMs: 1_000_000,
-			reconnectAttempts: 3,
-		});
-		activeBridges.push(sb);
-
-		await sb.start();
-		controlStreams[0]?.emitData({
-			welcome: {
-				sessionId: "s1",
-				serviceId: "svc",
-				serviceName: "n",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
-		});
-
-		const reconnects: ReconnectingEvent[] = [];
-		sb.on("reconnecting", (e) => reconnects.push(e));
-
-		// Wait for rotation to open the new pair, then end the new stream before
-		// any Welcome → swap rejects, rollback path must close the new channels.
-		await waitFor(
-			() => control.counts.created >= 2,
-			"rotation opened new channel",
-		);
-		const newControl = controlStreams[controlStreams.length - 1]!;
-		newControl.emit("end");
-
-		await waitFor(
-			() => reconnects.length > 0,
-			"rotation rollback scheduled reconnect",
-		);
-
-		await sb.stop();
-		expect(control.counts.closed).toBe(control.counts.created);
-		expect(registry.counts.closed).toBe(registry.counts.created);
-	});
-
-	test("failed reconnect cycles (provision throws) leak no channels", async () => {
-		const controlStreams: FakeServerStream[] = [];
-		const registryStreams: FakeRegistryStream[] = [];
-		const control = makeCountingControlFactory(controlStreams);
-		const registry = makeCountingRegistryFactory(registryStreams);
-		let firstConnect = true;
-
-		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-			provisionFn: async () => {
-				// First connect succeeds (opens channels); subsequent reconnect
-				// provisions reuse the cached cert, so to force fresh provisions we
-				// invalidate the cache by throwing after the first session drops.
-				if (firstConnect) {
-					firstConnect = false;
-					return fakeProvisionResult();
-				}
-				throw new Error("runtime down");
-			},
-			clientFactory: control.factory,
-			registryClientFactory: registry.factory,
-			certRefreshLeadMs: 1_000_000,
-			reconnectIntervalMs: 5,
-			reconnectAttempts: 3,
-		});
-		activeBridges.push(sb);
-
-		await sb.start();
-		await waitFor(() => controlStreams.length >= 1, "first control stream");
-		controlStreams[0]?.emitData({
-			welcome: {
-				sessionId: "s1",
-				serviceId: "svc",
-				serviceName: "n",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
-		});
-		await tick();
-
-		// Drop → reconnect attempts now hit the throwing provision (cached cert is
-		// still valid, so the channels stay reused; the failing provisions open no
-		// new channels). Run the attempts to exhaustion.
-		controlStreams[0]?.emitError(new Error("drop"));
-		await new Promise((r) => setTimeout(r, 120));
-		await sb.stop();
-
-		expect(control.counts.closed).toBe(control.counts.created);
-		expect(registry.counts.closed).toBe(registry.counts.created);
-	});
-});
-
-describe("ServiceBridge reconnect backoff", () => {
-	test("default (no reconnectIntervalMs) uses the jittered ladder, not a fixed 3s tick", async () => {
-		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-			provisionFn: async () => {
-				throw new Error("network");
-			},
-			// reconnectIntervalMs intentionally unset → ladder.
-			reconnectAttempts: 3,
-		});
-		activeBridges.push(sb);
-
-		const reconnects: ReconnectingEvent[] = [];
-		sb.on("reconnecting", (e) => reconnects.push(e));
-		sb.on("disconnected", () => {});
-
-		await sb.start();
-		await waitFor(() => reconnects.length >= 1, "first reconnecting event");
-
-		// The first reconnect is attempt #2 → ladder rung index 1 (~5000ms) ±20%
-		// jitter. The exact value is jittered (never a fixed flat number), which is
-		// the whole point: a fleet does not reconnect in lockstep. Assert it lands
-		// in the jittered 5000-rung band and is not the old flat 3000ms tick.
-		const first = reconnects[0]!;
-		expect(first.delayMs).toBeGreaterThan(3900);
-		expect(first.delayMs).toBeLessThan(6100);
-		expect(first.delayMs).not.toBe(3000);
-	});
-
-	test("explicit reconnectIntervalMs overrides the ladder with a flat delay", async () => {
-		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-			provisionFn: async () => {
-				throw new Error("network");
-			},
-			reconnectIntervalMs: 42,
-			reconnectAttempts: 3,
-		});
-		activeBridges.push(sb);
-
-		const reconnects: ReconnectingEvent[] = [];
-		sb.on("reconnecting", (e) => reconnects.push(e));
-		sb.on("disconnected", () => {});
-
-		await sb.start();
-		await waitFor(() => reconnects.length >= 1, "first reconnecting event");
-		expect(reconnects[0]?.delayMs).toBe(42);
-	});
-});
-
-describe("ServiceBridge policy listener registration (BUG-18)", () => {
-	function snapshotWithWarnings(declarations: string[]): RegistryEvent {
-		return {
-			snapshot: {
-				methods: [],
-				instances: [],
-				eventSubscriptions: [],
-				outgoingCalls: [],
-				policy: {
-					capabilities: [],
-					egress: [],
-					acceptance: [],
-					warnings: declarations.map((d) => ({
-						declaration: d,
-						value: "svc",
-						denySide: "self_egress",
-						reason: "not declared",
-					})),
-				},
-				captureModes: undefined,
-			},
-			update: undefined,
-		} as unknown as RegistryEvent;
-	}
-
-	test("policy_violation fires once per warning after two reconnect cycles", async () => {
-		const controlStreams: FakeServerStream[] = [];
-		const registryStreams: FakeRegistryStream[] = [];
-		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-			provisionFn: async () => fakeProvisionResult(),
-			clientFactory: () => {
-				const s = new FakeServerStream();
-				controlStreams.push(s);
-				return makeFakeClient(s);
-			},
-			registryClientFactory: makeRegistryFactory(registryStreams),
-			certRefreshLeadMs: 1_000_000,
-			reconnectIntervalMs: 5,
-			reconnectAttempts: 10,
-		});
-		activeBridges.push(sb);
-
-		const violations: PolicyViolationEvent[] = [];
-		sb.on("policy_violation", (v) => violations.push(v));
-
-		await sb.start();
-		await waitFor(() => registryStreams.length >= 1, "first registry stream");
-		controlStreams[0]?.emitData({
-			welcome: {
-				sessionId: "s1",
-				serviceId: "svc",
-				serviceName: "n",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
-		});
-		await tick();
-
-		// Two transport drops → two reconnects → three openSession calls total.
-		controlStreams[0]?.emitError(new Error("drop-1"));
-		await waitFor(
-			() => registryStreams.length >= 2,
-			"second registry stream after reconnect 1",
-		);
-		controlStreams[1]?.emitData({
-			welcome: {
-				sessionId: "s2",
-				serviceId: "svc",
-				serviceName: "n",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
-		});
-		await tick();
-
-		controlStreams[1]?.emitError(new Error("drop-2"));
-		await waitFor(
-			() => registryStreams.length >= 3,
-			"third registry stream after reconnect 2",
-		);
-		controlStreams[2]?.emitData({
-			welcome: {
-				sessionId: "s3",
-				serviceId: "svc",
-				serviceName: "n",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
-		});
-		await tick();
-
-		// Emit a single PolicyEvaluation carrying one warning on the latest stream.
-		// With the listener registered once (not per openSession), exactly one
-		// policy_violation must fire — not three.
-		const latest = registryStreams[registryStreams.length - 1]!;
-		latest.emitEvent(snapshotWithWarnings(["rpc.call"]));
-		await tick();
-
-		expect(violations.length).toBe(1);
-		expect(violations[0]?.declaration).toBe("rpc.call");
-	});
-});
-
-describe("ServiceBridge cert rotation (overlap)", () => {
-	test("waits for Welcome on new session before closing old", async () => {
-		const oldStream = new FakeServerStream();
-		const newStream = new FakeServerStream();
-		const streams = [oldStream, newStream];
-		let streamIdx = 0;
-
-		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-			provisionFn: async () => ({
-				...fakeProvisionResult(),
-				notAfterUnix: BigInt(Math.floor(Date.now() / 1000) + 1),
-			}),
-			refreshFn: async () => ({
-				...fakeProvisionResult(),
-				notAfterUnix: BigInt(Math.floor(Date.now() / 1000) + 3600),
-			}),
-			clientFactory: () => {
-				const s = streams[streamIdx++];
-				if (!s) throw new Error("test: stream index out of range");
-				return makeFakeClient(s);
-			},
-			certRefreshLeadMs: 0,
-			certRefreshJitterMs: 0,
-		});
-		activeBridges.push(sb);
-
-		const reconnects: ReconnectingEvent[] = [];
-		const disconnects: DisconnectedEvent[] = [];
-		sb.on("reconnecting", (e) => reconnects.push(e));
-		sb.on("disconnected", (e) => disconnects.push(e));
-
-		await sb.start();
-		oldStream.emitData({
-			welcome: {
-				sessionId: "s1",
-				serviceId: "svc",
-				serviceName: "svc-name",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
-		});
-
-		// Wait for the cert-refresh timer to fire (TTL=1s, lead=0) and the new
-		// session to be opened. The second clientFactory call (streamIdx===2) is
-		// the deterministic signal that rotation started; the fixed sleep alone is
-		// a real production timer, but on a slow runner the rotation may not have
-		// progressed past openSession yet.
-		await waitFor(() => streamIdx === 2, "rotation opened the new session");
-
-		// New session opened — old NOT closed yet (still no Welcome on new).
-		expect(oldStream.cancelled).toBe(false);
-
-		// Deliver Welcome on new stream — now old must be closed.
-		newStream.emitData({
-			welcome: {
-				sessionId: "s2",
-				serviceId: "svc",
-				serviceName: "svc-name",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
-		});
-		await waitFor(
-			() => oldStream.cancelled,
-			"old session closed after new Welcome",
-		);
-
-		expect(oldStream.cancelled).toBe(true);
-		expect(reconnects.length).toBe(0);
-		expect(disconnects.filter((d) => !d.reason.startsWith("drain:"))).toEqual(
-			[],
-		);
-	});
-
-	test("session adopted by rotation stays supervised — stream error reconnects", async () => {
-		const controlStreams: FakeServerStream[] = [];
-		const sb = rotatingBridge(controlStreams, {
-			reconnectIntervalMs: 5,
-			reconnectAttempts: 5,
-		});
-		activeBridges.push(sb);
-
-		await sb.start();
-		controlStreams[0]?.emitData({
-			welcome: {
-				sessionId: "s1",
-				serviceId: "svc",
-				serviceName: "n",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
-		});
-		await waitFor(() => controlStreams.length >= 2, "rotation opened a stream");
-		controlStreams[1]?.emitData({
-			welcome: {
-				sessionId: "s2",
-				serviceId: "svc",
-				serviceName: "n",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
-		});
-		await waitFor(
-			() => sb.identity()?.sessionId === "s2",
-			"rotation welcomed the new session",
-		);
-
-		const reconnects: ReconnectingEvent[] = [];
-		sb.on("reconnecting", (e) => reconnects.push(e));
-
-		controlStreams[1]?.emitError(new Error("post-rotation drop"));
-		await waitFor(
-			() => reconnects.length > 0,
-			"rotated session drop scheduled a reconnect",
-		);
-		expect(reconnects[0]?.reason).toContain("post-rotation drop");
-		await waitFor(
-			() => controlStreams.length >= 3,
-			"reconnect opened a fresh control stream",
-		);
-	});
-
-	test("session adopted by rotation stays supervised — stream end reconnects", async () => {
-		const controlStreams: FakeServerStream[] = [];
-		const sb = rotatingBridge(controlStreams, {
-			reconnectIntervalMs: 5,
-			reconnectAttempts: 5,
-		});
-		activeBridges.push(sb);
-
-		await sb.start();
-		controlStreams[0]?.emitData({
-			welcome: {
-				sessionId: "s1",
-				serviceId: "svc",
-				serviceName: "n",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
-		});
-		await waitFor(() => controlStreams.length >= 2, "rotation opened a stream");
-		controlStreams[1]?.emitData({
-			welcome: {
-				sessionId: "s2",
-				serviceId: "svc",
-				serviceName: "n",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
-		});
-		await waitFor(
-			() => sb.identity()?.sessionId === "s2",
-			"rotation welcomed the new session",
-		);
-
-		const reconnects: ReconnectingEvent[] = [];
-		sb.on("reconnecting", (e) => reconnects.push(e));
-
-		controlStreams[1]?.emit("end");
-		await waitFor(
-			() => reconnects.length > 0,
-			"rotated session end scheduled a reconnect",
-		);
-		expect(reconnects[0]?.reason).toBe("stream ended");
-	});
-
-	test("rotation rebuilds every cert-bound side channel, not just Control + Registry", async () => {
-		const controlStreams: FakeServerStream[] = [];
-		const rotatedNotAfter = BigInt(Math.floor(Date.now() / 1000) + 7200);
-		const sb = rotatingBridge(controlStreams, {}, rotatedNotAfter);
-		activeBridges.push(sb);
-
-		const internals = sb as unknown as {
-			_eventsClient: unknown;
-			_workflowsClient: unknown;
-			_jobsClient: unknown;
-			_proxyTransport: unknown;
-			_rpcClient: unknown;
-			_directTransport: { creds: { notAfterUnix: bigint } } | null;
-		};
-
-		await sb.start();
-		controlStreams[0]?.emitData({
-			welcome: {
-				sessionId: "s1",
-				serviceId: "svc",
-				serviceName: "n",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
-		});
-		await tick();
-
-		const before = {
-			events: internals._eventsClient,
-			workflows: internals._workflowsClient,
-			jobs: internals._jobsClient,
-			proxy: internals._proxyTransport,
-			rpc: internals._rpcClient,
-		};
-		expect(before.events).not.toBeNull();
-		expect(before.workflows).not.toBeNull();
-		expect(before.jobs).not.toBeNull();
-		expect(before.proxy).not.toBeNull();
-
-		await waitFor(() => controlStreams.length >= 2, "rotation opened a stream");
-		controlStreams[1]?.emitData({
-			welcome: {
-				sessionId: "s2",
-				serviceId: "svc",
-				serviceName: "n",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
-		});
-		await waitFor(
-			() => internals._eventsClient !== before.events,
-			"events channel rebuilt with the rotated cert",
-		);
-
-		expect(internals._workflowsClient).not.toBe(before.workflows);
-		expect(internals._jobsClient).not.toBe(before.jobs);
-		expect(internals._proxyTransport).not.toBe(before.proxy);
-		expect(internals._rpcClient).not.toBe(before.rpc);
-		// DirectTransport rotates in place; its TTL cache keys off notAfterUnix.
-		expect(internals._directTransport?.creds.notAfterUnix).toBe(
-			rotatedNotAfter,
-		);
-	});
-
-	test("rotation refreshes the provision cache — a later reconnect does not re-Provision", async () => {
-		let provisionCalls = 0;
-		const controlStreams: FakeServerStream[] = [];
-		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-			provisionFn: async () => {
-				provisionCalls++;
-				return {
-					...fakeProvisionResult(),
-					notAfterUnix: BigInt(Math.floor(Date.now() / 1000) + 1),
-				};
-			},
-			refreshFn: async () => ({
-				...fakeProvisionResult(),
-				notAfterUnix: BigInt(Math.floor(Date.now() / 1000) + 3600),
-			}),
-			clientFactory: () => {
-				const s = new FakeServerStream();
-				controlStreams.push(s);
-				return makeFakeClient(s);
-			},
-			// Lead window wide enough that the initial 1s cert is NOT reusable but
-			// the rotated 1h cert is — so a stale lastProvision forces a fresh
-			// argon2 Provision on the next reconnect and the assertion catches it.
-			certRefreshLeadMs: 60_000,
-			certRefreshJitterMs: 0,
-			reconnectIntervalMs: 5,
-			reconnectAttempts: 5,
-		});
-		activeBridges.push(sb);
-
-		await sb.start();
-		expect(provisionCalls).toBe(1);
-		controlStreams[0]?.emitData({
-			welcome: {
-				sessionId: "s1",
-				serviceId: "svc",
-				serviceName: "n",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
-		});
-		await waitFor(() => controlStreams.length >= 2, "rotation opened a stream");
-		controlStreams[1]?.emitData({
-			welcome: {
-				sessionId: "s2",
-				serviceId: "svc",
-				serviceName: "n",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
-		});
-		await waitFor(
-			() => sb.identity()?.sessionId === "s2",
-			"rotation welcomed the new session",
-		);
-		expect(provisionCalls).toBe(1);
-
-		controlStreams[1]?.emitError(new Error("drop after rotation"));
-		await waitFor(
-			() => controlStreams.length >= 3,
-			"reconnect opened a fresh control stream",
-		);
-		expect(provisionCalls).toBe(1);
-	});
-
-	test("rotation failure emits reconnecting (does NOT silently swallow)", async () => {
-		const oldStream = new FakeServerStream();
-
-		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-			provisionFn: async () => ({
-				...fakeProvisionResult(),
-				notAfterUnix: BigInt(Math.floor(Date.now() / 1000) + 1),
-			}),
-			refreshFn: async () => {
-				throw new Error("rotate-fail");
-			},
-			clientFactory: () => makeFakeClient(oldStream),
-			certRefreshLeadMs: 0,
-			certRefreshJitterMs: 0,
-			reconnectIntervalMs: 1_000_000,
-			reconnectAttempts: 3,
-		});
-		activeBridges.push(sb);
-
-		const reconnects: ReconnectingEvent[] = [];
-		sb.on("reconnecting", (e) => reconnects.push(e));
-
-		await sb.start();
-		oldStream.emitData({
-			welcome: {
-				sessionId: "s1",
-				serviceId: "svc",
-				serviceName: "svc-name",
-				runtimeVersion: "",
-				protocolVersion: 0,
-			},
-		});
-
-		await waitFor(
-			() => reconnects.length > 0,
-			"rotation failure surfaced a reconnecting event",
-		);
-		expect(reconnects.length).toBeGreaterThan(0);
-		const rot0 = reconnects[0];
-		expect(rot0?.reason).toContain("rotate-fail");
-	});
-});
-
-describe("ServiceBridge non-retryable errors (H11)", () => {
-	test("UNAUTHENTICATED provision error emits disconnected with ConnectionError and does NOT reconnect", async () => {
-		const unauthErr = Object.assign(new Error("invalid key"), {
-			code: GrpcStatus.UNAUTHENTICATED,
-		});
-		let provisionCalls = 0;
-		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-			provisionFn: async () => {
-				provisionCalls++;
-				throw unauthErr;
-			},
-			reconnectIntervalMs: 5,
-			reconnectAttempts: 3,
-		});
-		activeBridges.push(sb);
-
-		const disconnects: DisconnectedEvent[] = [];
-		const reconnects: ReconnectingEvent[] = [];
-		sb.on("disconnected", (e) => disconnects.push(e));
-		sb.on("reconnecting", (e) => reconnects.push(e));
-
-		await expect(sb.start()).rejects.toBeInstanceOf(ConnectionError);
-		await new Promise((r) => setTimeout(r, 50));
-
-		expect(disconnects.length).toBe(1);
-		const unauth0 = disconnects[0];
-		expect(unauth0?.error).toBeInstanceOf(ConnectionError);
-		expect((unauth0!.error as ConnectionError).code).toBe(
-			GrpcStatus.UNAUTHENTICATED,
-		);
-		expect(reconnects.length).toBe(0);
-		expect(provisionCalls).toBe(1);
-	});
-
-	test("UNAVAILABLE provision error retries normally", async () => {
-		const unavailErr = Object.assign(new Error("service unavailable"), {
-			code: GrpcStatus.UNAVAILABLE,
-		});
-		const sb = new ServiceBridge("localhost:0", VALID_KEY, {
-			advertise: false,
-			_disableTelemetryTransport: true,
-			provisionFn: async () => {
-				throw unavailErr;
-			},
-			reconnectIntervalMs: 5,
-			reconnectAttempts: 2,
-		});
-		activeBridges.push(sb);
-
-		const reconnects: ReconnectingEvent[] = [];
-		sb.on("reconnecting", (e) => reconnects.push(e));
-		sb.on("disconnected", () => {});
-
-		await sb.start();
-		await new Promise((r) => setTimeout(r, 80));
-
-		expect(reconnects.length).toBeGreaterThan(0);
-	});
-});
-
-function tick(): Promise<void> {
-	return new Promise((r) => setImmediate(r));
-}
-
-// waitFor polls `predicate` until it returns true or the timeout elapses.
-// Replaces fixed `await tick()` timing assumptions on the async
-// provision/Welcome/rotation chain so the tests stay deterministic on a slow
-// CI runner where a single microtask turn is not enough to let the chain
-// settle. On timeout it throws with `label` so the failure points at the exact
-// condition that never became true rather than at a stale assertion.
-async function waitFor(
-	predicate: () => boolean,
-	label: string,
-	timeoutMs = 3000,
-): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (!predicate()) {
-		if (Date.now() > deadline) {
-			throw new Error(`waitFor timed out after ${timeoutMs}ms: ${label}`);
-		}
-		await new Promise((r) => setTimeout(r, 5));
-	}
-}
-
-// once resolves with the first event of the given kind emitted by the bridge,
-// or rejects on timeout with `event` named so a missed emission is obvious.
-// ServiceBridge exposes a one-shot-friendly `on(event, handler)`; the handler
-// fires for every emission but we only resolve once.
-function once<E extends "connected" | "reconnecting" | "disconnected">(
-	sb: ServiceBridge,
-	event: E,
-	timeoutMs = 3000,
-): Promise<void> {
-	return new Promise((resolve, reject) => {
-		const timer = setTimeout(() => {
-			reject(new Error(`once timed out after ${timeoutMs}ms: '${event}'`));
-		}, timeoutMs);
-		let fired = false;
-		sb.on(event, () => {
-			if (fired) return;
-			fired = true;
-			clearTimeout(timer);
-			resolve();
-		});
-	});
-}

@@ -22,7 +22,7 @@ import type { CompensateSpec, Step, WorkflowDef } from "./types";
 
 export class WorkflowValidationError extends ServiceBridgeError {
 	constructor(message: string) {
-		super(`workflow/validate: ${message}`);
+		super("VALIDATION", `workflow/validate: ${message}`);
 		this.name = "WorkflowValidationError";
 	}
 }

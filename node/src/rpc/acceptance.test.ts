@@ -13,6 +13,7 @@ import {
 	evaluatePeerAcceptance,
 	getPeerCertFromCall,
 	parsePeerSpiffeUri,
+	peerOfCall,
 } from "./acceptance";
 
 const RUNTIME_PEER_COMMON_NAME = "servicebridge-runtime";
@@ -65,7 +66,9 @@ async function issueCert(
 	};
 }
 
-function spiffeUri(serviceId: string, instanceId = "i-1"): string {
+const INSTANCE = "i-1";
+
+function spiffeUri(serviceId: string, instanceId = INSTANCE): string {
 	return `spiffe://service-bridge/service/${serviceId}/instance/${instanceId}`;
 }
 
@@ -148,6 +151,7 @@ describe("classifyPeer", () => {
 		expect(classifyPeer(sdkLeafA)).toEqual({
 			kind: "service",
 			serviceId: callerA,
+			instanceId: INSTANCE,
 		});
 	});
 
@@ -159,7 +163,7 @@ describe("classifyPeer", () => {
 				raw: sdkLeafA.raw,
 				subject: { CN: "servicebridge-leaf" },
 			}),
-		).toEqual({ kind: "service", serviceId: callerA });
+		).toEqual({ kind: "service", serviceId: callerA, instanceId: INSTANCE });
 	});
 
 	it("identifies the runtime by its exact sole URI SAN", () => {
@@ -193,7 +197,7 @@ describe("classifyPeer", () => {
 	it("falls back to subjectaltname when no DER is present", () => {
 		expect(
 			classifyPeer({ subjectaltname: `URI:${spiffeUri(callerA)}` }),
-		).toEqual({ kind: "service", serviceId: callerA });
+		).toEqual({ kind: "service", serviceId: callerA, instanceId: INSTANCE });
 	});
 
 	it("rejects a runtime-looking CN without its URI identity", () => {
@@ -220,7 +224,7 @@ describe("classifyPeer", () => {
 			classifyPeer({
 				subjectaltname: `DNS:host.local, URI:${spiffeUri(callerB)}`,
 			}),
-		).toEqual({ kind: "service", serviceId: callerB });
+		).toEqual({ kind: "service", serviceId: callerB, instanceId: INSTANCE });
 	});
 
 	it("does not treat a DNS-only SAN as the runtime when CN says otherwise", () => {
@@ -371,18 +375,22 @@ describe("getPeerCertFromCall", () => {
 describe("evaluatePeerAcceptance", () => {
 	const restrictivePolicy = policyWith([makeAcceptanceRule(callerA, "charge")]);
 
-	it("default-allow when policy is null", () => {
-		expect(evaluatePeerAcceptance(null, makeCall(sdkLeafA), "x")).toBeNull();
-	});
-
 	it("default-allow when policy has no rpc.handle rules", () => {
 		expect(
-			evaluatePeerAcceptance(policyWith([]), makeCall(sdkLeafA), "x"),
+			evaluatePeerAcceptance(
+				policyWith([]),
+				peerOfCall(makeCall(sdkLeafA)),
+				"x",
+			),
 		).toBeNull();
 	});
 
 	it("fail-closed when the peer certificate cannot be extracted", () => {
-		const denial = evaluatePeerAcceptance(restrictivePolicy, {}, "charge");
+		const denial = evaluatePeerAcceptance(
+			restrictivePolicy,
+			peerOfCall({}),
+			"charge",
+		);
 		expect(denial).toContain("could not extract peer certificate");
 	});
 
@@ -392,14 +400,18 @@ describe("evaluatePeerAcceptance", () => {
 				throw new Error("no auth context");
 			},
 		};
-		const denial = evaluatePeerAcceptance(restrictivePolicy, call, "charge");
+		const denial = evaluatePeerAcceptance(
+			restrictivePolicy,
+			peerOfCall(call),
+			"charge",
+		);
 		expect(denial).toContain("could not extract peer certificate");
 	});
 
 	it("fail-closed when the peer identity cannot be established", () => {
 		const denial = evaluatePeerAcceptance(
 			restrictivePolicy,
-			makeCall(noSanStrangerCert),
+			peerOfCall(makeCall(noSanStrangerCert)),
 			"charge",
 		);
 		expect(denial).toContain("peer identity not established");
@@ -408,7 +420,7 @@ describe("evaluatePeerAcceptance", () => {
 	it("fail-closed on an unresolvable URI SAN instead of assuming the runtime", () => {
 		const denial = evaluatePeerAcceptance(
 			restrictivePolicy,
-			makeCall(foreignUriCert),
+			peerOfCall(makeCall(foreignUriCert)),
 			"charge",
 		);
 		expect(denial).toContain("peer identity not established");
@@ -417,10 +429,12 @@ describe("evaluatePeerAcceptance", () => {
 	it("fail-closed on an unparseable peer certificate", () => {
 		const denial = evaluatePeerAcceptance(
 			restrictivePolicy,
-			makeCall({
-				raw: new Uint8Array([9, 9, 9]),
-				subject: { CN: RUNTIME_PEER_COMMON_NAME },
-			} as CertFixture),
+			peerOfCall(
+				makeCall({
+					raw: new Uint8Array([9, 9, 9]),
+					subject: { CN: RUNTIME_PEER_COMMON_NAME },
+				} as CertFixture),
+			),
 			"charge",
 		);
 		expect(denial).toContain("unparseable");
@@ -430,7 +444,7 @@ describe("evaluatePeerAcceptance", () => {
 		expect(
 			evaluatePeerAcceptance(
 				restrictivePolicy,
-				makeCall(runtimeCert),
+				peerOfCall(makeCall(runtimeCert)),
 				"charge",
 			),
 		).toBeNull();
@@ -439,7 +453,7 @@ describe("evaluatePeerAcceptance", () => {
 	it("denies when acceptance rules reject the caller", () => {
 		const denial = evaluatePeerAcceptance(
 			restrictivePolicy,
-			makeCall(sdkLeafB),
+			peerOfCall(makeCall(sdkLeafB)),
 			"charge",
 		);
 		expect(denial).toContain("acceptance denied");
@@ -449,7 +463,7 @@ describe("evaluatePeerAcceptance", () => {
 	it("denies an allowed caller invoking a method it may not call", () => {
 		const denial = evaluatePeerAcceptance(
 			restrictivePolicy,
-			makeCall(sdkLeafA),
+			peerOfCall(makeCall(sdkLeafA)),
 			"refund",
 		);
 		expect(denial).toContain("acceptance denied");
@@ -457,7 +471,11 @@ describe("evaluatePeerAcceptance", () => {
 
 	it("allows when acceptance rules accept the caller", () => {
 		expect(
-			evaluatePeerAcceptance(restrictivePolicy, makeCall(sdkLeafA), "charge"),
+			evaluatePeerAcceptance(
+				restrictivePolicy,
+				peerOfCall(makeCall(sdkLeafA)),
+				"charge",
+			),
 		).toBeNull();
 	});
 
@@ -465,7 +483,7 @@ describe("evaluatePeerAcceptance", () => {
 		expect(
 			evaluatePeerAcceptance(
 				restrictivePolicy,
-				makeAuthContextCall(sdkLeafA),
+				peerOfCall(makeAuthContextCall(sdkLeafA)),
 				"charge",
 			),
 		).toBeNull();

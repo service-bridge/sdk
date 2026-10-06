@@ -139,6 +139,15 @@ export class WatchStream {
 	private peersChangeListeners = new Set<
 		(added: string[], removed: string[]) => void
 	>();
+	// Access revoked by the operator (decision 12). Instances are revoked for
+	// good; a service is revoked until an instance of it the SDK had not seen
+	// at revocation time appears (the service was re-activated and provisioned
+	// anew). Value: instance ids of the service known when it was revoked.
+	private revokedServices = new Map<string, Set<string>>();
+	private revokedInstances = new Set<string>();
+	private revocationListeners = new Set<() => void>();
+	private snapshotListeners = new Set<() => void>();
+	private _hasSnapshot = false;
 	// Retry state. A broken watch self-restarts on the shared jittered ladder
 	// using the (req, client) from the latest start()/restart(); session
 	// rotation refreshes both via restart(). One pending timer at a time —
@@ -168,6 +177,7 @@ export class WatchStream {
 
 	stop(): void {
 		this._stopped = true;
+		this._hasSnapshot = false;
 		this.clearRetryTimer();
 		const old = this.stream;
 		this.stream = null;
@@ -228,6 +238,32 @@ export class WatchStream {
 			clearTimeout(this._timer);
 			this._timer = null;
 		}
+	}
+
+	// isRevoked reports whether calls from or to this peer must be refused.
+	isRevoked(serviceId: string, instanceId: string): boolean {
+		return (
+			this.revokedInstances.has(instanceId) ||
+			this.revokedServices.has(serviceId)
+		);
+	}
+
+	// onRevoked fires after a frame revoked a service or an instance.
+	onRevoked(fn: () => void): () => void {
+		this.revocationListeners.add(fn);
+		return () => this.revocationListeners.delete(fn);
+	}
+
+	// hasSnapshot reports whether the current stream generation applied a
+	// snapshot: until then there is no policy and no mesh view to act on.
+	hasSnapshot(): boolean {
+		return this._hasSnapshot;
+	}
+
+	// onSnapshot fires after every applied snapshot frame.
+	onSnapshot(fn: () => void): () => void {
+		this.snapshotListeners.add(fn);
+		return () => this.snapshotListeners.delete(fn);
 	}
 
 	// snapshot exposes the live descriptor cache read-only. Copying it here
@@ -412,8 +448,11 @@ export class WatchStream {
 				channelCaptureModesFromProto(evt.snapshot.captureModes),
 			);
 			this.applyTelemetryConfig(evt.snapshot.captureModes);
+			this.unrevoke(evt.snapshot.instances);
 			this.emitMethods(evt.snapshot.methods, removedMethods);
 			this.emitInstances(evt.snapshot.instances, removedInstances);
+			this._hasSnapshot = true;
+			for (const fn of this.snapshotListeners) fn();
 		} else if (evt.update) {
 			for (const m of evt.update.added) {
 				this.cache.set(cacheKey(m), m);
@@ -472,11 +511,36 @@ export class WatchStream {
 					fn(addedPeers, removedPeers);
 				}
 			}
+			this.unrevoke(evt.update.addedInstances);
+			const revoked = this.applyRevocations(
+				evt.update.revokedServices ?? [],
+				evt.update.revokedInstances ?? [],
+			);
 			this.emitMethods(evt.update.added, removedMethods);
 			this.emitInstances(
 				evt.update.addedInstances,
 				evt.update.removedInstances,
 			);
+			if (revoked) for (const fn of this.revocationListeners) fn();
+		}
+	}
+
+	private applyRevocations(services: string[], instances: string[]): boolean {
+		for (const serviceId of services) {
+			const known = new Set<string>();
+			for (const inst of this.instances.values())
+				if (inst.serviceId === serviceId) known.add(inst.instanceId);
+			this.revokedServices.set(serviceId, known);
+		}
+		for (const id of instances) this.revokedInstances.add(id);
+		return services.length > 0 || instances.length > 0;
+	}
+
+	private unrevoke(instances: ServiceInstanceInfo[]): void {
+		for (const inst of instances) {
+			const known = this.revokedServices.get(inst.serviceId);
+			if (known && !known.has(inst.instanceId))
+				this.revokedServices.delete(inst.serviceId);
 		}
 	}
 }

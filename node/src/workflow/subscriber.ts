@@ -16,7 +16,6 @@
 
 import type { ClientReadableStream } from "@grpc/grpc-js";
 import type { ServiceBridge } from "../connection/service-bridge";
-import type { Logger } from "../events/publisher";
 import type {
 	RunAssignment,
 	WorkflowsClient,
@@ -37,6 +36,11 @@ const HEARTBEAT_INTERVAL_MS = 10_000;
 export interface SubscriberIdentity {
 	serviceId: string;
 	instanceId: string;
+}
+
+interface Logger {
+	warn(msg: string, ...args: unknown[]): void;
+	error(msg: string, ...args: unknown[]): void;
 }
 
 interface SubscriberDeps {

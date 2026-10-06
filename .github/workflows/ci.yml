@@ -108,7 +108,7 @@ jobs:
         working-directory: node
       - run: npm pack --pack-destination "$RUNNER_TEMP"
         working-directory: node
-      - name: install and exercise published exports and native dependency
+      - name: install and exercise the published exports
         env:
           SMOKE_RUNTIME: ${{ matrix.runtime }}
         run: |
@@ -116,9 +116,10 @@ jobs:
           cd "$RUNNER_TEMP/consumer"
           npm init -y
           if [ "$SMOKE_RUNTIME" = bun ]; then
-            bun add "$RUNNER_TEMP"/service-bridge-*.tgz express fastify hono typescript@5
+            bun add "$RUNNER_TEMP"/service-bridge-*.tgz express fastify hono
           else
-            npm install "$RUNNER_TEMP"/service-bridge-*.tgz express fastify hono typescript@5
+            npm install "$RUNNER_TEMP"/service-bridge-*.tgz express fastify hono
           fi
+          if tar tzf "$RUNNER_TEMP"/service-bridge-*.tgz | grep -q '\.map$'; then echo "source maps must not be published"; exit 1; fi
           cp "$GITHUB_WORKSPACE/node/tests/fixtures/packed-smoke.mjs" smoke.mjs
           if [ "$SMOKE_RUNTIME" = bun ]; then bun smoke.mjs; else node smoke.mjs; fi

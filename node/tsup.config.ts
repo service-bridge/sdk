@@ -13,7 +13,9 @@ export default defineConfig({
 	outDir: "dist",
 	dts: true,
 	clean: true,
-	sourcemap: true,
+	// No source maps in the published package (NSDK-15): they doubled the
+	// tarball and pointed at sources that are not shipped.
+	sourcemap: false,
 	// Shared internal modules (telemetry/context → the `als` AsyncLocalStorage
 	// singleton) MUST resolve to one instance across every entry. With splitting
 	// off, each entry inlines its own copy of `als`, so a plugin imported via
@@ -21,5 +23,4 @@ export default defineConfig({
 	// core read by `service-bridge` → trace context is invisible to rpc.call and
 	// the trace splits. Splitting hoists shared code into one chunk, one `als`.
 	splitting: true,
-	external: ["better-sqlite3", "bun:sqlite"],
 });

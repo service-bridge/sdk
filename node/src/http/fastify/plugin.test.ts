@@ -189,45 +189,21 @@ describe("sbFastify plugin", () => {
 		await app.inject({ method: "GET", url: "/missing" });
 		await app.inject({ method: "GET", url: "/boom" });
 		expect(stub.endCalls).toEqual([
-			{ status: Status.ERROR, message: "HTTP 404" },
-			{ status: Status.ERROR, message: "HTTP 503" },
+			{ status: Status.ERROR, message: "HTTP 404", meta: { status: 404 } },
+			{ status: Status.ERROR, message: "HTTP 503", meta: { status: 503 } },
 		]);
 	});
 
-	it("rejects scanner probes before creating HTTP telemetry", async () => {
+	it("names the op after the route template", async () => {
 		const stub = makeSbStub();
 		app = Fastify({ logger: false });
 		await app.register(sbFastify, { sb: stub.sb });
-		app.get("/*", async () => ({ leaked: true }));
+		app.get("/users/:id", async () => ({}));
 		await app.ready();
-
-		const response = await app.inject({ method: "GET", url: "/api/dev/.env" });
-		expect(response.statusCode).toBe(404);
-		expect(response.json()).toEqual({ error: "Not Found" });
-		expect(stub.started).toHaveLength(0);
-		expect(stub.endCalls).toHaveLength(0);
-	});
-
-	it("rate-limits by a trusted proxy address and emits no rejected op", async () => {
-		const stub = makeSbStub();
-		app = Fastify({ logger: false });
-		await app.register(sbFastify, {
-			sb: stub.sb,
-			security: {
-				rateLimit: { limit: 1, windowMs: 60_000, trustProxyHops: 1 },
-			},
-		});
-		app.get("/ok", async () => ({ ok: true }));
-		await app.ready();
-
-		const headers = { "x-forwarded-for": "198.51.100.20" };
-		expect(
-			(await app.inject({ method: "GET", url: "/ok", headers })).statusCode,
-		).toBe(200);
-		const rejected = await app.inject({ method: "GET", url: "/ok", headers });
-		expect(rejected.statusCode).toBe(429);
-		expect(rejected.headers["retry-after"]).toBeDefined();
-		expect(stub.started).toHaveLength(1);
+		await app.inject({ method: "GET", url: "/users/42?token=secret" });
+		expect(stub.started[0]?.subject).toBe("http.handle:GET//users/:id");
+		expect(stub.started[0]?.businessKey).toBe("GET /users/:id");
+		expect(stub.endCalls[0]?.meta).toEqual({ status: 200 });
 	});
 });
 
@@ -259,7 +235,7 @@ describe("sbFastify payload capture gating", () => {
 		const stub = await roundtrip("none");
 		expect(stub.captures).toHaveLength(0);
 		expect(stub.endCalls).toEqual([
-			{ status: Status.SUCCESS, message: undefined },
+			{ status: Status.SUCCESS, message: undefined, meta: { status: 200 } },
 		]);
 	});
 

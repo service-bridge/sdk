@@ -2,13 +2,12 @@ import type { ReadableStreamDefaultReader as WebReader } from "node:stream/web";
 import type { Hono } from "hono";
 import type { ServiceBridge } from "../../connection/service-bridge";
 import { runWithTrace } from "../../telemetry/context";
-import { Status } from "../../telemetry/ops";
 import { RAW_JSON_CONTRACT } from "../_common/body-capture";
-import { startHttpOp, statusForHttpCode } from "../_common/http-op";
 import {
-	HttpRequestGuard,
-	type HttpSecurityOptions,
-} from "../_common/security";
+	type HttpIntegrationOptions,
+	startHttpOp,
+	UNMATCHED_ROUTE,
+} from "../_common/http-op";
 import { resolveHttpAdvertiseHost } from "../endpoint";
 
 /**
@@ -18,15 +17,9 @@ import { resolveHttpAdvertiseHost } from "../endpoint";
  *
  * @public — см. ./README.md
  */
-export interface HonoEndpoint {
+export interface HonoEndpoint extends HttpIntegrationOptions {
 	host?: string;
 	port: number;
-	security?: HttpSecurityOptions;
-	resolveRemoteAddress?: (
-		request: Request,
-		env: unknown,
-		executionContext: unknown,
-	) => string | null | undefined;
 }
 
 /**
@@ -68,10 +61,6 @@ export function attachHono(
 	sb: ServiceBridge,
 	endpoint: HonoEndpoint,
 ): void {
-	if (endpoint.security?.rateLimit && !endpoint.resolveRemoteAddress)
-		throw new Error(
-			"Hono rate limiting requires resolveRemoteAddress from the server adapter",
-		);
 	collectHonoRoutes(app, sb);
 	const host = resolveHttpAdvertiseHost(endpoint.host);
 	sb.routes.publishHttp({ host, port: endpoint.port });
@@ -80,59 +69,62 @@ export function attachHono(
 
 const TRACE_FLAG = Symbol.for("servicebridge.hono.trace");
 
+// RouterRouteLike is what Hono's router stores per handler.
+interface RouterRouteLike {
+	path?: string;
+	method?: string;
+}
+
+/**
+ * The template of the route Hono will dispatch the request to: the last
+ * non-middleware entry the app's own router matches ("*" when none).
+ */
+function honoRoute(app: Hono, method: string, pathname: string): string {
+	const router = (
+		app as unknown as {
+			router?: {
+				match(method: string, path: string): [unknown[], ...unknown[]];
+			};
+		}
+	).router;
+	const matched = router?.match(method, pathname)?.[0] ?? [];
+	let route: string = UNMATCHED_ROUTE;
+	for (const entry of matched) {
+		const pair = (
+			Array.isArray(entry) && Array.isArray(entry[0]) ? entry[0] : entry
+		) as unknown[];
+		const info = pair[1] as RouterRouteLike | undefined;
+		if (info?.path && info.method && info.method !== "ALL") route = info.path;
+	}
+	return route;
+}
+
 function installHonoTracing(
 	app: Hono,
 	sb: ServiceBridge,
 	endpoint: HonoEndpoint,
 ): void {
-	const security = endpoint.security;
-	if (security?.rateLimit && !endpoint.resolveRemoteAddress) {
-		throw new Error(
-			"Hono rate limiting requires resolveRemoteAddress from the server adapter",
-		);
-	}
 	const tagged = app as Hono & { [TRACE_FLAG]?: boolean };
 	if (tagged[TRACE_FLAG]) return;
 	tagged[TRACE_FLAG] = true;
 
-	// Hono.use(...) после регистрации роутов не догоняет — порядок матчит.
-	// Поэтому оборачиваем сам fetch: парсим X-SB-Trace + запускаем downstream
-	// chain в runWithTrace, чтобы handler и downstream user-code видели ALS,
-	// и эмитим HTTP.HANDLE op (start/end по response.status).
+	// Hono.use(...) after the routes would never run before them, so the fetch
+	// entry point itself is wrapped: the op starts, the chain runs inside its
+	// trace scope, and the op ends on the response status.
 	const origFetch = app.fetch.bind(app);
-	const guard = new HttpRequestGuard(
-		endpoint.resolveRemoteAddress
-			? security
-			: { ...security, rateLimit: false },
-	);
 	// biome-ignore lint/suspicious/noExplicitAny: env/executionCtx — рантайм-зависимы
 	(app as any).fetch = async (req: Request, env?: any, executionCtx?: any) => {
 		const url = new URL(req.url);
-		const decision = guard.check({
-			method: req.method,
-			pathname: `${url.pathname}${url.search}`,
-			remoteAddress: endpoint.resolveRemoteAddress?.(req, env, executionCtx),
-			forwardedFor: req.headers.get("x-forwarded-for"),
-		});
-		if (!decision.allowed) {
-			const headers = new Headers({ "content-type": "application/json" });
-			if (decision.retryAfterSeconds) {
-				headers.set("Retry-After", String(decision.retryAfterSeconds));
-			}
-			return new Response(
-				JSON.stringify({
-					error: decision.status === 429 ? "Too Many Requests" : "Not Found",
-				}),
-				{ status: decision.status, headers },
-			);
-		}
-		const op = startHttpOp(sb, {
-			method: req.method,
-			subjectPath: url.pathname,
-			keyPath: url.pathname,
-			traceHeader: req.headers.get("x-sb-trace"),
-			idempotencyKey: req.headers.get("idempotency-key"),
-		});
+		const op = startHttpOp(
+			sb,
+			{
+				method: req.method,
+				route: honoRoute(app, req.method, url.pathname),
+				traceHeader: req.headers.get("x-sb-trace"),
+				idempotencyKey: req.headers.get("idempotency-key"),
+			},
+			endpoint,
+		);
 		const handle = op.handle;
 		const limit = handle.payloadMaxBytes ?? 65536;
 		const request =
@@ -147,8 +139,7 @@ function installHonoTracing(
 		return runWithTrace(op.scope, async () => {
 			try {
 				const res = (await origFetch(request, env, executionCtx)) as Response;
-				const { status, message } = statusForHttpCode(res.status);
-				handle.end(status, message);
+				op.finish(res.status);
 				if (!op.capturing || !res.body) return res;
 				return new Response(
 					passiveCapture(res.body, limit, (bytes, size) =>
@@ -161,7 +152,7 @@ function installHonoTracing(
 					},
 				);
 			} catch (err) {
-				handle.end(Status.ERROR, (err as Error).message);
+				op.fail((err as Error).message);
 				throw err;
 			}
 		});

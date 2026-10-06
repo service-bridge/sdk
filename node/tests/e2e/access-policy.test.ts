@@ -170,8 +170,7 @@ describe("access-policy (ADR-0004)", () => {
 			"orders.a.b",
 			"orders.#",
 		]) {
-			sub.event.handle(pattern, async () => {});
-			sub.event.define(pattern, ORDER);
+			sub.event.handle(pattern, async () => {}, { schema: ORDER });
 		}
 
 		await connect(sub);
@@ -471,8 +470,7 @@ describe("access-policy (ADR-0004)", () => {
 			async () => ({ transactionId: "self", ok: true }),
 			{ schema: PAY },
 		);
-		caller.event.handle(selfSub, async () => {});
-		caller.event.define(selfSub, ORDER);
+		caller.event.handle(selfSub, async () => {}, { schema: ORDER });
 		await connect(caller);
 		await waitFor(() => caller!.identity() !== null, 5_000, "caller connected");
 
@@ -538,8 +536,7 @@ describe("access-policy (ADR-0004)", () => {
 		await sleep(400);
 
 		caller = dedicated("second");
-		caller.event.handle("*.created", async () => {});
-		caller.event.define("*.created", ORDER);
+		caller.event.handle("*.created", async () => {}, { schema: ORDER });
 		await connect(caller);
 		await waitFor(() => caller!.identity() !== null, 5_000, "sub connected");
 
@@ -579,8 +576,7 @@ describe("access-policy (ADR-0004)", () => {
 
 		caller = dedicated("second");
 		// payments.* is disjoint from the scope rule orders.*.
-		caller.event.handle("payments.*", async () => {});
-		caller.event.define("payments.*", ORDER);
+		caller.event.handle("payments.*", async () => {}, { schema: ORDER });
 		await connect(caller);
 		await waitFor(() => caller!.identity() !== null, 5_000, "sub connected");
 

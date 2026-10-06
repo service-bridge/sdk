@@ -22,16 +22,9 @@
 // The warm pool is closed once at process exit via the global afterAll in
 // setup.ts (a top-level afterAll in a Bun preload fires once per run).
 
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { ServiceBridge } from "../../../src/connection/service-bridge";
 
 export type Role = "primary" | "second" | "third";
-
-const CONNECT_TIMEOUT_MS = 10_000;
-// A fresh runtime database must never receive a previous run's SQLite outbox.
-const dataRoot = mkdtempSync(join(tmpdir(), "sb-e2e-pool-"));
 
 const POOL_OPTS = {
 	reconnectIntervalMs: 500,
@@ -40,6 +33,7 @@ const POOL_OPTS = {
 	// with no scheduling jitter in lifecycle fixtures.
 	certRefreshLeadMs: 60_000,
 	certRefreshJitterMs: 0,
+	startTimeoutMs: 10_000,
 } as const;
 
 const ROLE_INDEX: Record<Role, number> = { primary: 1, second: 2, third: 3 };
@@ -71,12 +65,11 @@ function keyForRole(role: Role): { url: string; key: string } {
 	return { url, key };
 }
 
-function buildClient(role: Role, tag: string): ServiceBridge {
+function buildClient(role: Role): ServiceBridge {
 	const { url, key } = keyForRole(role);
 	return new ServiceBridge(url, key, {
 		...POOL_OPTS,
 		advertise: { host: "127.0.0.1", port: 0 },
-		dataDir: join(dataRoot, `${domain()}-${tag}`),
 	});
 }
 
@@ -98,25 +91,10 @@ function registerWorkflowSentinel(sb: ServiceBridge): void {
 // connect starts a client and resolves once it is connected (identity() set).
 // Used by the pool and by dedicated clients a test owns and stop()s itself.
 export async function connect(sb: ServiceBridge): Promise<ServiceBridge> {
-	await new Promise<void>((resolve, reject) => {
-		const timer = setTimeout(() => {
-			reject(
-				new Error(`pool: connect timed out after ${CONNECT_TIMEOUT_MS}ms`),
-			);
-		}, CONNECT_TIMEOUT_MS);
-		sb.on("connected", () => {
-			clearTimeout(timer);
-			resolve();
-		});
-		sb.on("disconnected", (evt) => {
-			clearTimeout(timer);
-			reject(evt.error ?? new Error(evt.reason));
-		});
-		sb.start().catch((err: unknown) => {
-			clearTimeout(timer);
-			reject(err instanceof Error ? err : new Error(String(err)));
-		});
-	});
+	// start() resolves once the session is welcomed and the first registry
+	// snapshot arrived, and rejects (stopping the client) on a terminal error or
+	// after startTimeoutMs.
+	await sb.start();
 	return sb;
 }
 
@@ -132,7 +110,7 @@ const pool = new Map<Role, Entry>();
 export function shared(role: Role = "primary"): Promise<ServiceBridge> {
 	let entry = pool.get(role);
 	if (!entry) {
-		const sb = buildClient(role, role);
+		const sb = buildClient(role);
 		registerWorkflowSentinel(sb);
 		entry = { sb, ready: connect(sb) };
 		pool.set(role, entry);
@@ -140,13 +118,10 @@ export function shared(role: Role = "primary"): Promise<ServiceBridge> {
 	return entry.ready;
 }
 
-let dedicatedCount = 0;
-
 // dedicated returns a fresh UNSTARTED client under the role's per-domain key.
-// The caller registers handlers, then connect()s and stop()s it. Each gets its
-// own SQLite outbox so concurrent dedicated clients never share a file.
+// The caller registers handlers, then connect()s and stop()s it.
 export function dedicated(role: Role = "primary"): ServiceBridge {
-	return buildClient(role, `ded-${++dedicatedCount}`);
+	return buildClient(role);
 }
 
 // closeAll stops every warm client. Called once from the global afterAll.
@@ -154,5 +129,4 @@ export async function closeAll(): Promise<void> {
 	const entries = [...pool.values()];
 	pool.clear();
 	await Promise.all(entries.map((e) => e.sb.stop().catch(() => {})));
-	rmSync(dataRoot, { recursive: true, force: true });
 }

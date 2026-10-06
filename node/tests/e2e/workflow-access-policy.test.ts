@@ -341,7 +341,6 @@ describe("workflow-access-policy", () => {
 			...FAST_WF_OPTS,
 			failOnPolicyViolation: true,
 			advertise: { host: "127.0.0.1", port: 0 },
-			dataDir: `./.servicebridge-e2e/${domain}-ap-fov-${Date.now()}`,
 		});
 		caller.service(ownerSvcName, { workflows: [wfName] });
 		clients.push(caller);
@@ -351,7 +350,7 @@ describe("workflow-access-policy", () => {
 
 		// start() may reject: the policy handler calls stop() from inside the first
 		// PolicyEvaluation frame, which can land mid-connect. The rejection alone
-		// proves nothing (stale keys, unreachable runtime and a bad dataDir all
+		// proves nothing (stale keys and an unreachable runtime both
 		// produce one), so it is only carried into the failure message — the
 		// assertion is on the `disconnected` payload the policy path emits.
 		let startError: Error | undefined;

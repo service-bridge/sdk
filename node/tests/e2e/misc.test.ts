@@ -21,6 +21,7 @@ import {
 import { Channel } from "../../src/pb/servicebridge/v1/telemetry";
 import {
 	connect,
+	declareRpc,
 	dedicated,
 	type Role,
 	shared,
@@ -203,7 +204,7 @@ describe("misc: registry discovery", () => {
 		const method = uniqueName("charge");
 
 		provider = dedicated("primary");
-		provider.rpc._declareForTests(method);
+		declareRpc(provider, method);
 		await connect(provider);
 		const providerName = provider.identity()?.serviceName as string;
 
@@ -234,7 +235,7 @@ describe("misc: registry discovery", () => {
 		expect(hasMethod(consumer.serviceMap(), method)).toBe(false);
 
 		provider = dedicated("primary");
-		provider.rpc._declareForTests(method);
+		declareRpc(provider, method);
 		await connect(provider);
 		expect(provider.identity()?.serviceName).toBe(providerName);
 
@@ -249,7 +250,7 @@ describe("misc: registry discovery", () => {
 		const method = uniqueName("pay");
 
 		provider = dedicated("primary");
-		provider.rpc._declareForTests(method);
+		declareRpc(provider, method);
 		await connect(provider);
 		const providerName = provider.identity()?.serviceName as string;
 
@@ -280,7 +281,7 @@ describe("misc: registry discovery", () => {
 		];
 
 		provider = dedicated("primary");
-		for (const m of methods) provider.rpc._declareForTests(m);
+		for (const m of methods) declareRpc(provider, m);
 		await connect(provider);
 		const providerName = provider.identity()?.serviceName as string;
 
@@ -323,12 +324,12 @@ describe("misc: registry discovery", () => {
 
 		// Two ServiceBridge instances of the SAME key → two instanceIds.
 		provider = dedicated("primary");
-		provider.rpc._declareForTests(methodA);
+		declareRpc(provider, methodA);
 		await connect(provider);
 		const providerName = provider.identity()?.serviceName as string;
 
 		provider2 = dedicated("primary");
-		provider2.rpc._declareForTests(methodB);
+		declareRpc(provider2, methodB);
 		await connect(provider2);
 
 		consumer = dedicated("second");
@@ -381,10 +382,11 @@ describe("misc: service-map enrichment", () => {
 
 		consumer = dedicated("second");
 		consumer.service(calleeName, { rpc: [method] });
-		consumer.event.handle(subPattern, async () => {});
-		consumer.event.define(subPattern, {
-			protoFile: ORDER_PROTO,
-			method: "orders_created",
+		consumer.event.handle(subPattern, async () => {}, {
+			schema: {
+				protoFile: ORDER_PROTO,
+				method: "orders_created",
+			},
 		});
 		await connect(consumer);
 		// event.handle registration keeps the consumer connected (absorbs the old

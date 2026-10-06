@@ -3,6 +3,7 @@ import {
 	SDK_LANGUAGE,
 	SDK_VERSION,
 } from "../connection/handshake";
+import { HandlerError, ValidationError } from "../errors";
 import { RouteCollector } from "../http/route";
 import type {
 	IncomingMethod as PbIncomingMethod,
@@ -13,6 +14,7 @@ import type {
 import { MethodType } from "../pb/servicebridge/v1/registry";
 import type {
 	DispatchPort,
+	RpcHandlerContext,
 	StreamItem,
 	UnaryResult,
 } from "../rpc/dispatch-port";
@@ -49,33 +51,62 @@ export interface ServiceDeps {
 	http?: string[];
 }
 
-// RpcHandlerFn is the function shape accepted by Handle.rpc().
+// RpcHandlerFn is the function shape accepted by sb.rpc.handle(). Throw a
+// HandlerError to answer with a business code; any other error reaches the
+// caller as handler code "INTERNAL".
 export type RpcHandlerFn<Req = unknown, Res = unknown> = (
 	req: Req,
+	ctx: RpcHandlerContext,
 ) => Promise<Res> | Res;
 
-// RpcStreamHandlerFn is the function shape accepted by Handle.stream().
-// Implementations return an AsyncIterable / async generator that yields one
-// chunk at a time. Termination (return) ends the stream; thrown errors are
-// caught by the CallServer and mapped to the final StreamChunk.error_code.
+// RpcStreamHandlerFn is the function shape accepted by sb.rpc.handleStream():
+// an async generator yielding one chunk at a time. ctx.signal aborts when the
+// caller goes away; stop producing then.
 export type RpcStreamHandlerFn<Req = unknown, Chunk = unknown> = (
 	req: Req,
+	ctx: RpcHandlerContext,
 ) => AsyncIterable<Chunk>;
 
-// EventHandlerFn is the function shape accepted by Handle.event().
+/** What an event handler knows about the delivery it serves. @public */
 export interface EventHandlerContext {
+	eventId: string;
+	/** Concrete event name the publisher used. */
+	eventName: string;
 	attempt: number;
 	deliveryId: string;
-	eventId: string;
 	leaseToken: string;
+	partitionKey: string;
+	headers: Record<string, string>;
+	occurredAtMs: number;
+	/** Aborts when the delivery stream breaks or the bridge stops. */
 	signal: AbortSignal;
 }
+
 export type EventHandlerFn = (
 	payload: unknown,
 	context: EventHandlerContext,
 ) => Promise<void> | void;
 
-const NO_EVENT_HANDLERS: readonly EventHandlerFn[] = [];
+/**
+ * Options of sb.event.handle(). `schema` decodes the payload (without it the
+ * handler receives the raw protobuf bytes); `filter` is a Filter Expression
+ * the runtime evaluates against the event before delivering it.
+ *
+ * @public — см. ../events/README.md
+ */
+export interface EventHandlerOpts {
+	schema?: SchemaSpec;
+	/** All-equalities filter, e.g. `{ "$.region": "eu", "$.amount": 100 }`. */
+	filter?: Record<string, unknown>;
+}
+
+/** One subscription of this process: pattern → handler. @internal */
+export interface SubscriptionEntry {
+	pattern: string;
+	filter: string;
+	fn: EventHandlerFn;
+	schemaPair?: SchemaPair;
+}
 
 interface HandlerEntry {
 	type: MethodType;
@@ -136,8 +167,10 @@ export class Handle {
 	// Every mutation funnels through addEntry / publishEvent so the indexes
 	// cannot drift from the arrays.
 	private readonly rpcByName = new Map<string, HandlerEntry>();
-	private readonly eventsByPattern = new Map<string, EventHandlerFn[]>();
 	private readonly publishedByName = new Map<string, PublishedEntry>();
+	// Event subscriptions are not published events: a subscriber never lands in
+	// `published` (NSDK-08) and carries its own decoding schema.
+	private readonly subscriptions = new Map<string, SubscriptionEntry>();
 
 	// Pending registrations awaiting their async SchemaPair to load. Covers
 	// rpc / stream handlers AND publishEvent declarations.
@@ -148,17 +181,7 @@ export class Handle {
 	private addEntry(entry: HandlerEntry): void {
 		this._entries.push(entry);
 		if (entry.type === MethodType.METHOD_TYPE_RPC) {
-			// First registration of a name wins, as with the previous find().
-			if (!this.rpcByName.has(entry.name)) {
-				this.rpcByName.set(entry.name, entry);
-			}
-			return;
-		}
-		if (entry.type === MethodType.METHOD_TYPE_EVENT) {
-			const fn = entry.fn as EventHandlerFn;
-			const bucket = this.eventsByPattern.get(entry.name);
-			if (bucket) bucket.push(fn);
-			else this.eventsByPattern.set(entry.name, [fn]);
+			this.rpcByName.set(entry.name, entry);
 		}
 	}
 
@@ -191,29 +214,17 @@ export class Handle {
 		this.registerRpc(name, fn, true, opts);
 	}
 
-	// _declareForTests registers an RPC entry without a schema. Tests use this
-	// to assemble Handle / Registry fixtures that exercise registration paths
-	// without loading real .proto files. Production code MUST go through `rpc`
-	// or `stream` with an explicit `schema`.
-	//
-	// @internal — см. ./README.md
-	_declareForTests(name: string, streaming = false): void {
-		this.addEntry({
-			type: MethodType.METHOD_TYPE_RPC,
-			name,
-			inputSchemaJson: null,
-			outputSchemaJson: null,
-			fn: () => undefined,
-			streaming,
-		});
-	}
-
 	private registerRpc(
 		name: string,
 		fn: unknown,
 		streaming: boolean,
 		opts: RpcHandlerOpts,
 	): void {
+		if (!name) throw new ValidationError("rpc.handle: method name is empty");
+		if (this.rpcByName.has(name))
+			throw new ValidationError(
+				`rpc.handle: method "${name}" already has a handler`,
+			);
 		const entry: HandlerEntry = {
 			type: MethodType.METHOD_TYPE_RPC,
 			name,
@@ -254,12 +265,11 @@ export class Handle {
 	// Re-declaration with the same SchemaSpec object is no-op. Re-declaration
 	// with a different SchemaSpec throws — there must be one canonical schema
 	// per (process, event-name).
-	publishEvent(name: string, spec?: SchemaSpec): void {
+	publishEvent(name: string, spec: SchemaSpec): void {
 		const existing = this.publishedByName.get(name);
 		if (existing) {
 			if (existing.spec === spec) return; // idempotent re-define with same spec
-			if (existing.spec === undefined && spec === undefined) return;
-			throw new Error(
+			throw new ValidationError(
 				`event.define: event "${name}" already declared with a different schema spec`,
 			);
 		}
@@ -272,8 +282,6 @@ export class Handle {
 		};
 		this._published.push(entry);
 		this.publishedByName.set(name, entry);
-
-		if (!spec) return; // schema-less event — registered name only
 
 		// For ProtoFileSpec without explicit input/output, propagate the event
 		// name so buildSchemaPair can look it up in the .proto service block.
@@ -305,50 +313,58 @@ export class Handle {
 		return { contractHash: entry.contractHash, pair: entry.schemaPair };
 	}
 
-	// _declarePublishedEventForTests — registers a published event without a
-	// real schema spec. Bypasses async load; tests use this to exercise
-	// registration paths without .proto files. Production code MUST go through
-	// publishEvent(name, spec) with an explicit schema.
-	// @internal
-	_declarePublishedEventForTests(name: string): void {
-		if (this.publishedByName.has(name)) return;
-		const entry: PublishedEntry = {
-			name,
-			inputSchemaJson: null,
-			contractHash: "",
-		};
-		this._published.push(entry);
-		this.publishedByName.set(name, entry);
-	}
-
-	// event registers a durable event subscription. Pattern может быть точным
-	// именем или AMQP wildcard. Схема payload-а живёт у publisher'а (event.define)
-	// и используется и для encode, и для decode — handler-side schema смысла не
-	// имеет (один pattern матчит много событий с разными схемами).
-	event(name: string, fn: unknown): void {
-		this.addEntry({
-			type: MethodType.METHOD_TYPE_EVENT,
-			name,
-			inputSchemaJson: null,
-			outputSchemaJson: null,
+	// event registers this process's handler for an event pattern (exact name
+	// or AMQP wildcard). Routing is the runtime's (ADR-0002): the delivery says
+	// which patterns it matched, nothing is matched locally. One handler per
+	// pattern: the runtime keys a subscription (and its filter) by pattern.
+	event(
+		pattern: string,
+		fn: EventHandlerFn,
+		opts: EventHandlerOpts = {},
+	): void {
+		if (!EVENT_PATTERN_RE.test(pattern))
+			throw new ValidationError(
+				`event.handle: invalid pattern "${pattern}" — dot-separated segments of [a-z0-9_-], "*" or "#"`,
+			);
+		if (this.subscriptions.has(pattern))
+			throw new ValidationError(
+				`event.handle: pattern "${pattern}" already has a handler`,
+			);
+		const entry: SubscriptionEntry = {
+			pattern,
+			filter: opts.filter ? JSON.stringify(opts.filter) : "",
 			fn,
-		});
+		};
+		this.subscriptions.set(pattern, entry);
+		if (!opts.schema) return;
+		const spec: SchemaSpec =
+			"protoFile" in opts.schema && !opts.schema.method
+				? { ...opts.schema, method: pattern }
+				: opts.schema;
+		const load = import("../serde/serializer").then(({ buildSchemaPair }) =>
+			buildSchemaPair(spec).then((pair) => {
+				entry.schemaPair = pair;
+			}),
+		);
+		this.trackPending(load);
 	}
 
-	// eventHandlers returns the handlers registered for an exact pattern, in
-	// registration order — the in-process fan-out set for one delivered event.
-	// The returned array is the live bucket; callers must not mutate it.
-	eventHandlers(pattern: string): readonly EventHandlerFn[] {
-		const exact = this.eventsByPattern.get(pattern) ?? NO_EVENT_HANDLERS;
-		const matched = [...exact];
-		for (const [subscription, handlers] of this.eventsByPattern) {
-			if (
-				subscription !== pattern &&
-				matchEventPattern(subscription.split("."), pattern.split("."))
-			)
-				matched.push(...handlers);
-		}
-		return matched;
+	// subscription returns this process's handler for one matched pattern.
+	subscription(pattern: string): SubscriptionEntry | undefined {
+		return this.subscriptions.get(pattern);
+	}
+
+	// subscriptionCount — the subscriber stream opens only when non-zero.
+	subscriptionCount(): number {
+		return this.subscriptions.size;
+	}
+
+	// eventSubscriptions emits RegisterRequest.event_subscriptions.
+	eventSubscriptions(): { pattern: string; filter: string }[] {
+		return [...this.subscriptions.values()].map((s) => ({
+			pattern: s.pattern,
+			filter: s.filter,
+		}));
 	}
 
 	workflow(
@@ -402,23 +418,21 @@ export class Handle {
 	// через RegisterRequest.event_subscriptions — единственный канал для них.
 	// См. ADR 0006 + registry README.
 	incomingMethods(): PbIncomingMethod[] {
-		return this._entries
-			.filter((e) => e.type !== MethodType.METHOD_TYPE_EVENT)
-			.map((e) => ({
-				type: e.type,
-				name: e.name,
-				inputSchemaJson: e.inputSchemaJson ?? Buffer.alloc(0),
-				outputSchemaJson: e.outputSchemaJson ?? Buffer.alloc(0),
-				streaming: e.streaming ?? false,
-				// SDK computes the contract hash; runtime stores opaque (ADR 0005).
-				// Workflow entries carry a graph fingerprint (ADR-W-002) via
-				// contractHashOverride. Empty when neither source is set.
-				contractHash: e.contractHashOverride
-					? e.contractHashOverride
-					: e.schemaPair
-						? computeContractHash(e.schemaPair)
-						: "",
-			}));
+		return this._entries.map((e) => ({
+			type: e.type,
+			name: e.name,
+			inputSchemaJson: e.inputSchemaJson ?? Buffer.alloc(0),
+			outputSchemaJson: e.outputSchemaJson ?? Buffer.alloc(0),
+			streaming: e.streaming ?? false,
+			// SDK computes the contract hash; runtime stores opaque (ADR 0005).
+			// Workflow entries carry a graph fingerprint (ADR-W-002) via
+			// contractHashOverride. Empty when neither source is set.
+			contractHash: e.contractHashOverride
+				? e.contractHashOverride
+				: e.schemaPair
+					? computeContractHash(e.schemaPair)
+					: "",
+		}));
 	}
 
 	// publishedEvents emits PublishedEvent rows for RegisterRequest. ADR-0002:
@@ -433,115 +447,119 @@ export class Handle {
 	}
 
 	// asDispatchPort exposes a DispatchPort over the registered handlers.
-	// CallServer uses this instead of reaching into private _entries.
+	// Refusals before the handler (unknown method, wrong kind, undecodable
+	// request) are gRPC statuses; a handler failure is error_code under OK.
 	asDispatchPort(): DispatchPort {
-		const findRpc = (method: string): HandlerEntry | undefined =>
-			this.rpcByName.get(method);
-
-		const handle = this;
-
+		const lookup = (
+			method: string,
+			streaming: boolean,
+		):
+			| { entry: HandlerEntry & { schemaPair: SchemaPair } }
+			| { refusal: UnaryResult } => {
+			const entry = this.rpcByName.get(method);
+			if (!entry)
+				return {
+					refusal: {
+						status: GRPC_NOT_FOUND,
+						errorMessage: `rpc: no handler for method ${method}`,
+					},
+				};
+			if (!!entry.streaming !== streaming)
+				return {
+					refusal: {
+						status: GRPC_FAILED_PRECONDITION,
+						errorMessage: streaming
+							? `rpc: method ${method} is unary — call it with Unary`
+							: `rpc: method ${method} is streaming — call it with Stream`,
+					},
+				};
+			if (!entry.schemaPair)
+				return {
+					refusal: {
+						status: GRPC_FAILED_PRECONDITION,
+						errorMessage: `rpc: schema not loaded for method ${method}`,
+					},
+				};
+			return { entry: entry as HandlerEntry & { schemaPair: SchemaPair } };
+		};
+		const decode = (
+			entry: HandlerEntry & { schemaPair: SchemaPair },
+			payload: Uint8Array,
+		): { request: unknown } | { refusal: UnaryResult } => {
+			try {
+				return { request: entry.schemaPair.input.decode(payload) };
+			} catch (err) {
+				return {
+					refusal: {
+						status: GRPC_INVALID_ARGUMENT,
+						errorMessage: `rpc: decode request: ${(err as Error).message}`,
+					},
+				};
+			}
+		};
 		return {
-			dispatchUnary: async (
-				method: string,
-				payload: Uint8Array,
-			): Promise<UnaryResult> => {
-				const entry = findRpc(method);
-				if (!entry) {
-					return {
-						payload: new Uint8Array(0),
-						errorCode: "NOT_FOUND",
-						errorMessage: `no RPC handler for method ${method}`,
-					};
-				}
-				if (entry.streaming) {
-					return {
-						payload: new Uint8Array(0),
-						errorCode: "FAILED_PRECONDITION",
-						errorMessage: `method ${method} is streaming — call via Stream`,
-					};
-				}
-				if (!entry.schemaPair) {
-					return {
-						payload: new Uint8Array(0),
-						errorCode: "INTERNAL",
-						errorMessage: `schema not loaded for method ${method}`,
-					};
-				}
-				let request: unknown;
+			dispatchUnary: async (method, payload, ctx): Promise<UnaryResult> => {
+				const found = lookup(method, false);
+				if ("refusal" in found) return found.refusal;
+				const decoded = decode(found.entry, payload);
+				if ("refusal" in decoded) return decoded.refusal;
 				try {
-					request = entry.schemaPair.input.decode(payload);
+					const fn = found.entry.fn as RpcHandlerFn;
+					const result = await fn(decoded.request, ctx);
+					return { payload: found.entry.schemaPair.output.encode(result) };
 				} catch (err) {
-					return {
-						payload: new Uint8Array(0),
-						errorCode: "INVALID_ARGUMENT",
-						errorMessage: `decode: ${(err as Error).message}`,
-					};
-				}
-				try {
-					const fn = entry.fn as RpcHandlerFn;
-					const result = await fn(request);
-					const bytes = entry.schemaPair.output.encode(
-						result as Record<string, unknown>,
-					);
-					return { payload: bytes };
-				} catch (err) {
-					return {
-						payload: new Uint8Array(0),
-						errorCode: "INTERNAL",
-						errorMessage: (err as Error).message,
-					};
+					return handlerFailure(err);
 				}
 			},
-			captureMode: (method: string): CaptureMode | undefined => {
-				return findRpc(method)?.captureMode;
-			},
+			captureMode: (method: string): CaptureMode | undefined =>
+				this.rpcByName.get(method)?.captureMode,
 			dispatchStream: async function* (
 				method: string,
 				payload: Uint8Array,
+				ctx: RpcHandlerContext,
 			): AsyncIterable<StreamItem> {
-				void handle;
-				const entry = findRpc(method);
-				if (!entry?.streaming) {
-					yield {
-						errorCode: "NOT_FOUND",
-						errorMessage: `no streaming handler for method ${method}`,
-					};
+				const found = lookup(method, true);
+				if ("refusal" in found) {
+					yield found.refusal;
 					return;
 				}
-				if (!entry.schemaPair) {
-					yield {
-						errorCode: "INTERNAL",
-						errorMessage: `schema not loaded for method ${method}`,
-					};
+				const decoded = decode(found.entry, payload);
+				if ("refusal" in decoded) {
+					yield decoded.refusal;
 					return;
 				}
-				let request: unknown;
-				try {
-					request = entry.schemaPair.input.decode(payload);
-				} catch (err) {
-					yield {
-						errorCode: "INVALID_ARGUMENT",
-						errorMessage: `decode: ${(err as Error).message}`,
-					};
-					return;
-				}
+				const { entry } = found;
 				try {
 					const fn = entry.fn as RpcStreamHandlerFn;
-					for await (const chunk of fn(request)) {
-						const bytes = entry.schemaPair.output.encode(
-							chunk as Record<string, unknown>,
-						);
-						yield { payload: bytes };
+					for await (const chunk of fn(decoded.request, ctx)) {
+						yield { payload: entry.schemaPair.output.encode(chunk) };
 					}
 				} catch (err) {
-					yield {
-						errorCode: "INTERNAL",
-						errorMessage: (err as Error).message,
-					};
+					yield handlerFailure(err);
 				}
 			},
 		};
 	}
+}
+
+// gRPC status codes of the refusals above (numeric: no grpc-js import here).
+const GRPC_INVALID_ARGUMENT = 3;
+const GRPC_NOT_FOUND = 5;
+const GRPC_FAILED_PRECONDITION = 9;
+
+// EVENT_PATTERN_RE accepts an event name or an AMQP pattern ("*" one segment,
+// "#" zero or more).
+const EVENT_PATTERN_RE = /^([a-z0-9_-]+|\*|#)(\.([a-z0-9_-]+|\*|#))*$/;
+
+// handlerFailure turns a thrown error into the handler's answer: a
+// HandlerError keeps its business code, anything else is "INTERNAL".
+function handlerFailure(err: unknown): UnaryResult {
+	if (err instanceof HandlerError)
+		return { errorCode: err.handlerCode, errorMessage: err.message };
+	return {
+		errorCode: "INTERNAL",
+		errorMessage: err instanceof Error ? err.message : String(err),
+	};
 }
 
 export class Registry {
@@ -631,22 +649,7 @@ export class Registry {
 			});
 		}
 
-		// Dedup event subscriptions by pattern. Multiple `event.handle(name, fn)`
-		// calls with the same pattern produce multiple HandlerEntry rows (so the
-		// subscriber dispatches to all matching handlers locally — that's the
-		// fan-out-within-SDK semantics tests rely on), but the runtime's
-		// `event_subscriptions` table has PRIMARY KEY (subscriber_id, pattern),
-		// so sending duplicates would trip the unique constraint inside
-		// `ReplaceEventSubs` and roll back the entire registration. One row per
-		// distinct pattern is enough — the SDK side handles in-process fan-out.
-		const seenPatterns = new Set<string>();
-		const eventSubscriptions: { pattern: string; filter: string }[] = [];
-		for (const e of this._handle._entries) {
-			if (e.type !== MethodType.METHOD_TYPE_EVENT) continue;
-			if (seenPatterns.has(e.name)) continue;
-			seenPatterns.add(e.name);
-			eventSubscriptions.push({ pattern: e.name, filter: "" });
-		}
+		const eventSubscriptions = this._handle.eventSubscriptions();
 
 		return {
 			incoming,
@@ -667,19 +670,4 @@ export class Registry {
 
 	private _callEndpoint = "";
 	private _httpEndpoint = "";
-}
-
-function matchEventPattern(pattern: string[], name: string[]): boolean {
-	if (!pattern.length) return !name.length;
-	if (pattern[0] === "#")
-		return (
-			name.some((_part, index) =>
-				matchEventPattern(pattern.slice(1), name.slice(index)),
-			) || matchEventPattern(pattern.slice(1), [])
-		);
-	return (
-		!!name.length &&
-		(pattern[0] === "*" || pattern[0] === name[0]) &&
-		matchEventPattern(pattern.slice(1), name.slice(1))
-	);
 }

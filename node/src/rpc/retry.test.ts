@@ -1,45 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import {
-	backoffDelay,
-	DEFAULT_RETRY,
-	GRPC_CODE_ABORTED,
-	GRPC_CODE_DEADLINE_EXCEEDED,
-	GRPC_CODE_INTERNAL,
-	GRPC_CODE_RESOURCE_EXHAUSTED,
-	GRPC_CODE_UNAVAILABLE,
-	GRPC_CODE_UNKNOWN,
-	isRetryable,
-	mergeRetryOpts,
-} from "./retry";
-
-describe("isRetryable", () => {
-	for (const code of [
-		GRPC_CODE_UNAVAILABLE,
-		GRPC_CODE_RESOURCE_EXHAUSTED,
-		GRPC_CODE_DEADLINE_EXCEEDED,
-		GRPC_CODE_INTERNAL,
-		GRPC_CODE_ABORTED,
-		GRPC_CODE_UNKNOWN,
-	]) {
-		it(`does not replay unknown outcome ${code}, even with a key`, () => {
-			expect(isRetryable({ code }, false)).toBe(false);
-			expect(isRetryable({ code }, true)).toBe(false);
-		});
-	}
-	it("retries locally identified failures before dispatch", () => {
-		expect(
-			isRetryable({ preDispatch: true, code: GRPC_CODE_UNAVAILABLE }, false),
-		).toBe(true);
-	});
-	it("does not infer safety from message text", () => {
-		expect(
-			isRetryable(
-				{ code: GRPC_CODE_UNAVAILABLE, message: "ECONNREFUSED" },
-				true,
-			),
-		).toBe(false);
-	});
-});
+import { backoffDelay, DEFAULT_RETRY, mergeRetryOpts } from "./retry";
 
 describe("backoffDelay", () => {
 	it("base delay at attempt 0 (without jitter)", () => {

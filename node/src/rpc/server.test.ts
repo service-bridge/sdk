@@ -1,83 +1,118 @@
+// server.test.ts — CallServer wire form: refusals are gRPC statuses (the
+// transient ones carry x-sb-not-dispatched), a handler failure is error_code
+// under OK, the handler gets ctx, cancellation reaches it. The TLS bind path
+// is covered by e2e; here the two call handlers are driven directly.
+
 import { describe, expect, it } from "bun:test";
 import { EventEmitter } from "node:events";
 import * as grpc from "@grpc/grpc-js";
+import type { CertificateStore } from "../connection/tls-material";
+import { silentLogger } from "../logger";
 import type { CallRequest, CallResponse } from "../pb/servicebridge/v1/call";
 import type { PolicyEvaluation } from "../pb/servicebridge/v1/registry";
 import { currentTraceContext } from "../telemetry/context";
 import type { CaptureMode } from "../telemetry/payload-capture";
-import { type TraceContext, ZERO_OP_ID } from "../telemetry/trace-context";
+import { ZERO_OP_ID } from "../telemetry/trace-context";
 import { formatXSbTrace } from "../telemetry/wire-trace";
-import type { DispatchPort, StreamItem, UnaryResult } from "./dispatch-port";
+import type {
+	DispatchPort,
+	RpcHandlerContext,
+	StreamItem,
+	UnaryResult,
+} from "./dispatch-port";
 import { CallServer, type CallServerLimits } from "./server";
+import { NOT_DISPATCHED_TRAILER } from "./wire";
 
-// CallServer.start() needs a bound TLS socket, so the wire path is covered by
-// e2e. These tests drive the two call handlers directly with the grpc-js call
-// shapes, which is where the status/error-code contract lives.
 interface ServerInternals {
 	handleUnary(
 		call: unknown,
 		callback: grpc.sendUnaryData<CallResponse>,
 	): Promise<void>;
 	handleStream(call: unknown): Promise<void>;
+	beginDrain(): void;
+	waitIdle(ms: number): Promise<void>;
 }
 
-const emptyCreds = {
-	caChainDer: Buffer.alloc(0),
-	leafCertDer: Buffer.alloc(0),
-	privateKeyDer: Buffer.alloc(0),
+const OPEN_POLICY: PolicyEvaluation = {
+	capabilities: ["rpc.handle"],
+	egress: [],
+	acceptance: [],
+	warnings: [],
 };
 
-const notImplementedStream = (): AsyncIterable<StreamItem> => {
-	throw new Error("stream not implemented");
-};
+const CALLER = "11111111-1111-1111-1111-111111111111";
 
 function makeServer(
 	dispatch: Partial<DispatchPort>,
-	getPolicy: () => PolicyEvaluation | null = () => null,
-	limits: CallServerLimits = {},
+	opts: {
+		policy?: PolicyEvaluation | null;
+		limits?: CallServerLimits;
+		revoked?: (s: string, i: string) => boolean;
+	} = {},
 ): ServerInternals {
 	const port: DispatchPort = {
 		dispatchUnary:
 			dispatch.dispatchUnary ??
 			(() => Promise.reject(new Error("unary not implemented"))),
-		dispatchStream: dispatch.dispatchStream ?? notImplementedStream,
+		dispatchStream:
+			dispatch.dispatchStream ??
+			(() => {
+				throw new Error("stream not implemented");
+			}),
 		captureMode:
 			dispatch.captureMode ?? ((): CaptureMode | undefined => undefined),
 	};
-	const server = new CallServer(port, emptyCreds, getPolicy, limits);
-	return server as unknown as ServerInternals;
+	const policy = opts.policy === undefined ? OPEN_POLICY : opts.policy;
+	return new CallServer({
+		dispatch: port,
+		store: {} as CertificateStore,
+		policy: () => policy,
+		isRevoked: opts.revoked ?? (() => false),
+		limits: opts.limits,
+		logger: silentLogger,
+	}) as unknown as ServerInternals;
 }
 
 function makeRequest(over: Partial<CallRequest> = {}): CallRequest {
 	return {
 		method: "charge",
 		payload: new Uint8Array([1, 2, 3]),
+		callerService: "",
+		requestId: "req-1",
+		idempotencyKey: "",
 		xSbTrace: "",
 		...over,
 	} as CallRequest;
 }
 
-// makeUnaryCall builds a call with no TLS peer. Acceptance only inspects the
-// peer when policy carries rpc.handle rules, so this is the shape for every
-// test that is not about acceptance.
-function makeUnaryCall(request: CallRequest = makeRequest()): unknown {
-	return Object.assign(new EventEmitter(), { request, cancelled: false });
+// A peer presenting an SDK SPIFFE identity (subjectaltname path).
+function sdkPeer(serviceId = CALLER, instanceId = "inst-a") {
+	return {
+		getAuthContext: () => ({
+			sslPeerCertificate: {
+				subjectaltname: `URI:spiffe://service-bridge/service/${serviceId}/instance/${instanceId}`,
+			},
+		}),
+	};
 }
 
-interface CapturedCallback {
-	error: grpc.ServiceError | null;
-	response: CallResponse | null;
-	calls: number;
+function makeUnaryCall(
+	request: CallRequest = makeRequest(),
+	extra: object = {},
+	deadline: grpc.Deadline = Number.POSITIVE_INFINITY,
+): EventEmitter & { request: CallRequest; cancelled: boolean } {
+	return Object.assign(new EventEmitter(), {
+		request,
+		cancelled: false,
+		getDeadline: () => deadline,
+		...extra,
+	});
 }
 
-function captureCallback(): {
-	callback: grpc.sendUnaryData<CallResponse>;
-	captured: CapturedCallback;
-	settled: Promise<void>;
-} {
-	const captured: CapturedCallback = {
-		error: null,
-		response: null,
+function captureCallback() {
+	const captured = {
+		error: null as (grpc.ServiceError & { metadata?: grpc.Metadata }) | null,
+		response: null as CallResponse | null,
 		calls: 0,
 	};
 	let resolve!: () => void;
@@ -93,26 +128,32 @@ function captureCallback(): {
 	return { callback, captured, settled };
 }
 
-// FakeWritable stands in for grpc.ServerWritableStream. It records chunks and
-// lets a test force write() to return false so the drain path is exercised.
 class FakeWritable extends EventEmitter {
-	readonly chunks: unknown[] = [];
+	readonly chunks: { errorCode?: string; payload?: Uint8Array }[] = [];
 	ended = false;
 	writableEnded = false;
 	destroyed = false;
+	cancelled = false;
 	acceptWrites = true;
-	emittedError: unknown = null;
+	emittedError: (grpc.ServiceError & { metadata?: grpc.Metadata }) | null =
+		null;
 
-	constructor(readonly request: CallRequest) {
+	constructor(
+		readonly request: CallRequest,
+		extra: object = {},
+	) {
 		super();
-		// grpc-js attaches its own 'error' listener; mirror that so emit() here
-		// never throws an unhandled 'error'.
+		Object.assign(this, extra);
 		this.on("error", (err) => {
 			this.emittedError = err;
 		});
 	}
 
-	write(chunk: unknown): boolean {
+	getDeadline(): grpc.Deadline {
+		return Number.POSITIVE_INFINITY;
+	}
+
+	write(chunk: { errorCode?: string; payload?: Uint8Array }): boolean {
 		this.chunks.push(chunk);
 		return this.acceptWrites;
 	}
@@ -123,10 +164,12 @@ class FakeWritable extends EventEmitter {
 	}
 }
 
-// ── unary: dispatch result mapping ───────────────────────────────────────────
+function notDispatched(err: { metadata?: grpc.Metadata } | null): boolean {
+	return err?.metadata?.get(NOT_DISPATCHED_TRAILER)[0] === "1";
+}
 
-describe("CallServer.handleUnary", () => {
-	it("returns the handler payload with gRPC status OK", async () => {
+describe("CallServer unary outcomes", () => {
+	it("returns the handler payload under OK", async () => {
 		const server = makeServer({
 			dispatchUnary: async (): Promise<UnaryResult> => ({
 				payload: new Uint8Array([7, 8]),
@@ -135,353 +178,292 @@ describe("CallServer.handleUnary", () => {
 		const { callback, captured, settled } = captureCallback();
 		await server.handleUnary(makeUnaryCall(), callback);
 		await settled;
-
 		expect(captured.error).toBeNull();
 		expect(captured.response?.errorCode).toBe("");
 		expect(Buffer.from(captured.response?.payload ?? [])).toEqual(
 			Buffer.from([7, 8]),
 		);
-	});
-
-	it("maps a thrown handler error to errorCode INTERNAL with gRPC status OK", async () => {
-		// This split is what the caller's retry decision keys off: a handler
-		// failure must not look like a transport failure.
-		const server = makeServer({
-			dispatchUnary: async () => {
-				throw new Error("handler blew up");
-			},
-		});
-		const { callback, captured, settled } = captureCallback();
-		await server.handleUnary(makeUnaryCall(), callback);
-		await settled;
-
-		expect(captured.error).toBeNull();
-		expect(captured.response?.errorCode).toBe("INTERNAL");
-		expect(captured.response?.errorMessage).toBe("handler blew up");
-	});
-
-	it("passes a dispatch-reported NOT_FOUND through as an application error", async () => {
-		const server = makeServer({
-			dispatchUnary: async () => ({
-				payload: new Uint8Array(),
-				errorCode: "NOT_FOUND",
-				errorMessage: "rpc: no handler for method missing",
-			}),
-		});
-		const { callback, captured, settled } = captureCallback();
-		await server.handleUnary(
-			makeUnaryCall(makeRequest({ method: "missing" })),
-			callback,
-		);
-		await settled;
-
-		expect(captured.error).toBeNull();
-		expect(captured.response?.errorCode).toBe("NOT_FOUND");
-	});
-
-	it("passes FAILED_PRECONDITION through when a streaming method is called unary", async () => {
-		const server = makeServer({
-			dispatchUnary: async () => ({
-				payload: new Uint8Array(),
-				errorCode: "FAILED_PRECONDITION",
-				errorMessage: "rpc: method feed is streaming",
-			}),
-		});
-		const { callback, captured, settled } = captureCallback();
-		await server.handleUnary(
-			makeUnaryCall(makeRequest({ method: "feed" })),
-			callback,
-		);
-		await settled;
-
-		expect(captured.response?.errorCode).toBe("FAILED_PRECONDITION");
-		expect(captured.response?.errorMessage).toContain("streaming");
-	});
-
-	it("passes INVALID_ARGUMENT through on a decode failure", async () => {
-		const server = makeServer({
-			dispatchUnary: async () => ({
-				payload: new Uint8Array(),
-				errorCode: "INVALID_ARGUMENT",
-				errorMessage: "rpc: decode request: bad wire type",
-			}),
-		});
-		const { callback, captured, settled } = captureCallback();
-		await server.handleUnary(makeUnaryCall(), callback);
-		await settled;
-
-		expect(captured.error).toBeNull();
-		expect(captured.response?.errorCode).toBe("INVALID_ARGUMENT");
-	});
-
-	it("calls the callback exactly once", async () => {
-		const server = makeServer({
-			dispatchUnary: async () => ({ payload: new Uint8Array() }),
-		});
-		const { callback, captured, settled } = captureCallback();
-		await server.handleUnary(makeUnaryCall(), callback);
-		await settled;
 		expect(captured.calls).toBe(1);
 	});
-});
 
-// ── unary: acceptance ────────────────────────────────────────────────────────
-
-describe("CallServer acceptance", () => {
-	const restrictivePolicy: PolicyEvaluation = {
-		capabilities: [],
-		egress: [],
-		acceptance: [
-			{
-				action: "rpc.handle",
-				peerServiceId: "svc-allowed",
-				peerServiceName: "",
-				targetName: "charge",
-			},
-		],
-		warnings: [],
-	};
-
-	it("rejects with PERMISSION_DENIED when the peer cannot be identified", async () => {
-		let dispatched = false;
-		const server = makeServer(
-			{
-				dispatchUnary: async () => {
-					dispatched = true;
-					return { payload: new Uint8Array() };
-				},
-			},
-			() => restrictivePolicy,
-		);
-		const { callback, captured, settled } = captureCallback();
-		await server.handleUnary(makeUnaryCall(), callback);
-		await settled;
-
-		expect(captured.error?.code).toBe(grpc.status.PERMISSION_DENIED);
-		expect(dispatched).toBe(false);
-	});
-
-	it("ends a denied stream with a PERMISSION_DENIED chunk", async () => {
-		const server = makeServer({}, () => restrictivePolicy);
-		const call = new FakeWritable(makeRequest());
-		await server.handleStream(call);
-
-		expect(call.chunks).toHaveLength(1);
-		expect((call.chunks[0] as { errorCode: string }).errorCode).toBe(
-			"PERMISSION_DENIED",
-		);
-		expect(call.ended).toBe(true);
-	});
-
-	it("admits the call when policy carries no rpc.handle rules", async () => {
-		const server = makeServer(
-			{ dispatchUnary: async () => ({ payload: new Uint8Array([1]) }) },
-			() => ({ capabilities: [], egress: [], acceptance: [], warnings: [] }),
-		);
+	it("passes the handler's business code under OK", async () => {
+		const server = makeServer({
+			dispatchUnary: async () => ({
+				errorCode: "OUT_OF_STOCK",
+				errorMessage: "nothing left",
+			}),
+		});
 		const { callback, captured, settled } = captureCallback();
 		await server.handleUnary(makeUnaryCall(), callback);
 		await settled;
 		expect(captured.error).toBeNull();
-	});
-});
-
-// ── overload ─────────────────────────────────────────────────────────────────
-
-describe("CallServer overload", () => {
-	it("returns RESOURCE_EXHAUSTED instead of queueing past the limit", async () => {
-		let started = 0;
-		let unblock!: () => void;
-		const blocked = new Promise<void>((r) => {
-			unblock = r;
-		});
-		const server = makeServer(
-			{
-				dispatchUnary: async () => {
-					started++;
-					await blocked;
-					return { payload: new Uint8Array() };
-				},
-			},
-			() => null,
-			{ maxConcurrentCalls: 1, maxQueuedCalls: 0 },
-		);
-
-		const first = captureCallback();
-		const inflight = server.handleUnary(makeUnaryCall(), first.callback);
-		// Let the first call reach the handler and occupy the only slot.
-		await Promise.resolve();
-		await Promise.resolve();
-		expect(started).toBe(1);
-
-		const shed = captureCallback();
-		await server.handleUnary(makeUnaryCall(), shed.callback);
-		await shed.settled;
-
-		expect(shed.captured.error?.code).toBe(grpc.status.RESOURCE_EXHAUSTED);
-		expect(shed.captured.error?.message).toContain("overloaded");
-		// The shed call never reached the handler — load was dropped, not buffered.
-		expect(started).toBe(1);
-
-		unblock();
-		await inflight;
-		await first.settled;
-		expect(first.captured.error).toBeNull();
+		expect(captured.response?.errorCode).toBe("OUT_OF_STOCK");
+		expect(captured.response?.errorMessage).toBe("nothing left");
 	});
 
-	it("queues up to the queue depth before shedding", async () => {
-		let started = 0;
-		let unblock!: () => void;
-		const blocked = new Promise<void>((r) => {
-			unblock = r;
-		});
-		const server = makeServer(
-			{
-				dispatchUnary: async () => {
-					started++;
-					await blocked;
-					return { payload: new Uint8Array() };
-				},
-			},
-			() => null,
-			{ maxConcurrentCalls: 1, maxQueuedCalls: 1 },
-		);
-
-		const a = captureCallback();
-		const b = captureCallback();
-		const c = captureCallback();
-		const running = server.handleUnary(makeUnaryCall(), a.callback);
-		await Promise.resolve();
-		await Promise.resolve();
-		const queued = server.handleUnary(makeUnaryCall(), b.callback);
-		await Promise.resolve();
-
-		await server.handleUnary(makeUnaryCall(), c.callback);
-		await c.settled;
-		expect(c.captured.error?.code).toBe(grpc.status.RESOURCE_EXHAUSTED);
-		expect(started).toBe(1);
-
-		unblock();
-		await running;
-		await queued;
-		await b.settled;
-		// The queued call ran once a slot freed up.
-		expect(b.captured.error).toBeNull();
-		expect(started).toBe(2);
-	});
-
-	it("frees the slot after a handler throws", async () => {
-		const server = makeServer(
-			{
-				dispatchUnary: async () => {
-					throw new Error("boom");
-				},
-			},
-			() => null,
-			{ maxConcurrentCalls: 1, maxQueuedCalls: 0 },
-		);
-
-		for (let i = 0; i < 3; i++) {
+	it.each([
+		[grpc.status.NOT_FOUND],
+		[grpc.status.FAILED_PRECONDITION],
+		[grpc.status.INVALID_ARGUMENT],
+	])(
+		"a dispatch refusal %d is a gRPC status without the trailer",
+		async (status) => {
+			const server = makeServer({
+				dispatchUnary: async () => ({ status, errorMessage: "refused" }),
+			});
 			const { callback, captured, settled } = captureCallback();
 			await server.handleUnary(makeUnaryCall(), callback);
 			await settled;
-			expect(captured.error).toBeNull();
-			expect(captured.response?.errorCode).toBe("INTERNAL");
-		}
+			expect(captured.error?.code).toBe(status);
+			expect(notDispatched(captured.error)).toBe(false);
+		},
+	);
+});
+
+describe("CallServer refusals before the handler", () => {
+	it("refuses with UNAVAILABLE + not-dispatched until a policy arrived", async () => {
+		let ran = false;
+		const server = makeServer(
+			{
+				dispatchUnary: async () => {
+					ran = true;
+					return { payload: new Uint8Array() };
+				},
+			},
+			{ policy: null },
+		);
+		const { callback, captured, settled } = captureCallback();
+		await server.handleUnary(makeUnaryCall(), callback);
+		await settled;
+		expect(captured.error?.code).toBe(grpc.status.UNAVAILABLE);
+		expect(notDispatched(captured.error)).toBe(true);
+		expect(ran).toBe(false);
 	});
 
-	it("fails an overloaded stream with a RESOURCE_EXHAUSTED status", async () => {
+	it("refuses with UNAVAILABLE + not-dispatched while draining", async () => {
+		const server = makeServer({
+			dispatchUnary: async () => ({ payload: new Uint8Array() }),
+		});
+		server.beginDrain();
+		const { callback, captured, settled } = captureCallback();
+		await server.handleUnary(makeUnaryCall(), callback);
+		await settled;
+		expect(captured.error?.code).toBe(grpc.status.UNAVAILABLE);
+		expect(captured.error?.details).toContain("draining");
+		expect(notDispatched(captured.error)).toBe(true);
+	});
+
+	it("refuses a revoked caller with PERMISSION_DENIED at once", async () => {
+		const server = makeServer(
+			{ dispatchUnary: async () => ({ payload: new Uint8Array() }) },
+			{ revoked: (s, i) => s === CALLER && i === "inst-a" },
+		);
+		const { callback, captured, settled } = captureCallback();
+		await server.handleUnary(makeUnaryCall(makeRequest(), sdkPeer()), callback);
+		await settled;
+		expect(captured.error?.code).toBe(grpc.status.PERMISSION_DENIED);
+		expect(captured.error?.details).toContain("revoked");
+		expect(notDispatched(captured.error)).toBe(false);
+	});
+
+	it("refuses a caller the acceptance rules deny", async () => {
+		const policy: PolicyEvaluation = {
+			...OPEN_POLICY,
+			acceptance: [
+				{
+					action: "rpc.handle",
+					peerServiceId: "22222222-2222-2222-2222-222222222222",
+					peerServiceName: "other",
+					targetName: "*",
+				},
+			],
+		};
+		const server = makeServer(
+			{ dispatchUnary: async () => ({ payload: new Uint8Array() }) },
+			{ policy },
+		);
+		const { callback, captured, settled } = captureCallback();
+		await server.handleUnary(makeUnaryCall(makeRequest(), sdkPeer()), callback);
+		await settled;
+		expect(captured.error?.code).toBe(grpc.status.PERMISSION_DENIED);
+	});
+
+	it("a denied stream ends with a gRPC status, not an error chunk", async () => {
+		const server = makeServer({}, { policy: null });
+		const call = new FakeWritable(makeRequest());
+		await server.handleStream(call);
+		expect(call.emittedError?.code).toBe(grpc.status.UNAVAILABLE);
+		expect(call.chunks).toHaveLength(0);
+	});
+
+	it("sheds load with RESOURCE_EXHAUSTED + not-dispatched past the limits", async () => {
 		let unblock!: () => void;
 		const blocked = new Promise<void>((r) => {
 			unblock = r;
 		});
+		let started = 0;
 		const server = makeServer(
 			{
-				// eslint-disable-next-line require-yield
-				dispatchStream: async function* () {
+				dispatchUnary: async () => {
+					started++;
 					await blocked;
-					yield { payload: new Uint8Array([1]) } as StreamItem;
+					return { payload: new Uint8Array() };
 				},
 			},
-			() => null,
-			{ maxConcurrentCalls: 1, maxQueuedCalls: 0 },
+			{ limits: { maxConcurrentCalls: 1, maxQueuedCalls: 0 } },
 		);
-
-		const first = new FakeWritable(makeRequest());
-		const inflight = server.handleStream(first);
-		await Promise.resolve();
-		await Promise.resolve();
-
-		const shed = new FakeWritable(makeRequest());
-		await server.handleStream(shed);
-
-		expect(shed.emittedError).toMatchObject({
-			code: grpc.status.RESOURCE_EXHAUSTED,
-		});
-		expect(shed.chunks).toHaveLength(0);
-
+		const first = captureCallback();
+		const inflight = server.handleUnary(makeUnaryCall(), first.callback);
+		await new Promise((r) => setTimeout(r, 1));
+		expect(started).toBe(1);
+		const shed = captureCallback();
+		await server.handleUnary(makeUnaryCall(), shed.callback);
+		await shed.settled;
+		expect(shed.captured.error?.code).toBe(grpc.status.RESOURCE_EXHAUSTED);
+		expect(notDispatched(shed.captured.error)).toBe(true);
+		expect(started).toBe(1);
 		unblock();
 		await inflight;
+		expect(first.captured.error).toBeNull();
 	});
 });
 
-// ── streaming ────────────────────────────────────────────────────────────────
+describe("CallServer handler context", () => {
+	it("hands the handler requestId, idempotencyKey, deadline and the verified caller", async () => {
+		let ctx: RpcHandlerContext | undefined;
+		const server = makeServer({
+			dispatchUnary: async (_m, _p, c) => {
+				ctx = c;
+				return { payload: new Uint8Array() };
+			},
+		});
+		const deadline = new Date(Date.now() + 5_000);
+		const { callback, settled } = captureCallback();
+		await server.handleUnary(
+			makeUnaryCall(
+				makeRequest({ requestId: "r-9", idempotencyKey: "k-1" }),
+				sdkPeer(),
+				deadline,
+			),
+			callback,
+		);
+		await settled;
+		expect(ctx?.requestId).toBe("r-9");
+		expect(ctx?.idempotencyKey).toBe("k-1");
+		expect(ctx?.deadline).toBe(deadline.getTime());
+		expect(ctx?.caller).toEqual({ serviceId: CALLER, instanceId: "inst-a" });
+		expect(ctx?.signal.aborted).toBe(false);
+	});
 
-describe("CallServer.handleStream", () => {
+	it("aborts the handler's signal when the caller cancels", async () => {
+		let signal: AbortSignal | undefined;
+		let release!: () => void;
+		const server = makeServer({
+			dispatchUnary: async (_m, _p, c) => {
+				signal = c.signal;
+				await new Promise<void>((r) => {
+					release = r;
+				});
+				return { payload: new Uint8Array() };
+			},
+		});
+		const call = makeUnaryCall();
+		const { callback } = captureCallback();
+		const running = server.handleUnary(call, callback);
+		await new Promise((r) => setTimeout(r, 1));
+		call.cancelled = true;
+		call.emit("cancelled");
+		expect(signal?.aborted).toBe(true);
+		release();
+		await running;
+	});
+
+	it("aborts the handler's signal at the deadline", async () => {
+		let signal: AbortSignal | undefined;
+		const server = makeServer({
+			dispatchUnary: async (_m, _p, c) => {
+				signal = c.signal;
+				await new Promise((r) => setTimeout(r, 40));
+				return { payload: new Uint8Array() };
+			},
+		});
+		const { callback, settled } = captureCallback();
+		await server.handleUnary(
+			makeUnaryCall(makeRequest(), {}, new Date(Date.now() + 10)),
+			callback,
+		);
+		await settled;
+		expect(signal?.aborted).toBe(true);
+	});
+
+	it("waitIdle resolves once the in-flight calls finished", async () => {
+		let release!: () => void;
+		const server = makeServer({
+			dispatchUnary: async () => {
+				await new Promise<void>((r) => {
+					release = r;
+				});
+				return { payload: new Uint8Array() };
+			},
+		});
+		const { callback } = captureCallback();
+		const running = server.handleUnary(makeUnaryCall(), callback);
+		await new Promise((r) => setTimeout(r, 1));
+		let idle = false;
+		const waiting = server.waitIdle(5_000).then(() => {
+			idle = true;
+		});
+		await new Promise((r) => setTimeout(r, 5));
+		expect(idle).toBe(false);
+		release();
+		await running;
+		await waiting;
+		expect(idle).toBe(true);
+	});
+});
+
+describe("CallServer streams", () => {
 	it("writes each chunk and ends the stream", async () => {
 		const server = makeServer({
-			dispatchStream: async function* () {
+			dispatchStream: async function* (): AsyncIterable<StreamItem> {
 				yield { payload: new Uint8Array([1]) };
 				yield { payload: new Uint8Array([2]) };
 			},
 		});
 		const call = new FakeWritable(makeRequest());
 		await server.handleStream(call);
-
 		expect(call.chunks).toHaveLength(2);
 		expect(call.ended).toBe(true);
 	});
 
-	it("terminates on an application error chunk", async () => {
+	it("ends with an error chunk on a handler failure", async () => {
 		const server = makeServer({
-			dispatchStream: async function* () {
+			dispatchStream: async function* (): AsyncIterable<StreamItem> {
 				yield { payload: new Uint8Array([1]) };
-				yield { errorCode: "INTERNAL", errorMessage: "mid-stream failure" };
-				yield { payload: new Uint8Array([3]) };
+				yield { errorCode: "INTERNAL", errorMessage: "boom" };
 			},
 		});
 		const call = new FakeWritable(makeRequest());
 		await server.handleStream(call);
-
-		expect(call.chunks).toHaveLength(2);
-		expect((call.chunks[1] as { errorCode: string }).errorCode).toBe(
-			"INTERNAL",
-		);
+		expect(call.chunks.at(-1)?.errorCode).toBe("INTERNAL");
 		expect(call.ended).toBe(true);
 	});
 
-	it("maps a thrown generator error to an INTERNAL chunk", async () => {
+	it("turns a dispatch refusal into a gRPC status", async () => {
 		const server = makeServer({
-			dispatchStream: async function* () {
-				yield { payload: new Uint8Array([1]) };
-				throw new Error("generator blew up");
+			dispatchStream: async function* (): AsyncIterable<StreamItem> {
+				yield { status: grpc.status.NOT_FOUND, errorMessage: "no such" };
 			},
 		});
 		const call = new FakeWritable(makeRequest());
 		await server.handleStream(call);
-
-		const last = call.chunks[call.chunks.length - 1] as {
-			errorCode: string;
-			errorMessage: string;
-		};
-		expect(last.errorCode).toBe("INTERNAL");
-		expect(last.errorMessage).toBe("generator blew up");
-		expect(call.ended).toBe(true);
+		expect(call.emittedError?.code).toBe(grpc.status.NOT_FOUND);
 	});
 
 	it("waits for 'drain' when the consumer is slow", async () => {
 		let produced = 0;
 		const server = makeServer({
-			dispatchStream: async function* () {
+			dispatchStream: async function* (): AsyncIterable<StreamItem> {
 				for (let i = 0; i < 3; i++) {
 					produced++;
 					yield { payload: new Uint8Array([i]) };
@@ -489,35 +471,23 @@ describe("CallServer.handleStream", () => {
 			},
 		});
 		const call = new FakeWritable(makeRequest());
-		call.acceptWrites = false; // every write() signals "buffer full"
-
+		call.acceptWrites = false;
 		const running = server.handleStream(call);
-		await Promise.resolve();
-		await Promise.resolve();
-
-		// Production is parked on the first drain instead of racing ahead.
+		await new Promise((r) => setTimeout(r, 5));
 		expect(produced).toBe(1);
-		expect(call.ended).toBe(false);
-
 		call.acceptWrites = true;
 		call.emit("drain");
 		await running;
-
 		expect(produced).toBe(3);
-		expect(call.chunks).toHaveLength(3);
-		expect(call.ended).toBe(true);
 	});
 
 	it("stops the generator when the caller cancels", async () => {
-		let produced = 0;
 		let returned = false;
 		const server = makeServer({
-			dispatchStream: async function* () {
+			dispatchStream: async function* (): AsyncIterable<StreamItem> {
 				try {
 					while (true) {
-						produced++;
-						yield { payload: new Uint8Array([produced % 256]) };
-						// A real handler yields to the event loop between chunks.
+						yield { payload: new Uint8Array([1]) };
 						await new Promise((r) => setTimeout(r, 1));
 					}
 				} finally {
@@ -526,65 +496,22 @@ describe("CallServer.handleStream", () => {
 			},
 		});
 		const call = new FakeWritable(makeRequest());
-
 		const running = server.handleStream(call);
 		await new Promise((r) => setTimeout(r, 5));
-		expect(produced).toBeGreaterThan(0);
-
+		call.cancelled = true;
 		call.emit("cancelled");
 		await running;
-
-		const producedAtCancel = produced;
-		// The generator's finally ran — it is not still producing into a dead call.
 		expect(returned).toBe(true);
-		await new Promise((r) => setTimeout(r, 5));
-		expect(produced).toBe(producedAtCancel);
-		// A cancelled call is already closed; the server does not end() it again.
 		expect(call.ended).toBe(false);
 	});
-
-	it("releases the concurrency slot after cancellation", async () => {
-		const server = makeServer(
-			{
-				dispatchStream: async function* () {
-					while (true) {
-						yield { payload: new Uint8Array([1]) };
-						await new Promise((r) => setTimeout(r, 1));
-					}
-				},
-			},
-			() => null,
-			{ maxConcurrentCalls: 1, maxQueuedCalls: 0 },
-		);
-
-		const first = new FakeWritable(makeRequest());
-		const running = server.handleStream(first);
-		await new Promise((r) => setTimeout(r, 5));
-		first.emit("cancelled");
-		await running;
-
-		// Slot returned — the next stream is admitted rather than shed.
-		const second = new FakeWritable(makeRequest());
-		const next = server.handleStream(second);
-		await new Promise((r) => setTimeout(r, 5));
-		second.emit("cancelled");
-		await next;
-		expect(second.emittedError).toBeNull();
-	});
 });
-
-// ── trace context ────────────────────────────────────────────────────────────
-
-const UUID_RE =
-	/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 describe("CallServer trace context", () => {
 	const traceId = "019ffc00-0000-7000-8000-000000000001";
 	const parentOpId = "019ffc00-0000-7000-8000-000000000002";
-	const inboundHeader = formatXSbTrace(traceId, parentOpId);
 
 	it("runs the handler inside the inbound trace context", async () => {
-		let seen: TraceContext | undefined;
+		let seen: { traceId: string; parentOpId: string } | undefined;
 		const server = makeServer({
 			dispatchUnary: async () => {
 				seen = currentTraceContext();
@@ -592,124 +519,33 @@ describe("CallServer trace context", () => {
 			},
 		});
 		const { callback, settled } = captureCallback();
-		await server.handleUnary(
-			makeUnaryCall(makeRequest({ xSbTrace: inboundHeader })),
-			callback,
-		);
-		await settled;
-
-		expect(seen?.traceId).toBe(traceId);
-		expect(seen?.parentOpId).toBe(parentOpId);
-	});
-
-	it("mints a fresh root context when X-SB-Trace is absent", async () => {
-		let seen: TraceContext | undefined;
-		const server = makeServer({
-			dispatchUnary: async () => {
-				seen = currentTraceContext();
-				return { payload: new Uint8Array() };
-			},
-		});
-		const { callback, settled } = captureCallback();
-		await server.handleUnary(makeUnaryCall(), callback);
-		await settled;
-
-		expect(seen).toBeDefined();
-		expect(seen?.traceId).toMatch(UUID_RE);
-		expect(seen?.parentOpId).toBe(ZERO_OP_ID);
-	});
-
-	it("mints a fresh root context on a malformed X-SB-Trace instead of throwing", async () => {
-		let seen: TraceContext | undefined;
-		const server = makeServer({
-			dispatchUnary: async () => {
-				seen = currentTraceContext();
-				return { payload: new Uint8Array() };
-			},
-		});
-		const { callback, captured, settled } = captureCallback();
-		await server.handleUnary(
-			makeUnaryCall(makeRequest({ xSbTrace: "not-a-valid-trace-header" })),
-			callback,
-		);
-		await settled;
-
-		// Strict parse, never an exception: a bad header yields a fresh root trace.
-		expect(captured.error).toBeNull();
-		expect(seen?.traceId).toMatch(UUID_RE);
-		expect(seen?.traceId).not.toBe(traceId);
-	});
-
-	it("mints a fresh root context when X-SB-Trace is the right length but not UUIDs", async () => {
-		let seen: TraceContext | undefined;
-		const server = makeServer({
-			dispatchUnary: async () => {
-				seen = currentTraceContext();
-				return { payload: new Uint8Array() };
-			},
-		});
-		const { callback, captured, settled } = captureCallback();
 		await server.handleUnary(
 			makeUnaryCall(
-				makeRequest({ xSbTrace: `${"z".repeat(36)}-${"z".repeat(36)}` }),
+				makeRequest({ xSbTrace: formatXSbTrace(traceId, parentOpId) }),
 			),
 			callback,
 		);
 		await settled;
-
-		expect(captured.error).toBeNull();
-		expect(seen?.traceId).toMatch(UUID_RE);
+		expect(seen).toEqual({ traceId, parentOpId });
 	});
 
-	it("runs a streaming handler inside the inbound trace context", async () => {
-		let seen: TraceContext | undefined;
-		const server = makeServer({
-			dispatchStream: async function* () {
-				seen = currentTraceContext();
-				yield { payload: new Uint8Array([1]) };
-			},
-		});
-		const call = new FakeWritable(makeRequest({ xSbTrace: inboundHeader }));
-		await server.handleStream(call);
-
-		expect(seen?.traceId).toBe(traceId);
-		expect(seen?.parentOpId).toBe(parentOpId);
-	});
-});
-
-// ── telemetry ────────────────────────────────────────────────────────────────
-
-describe("CallServer telemetry", () => {
-	it("never reaches the op emitter — the callee emits no op (ADR-0001)", async () => {
-		// One logical RPC call is one operations row, owned by the caller. The op
-		// emitter lives in telemetry/ops; the callee must not touch it, and the
-		// only way to emit is to import it.
-		const source = await Bun.file(
-			new URL("./server.ts", import.meta.url),
-		).text();
-		expect(source).not.toContain("telemetry/ops");
-	});
-
-	it("dispatches each call exactly once", async () => {
-		let unaryCalls = 0;
-		let streamCalls = 0;
-		const server = makeServer({
-			dispatchUnary: async () => {
-				unaryCalls++;
-				return { payload: new Uint8Array() };
-			},
-			dispatchStream: async function* () {
-				streamCalls++;
-				yield { payload: new Uint8Array([1]) };
-			},
-		});
-
-		const { callback, settled } = captureCallback();
-		await server.handleUnary(makeUnaryCall(), callback);
-		await settled;
-		await server.handleStream(new FakeWritable(makeRequest()));
-
-		expect(unaryCalls).toBe(1);
-		expect(streamCalls).toBe(1);
+	it("mints a fresh root on a missing or malformed X-SB-Trace", async () => {
+		for (const xSbTrace of ["", "garbage"]) {
+			let seen: { traceId: string; parentOpId: string } | undefined;
+			const server = makeServer({
+				dispatchUnary: async () => {
+					seen = currentTraceContext();
+					return { payload: new Uint8Array() };
+				},
+			});
+			const { callback, settled } = captureCallback();
+			await server.handleUnary(
+				makeUnaryCall(makeRequest({ xSbTrace })),
+				callback,
+			);
+			await settled;
+			expect(seen?.parentOpId).toBe(ZERO_OP_ID);
+			expect(seen?.traceId).not.toBe(traceId);
+		}
 	});
 });

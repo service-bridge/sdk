@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { silentLogger } from "../logger";
 // subscriber.trace.test.ts — trace-context propagation for job dispatch.
 //
 // Keystone (service-bridge.ts::runHandlerWithTrace): a job handler must run
@@ -92,18 +93,19 @@ function makeSubscriber(
 ): { sub: JobSubscriber; results: unknown[] } {
 	const results: unknown[] = [];
 	const deps: SubscriberDeps = {
-		rpcClient: {
-			subscribe: () => stream,
-			jobResult: (req: unknown, cb: (err: unknown) => void) => {
-				results.push(req);
-				cb(null);
-			},
-			heartbeat: () => {},
-			// biome-ignore lint/suspicious/noExplicitAny: minimal grpc stub
-		} as any,
+		client: () =>
+			({
+				subscribe: () => stream,
+				jobResult: (req: unknown, cb: (err: unknown) => void) => {
+					results.push(req);
+					cb(null);
+				},
+				heartbeat: () => {},
+				// biome-ignore lint/suspicious/noExplicitAny: minimal grpc stub
+			}) as any,
 		identity: () => ({ serviceId: "svc-1", instanceId: "inst-1" }),
 		domain,
-		logger: { warn: () => {}, error: () => {} },
+		logger: silentLogger,
 		runWithTrace: runHandlerWithTrace,
 	};
 	const sub = new JobSubscriber(deps);

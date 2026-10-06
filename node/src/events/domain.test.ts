@@ -1,6 +1,6 @@
 import { describe, expect, it, mock } from "bun:test";
 import path from "node:path";
-import { MethodType } from "../pb/servicebridge/v1/registry";
+import { StateError } from "../errors";
 import { Registry } from "../registry/registry";
 import {
 	computeContractHash,
@@ -59,16 +59,6 @@ describe("EventDomain.define", () => {
 		expect(req.published[0]!.contractHash).not.toBe(computeContractHash(pair));
 	});
 
-	it("define without spec — schemaJson empty, contractHash empty", async () => {
-		const { domain, registry } = makeDomain();
-		domain.define("orders_created");
-		await registry._handle.finalize();
-
-		const req = registry.buildRegisterRequest();
-		expect(req.published[0]!.schemaJson.length).toBe(0);
-		expect(req.published[0]!.contractHash).toBe("");
-	});
-
 	it("getPublishedEvent returns pair + contractHash after finalize", async () => {
 		const { domain, registry } = makeDomain();
 		domain.define("orders_created", {
@@ -95,15 +85,6 @@ describe("EventDomain.define", () => {
 		expect(decoded.orderId).toBe("o-1");
 		expect(decoded.amount).toBeCloseTo(10.5);
 		expect(decoded.currency).toBe("USD");
-	});
-
-	it("getPublishedEvent returns undefined for schema-less event", async () => {
-		const { domain, registry } = makeDomain();
-		domain.define("orders_created");
-		await registry._handle.finalize();
-		expect(
-			registry._handle.getPublishedEvent("orders_created"),
-		).toBeUndefined();
 	});
 
 	it("identical re-define is a no-op", async () => {
@@ -152,13 +133,15 @@ describe("EventDomain.define", () => {
 });
 
 describe("EventDomain.handle", () => {
-	it("registers event subscription in registry._handle._entries", () => {
+	it("registers a subscription, not an incoming method nor a published event", () => {
 		const { domain, registry } = makeDomain();
-		domain.handle("orders.*", async () => {});
-		const entries = registry._handle._entries;
-		expect(entries).toHaveLength(1);
-		expect(entries[0]!.type).toBe(MethodType.METHOD_TYPE_EVENT);
-		expect(entries[0]!.name).toBe("orders.*");
+		domain.handle("orders.*", async () => {}, { filter: { "$.region": "eu" } });
+		expect(registry._handle.subscription("orders.*")?.filter).toBe(
+			'{"$.region":"eu"}',
+		);
+		const req = registry.buildRegisterRequest();
+		expect(req.incoming).toHaveLength(0);
+		expect(req.published).toHaveLength(0);
 	});
 
 	it("entry appears in eventSubscriptions", () => {
@@ -184,10 +167,10 @@ describe("EventDomain.publish", () => {
 		expect(args[1]).toEqual({ orderId: "o-1" });
 	});
 
-	it("throws when publisher not ready", async () => {
+	it("rejects with a StateError before start()", async () => {
 		const { domain } = makeDomain(null);
-		await expect(domain.publish("orders.created", {})).rejects.toThrow(
-			/publisher not ready/,
+		await expect(domain.publish("orders.created", {})).rejects.toBeInstanceOf(
+			StateError,
 		);
 	});
 });

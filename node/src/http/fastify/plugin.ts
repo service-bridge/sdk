@@ -5,17 +5,15 @@ import type {
 	FastifyRequest,
 	RouteOptions,
 } from "fastify";
-import fp from "fastify-plugin";
 import type { ServiceBridge } from "../../connection/service-bridge";
 import { als } from "../../telemetry/context";
-import { type OpHandle, Status } from "../../telemetry/ops";
-import type { TraceContext } from "../../telemetry/trace-context";
 import { bodyToBytes, RAW_JSON_CONTRACT } from "../_common/body-capture";
-import { startHttpOp, statusForHttpCode } from "../_common/http-op";
 import {
-	HttpRequestGuard,
-	type HttpSecurityOptions,
-} from "../_common/security";
+	type HttpIntegrationOptions,
+	type HttpOp,
+	startHttpOp,
+	UNMATCHED_ROUTE,
+} from "../_common/http-op";
 import { resolveHttpAdvertiseHost } from "../endpoint";
 
 /**
@@ -23,9 +21,8 @@ import { resolveHttpAdvertiseHost } from "../endpoint";
  *
  * @public — см. ./README.md
  */
-export interface SbFastifyOptions {
+export interface SbFastifyOptions extends HttpIntegrationOptions {
 	sb: ServiceBridge;
-	security?: HttpSecurityOptions;
 	/**
 	 * Опционально: явный host для http_endpoint. По умолчанию идёт
 	 * `resolveHttpAdvertiseHost()` — bound socket address, иначе `127.0.0.1`.
@@ -35,10 +32,8 @@ export interface SbFastifyOptions {
 
 declare module "fastify" {
 	interface FastifyRequest {
-		sbTraceCtx?: TraceContext;
-		sbHttpHandle?: OpHandle;
-		sbHttpCapturing?: boolean;
-		sbHttpFinish?: (status: Status, message?: string) => void;
+		sbHttpOp?: HttpOp;
+		sbHttpFinish?: (end: () => void) => void;
 	}
 }
 
@@ -66,56 +61,27 @@ const plugin: FastifyPluginAsync<SbFastifyOptions> = async (
 	opts: SbFastifyOptions,
 ) => {
 	const { sb } = opts;
-	const guard = new HttpRequestGuard(opts.security);
 
-	// Reject at the first Fastify hook, before parsing bodies, route execution and
-	// ServiceBridge telemetry. This keeps scanner floods out of operations.
-	fastify.addHook(
-		"onRequest",
-		(req: FastifyRequest, reply: FastifyReply, done) => {
-			const decision = guard.check({
-				method: req.method,
-				pathname: req.url,
-				remoteAddress: req.socket.remoteAddress,
-				forwardedFor: req.headers["x-forwarded-for"]?.toString(),
-			});
-			if (decision.allowed) {
-				done();
-				return;
-			}
-			if (decision.retryAfterSeconds) {
-				reply.header("Retry-After", String(decision.retryAfterSeconds));
-			}
-			reply.code(decision.status).send({
-				error: decision.status === 429 ? "Too Many Requests" : "Not Found",
-			});
-		},
-	);
-
-	// preHandler — последний async-hook перед route-handler'ом. Используем
-	// als.enterWith (а не runWithTrace callback-style) потому что Fastify hooks
-	// API возвращает Promise, а не принимает next() callback. enterWith
-	// устанавливает ALS-фрейм на текущий async-scope, hand'ler и downstream
-	// user-code (sb.rpc.call / sb.event.publish / etc.) видят TraceContext.
-	// HTTP.HANDLE op стартует здесь, end — в onResponse hook. ALS-фрейм несёт
-	// childContext(ctx, handle.opId): downstream-операции вложены под HTTP.HANDLE
-	// (симметрично rpc-клиенту, который ставит CALL.op_id родителем для callee).
+	// preHandler is the last async hook before the route handler; the route
+	// template is known here. als.enterWith puts the op's trace scope on the
+	// current async context, so the handler and everything it calls nest
+	// under HTTP.HANDLE.
 	fastify.addHook(
 		"preHandler",
 		async (req: FastifyRequest, reply: FastifyReply) => {
-			const op = startHttpOp(sb, {
-				method: req.method,
-				subjectPath: req.routeOptions?.url ?? req.url,
-				keyPath: req.url,
-				traceHeader: req.headers["x-sb-trace"],
-				idempotencyKey: req.headers["idempotency-key"],
-			});
-			req.sbTraceCtx = op.incoming;
-			req.sbHttpHandle = op.handle;
-			req.sbHttpCapturing = op.capturing;
-			// IncomingMessage abort only covers interrupted request bodies. A client
-			// can disconnect after its POST was fully read, before/during the reply;
-			// Fastify then never calls onResponse. Observe the response socket too.
+			const op = startHttpOp(
+				sb,
+				{
+					method: req.method,
+					route: req.routeOptions?.url ?? UNMATCHED_ROUTE,
+					traceHeader: req.headers["x-sb-trace"],
+					idempotencyKey: req.headers["idempotency-key"],
+				},
+				opts,
+			);
+			req.sbHttpOp = op;
+			// A client may disconnect after its request was read, before or
+			// during the reply; Fastify then never calls onResponse.
 			let finished = false;
 			let responseFinished = false;
 			const responseFinish = () => {
@@ -123,24 +89,21 @@ const plugin: FastifyPluginAsync<SbFastifyOptions> = async (
 			};
 			reply.raw.once("finish", responseFinish);
 			const abort = () => {
-				if (!responseFinished) {
-					req.sbHttpFinish?.(Status.TIMEOUT, "client abort");
-				}
+				if (!responseFinished) req.sbHttpFinish?.(() => op.abort());
 			};
-			req.sbHttpFinish = (status, message) => {
+			req.sbHttpFinish = (end) => {
 				if (finished) return;
 				finished = true;
 				reply.raw.off("close", abort);
 				reply.raw.off("finish", responseFinish);
 				req.raw.socket.off("close", abort);
 				req.raw.off("aborted", abort);
-				op.handle.end(status, message);
+				end();
 			};
 			reply.raw.once("close", abort);
 			req.raw.socket.once("close", abort);
 			req.raw.once("aborted", abort);
 			als.enterWith(op.scope);
-			// Request body (IN) — Fastify has already parsed it by preHandler.
 			if (op.capturing) {
 				const inBytes = bodyToBytes(req.body);
 				if (inBytes) op.handle.captureIn(inBytes, RAW_JSON_CONTRACT);
@@ -148,14 +111,14 @@ const plugin: FastifyPluginAsync<SbFastifyOptions> = async (
 		},
 	);
 
-	// onSend exposes the serialized response payload — capture it (OUT) before
-	// onResponse ends the op (so "errors"-mode buffering still works).
+	// onSend exposes the serialized response payload — captured before
+	// onResponse ends the op ("errors" mode buffers until the status is known).
 	fastify.addHook(
 		"onSend",
 		async (req: FastifyRequest, _reply: FastifyReply, payload: unknown) => {
-			if (!req.sbHttpCapturing) return payload;
+			if (!req.sbHttpOp?.capturing) return payload;
 			const outBytes = bodyToBytes(payload);
-			if (outBytes) req.sbHttpHandle?.captureOut(outBytes, RAW_JSON_CONTRACT);
+			if (outBytes) req.sbHttpOp.handle.captureOut(outBytes, RAW_JSON_CONTRACT);
 			return payload;
 		},
 	);
@@ -163,14 +126,14 @@ const plugin: FastifyPluginAsync<SbFastifyOptions> = async (
 	fastify.addHook(
 		"onResponse",
 		async (req: FastifyRequest, reply: FastifyReply) => {
-			const handle = req.sbHttpHandle;
-			if (!handle) return;
-			const { status, message } = statusForHttpCode(reply.statusCode);
-			req.sbHttpFinish?.(status, message);
+			const op = req.sbHttpOp;
+			if (!op) return;
+			req.sbHttpFinish?.(() => op.finish(reply.statusCode));
 		},
 	);
 	fastify.addHook("onRequestAbort", async (req: FastifyRequest) => {
-		req.sbHttpFinish?.(Status.TIMEOUT, "client abort");
+		const op = req.sbHttpOp;
+		if (op) req.sbHttpFinish?.(() => op.abort());
 	});
 
 	fastify.addHook("onRoute", (route: RouteOptions) => {
@@ -207,7 +170,18 @@ const plugin: FastifyPluginAsync<SbFastifyOptions> = async (
  *
  * @public — см. ./README.md
  */
-export const sbFastify = fp(plugin, {
-	name: "servicebridge/fastify",
-	fastify: "4.x || 5.x",
-});
+export const sbFastify: FastifyPluginAsync<SbFastifyOptions> = Object.assign(
+	plugin,
+	{
+		// What fastify-plugin would set: run in the parent scope (the hooks must
+		// see every route of the app, not only the plugin's own), and declare the
+		// name and supported Fastify range. Written out so the SDK does not need
+		// fastify-plugin as a dependency.
+		[Symbol.for("skip-override")]: true,
+		[Symbol.for("fastify.display-name")]: "servicebridge/fastify",
+		[Symbol.for("plugin-meta")]: {
+			name: "servicebridge/fastify",
+			fastify: "4.x || 5.x",
+		},
+	},
+);

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { silentLogger } from "../logger";
 // subscriber.test.ts — JobSubscriber stream lifecycle and lease heartbeat.
 //
 // The stream state machine itself lives in registry/StreamSupervisor and is
@@ -76,39 +77,42 @@ function makeHarness(
 	let heartbeatError: string | null = null;
 
 	const deps: SubscriberDeps = {
-		rpcClient: {
-			subscribe: (req: { serviceId: string; instanceId: string }) => {
-				requests.push(req);
-				const s = makeFakeStream();
-				streams.push(s);
-				return s;
-			},
-			jobResult: (req: unknown, cb: (err: unknown) => void) => {
-				results.push(req);
-				cb(null);
-			},
-			heartbeat: (
-				req: { serviceId: string; instanceId: string },
-				_metadata: unknown,
-				_options: unknown,
-				cb: (
-					err: { message: string } | null,
-					response?: { heartbeatIntervalMs: number },
-				) => void,
-			) => {
-				heartbeats.push(req);
-				cb(heartbeatError === null ? null : { message: heartbeatError }, {
-					heartbeatIntervalMs: opts.heartbeatIntervalMs?.() ?? 0,
-				});
-			},
-			// biome-ignore lint/suspicious/noExplicitAny: minimal grpc stub
-		} as any,
+		client: () =>
+			({
+				subscribe: (req: { serviceId: string; instanceId: string }) => {
+					requests.push(req);
+					const s = makeFakeStream();
+					streams.push(s);
+					return s;
+				},
+				jobResult: (req: unknown, cb: (err: unknown) => void) => {
+					results.push(req);
+					cb(null);
+				},
+				heartbeat: (
+					req: { serviceId: string; instanceId: string },
+					_metadata: unknown,
+					_options: unknown,
+					cb: (
+						err: { message: string } | null,
+						response?: { heartbeatIntervalMs: number },
+					) => void,
+				) => {
+					heartbeats.push(req);
+					cb(heartbeatError === null ? null : { message: heartbeatError }, {
+						heartbeatIntervalMs: opts.heartbeatIntervalMs?.() ?? 0,
+					});
+				},
+				// biome-ignore lint/suspicious/noExplicitAny: minimal grpc stub
+			}) as any,
 		identity:
 			opts.identity ?? (() => ({ serviceId: "svc-1", instanceId: "inst-1" })),
 		domain,
 		logger: {
-			warn: (m) => warns.push(m),
-			error: () => {},
+			...silentLogger,
+			warn: (m, attrs) => {
+				warns.push(attrs ? `${m} ${JSON.stringify(attrs)}` : m);
+			},
 		},
 		runWithTrace: (_xSbTrace, fn) => fn(),
 		reconnectOpts: opts.reconnectOpts ?? { ladder: [4], jitterRatio: 0 },
@@ -334,7 +338,11 @@ describe("JobSubscriber heartbeat", () => {
 		// biome-ignore lint/suspicious/noExplicitAny: private escalation hook
 		(h.sub as any).onHeartbeatFailure("transient");
 		expect(h.streams).toHaveLength(1);
-		expect(h.warns.some((w) => w.includes("(1/3): transient"))).toBe(true);
+		expect(
+			h.warns.some(
+				(w) => w.includes('"failures":1') && w.includes("transient"),
+			),
+		).toBe(true);
 		await h.sub.stop();
 	});
 });

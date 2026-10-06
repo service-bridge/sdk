@@ -1,10 +1,10 @@
 import { describe, expect, it, mock } from "bun:test";
 import { join } from "node:path";
+import { AccessDeniedError, ServiceBridgeError, StateError } from "../errors";
 import { MethodType } from "../pb/servicebridge/v1/registry";
 import { Registry } from "../registry/registry";
 import type { RpcClient } from "./client";
 import { RpcDomain } from "./domain";
-import { RpcAccessDeniedError } from "./errors";
 
 const protoFile = join(
 	import.meta.dir,
@@ -81,20 +81,22 @@ describe("RpcDomain.call", () => {
 
 	it("throws when client is not ready", async () => {
 		const { domain } = makeDomain(null);
-		await expect(domain.call("svc", "method", {})).rejects.toThrow(
-			/rpc client not ready/,
+		await expect(domain.call("svc", "method", {})).rejects.toBeInstanceOf(
+			StateError,
 		);
 	});
 });
 
-describe("RpcDomain._declareForTests", () => {
-	it("registers RPC entry without schema", () => {
-		const { domain, registry } = makeDomain();
-		domain._declareForTests("ping");
-		const entries = registry._handle._entries;
-		expect(entries).toHaveLength(1);
-		expect(entries[0]!.type).toBe(MethodType.METHOD_TYPE_RPC);
-		expect(entries[0]!.name).toBe("ping");
+describe("RpcDomain.handle duplicates", () => {
+	it("refuses a second handler for the same method", () => {
+		const { domain } = makeDomain();
+		const opts = {
+			schema: { protoFile, input: "ChargeRequest", output: "ChargeResponse" },
+		};
+		domain.handle("charge", () => ({}), opts);
+		expect(() => domain.handle("charge", () => ({}), opts)).toThrow(
+			/already has a handler/,
+		);
 	});
 });
 
@@ -106,16 +108,11 @@ describe("RpcDomain.call access denied (gate #3)", () => {
 		reason: string;
 	};
 
-	it("maps gRPC PERMISSION_DENIED to RpcAccessDeniedError + emits policy_violation", async () => {
+	it("emits policy_violation for an AccessDeniedError and rethrows it", async () => {
 		const violations: Violation[] = [];
+		const denied = new AccessDeniedError("no rpc.call rule for billing/charge");
 		const client = {
-			call: () =>
-				Promise.reject(
-					Object.assign(new Error("denied"), {
-						code: 7,
-						details: "no rpc.call rule for billing/charge",
-					}),
-				),
+			call: () => Promise.reject(denied),
 		} as unknown as RpcClient;
 		const domain = new RpcDomain(
 			makeRegistry(),
@@ -129,11 +126,7 @@ describe("RpcDomain.call access denied (gate #3)", () => {
 		} catch (e) {
 			caught = e;
 		}
-		expect(caught).toBeInstanceOf(RpcAccessDeniedError);
-		const err = caught as RpcAccessDeniedError;
-		expect(err.serviceName).toBe("billing");
-		expect(err.methodName).toBe("charge");
-		expect(err.reason).toContain("billing/charge");
+		expect(caught).toBe(denied);
 		expect(violations).toHaveLength(1);
 		expect(violations[0]).toMatchObject({
 			declaration: "rpc.call",
@@ -142,10 +135,10 @@ describe("RpcDomain.call access denied (gate #3)", () => {
 		});
 	});
 
-	it("rethrows non-permission errors unchanged", async () => {
+	it("rethrows other errors unchanged", async () => {
 		const client = {
 			call: () =>
-				Promise.reject(Object.assign(new Error("unavailable"), { code: 14 })),
+				Promise.reject(new ServiceBridgeError("CONNECTION", "unavailable")),
 		} as unknown as RpcClient;
 		const domain = new RpcDomain(makeRegistry(), () => client);
 
@@ -155,7 +148,7 @@ describe("RpcDomain.call access denied (gate #3)", () => {
 		} catch (e) {
 			caught = e;
 		}
-		expect(caught).not.toBeInstanceOf(RpcAccessDeniedError);
+		expect(caught).not.toBeInstanceOf(AccessDeniedError);
 		expect((caught as Error).message).toBe("unavailable");
 	});
 });

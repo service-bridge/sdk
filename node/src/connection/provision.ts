@@ -1,12 +1,11 @@
-import { makeSpiffeCheck, RUNTIME_SPIFFE_URI } from "./spiffe";
-import "reflect-metadata";
 import * as grpc from "@grpc/grpc-js";
-import * as x509 from "@peculiar/x509";
 import { BootstrapClient } from "../pb/servicebridge/v1/bootstrap";
 import type { ControlClient } from "../pb/servicebridge/v1/control";
+import { buildCsr } from "./csr";
 import type { BootstrapKey } from "./key";
 import { derToPem } from "./pem";
 import { ConnectionError } from "./service-bridge-error";
+import { makeSpiffeCheck, RUNTIME_SPIFFE_URI } from "./spiffe";
 
 /** @internal см. ./README.md */
 export interface Keypair {
@@ -21,7 +20,8 @@ export interface ProvisionResult {
 	serviceId: string;
 	serviceName: string;
 	instanceId: string;
-	notAfterUnix: bigint;
+	// Leaf expiry, unix ms (ADR-0006).
+	notAfterUnixMs: number;
 	privateKey: CryptoKey;
 	privateKeyDer: Buffer; // PKCS#8 DER for sync mTLS credential construction
 }
@@ -46,16 +46,10 @@ export async function generateKeypairAndCSR(): Promise<Keypair> {
 		["sign", "verify"],
 	);
 
-	const csr = await x509.Pkcs10CertificateRequestGenerator.create({
-		name: "CN=servicebridge-instance",
-		keys: keyPair,
-		signingAlgorithm: { name: "ECDSA", hash: "SHA-256" },
-	});
-
 	return {
 		privateKey: keyPair.privateKey,
 		publicKey: keyPair.publicKey,
-		csrDer: new Uint8Array(csr.rawData),
+		csrDer: await buildCsr(keyPair),
 	};
 }
 
@@ -136,7 +130,7 @@ export async function provision(
 						serviceId: response.serviceId,
 						serviceName: response.serviceName,
 						instanceId: response.instanceId,
-						notAfterUnix: BigInt(Math.floor(response.notAfterUnixMs / 1000)),
+						notAfterUnixMs: Number(response.notAfterUnixMs),
 						privateKey,
 						privateKeyDer,
 					});
@@ -151,8 +145,8 @@ export async function provision(
 /**
  * Reissues a leaf cert via Control.RefreshCert under the existing mTLS channel.
  * No argon2 — identity is proven by the live client cert. The runtime generates
- * a fresh instance_id (preserving overlap-rotation semantics); the CA cert
- * and parent service identity carry over from the previous provision.
+ * only the leaf: the instance_id stays the same for the life of the process,
+ * and the CA cert and parent service identity carry over.
  *
  * Caller must reuse the existing mTLS ControlClient — RefreshCert is in the
  * default-deny set and rejects unauthenticated channels.
@@ -185,8 +179,8 @@ export async function refresh(
 				caChainDer: Buffer.from(response.caChainDer),
 				serviceId: previous.serviceId,
 				serviceName: previous.serviceName,
-				instanceId: response.instanceId,
-				notAfterUnix: BigInt(Math.floor(response.notAfterUnixMs / 1000)),
+				instanceId: previous.instanceId,
+				notAfterUnixMs: Number(response.notAfterUnixMs),
 				privateKey,
 				privateKeyDer,
 			});

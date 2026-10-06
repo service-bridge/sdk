@@ -1,5 +1,6 @@
 import type { RpcHandlerFn } from "../registry/registry";
 import type { CallOpts } from "../rpc/client";
+import type { RpcHandlerContext } from "../rpc/dispatch-port";
 
 // RpcCallRecord captures one outbound `rpc.call()` made through the harness,
 // in the order it happened. `opts` is present only when the caller passed it.
@@ -45,12 +46,19 @@ export class TestRpcDomain {
 	async invoke<Req = unknown, Res = unknown>(
 		name: string,
 		req: Req,
+		ctx: Partial<RpcHandlerContext> = {},
 	): Promise<Res> {
 		const fn = this.handlers.get(name);
 		if (!fn) {
 			throw new Error(`testing: no RPC handler registered for "${name}"`);
 		}
-		return (await fn(req)) as Res;
+		return (await fn(req, {
+			signal: ctx.signal ?? new AbortController().signal,
+			deadline: ctx.deadline ?? null,
+			requestId: ctx.requestId ?? "test-request",
+			idempotencyKey: ctx.idempotencyKey ?? "",
+			caller: ctx.caller ?? null,
+		})) as Res;
 	}
 
 	async call<Req = unknown, Res = unknown>(
