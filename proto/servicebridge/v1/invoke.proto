@@ -28,6 +28,12 @@ message InvokeRequest {
   // schema registered — matched only against instances that advertise an
   // empty hash for the method.
   bytes contract_hash = 7;
+
+  // Instances the caller already failed to reach directly (e.g. the direct
+  // transport's pick before falling back to proxy). The runtime prefers any
+  // other compatible instance and uses an excluded one only when nothing
+  // else is left.
+  repeated string exclude_instance_ids = 8;
 }
 
 message InvokeResponse {
