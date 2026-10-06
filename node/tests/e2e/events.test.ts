@@ -47,12 +47,14 @@ type DlqPage = { entries: DlqEntry[]; nextCursor: string };
 // depends on, spelled out instead of cast to `any`. DLQ inspection has no
 // public API; see the note on listDlq() below.
 type EventsClientHolder = {
-	_eventsClient?: {
-		listDlq(
-			req: ListDlqRequest,
-			cb: (err: Error | null, res?: DlqPage) => void,
-		): void;
-	};
+	channels?: {
+		events: {
+			listDlq(
+				req: ListDlqRequest,
+				cb: (err: Error | null, res?: DlqPage) => void,
+			): void;
+		};
+	} | null;
 };
 
 // Reads the runtime URL + the per-domain key for a role straight from env, the
@@ -632,7 +634,7 @@ describe("events", () => {
 		// the exact private surface it depends on stays visible and typechecked,
 		// and it breaks loudly if that surface ever moves.
 		function listDlq(sb: ServiceBridge, req: ListDlqRequest): Promise<DlqPage> {
-			const client = (sb as unknown as EventsClientHolder)._eventsClient;
+			const client = (sb as unknown as EventsClientHolder).channels?.events;
 			if (!client) {
 				throw new Error("eventsClient not ready — call start() first");
 			}

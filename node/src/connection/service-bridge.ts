@@ -788,29 +788,22 @@ export class ServiceBridge {
 			for (const m of entry.methods) byServiceId.set(m.serviceId, entry);
 			for (const i of entry.instances) byServiceId.set(i.serviceId, entry);
 		}
-		// A service may have no method or instance in this caller's view (a pure
-		// subscriber, this very service): its subscriptions and outgoing calls
-		// still get an entry, by name.
-		const entryFor = (serviceId: string, serviceName: string) => {
-			let entry = byServiceId.get(serviceId) ?? result.get(serviceName);
-			if (!entry) {
-				entry = blank();
-				result.set(serviceName, entry);
-			}
+		// This very service may have no method or instance in its own view (a
+		// pure subscriber); its subscriptions and outgoing calls still get an
+		// entry. Other services appear only through what the caller may see.
+		const self = this.currentIdentity;
+		const entryOf = (serviceId: string): ServiceMapEntry | undefined => {
+			const known = byServiceId.get(serviceId);
+			if (known || !self || serviceId !== self.serviceId) return known;
+			const entry = result.get(self.serviceName) ?? blank();
+			result.set(self.serviceName, entry);
 			byServiceId.set(serviceId, entry);
 			return entry;
 		};
 		for (const es of this.watch.eventSubscriptionsSnapshot().values())
-			entryFor(es.serviceId, es.serviceName).eventSubscriptions.push(es);
-		const self = this.currentIdentity;
-		for (const oc of this.watch.outgoingCallsSnapshot().values()) {
-			const entry =
-				byServiceId.get(oc.callerServiceId) ??
-				(self && oc.callerServiceId === self.serviceId
-					? entryFor(self.serviceId, self.serviceName)
-					: undefined);
-			entry?.outgoingCalls.push(oc);
-		}
+			entryOf(es.serviceId)?.eventSubscriptions.push(es);
+		for (const oc of this.watch.outgoingCallsSnapshot().values())
+			entryOf(oc.callerServiceId)?.outgoingCalls.push(oc);
 		return result;
 	}
 
