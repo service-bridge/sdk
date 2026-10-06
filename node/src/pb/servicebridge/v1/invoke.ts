@@ -38,6 +38,13 @@ export interface InvokeRequest {
    * empty hash for the method.
    */
   contractHash: Buffer;
+  /**
+   * Instances the caller already failed to reach directly (e.g. the direct
+   * transport's pick before falling back to proxy). The runtime prefers any
+   * other compatible instance and uses an excluded one only when nothing
+   * else is left.
+   */
+  excludeInstanceIds: string[];
 }
 
 export interface InvokeResponse {
@@ -62,6 +69,7 @@ function createBaseInvokeRequest(): InvokeRequest {
     idempotencyKey: "",
     xSbTrace: "",
     contractHash: Buffer.alloc(0),
+    excludeInstanceIds: [],
   };
 }
 
@@ -87,6 +95,9 @@ export const InvokeRequest: MessageFns<InvokeRequest> = {
     }
     if (message.contractHash.length !== 0) {
       writer.uint32(58).bytes(message.contractHash);
+    }
+    for (const v of message.excludeInstanceIds) {
+      writer.uint32(66).string(v!);
     }
     return writer;
   },
@@ -160,6 +171,14 @@ export const InvokeRequest: MessageFns<InvokeRequest> = {
             message.contractHash = Buffer.from(reader.bytes());
             continue;
           }
+          case 8: {
+            if (tag !== 66) {
+              break;
+            }
+
+            message.excludeInstanceIds.push(reader.string());
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -184,6 +203,7 @@ export const InvokeRequest: MessageFns<InvokeRequest> = {
     message.idempotencyKey = object.idempotencyKey ?? "";
     message.xSbTrace = object.xSbTrace ?? "";
     message.contractHash = object.contractHash ?? Buffer.alloc(0);
+    message.excludeInstanceIds = object.excludeInstanceIds?.map((e) => e) || [];
     return message;
   },
 };
