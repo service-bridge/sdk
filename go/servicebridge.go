@@ -29,6 +29,7 @@ import (
 	"github.com/service-bridge/sdk/go/internal/serde"
 	"github.com/service-bridge/sdk/go/internal/stream"
 	"github.com/service-bridge/sdk/go/internal/telemetry"
+	"github.com/service-bridge/sdk/go/internal/testkit"
 	wfi "github.com/service-bridge/sdk/go/internal/workflow"
 	wf "github.com/service-bridge/sdk/go/workflow"
 )
@@ -168,7 +169,50 @@ func New(url, key string, opts ...Option) (*Client, error) {
 	if err := c.buildDomains(); err != nil {
 		return nil, wrap(op, err)
 	}
+	if m := cfg.memory; m != nil {
+		c.installMemory(m)
+	}
 	return c, nil
+}
+
+func init() {
+	testkit.NewOption = func(m *testkit.Memory) any {
+		return Option(func(c *config) { c.memory = m })
+	}
+}
+
+// installMemory swaps every network edge for the harness's in-memory one and
+// hands the harness the client's own dispatch. Everything between — the
+// handlers' decoding and encoding, the publisher's queue, the subscriber's
+// routing — is the production code.
+func (c *Client) installMemory(m *testkit.Memory) {
+	c.caller = memoryOutbound{m: m}
+	publisher, err := events.NewPublisher(events.PublisherConfig{
+		Codec:             codec{},
+		Publish:           m.Publish,
+		MaxPending:        c.cfg.maxPendingPublishes,
+		Timeout:           c.cfg.publishTimeout,
+		OnPolicyViolation: c.onPublishViolation,
+		Logger:            c.log,
+	})
+	if err == nil {
+		c.publisher = publisher
+	}
+	m.Unary = c.dispatch.Unary
+	m.ServeStream = c.dispatch.Stream
+	m.Deliver = c.eventSub.Handle
+	m.Subscriptions = c.eventSub.Subscriptions
+	m.Wrap = wrap
+}
+
+type memoryOutbound struct{ m *testkit.Memory }
+
+func (o memoryOutbound) Unary(ctx context.Context, req rpc.Request) ([]byte, error) {
+	return o.m.Call(ctx, req)
+}
+
+func (o memoryOutbound) Stream(ctx context.Context, req rpc.Request) (*rpc.Stream, error) {
+	return o.m.Stream(ctx, req)
 }
 
 // runtimeAddr accepts both the bare host:port the runtime listens on and a
@@ -459,6 +503,14 @@ func (c *Client) Start(ctx context.Context) (result error) {
 	ctx = startCtx
 
 	c.dispatch.Seal()
+	if c.cfg.memory != nil {
+		// The harness is the runtime: nothing to provision, connect or
+		// register, and no stream to open.
+		c.lifeMu.Lock()
+		c.ready = !c.stopped
+		c.lifeMu.Unlock()
+		return wrap(op, c.publisher.Start(c.runCtx))
+	}
 	if err := c.registerConsumers(ctx); err != nil {
 		return wrap(op, err)
 	}
@@ -598,6 +650,13 @@ func (c *Client) Stop(ctx context.Context) error {
 }
 
 func (c *Client) shutdown(ctx context.Context, wasReady bool) error {
+	if c.cfg.memory != nil {
+		c.publisher.Close(ctx)
+		if c.cancel != nil {
+			c.cancel()
+		}
+		return nil
+	}
 	var errs []error
 
 	// 1. Drain.

@@ -577,31 +577,36 @@ A policy violation deserves attention even though it is not an error: the runtim
 
 ### Testing
 
-`sbtest` runs your handlers with no network, no runtime and no local storage.
+`sbtest` builds a real client whose network edges are in memory: you declare handlers, subscriptions and dependencies on it exactly as in production, and calls, deliveries and publications go through the same encoding, error mapping, publish queue and event routing.
 
 ```go
 import "github.com/service-bridge/sdk/go/sbtest"
 
 func TestCharge(t *testing.T) {
-	h := sbtest.New()
-	if err := sbtest.Handle(h.RPC, "Charge", chargeHandler); err != nil {
+	h := sbtest.New(t)
+	if err := sb.Handle(h.Client, "Charge", chargeHandler); err != nil {
+		t.Fatal(err)
+	}
+	_ = sbtest.Respond(h, "fraud-svc", "Score", func(ctx context.Context, req *fraudpb.ScoreRequest) (*fraudpb.Score, error) {
+		return &fraudpb.Score{Risk: 0.1}, nil
+	})
+	if err := h.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
 	res, err := sbtest.Invoke[*paymentpb.ChargeRequest, *paymentpb.ChargeReply](
-		context.Background(), h.RPC, "Charge", &paymentpb.ChargeRequest{Amount: 100})
+		context.Background(), h, "Charge", &paymentpb.ChargeRequest{Amount: 100},
+		sbtest.WithCaller("orders-svc-id", "inst-1"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res.GetOk() {
-		t.Fatal("expected the charge to be accepted")
+	if !res.GetOk() || len(h.Published()) != 1 {
+		t.Fatal("expected an accepted charge and one event")
 	}
 }
 ```
 
-`sbtest.Respond` / `RespondWith` arrange answers for outbound calls, `h.RPC.Calls()` reads back what was called, and `Define` / `Subscribe` / `Publish` do the same for events.
-
-What the double deliberately does **not** reproduce: runtime routing and wildcard event patterns, access policy, leases and fencing, retries and breakers, streaming, workflows, idempotency, partition ordering. A double that pretended to be a runtime would go green where production fails. Those belong in end-to-end tests against a live runtime. See [`sbtest/README.md`](./sbtest/README.md).
+`Invoke` / `InvokeStream` return errors in the caller's form (`CodeHandler` with the handler's `*sb.HandlerError`), `h.Calls()` and `h.Published()` read back the outbound traffic, and `h.Deliver(ctx, name, payload)` delivers an event with the matched patterns the runtime would compute. Access policy, subscription filters, retries, leases, workflows and jobs are the runtime's and stay with end-to-end tests. See [`sbtest/README.md`](./sbtest/README.md).
 
 ---
 

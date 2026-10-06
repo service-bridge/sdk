@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/service-bridge/sdk/go/internal/rpc"
+	"github.com/service-bridge/sdk/go/internal/testkit"
 )
 
 // Transport selects the path an outbound call travels.
@@ -77,6 +78,9 @@ type config struct {
 	reconnectLadder   []time.Duration
 
 	onTelemetryDrop func(TelemetryDrop)
+
+	// memory is the sbtest harness's in-memory transport; nil in production.
+	memory *testkit.Memory
 
 	logger *slog.Logger
 }

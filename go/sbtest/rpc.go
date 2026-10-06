@@ -2,171 +2,267 @@ package sbtest
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"sync"
+
+	"github.com/google/uuid"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+
+	servicebridge "github.com/service-bridge/sdk/go"
+	"github.com/service-bridge/sdk/go/internal/rpc"
+	"github.com/service-bridge/sdk/go/internal/serde"
 )
 
-// Handler is one registered unary RPC handler: the shape a service writes, with
-// the request already decoded.
-type Handler[Req, Res any] func(ctx context.Context, req Req) (Res, error)
+// InvokeOption describes the caller of an inbound call.
+type InvokeOption func(*rpc.CallInfo)
 
-// Responder computes the answer a doubled outbound call returns.
-type Responder[Req, Res any] func(ctx context.Context, req Req) (Res, error)
-
-// CallRecord is one outbound call the double intercepted, in the order it
-// happened. Input is the request as the caller passed it, not a decoded copy.
-type CallRecord struct {
-	Service string
-	Method  string
-	Input   any
-}
-
-// RPC doubles both directions of unary RPC: the handlers this service exposes
-// and the calls it makes to others.
-type RPC struct {
-	mu         sync.Mutex
-	handlers   map[string]erasedFunc
-	responders map[string]erasedFunc
-	calls      []CallRecord
-}
-
-// NewRPC builds an empty RPC double.
-func NewRPC() *RPC {
-	return &RPC{
-		handlers:   make(map[string]erasedFunc),
-		responders: make(map[string]erasedFunc),
+// WithCaller names the calling service and instance (CallInfo.CallerServiceID,
+// CallerInstanceID).
+func WithCaller(serviceID, instanceID string) InvokeOption {
+	return func(i *rpc.CallInfo) {
+		i.CallerServiceID = serviceID
+		i.CallerInstanceID = instanceID
 	}
 }
 
-// Handle registers the handler for one method name.
-//
-// A name that is already taken is refused rather than overwritten: the runtime
-// refuses a duplicate declaration too, and a test that quietly loses its first
-// registration passes for the wrong reason.
-func Handle[Req, Res any](r *RPC, method string, fn Handler[Req, Res]) error {
-	if r == nil {
-		return fmt.Errorf("sbtest: handle %q: nil rpc double: %w", method, ErrInvalidArg)
-	}
-	if method == "" {
-		return fmt.Errorf("sbtest: handle: empty method name: %w", ErrInvalidArg)
-	}
-	if fn == nil {
-		return fmt.Errorf("sbtest: handle %q: nil handler: %w", method, ErrInvalidArg)
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if _, taken := r.handlers[method]; taken {
-		return fmt.Errorf("sbtest: handle %q: %w", method, ErrDuplicate)
-	}
-	r.handlers[method] = erase(fn)
-	return nil
+// WithRequestID sets CallInfo.RequestID. A fresh UUID otherwise.
+func WithRequestID(id string) InvokeOption {
+	return func(i *rpc.CallInfo) { i.RequestID = id }
 }
 
-// Invoke runs the handler registered under method against req.
-//
-// The handler's own error comes back unwrapped, so a test asserts the business
-// failure it wrote rather than a transport classification the real server would
-// have put around it.
-func Invoke[Req, Res any](ctx context.Context, r *RPC, method string, req Req) (Res, error) {
-	var zero Res
-	if r == nil {
-		return zero, fmt.Errorf("sbtest: invoke %q: nil rpc double: %w", method, ErrInvalidArg)
-	}
+// WithIdempotencyKey sets CallInfo.IdempotencyKey.
+func WithIdempotencyKey(key string) InvokeOption {
+	return func(i *rpc.CallInfo) { i.IdempotencyKey = key }
+}
 
-	r.mu.Lock()
-	fn, ok := r.handlers[method]
-	r.mu.Unlock()
-	if !ok {
-		return zero, fmt.Errorf("sbtest: invoke %q: %w: register it with sbtest.Handle first",
-			method, ErrNoHandler)
+func (h *Harness) inbound(ctx context.Context, opts []InvokeOption) context.Context {
+	info := rpc.CallInfo{RequestID: uuid.NewString()}
+	if d, ok := ctx.Deadline(); ok {
+		info.Deadline = d
 	}
+	for _, opt := range opts {
+		opt(&info)
+	}
+	return rpc.WithCallInfo(ctx, info)
+}
 
-	out, err := fn(ctx, req)
+// Invoke calls the unary handler registered with servicebridge.Handle under
+// method, the way a peer would: req is encoded, the client's dispatcher
+// decodes it, runs the handler and encodes the answer, which is decoded into
+// Resp. A failure comes back as the caller would see it — a HandlerError the
+// handler returned as *servicebridge.Error{Code: CodeHandler} wrapping it, any
+// other error as code INTERNAL, an unknown method as NOT_FOUND, a request that
+// does not decode as VALIDATION. The handler's ctx carries the CallInfo and is
+// cancelled with ctx.
+func Invoke[Req, Resp proto.Message](ctx context.Context, h *Harness, method string, req Req, opts ...InvokeOption) (Resp, error) {
+	const op = "sbtest.Invoke"
+	var zero Resp
+	payload, err := proto.Marshal(req)
 	if err != nil {
-		return zero, err
+		return zero, fmt.Errorf("sbtest: invoke %s: encode request: %w", method, err)
 	}
-	return cast[Res](fmt.Sprintf("invoke %q", method), out)
+	out := h.mem.Unary(h.inbound(ctx, opts), method, payload)
+	if out.Status != codes.OK || out.ErrorCode != "" {
+		return zero, h.wireError(op, out)
+	}
+	resp := serde.New(zero)
+	if err := serde.Decode(out.Payload, resp); err != nil {
+		return zero, fmt.Errorf("sbtest: invoke %s: decode response: %w", method, err)
+	}
+	return resp, nil
 }
 
-// Call doubles one outbound call. Every call is recorded, answered response or
-// not, and the answer is whatever Respond configured for that service and
-// method.
-func Call[Req, Res any](ctx context.Context, r *RPC, service, method string, req Req) (Res, error) {
-	var zero Res
-	if r == nil {
-		return zero, fmt.Errorf("sbtest: call %s/%s: nil rpc double: %w", service, method, ErrInvalidArg)
-	}
-	if service == "" || method == "" {
-		return zero, fmt.Errorf("sbtest: call %s/%s: empty service or method name: %w",
-			service, method, ErrInvalidArg)
-	}
-
-	r.mu.Lock()
-	r.calls = append(r.calls, CallRecord{Service: service, Method: method, Input: req})
-	responder, ok := r.responders[calleeKey(service, method)]
-	r.mu.Unlock()
-
-	if !ok {
-		return zero, fmt.Errorf(
-			"sbtest: call %s/%s: %w: configure it with sbtest.Respond(rpc, %q, %q, …) first",
-			service, method, ErrNoResponse, service, method)
-	}
-
-	out, err := responder(ctx, req)
+// InvokeStream calls the streaming handler registered with
+// servicebridge.HandleStream and collects its chunks. The error follows the
+// rules of Invoke; the chunks sent before a failure are returned with it.
+func InvokeStream[Req, Chunk proto.Message](ctx context.Context, h *Harness, method string, req Req, opts ...InvokeOption) ([]Chunk, error) {
+	const op = "sbtest.InvokeStream"
+	var zero Chunk
+	payload, err := proto.Marshal(req)
 	if err != nil {
-		return zero, err
+		return nil, fmt.Errorf("sbtest: invoke stream %s: encode request: %w", method, err)
 	}
-	return cast[Res](fmt.Sprintf("call %s/%s", service, method), out)
-}
-
-// Respond configures the answer Call returns for one service and method.
-//
-// Re-configuring replaces the previous answer, unlike Handle: arranging a
-// different answer per case is what a test does, while two handlers under one
-// name is a declaration mistake.
-func Respond[Req, Res any](r *RPC, service, method string, fn Responder[Req, Res]) error {
-	if r == nil {
-		return fmt.Errorf("sbtest: respond %s/%s: nil rpc double: %w", service, method, ErrInvalidArg)
-	}
-	if service == "" || method == "" {
-		return fmt.Errorf("sbtest: respond %s/%s: empty service or method name: %w",
-			service, method, ErrInvalidArg)
-	}
-	if fn == nil {
-		return fmt.Errorf("sbtest: respond %s/%s: nil responder: %w", service, method, ErrInvalidArg)
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.responders[calleeKey(service, method)] = erase(fn)
-	return nil
-}
-
-// RespondWith configures a fixed answer, for the calls whose response does not
-// depend on the request.
-func RespondWith[Res any](r *RPC, service, method string, res Res) error {
-	return Respond(r, service, method, func(context.Context, any) (Res, error) {
-		return res, nil
+	var mu sync.Mutex
+	var chunks []Chunk
+	var decodeErr error
+	out := h.mem.ServeStream(h.inbound(ctx, opts), method, payload, func(raw []byte) error {
+		chunk := serde.New(zero)
+		if err := serde.Decode(raw, chunk); err != nil {
+			decodeErr = err
+			return err
+		}
+		mu.Lock()
+		chunks = append(chunks, chunk)
+		mu.Unlock()
+		return nil
 	})
+	if decodeErr != nil {
+		return chunks, fmt.Errorf("sbtest: invoke stream %s: decode chunk: %w", method, decodeErr)
+	}
+	if out.Status != codes.OK || out.ErrorCode != "" {
+		return chunks, h.wireError(op, out)
+	}
+	return chunks, nil
+}
+
+func statusError(out rpc.Outcome) error {
+	return status.Error(out.Status, out.StatusMessage)
+}
+
+// CallRecord is one outbound call the handler under test made, in order.
+type CallRecord struct {
+	Service        string
+	Method         string
+	Payload        []byte
+	IdempotencyKey string
+	BusinessKey    string
+	Transport      servicebridge.Transport
+}
+
+// DecodeCall reads the request of one recorded call back as T.
+func DecodeCall[T proto.Message](rec CallRecord) (T, error) {
+	var zero T
+	out := serde.New(zero)
+	if err := serde.Decode(rec.Payload, out); err != nil {
+		return zero, fmt.Errorf("sbtest: decode call %s/%s: %w", rec.Service, rec.Method, err)
+	}
+	return out, nil
 }
 
 // Calls returns the outbound calls in the order they happened.
-func (r *RPC) Calls() []CallRecord {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]CallRecord, len(r.calls))
-	copy(out, r.calls)
-	return out
+func (h *Harness) Calls() []CallRecord {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]CallRecord(nil), h.calls...)
 }
 
-// Reset clears handlers, configured answers and recorded calls.
-func (r *RPC) Reset() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	clear(r.handlers)
-	clear(r.responders)
-	r.calls = nil
+type responder func(ctx context.Context, payload []byte) ([]byte, error)
+
+type streamResponder func(ctx context.Context, payload []byte) ([][]byte, error)
+
+// Respond arranges the answer to every outbound call to service/method:
+// servicebridge.Call, a declared method's Call and a workflow call step all
+// land here. The request is decoded into Req and the answer encoded from Resp,
+// so a type mismatch fails as it would on the wire. Returning a
+// *servicebridge.HandlerError answers with that business code; any other
+// error answers INTERNAL. Arranging again replaces the previous answer.
+func Respond[Req, Resp proto.Message](h *Harness, service, method string, fn func(ctx context.Context, req Req) (Resp, error)) error {
+	if h == nil || service == "" || method == "" || fn == nil {
+		return fmt.Errorf("sbtest: respond %s/%s: %w", service, method, ErrInvalidArg)
+	}
+	var reqZero Req
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.responders[service+"/"+method] = func(ctx context.Context, payload []byte) ([]byte, error) {
+		req := serde.New(reqZero)
+		if err := serde.Decode(payload, req); err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+		resp, err := fn(ctx, req)
+		if err != nil {
+			return nil, remoteFailure(err)
+		}
+		return proto.Marshal(resp)
+	}
+	return nil
 }
 
-func calleeKey(service, method string) string { return service + "/" + method }
+// RespondStream arranges the chunks of every outbound servicebridge.Stream to
+// service/method.
+func RespondStream[Req, Chunk proto.Message](h *Harness, service, method string, fn func(ctx context.Context, req Req) ([]Chunk, error)) error {
+	if h == nil || service == "" || method == "" || fn == nil {
+		return fmt.Errorf("sbtest: respond stream %s/%s: %w", service, method, ErrInvalidArg)
+	}
+	var reqZero Req
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.streams[service+"/"+method] = func(ctx context.Context, payload []byte) ([][]byte, error) {
+		req := serde.New(reqZero)
+		if err := serde.Decode(payload, req); err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+		chunks, err := fn(ctx, req)
+		if err != nil {
+			return nil, remoteFailure(err)
+		}
+		out := make([][]byte, 0, len(chunks))
+		for _, c := range chunks {
+			raw, err := proto.Marshal(c)
+			if err != nil {
+				return nil, fmt.Errorf("sbtest: encode chunk: %w", err)
+			}
+			out = append(out, raw)
+		}
+		return out, nil
+	}
+	return nil
+}
+
+// remoteFailure is what a responder's error looks like after the wire: a
+// HandlerError keeps its code, anything else is the callee's INTERNAL.
+func remoteFailure(err error) error {
+	var he *servicebridge.HandlerError
+	if errors.As(err, &he) {
+		return &rpc.HandlerError{Code: he.Code, Message: he.Message}
+	}
+	return &rpc.HandlerError{Code: "INTERNAL", Message: err.Error()}
+}
+
+func (h *Harness) record(req rpc.Request) {
+	h.calls = append(h.calls, CallRecord{
+		Service:        req.Service,
+		Method:         req.Method,
+		Payload:        append([]byte(nil), req.Payload...),
+		IdempotencyKey: req.IdempotencyKey,
+		BusinessKey:    req.BusinessKey,
+		Transport:      transportOf(req.Transport),
+	})
+}
+
+func (h *Harness) call(ctx context.Context, req rpc.Request) ([]byte, error) {
+	h.mu.Lock()
+	h.record(req)
+	fn, ok := h.responders[req.Service+"/"+req.Method]
+	h.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("%w: %s/%s — arrange it with sbtest.Respond", ErrNoResponse, req.Service, req.Method)
+	}
+	return fn(ctx, req.Payload)
+}
+
+func (h *Harness) stream(ctx context.Context, req rpc.Request) (*rpc.Stream, error) {
+	h.mu.Lock()
+	h.record(req)
+	fn, ok := h.streams[req.Service+"/"+req.Method]
+	h.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("%w: %s/%s — arrange it with sbtest.RespondStream", ErrNoResponse, req.Service, req.Method)
+	}
+	chunks, err := fn(ctx, req.Payload)
+	if err != nil {
+		return nil, err
+	}
+	next := 0
+	return rpc.NewStream(func() ([]byte, error) {
+		if next >= len(chunks) {
+			return nil, io.EOF
+		}
+		next++
+		return chunks[next-1], nil
+	}, func() {}), nil
+}
+
+func transportOf(t rpc.Transport) servicebridge.Transport {
+	switch t {
+	case rpc.TransportDirect:
+		return servicebridge.TransportDirect
+	case rpc.TransportProxy:
+		return servicebridge.TransportProxy
+	default:
+		return servicebridge.TransportAuto
+	}
+}
