@@ -12,6 +12,7 @@ function op(opId: string, metaBytes = 0): OpReport {
 		traceId: "01900000-0000-7000-8000-000000000001",
 		opId,
 		parentOpId: "",
+		peerInstanceId: "",
 		channel: Channel.RPC,
 		kind: 1,
 		subject: "rpc.call:s/m",

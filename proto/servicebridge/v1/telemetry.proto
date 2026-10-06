@@ -83,8 +83,11 @@ message OpReport {
   optional int64 finished_at_ms = 13;  // unix-ms; absent = START, present = END
   Status  status            = 14;
   string  status_message    = 15;
-  bytes   meta_json         = 16;  // per-kind structured meta; cap 8KB
+  bytes   meta_json         = 16;  // per-kind structured meta; cap 8KB; on END merged into the row
   bytes   attrs_json        = 17;  // free-form key-value; cap 2KB
+  // RPC.CALL: the callee instance that served the call. The runtime keys the
+  // callee's health on it (successes and failures alike).
+  string  peer_instance_id  = 18;
 }
 
 enum LogLevel {
@@ -148,7 +151,10 @@ message TelemetryAck {
   uint32 backpressure_level        = 2;  // 0=normal, 1=slow, 2=pause
   uint64 drop_count_server_side    = 3;
   string drain_reason              = 4;  // non-empty → graceful close requested
-  // Highest sequence processed by runtime ingress, not a persistence guarantee.
+  // Highest batch sequence whose items are all committed (or deliberately not
+  // stored by policy). When an item of the stream is lost (overload, write
+  // failure) the ACK stops advancing and the stream ends with UNAVAILABLE;
+  // the SDK reconnects and resends from acknowledged_sequence + 1.
   uint64 acknowledged_sequence     = 5;
 }
 

@@ -572,10 +572,13 @@ type OpReport struct {
 	FinishedAtMs  *int64                 `protobuf:"varint,13,opt,name=finished_at_ms,json=finishedAtMs,proto3,oneof" json:"finished_at_ms,omitempty"` // unix-ms; absent = START, present = END
 	Status        Status                 `protobuf:"varint,14,opt,name=status,proto3,enum=servicebridge.v1.Status" json:"status,omitempty"`
 	StatusMessage string                 `protobuf:"bytes,15,opt,name=status_message,json=statusMessage,proto3" json:"status_message,omitempty"`
-	MetaJson      []byte                 `protobuf:"bytes,16,opt,name=meta_json,json=metaJson,proto3" json:"meta_json,omitempty"`    // per-kind structured meta; cap 8KB
+	MetaJson      []byte                 `protobuf:"bytes,16,opt,name=meta_json,json=metaJson,proto3" json:"meta_json,omitempty"`    // per-kind structured meta; cap 8KB; on END merged into the row
 	AttrsJson     []byte                 `protobuf:"bytes,17,opt,name=attrs_json,json=attrsJson,proto3" json:"attrs_json,omitempty"` // free-form key-value; cap 2KB
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// RPC.CALL: the callee instance that served the call. The runtime keys the
+	// callee's health on it (successes and failures alike).
+	PeerInstanceId string `protobuf:"bytes,18,opt,name=peer_instance_id,json=peerInstanceId,proto3" json:"peer_instance_id,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *OpReport) Reset() {
@@ -711,6 +714,13 @@ func (x *OpReport) GetAttrsJson() []byte {
 		return x.AttrsJson
 	}
 	return nil
+}
+
+func (x *OpReport) GetPeerInstanceId() string {
+	if x != nil {
+		return x.PeerInstanceId
+	}
+	return ""
 }
 
 // Log is a structured log entry.
@@ -1013,7 +1023,10 @@ type TelemetryAck struct {
 	BackpressureLevel      uint32                 `protobuf:"varint,2,opt,name=backpressure_level,json=backpressureLevel,proto3" json:"backpressure_level,omitempty"` // 0=normal, 1=slow, 2=pause
 	DropCountServerSide    uint64                 `protobuf:"varint,3,opt,name=drop_count_server_side,json=dropCountServerSide,proto3" json:"drop_count_server_side,omitempty"`
 	DrainReason            string                 `protobuf:"bytes,4,opt,name=drain_reason,json=drainReason,proto3" json:"drain_reason,omitempty"` // non-empty → graceful close requested
-	// Highest sequence processed by runtime ingress, not a persistence guarantee.
+	// Highest batch sequence whose items are all committed (or deliberately not
+	// stored by policy). When an item of the stream is lost (overload, write
+	// failure) the ACK stops advancing and the stream ends with UNAVAILABLE;
+	// the SDK reconnects and resends from acknowledged_sequence + 1.
 	AcknowledgedSequence uint64 `protobuf:"varint,5,opt,name=acknowledged_sequence,json=acknowledgedSequence,proto3" json:"acknowledged_sequence,omitempty"`
 	unknownFields        protoimpl.UnknownFields
 	sizeCache            protoimpl.SizeCache
@@ -2259,7 +2272,7 @@ const file_servicebridge_v1_telemetry_proto_rawDesc = "" +
 	"\vMetricBatch\x123\n" +
 	"\x05items\x18\x01 \x03(\v2\x1d.servicebridge.v1.MetricPointR\x05items\"I\n" +
 	"\fPayloadBatch\x129\n" +
-	"\x05items\x18\x01 \x03(\v2#.servicebridge.v1.PayloadAttachmentR\x05items\"\xcc\x04\n" +
+	"\x05items\x18\x01 \x03(\v2#.servicebridge.v1.PayloadAttachmentR\x05items\"\xf6\x04\n" +
 	"\bOpReport\x12\x19\n" +
 	"\btrace_id\x18\x01 \x01(\tR\atraceId\x12\x13\n" +
 	"\x05op_id\x18\x02 \x01(\tR\x04opId\x12 \n" +
@@ -2278,7 +2291,8 @@ const file_servicebridge_v1_telemetry_proto_rawDesc = "" +
 	"\x0estatus_message\x18\x0f \x01(\tR\rstatusMessage\x12\x1b\n" +
 	"\tmeta_json\x18\x10 \x01(\fR\bmetaJson\x12\x1d\n" +
 	"\n" +
-	"attrs_json\x18\x11 \x01(\fR\tattrsJsonB\x11\n" +
+	"attrs_json\x18\x11 \x01(\fR\tattrsJson\x12(\n" +
+	"\x10peer_instance_id\x18\x12 \x01(\tR\x0epeerInstanceIdB\x11\n" +
 	"\x0f_finished_at_msJ\x04\b\a\x10\bJ\x04\b\b\x10\tR\x10actor_service_idR\x11actor_instance_id\"\xf9\x01\n" +
 	"\x03Log\x12\x1c\n" +
 	"\n" +
