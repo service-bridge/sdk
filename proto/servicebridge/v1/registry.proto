@@ -180,7 +180,9 @@ message RegistryUpdate {
   reserved 12;
   reserved "capture_mode";
   // Re-emitted full per-channel capture modes when any channel's mode changes.
-  // Like policy, not incremental: the whole set is sent on change.
+  // Like policy, not incremental: the whole set is sent on change. Present only
+  // on that frame: an update without capture_modes (instances, methods,
+  // revocations) leaves the SDK's current modes untouched.
   CaptureModes capture_modes = 13;
 
   // Access revoked since the previous frame. SDKs drop the revoked services'

@@ -323,6 +323,30 @@ describe("WatchStream per-channel capture modes (runtime authority)", () => {
 		expect(ws.captureModeForChannel(Channel.EVENT)).toBe("errors");
 	});
 
+	it("an update without capture modes (revocation) keeps the current modes", () => {
+		const stream = new FakeStream();
+		const ws = new WatchStream();
+		const seen: string[] = [];
+		ws.start(emptyReq, makeClient(stream));
+		stream.emit("data", snapshot([], allModes(CaptureMode.CAPTURE_MODE_ALL)));
+		ws.onCaptureModes((modes) => seen.push(modes[Channel.RPC]));
+		const revocation = update([], []);
+		if (!revocation.update) throw new Error("update frame expected");
+		revocation.update.revokedServices = ["svc-other"];
+		revocation.update.revokedInstances = ["inst-other"];
+		stream.emit("data", revocation);
+		stream.emit("data", update([makeDesc("inst-1", "charge")], []));
+		for (const ch of [
+			Channel.RPC,
+			Channel.HTTP,
+			Channel.EVENT,
+			Channel.WORKFLOW,
+		]) {
+			expect(ws.captureModeForChannel(ch)).toBe("all");
+		}
+		expect(seen).toEqual([]);
+	});
+
 	it("notifies onCaptureModes listeners on change", () => {
 		const stream = new FakeStream();
 		const ws = new WatchStream();

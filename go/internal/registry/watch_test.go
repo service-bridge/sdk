@@ -220,6 +220,34 @@ func TestCaptureModesNeverPartiallyMerge(t *testing.T) {
 	}
 }
 
+// TestUpdateWithoutCaptureModesKeepsTheModes guards the QA-1 regression: a
+// revocation or an instance/method update carries no capture_modes, and the
+// SDK must not read it as "capture nothing".
+func TestUpdateWithoutCaptureModesKeepsTheModes(t *testing.T) {
+	c := registry.NewCache()
+	c.ApplySnapshot(&pb.RegistrySnapshot{
+		CaptureModes: &pb.CaptureModes{
+			Rpc:              pb.CaptureMode_CAPTURE_MODE_ALL,
+			Http:             pb.CaptureMode_CAPTURE_MODE_ALL,
+			Event:            pb.CaptureMode_CAPTURE_MODE_ERRORS,
+			Workflow:         pb.CaptureMode_CAPTURE_MODE_ALL,
+			TelemetryEnabled: true,
+			PayloadMaxBytes:  4096,
+		},
+	})
+	before := c.Capture()
+	change := c.ApplyUpdate(&pb.RegistryUpdate{
+		RevokedServices:  []string{"svc-other"},
+		RevokedInstances: []string{"inst-other"},
+	})
+	if change.Capture != nil {
+		t.Fatalf("a revocation reported a capture change: %+v", *change.Capture)
+	}
+	if got := c.Capture(); got != before {
+		t.Fatalf("capture after a revocation = %+v, want %+v", got, before)
+	}
+}
+
 // TestCaptureModesFallBackToTheDefaultCapWhenTheRuntimeSendsNone covers
 // proto3's "unset is zero": taking payload_max_bytes = 0 literally would
 // truncate every captured payload to nothing.

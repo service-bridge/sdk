@@ -53,7 +53,8 @@ function defaultChannelCaptureModes(): ChannelCaptureModes {
 }
 
 // channelCaptureModesFromProto maps the runtime-pushed CaptureModes message to
-// the SDK per-channel record. A missing message leaves every channel at "none".
+// the SDK per-channel record. A snapshot without the message leaves every
+// channel at "none"; an update without it is not applied at all.
 function channelCaptureModesFromProto(
 	m: ProtoCaptureModes | undefined,
 ): ChannelCaptureModes {
@@ -501,10 +502,15 @@ export class WatchStream {
 				this.policy = evt.update.policy;
 				this.emitPolicy(evt.update.policy);
 			}
-			this.applyCaptureModes(
-				channelCaptureModesFromProto(evt.update.captureModes),
-			);
-			this.applyTelemetryConfig(evt.update.captureModes);
+			// capture_modes rides an update only when the runtime changed the
+			// modes; an absent message (revocation, instance or method frame)
+			// leaves the current modes as they are.
+			if (evt.update.captureModes) {
+				this.applyCaptureModes(
+					channelCaptureModesFromProto(evt.update.captureModes),
+				);
+				this.applyTelemetryConfig(evt.update.captureModes);
+			}
 			const addedPeers = evt.update.addedPeers ?? [];
 			if (addedPeers.length > 0 || removedPeers.length > 0) {
 				for (const fn of this.peersChangeListeners) {

@@ -943,7 +943,9 @@ type RegistryUpdate struct {
 	AddedPeers   []string `protobuf:"bytes,10,rep,name=added_peers,json=addedPeers,proto3" json:"added_peers,omitempty"`
 	RemovedPeers []string `protobuf:"bytes,11,rep,name=removed_peers,json=removedPeers,proto3" json:"removed_peers,omitempty"`
 	// Re-emitted full per-channel capture modes when any channel's mode changes.
-	// Like policy, not incremental: the whole set is sent on change.
+	// Like policy, not incremental: the whole set is sent on change. Present only
+	// on that frame: an update without capture_modes (instances, methods,
+	// revocations) leaves the SDK's current modes untouched.
 	CaptureModes *CaptureModes `protobuf:"bytes,13,opt,name=capture_modes,json=captureModes,proto3" json:"capture_modes,omitempty"`
 	// Access revoked since the previous frame. SDKs drop the revoked services'
 	// and instances' direct connections and reject calls to them at once,

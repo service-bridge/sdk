@@ -219,7 +219,9 @@ export interface RegistryUpdate {
   removedPeers: string[];
   /**
    * Re-emitted full per-channel capture modes when any channel's mode changes.
-   * Like policy, not incremental: the whole set is sent on change.
+   * Like policy, not incremental: the whole set is sent on change. Present only
+   * on that frame: an update without capture_modes (instances, methods,
+   * revocations) leaves the SDK's current modes untouched.
    */
   captureModes?:
     | CaptureModes

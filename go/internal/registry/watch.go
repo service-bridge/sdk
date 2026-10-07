@@ -82,7 +82,8 @@ func normalizeMode(m pb.CaptureMode) pb.CaptureMode {
 }
 
 // nextCaptureState folds a pushed CaptureModes message onto the current state.
-// Modes always come whole, so a missing message means "capture nothing". The
+// Modes always come whole, so a snapshot without the message means "capture
+// nothing"; ApplyUpdate skips an update that carries none. The
 // telemetry globals are different: payload_max_bytes = 0 is proto3's "unset",
 // and taking it literally would truncate every payload to zero.
 func nextCaptureState(prev CaptureState, m *pb.CaptureModes) CaptureState {
@@ -585,9 +586,13 @@ func (c *Cache) ApplyUpdate(u *pb.RegistryUpdate) Change {
 		c.policy = p
 		change.Policy = p
 	}
-	if capture := nextCaptureState(c.capture, u.GetCaptureModes()); capture != c.capture {
-		c.capture = capture
-		change.Capture = &capture
+	// capture_modes rides an update only when the runtime changed the modes;
+	// an absent message (revocation, instance or method frame) keeps them.
+	if m := u.GetCaptureModes(); m != nil {
+		if capture := nextCaptureState(c.capture, m); capture != c.capture {
+			c.capture = capture
+			change.Capture = &capture
+		}
 	}
 
 	c.rebuild(dt)
