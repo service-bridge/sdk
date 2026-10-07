@@ -592,4 +592,63 @@ describe("misc: per-channel payload capture", () => {
 		// rpc untouched — channels are independent.
 		expect(sb.telemetry.captureModeForChannel(Channel.RPC)).toBe("none");
 	}, 20_000);
+
+	// QA-1: a revocation frame carries no capture modes; another SDK must keep
+	// the modes it has instead of reading the frame as "capture nothing".
+	test("revoking another instance leaves this SDK's capture modes as they are", async () => {
+		await setCapture("rpc.payload_capture", "all");
+		await setCapture("http.payload_capture", "errors");
+		await setCapture("events.payload_capture", "all");
+		await setCapture("workflows.payload_capture", "errors");
+		await sleep(1_500);
+
+		const primary = rawKey("primary");
+		sb = new ServiceBridge(primary.url, primary.key, FAST_OPTS);
+		await sb.start();
+		const watcher = sb;
+		await waitFor(
+			() => watcher.telemetry.captureModeForChannel(Channel.EVENT) === "all",
+			5_000,
+			"events capture mode = all before the revocation",
+		);
+
+		const second = rawKey("second");
+		const victim = new ServiceBridge(second.url, second.key, FAST_OPTS);
+		try {
+			await victim.start();
+			const instanceId = victim.instanceIdString();
+			const serviceId = await withDb(async (sql) => {
+				const rows = (await sql`
+					SELECT service_id::text AS id FROM service_instances WHERE id = ${instanceId}
+				`) as Array<{ id: string }>;
+				return rows[0]?.id ?? "";
+			});
+			expect(serviceId).not.toBe("");
+			await withDb(async (sql) => {
+				await sql`UPDATE service_instances SET credentials_revoked = true WHERE id = ${instanceId}`;
+			});
+
+			const watch = (
+				watcher as unknown as {
+					watch: { isRevoked(serviceId: string, instanceId: string): boolean };
+				}
+			).watch;
+			await waitFor(
+				() => watch.isRevoked(serviceId, instanceId),
+				5_000,
+				"the revocation reached the other SDK",
+			);
+		} finally {
+			await victim.stop().catch(() => {});
+		}
+
+		expect(watcher.telemetry.captureModeForChannel(Channel.RPC)).toBe("all");
+		expect(watcher.telemetry.captureModeForChannel(Channel.HTTP)).toBe(
+			"errors",
+		);
+		expect(watcher.telemetry.captureModeForChannel(Channel.EVENT)).toBe("all");
+		expect(watcher.telemetry.captureModeForChannel(Channel.WORKFLOW)).toBe(
+			"errors",
+		);
+	}, 30_000);
 });
