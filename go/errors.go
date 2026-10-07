@@ -173,11 +173,6 @@ func classify(err error) Code {
 	case errors.Is(err, context.Canceled):
 		return CodeCancelled
 	}
-	var validation *wfi.ValidationError
-	var pathErr *wfi.PathError
-	if errors.As(err, &validation) || errors.As(err, &pathErr) {
-		return CodeValidation
-	}
 	return CodeInternal
 }
 
@@ -191,8 +186,7 @@ func classifySentinel(err error) (Code, bool) {
 	case errors.Is(err, rpc.ErrPeerUnreachable),
 		errors.Is(err, rpc.ErrNoLease),
 		errors.Is(err, events.ErrStopped),
-		errors.Is(err, wfi.ErrNoIdentity),
-		errors.Is(err, wfi.ErrLeaseLost):
+		errors.Is(err, wfi.ErrNoIdentity):
 		return CodeConnection, true
 
 	case errors.Is(err, events.ErrNotSent),
@@ -207,7 +201,7 @@ func classifySentinel(err error) (Code, bool) {
 	case errors.Is(err, wfi.ErrWorkflowNotFound):
 		return CodeNotFound, true
 
-	case errors.Is(err, wfi.ErrRunTerminal):
+	case errors.Is(err, wfi.ErrRunTerminal), errors.Is(err, wfi.ErrRunFailed):
 		return CodeTerminal, true
 
 	case errors.Is(err, events.ErrQueueFull):

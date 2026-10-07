@@ -1,207 +1,210 @@
 import { describe, expect, it } from "bun:test";
+import { EventEmitter } from "node:events";
 import { MethodType } from "../pb/servicebridge/v1/registry";
+import type { WorkflowsClient } from "../pb/servicebridge/v1/workflows";
 import { Registry } from "../registry/registry";
-import { canonicalize, fingerprint } from "./canonical";
 import { WorkflowDomain } from "./domain";
-import type { WorkflowDef } from "./types";
+import {
+	WorkflowAccessDeniedError,
+	WorkflowNotFoundError,
+	WorkflowRunFailedError,
+	WorkflowTerminalError,
+} from "./errors";
 
-const TRIVIAL: WorkflowDef = {
-	steps: [{ id: "wait", type: "sleep", durationSec: 1 }],
-};
+const grpcErr = (code: number) =>
+	Object.assign(new Error(`code ${code}`), { code, details: `d${code}` });
 
-describe("WorkflowDomain.handle", () => {
-	it("registers METHOD_TYPE_WORKFLOW with the canonical graph + fingerprint", () => {
+function domainWith(client: Partial<Record<string, unknown>>) {
+	const violations: string[] = [];
+	const d = new WorkflowDomain(new Registry(), (v) => violations.push(v.value));
+	d._attachRpc(client as unknown as WorkflowsClient);
+	return { d, violations };
+}
+
+describe("WorkflowDomain", () => {
+	it("handle registers the structured definition and keeps local functions", () => {
 		const registry = new Registry();
-		const domain = new WorkflowDomain(registry);
+		const d = new WorkflowDomain(registry);
+		const fn = () => 1;
+		d.handle("flow", { version: "3", steps: [{ id: "a", type: "local", fn }] });
+		const m = registry._handle.incomingMethods()[0]!;
+		expect(m.type).toBe(MethodType.METHOD_TYPE_WORKFLOW);
+		expect(m.workflow?.steps[0]?.local).toEqual({});
+		expect(d._definition("flow")?.locals.get("a")).toBe(fn);
+		expect(d._definition("flow")?.version).toBe("3");
+		expect(d._size()).toBe(1);
+		expect(() => d.handle("flow", { steps: [] })).toThrow();
+	});
 
-		domain.handle("processPayment", TRIVIAL);
-		const methods = registry._handle.incomingMethods();
-		expect(methods).toHaveLength(1);
-		expect(methods[0]!.type).toBe(MethodType.METHOD_TYPE_WORKFLOW);
-		expect(methods[0]!.name).toBe("processPayment");
-
-		const canonical = canonicalize({
-			graph: TRIVIAL.steps,
-			retry: undefined,
-			maxParallelism: undefined,
-			timeoutSec: undefined,
+	it("start sends (service, workflow) and maps errors", async () => {
+		let sent: Record<string, unknown> = {};
+		const { d, violations } = domainWith({
+			start: (
+				req: Record<string, unknown>,
+				cb: (e: unknown, r?: unknown) => void,
+			) => {
+				sent = req;
+				if (req.workflow === "denied") return cb(grpcErr(7));
+				if (req.workflow === "missing") return cb(grpcErr(5));
+				cb(null, { runId: "r1" });
+			},
 		});
-		expect(Buffer.from(methods[0]!.inputSchemaJson).toString("utf8")).toBe(
-			canonical,
+		expect(
+			await d.start(
+				"orders",
+				"flow",
+				{ a: 1 },
+				{ idempotencyKey: "k", timeoutMs: 10 },
+			),
+		).toEqual({ runId: "r1" });
+		expect(sent).toMatchObject({
+			service: "orders",
+			workflow: "flow",
+			idempotencyKey: "k",
+			timeoutMs: 10,
+		});
+		expect(JSON.parse((sent.input as Buffer).toString())).toEqual({ a: 1 });
+		await expect(d.start("orders", "denied", null)).rejects.toBeInstanceOf(
+			WorkflowAccessDeniedError,
 		);
-		expect(methods[0]!.contractHash).toBe(
-			fingerprint({
-				graph: TRIVIAL.steps,
-				retry: undefined,
-				maxParallelism: undefined,
-				timeoutSec: undefined,
-			}),
-		);
-		expect(methods[0]!.outputSchemaJson.length).toBe(0);
-	});
-
-	it("opts.input overrides def.input on the registry entry", () => {
-		const registry = new Registry();
-		const domain = new WorkflowDomain(registry);
-
-		const def: WorkflowDef = {
-			...TRIVIAL,
-			input: { fromDef: "string" },
-		};
-		domain.handle("processOrder", def, { input: { fromOpts: "string" } });
-
-		// We can't inspect the override directly through incomingMethods (it
-		// already overwrites inputSchemaJson with the canonical graph). Instead
-		// confirm validation passed (no throw) and a single entry landed.
-		const methods = registry._handle.incomingMethods();
-		expect(methods).toHaveLength(1);
-	});
-
-	it("rejects invalid graph (duplicate id)", () => {
-		const registry = new Registry();
-		const domain = new WorkflowDomain(registry);
-		expect(() =>
-			domain.handle("bad", {
-				steps: [
-					{ id: "a", type: "sleep", durationSec: 1 },
-					{ id: "a", type: "sleep", durationSec: 1 },
-				],
-			}),
-		).toThrow(/duplicate step id/);
-	});
-
-	it("workflow-level retry lands on every operation step that has none", () => {
-		const registry = new Registry();
-		new WorkflowDomain(registry).handle("wf", {
-			retry: { maxAttempts: 5 },
-			steps: [
-				{ id: "a", type: "call", service: "s", method: "m", input: {} },
-				{
-					id: "b",
-					type: "call",
-					service: "s",
-					method: "m",
-					input: {},
-					retry: { maxAttempts: 2 },
-				},
-				{ id: "napping", type: "sleep", durationSec: 1 },
-				{
-					id: "group",
-					type: "parallel",
-					steps: [{ id: "inner", type: "publish", event: "e", input: {} }],
-				},
-			],
-		});
-		const graph = JSON.parse(
-			Buffer.from(
-				registry._handle.incomingMethods()[0]!.inputSchemaJson,
-			).toString("utf8"),
-		) as {
-			graph: Array<{
-				id: string;
-				retry?: { maxAttempts: number };
-				steps?: Array<{ retry?: { maxAttempts: number } }>;
-			}>;
-		};
-		const byId = new Map(graph.graph.map((s) => [s.id, s]));
-		// The runtime seeds workflow_steps.max_attempts from the per-step block.
-		expect(byId.get("a")?.retry?.maxAttempts).toBe(5);
-		// An explicit per-step policy wins.
-		expect(byId.get("b")?.retry?.maxAttempts).toBe(2);
-		// A park is resumed, not retried; a group is not an operation.
-		expect(byId.get("napping")?.retry).toBeUndefined();
-		expect(byId.get("group")?.retry).toBeUndefined();
-		expect(byId.get("group")?.steps?.[0]?.retry?.maxAttempts).toBe(5);
-	});
-
-	it("workflow-level retry changes the fingerprint", () => {
-		const a = new Registry();
-		const b = new Registry();
-		new WorkflowDomain(a).handle("wf", TRIVIAL);
-		new WorkflowDomain(b).handle("wf", {
-			...TRIVIAL,
-			retry: { maxAttempts: 4 },
-		});
-		expect(a._handle.incomingMethods()[0]!.contractHash).not.toBe(
-			b._handle.incomingMethods()[0]!.contractHash,
+		expect(violations).toEqual(["orders/denied"]);
+		await expect(d.start("orders", "missing", null)).rejects.toBeInstanceOf(
+			WorkflowNotFoundError,
 		);
 	});
 
-	it("fingerprint stable under property reorder", () => {
-		const a = new Registry();
-		const b = new Registry();
-		new WorkflowDomain(a).handle("wf", {
-			steps: [
+	it("signal returns the duplicate flag; terminal runs map to WorkflowTerminalError", async () => {
+		const { d } = domainWith({
+			signal: (
+				req: { signalId: string; runId: string },
+				cb: (e: unknown, r?: unknown) => void,
+			) => {
+				if (req.runId === "done") return cb(grpcErr(9));
+				cb(null, { duplicate: req.signalId === "dup" });
+			},
+			cancel: (_: unknown, cb: (e: unknown) => void) => cb(grpcErr(9)),
+			retryCompensation: (_: unknown, cb: (e: unknown) => void) => cb(null),
+			replay: (_: unknown, cb: (e: unknown, r?: unknown) => void) =>
+				cb(null, { runId: "r2" }),
+		});
+		expect(await d.signal("r", "go", {}, { signalId: "dup" })).toEqual({
+			duplicate: true,
+		});
+		expect(await d.signal("r", "go", {})).toEqual({ duplicate: false });
+		await expect(d.signal("done", "go", {})).rejects.toBeInstanceOf(
+			WorkflowTerminalError,
+		);
+		await expect(d.cancel("done")).rejects.toBeInstanceOf(
+			WorkflowTerminalError,
+		);
+		await d.retryCompensation("r");
+		expect(await d.replay("r", { fromStepId: "b" })).toEqual({ runId: "r2" });
+	});
+
+	it("await resolves the output on success and rejects other terminals", async () => {
+		const updates: Record<string, Array<Record<string, unknown>>> = {
+			ok: [
+				{ status: "active", terminal: false, output: Buffer.alloc(0) },
 				{
-					id: "x",
-					type: "call",
-					service: "s",
-					method: "m",
-					input: { foo: 1, bar: 2 },
+					status: "success",
+					terminal: true,
+					output: Buffer.from('{"a":1}'),
+					errorCode: "",
+					errorMessage: "",
 				},
 			],
-		});
-		new WorkflowDomain(b).handle("wf", {
-			steps: [
+			bad: [
 				{
-					id: "x",
-					type: "call",
-					method: "m",
-					service: "s",
-					input: { bar: 2, foo: 1 },
+					status: "failed_compensated",
+					terminal: true,
+					output: Buffer.alloc(0),
+					errorCode: "COMPENSATION_FAILED",
+					errorMessage: "x",
 				},
 			],
-		});
-		expect(a._handle.incomingMethods()[0]!.contractHash).toBe(
-			b._handle.incomingMethods()[0]!.contractHash,
-		);
-	});
-});
-
-describe("immutable executable workflow versions", () => {
-	it("requires local version, retains exact hashes and snapshots nested input", () => {
-		const registry = new Registry();
-		const domain = new WorkflowDomain(registry);
-		const first = async () => "old";
-		expect(() =>
-			domain.handle("local", {
-				steps: [{ id: "a", type: "local", fn: first }],
-			}),
-		).toThrow(/version/);
-		const def: WorkflowDef = {
-			version: "v1",
-			steps: [{ id: "a", type: "local", fn: first }],
+			cut: [{ status: "active", terminal: false }],
 		};
-		domain.handle("local", def);
-		const oldHash = registry._handle.incomingMethods()[0]!.contractHash;
-		def.steps[0]!.id = "mutated";
-		domain.handle("local", {
-			version: "v2",
-			steps: [{ id: "a", type: "local", fn: async () => "new" }],
+		const { d } = domainWith({
+			await: (req: { runId: string }) => {
+				const s = new EventEmitter();
+				queueMicrotask(() => {
+					for (const u of updates[req.runId]!) s.emit("data", u);
+					s.emit("end");
+				});
+				return s;
+			},
 		});
-		const entries = registry._handle._entries.filter(
-			(e) => e.type === MethodType.METHOD_TYPE_WORKFLOW,
-		);
-		expect(entries).toHaveLength(2);
-		expect(entries[0]!.contractHashOverride).toBe(oldHash);
-		expect((entries[0]!.fn as WorkflowDef["steps"])[0]!.id).toBe("a");
-		expect(registry._handle.incomingMethods()[1]!.contractHash).not.toBe(
-			oldHash,
-		);
+		expect(await d.await("ok")).toEqual({ a: 1 });
+		const err = await d.await("bad").catch((e) => e);
+		expect(err).toBeInstanceOf(WorkflowRunFailedError);
+		expect(err.status).toBe("failed_compensated");
+		await expect(d.await("cut")).rejects.toBeInstanceOf(WorkflowTerminalError);
 	});
-});
 
-it("workflow executable version has cross-SDK canonical golden fingerprint", () => {
-	const registry = new Registry();
-	new WorkflowDomain(registry).handle("golden", {
-		version: "v1",
-		steps: [{ id: "a", type: "local", fn: async () => null }],
+	it("query maps the snapshot", async () => {
+		const { d } = domainWith({
+			query: (_: unknown, cb: (e: unknown, r?: unknown) => void) =>
+				cb(null, {
+					runId: "r",
+					service: "s",
+					workflow: "w",
+					fingerprint: "f",
+					status: "active",
+					stopReason: "",
+					waitingReason: "signal",
+					input: Buffer.from("{}"),
+					output: Buffer.alloc(0),
+					errorCode: "",
+					errorMessage: "",
+					parentRunId: "",
+					startedAtUnixMs: 1,
+					endedAtUnixMs: 0,
+					steps: [
+						{
+							stepId: "w",
+							parentStepId: "",
+							kind: "wait_signal",
+							status: "parked",
+							attempt: 0,
+							output: Buffer.alloc(0),
+							errorCode: "",
+							errorMessage: "",
+							waitingReason: "signal",
+							waitKey: "go",
+							childRunId: "",
+							compensatesStepId: "",
+							startedAtUnixMs: 1,
+							endedAtUnixMs: 0,
+						},
+					],
+					signals: [
+						{
+							signalName: "x",
+							signalId: "",
+							payload: Buffer.from("1"),
+							enqueuedAtUnixMs: 5,
+						},
+					],
+				}),
+		});
+		const snap = await d.query("r");
+		expect(snap.waitingReason).toBe("signal");
+		expect(snap.output).toBeNull();
+		expect(snap.steps[0]).toMatchObject({
+			status: "parked",
+			waitKey: "go",
+			output: null,
+		});
+		expect(snap.signals[0]).toEqual({
+			signalName: "x",
+			signalId: "",
+			payload: 1,
+			enqueuedAtMs: 5,
+		});
 	});
-	const entry = registry._handle.incomingMethods()[0]!;
-	expect(Buffer.from(entry.inputSchemaJson).toString()).toBe(
-		'{"graph":[{"id":"a","type":"local"}],"version":"v1"}',
-	);
-	expect(entry.contractHash).toBe(
-		"791a2a611a183307ab8abb8bf7fa99201ff70ee22623ae93785543f9dd5e99be",
-	);
+
+	it("caller operations need an attached channel", async () => {
+		const d = new WorkflowDomain(new Registry());
+		await expect(d.query("r")).rejects.toThrow();
+	});
 });

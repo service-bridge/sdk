@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package servicebridge.v1;
 
+import "servicebridge/v1/workflows.proto";
+
 service Registry {
   rpc RegisterAndWatch(RegisterRequest) returns (stream RegistryEvent);
 }
@@ -59,6 +61,10 @@ message IncomingMethod {
   // SDK-supplied contract hash (hex SHA-256). Runtime stores opaque,
   // does not recompute. Empty for non-RPC method types (event/workflow/job/http).
   string     contract_hash      = 6;
+  // Workflow definition of a METHOD_TYPE_WORKFLOW method. The runtime
+  // validates it and computes its fingerprint (input/output schema and
+  // contract_hash are unused for workflows).
+  WorkflowDefinition workflow   = 7;
 }
 
 message PublishedEvent {

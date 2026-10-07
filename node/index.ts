@@ -17,7 +17,6 @@ export {
 	type ServiceInstanceInfo,
 	type ServiceMapEntry,
 	type TelemetryAPI,
-	type WorkflowHandlerOpts,
 } from "./src/connection/service-bridge";
 export { ConnectionError } from "./src/connection/service-bridge-error";
 export {
@@ -78,7 +77,19 @@ export type { WorkflowDomain } from "./src/workflow/domain";
 export {
 	WorkflowAccessDeniedError,
 	WorkflowNotFoundError,
+	WorkflowRunFailedError,
 	WorkflowTerminalError,
 } from "./src/workflow/errors";
-export { JsonPathError } from "./src/workflow/jsonpath";
-export { WorkflowValidationError } from "./src/workflow/validate";
+export type {
+	JsonExpression,
+	Predicate,
+	RetryPolicy as WorkflowRetryPolicy,
+	RunSnapshot,
+	RunStatus,
+	Step,
+	StepSnapshot,
+	StepStatus,
+	WorkflowDef,
+	WorkflowSignalOpts,
+	WorkflowStartOpts,
+} from "./src/workflow/types";

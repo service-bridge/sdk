@@ -58,7 +58,7 @@ func TestLinearWorkflowRunsToSuccess(t *testing.T) {
 	}
 	start(ctx, t, c)
 
-	runID, err := c.Workflow.Start(ctx, name, map[string]any{"n": 21})
+	runID, err := c.Workflow.Start(ctx, serviceName(domainWorkflow, 1), name, map[string]any{"n": 21})
 	if err != nil {
 		t.Fatalf("start run: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestLinearWorkflowRunsToSuccess(t *testing.T) {
 	byID := map[string]any{}
 	for _, s := range snap.Steps {
 		if s.Status != "success" {
-			t.Errorf("step %s finished as %q (last error: %q)", s.StepID, s.Status, s.LastError)
+			t.Errorf("step %s finished as %q (error: %q)", s.StepID, s.Status, s.ErrorMessage)
 		}
 		byID[s.StepID] = s.Output
 	}
@@ -177,7 +177,7 @@ func TestWorkflowCallStepReachesTypedHandler(t *testing.T) {
 	start(ctx, t, owner)
 	waitForMethod(ctx, t, owner, calleeName, method)
 
-	runID, err := owner.Workflow.Start(ctx, name, map[string]any{"text": "from-go-workflow"})
+	runID, err := owner.Workflow.Start(ctx, serviceName(domainWorkflow, 1), name, map[string]any{"text": "from-go-workflow"})
 	if err != nil {
 		t.Fatalf("start run: %v", err)
 	}
@@ -282,7 +282,7 @@ func TestWorkflowCallStepFailsOnAnUndeclaredComputedTarget(t *testing.T) {
 	}
 	start(ctx, t, owner)
 
-	runID, err := owner.Workflow.Start(ctx, name, map[string]any{"service": callee, "method": method})
+	runID, err := owner.Workflow.Start(ctx, serviceName(domainWorkflow, 1), name, map[string]any{"service": callee, "method": method})
 	if err != nil {
 		t.Fatalf("start run: %v", err)
 	}
@@ -332,7 +332,7 @@ func TestWorkflowCallStepSurfacesTheCalleeError(t *testing.T) {
 	start(ctx, t, owner)
 	waitForMethod(ctx, t, owner, calleeName, method)
 
-	runID, err := owner.Workflow.Start(ctx, name, map[string]any{})
+	runID, err := owner.Workflow.Start(ctx, serviceName(domainWorkflow, 1), name, map[string]any{})
 	if err != nil {
 		t.Fatalf("start run: %v", err)
 	}
@@ -355,7 +355,7 @@ func awaitFailedRun(ctx context.Context, t *testing.T, c *servicebridge.Client, 
 			return false, err
 		}
 		snap = got
-		return got.Status == "failed" || got.Status == "success" || got.Status == "cancelled", nil
+		return terminal(got.Status), nil
 	})
 	if snap.Status != "failed" {
 		t.Fatalf("run %s finished as %q, want failed", runID, snap.Status)
@@ -366,7 +366,7 @@ func awaitFailedRun(ctx context.Context, t *testing.T, c *servicebridge.Client, 
 func stepError(snap servicebridge.RunSnapshot, stepID string) string {
 	for _, s := range snap.Steps {
 		if s.StepID == stepID {
-			return s.LastError
+			return s.ErrorMessage
 		}
 	}
 	return ""

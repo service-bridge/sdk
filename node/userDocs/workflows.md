@@ -2,255 +2,198 @@
 
 ← [Events](./events.md) · Дальше: [Jobs](./jobs.md) · [Integrations](./integrations.md) →
 
-Durable workflows: DAG из шагов с persistent state. Runtime владеет recovery, retry-логикой и компенсацией — SDK-runner тонкий и не делает собственных ретраев.
+Durable workflows: DAG шагов, который интерпретирует runtime. Runtime хранит состояние каждого шага, сам решает, какие шаги готовы, держит таймеры, ожидания событий и сигналов, вложенные прогоны, повторы и компенсации. SDK объявляет определение и исполняет задачи, которые runtime ему выдаёт: локальные функции, RPC-вызовы, публикации и компенсации.
 
-> **Не путать с Jobs.** Workflows — это **долгоживущие multi-step бизнес-процессы**, которые запускает вызывающая сторона через `sb.workflow.start(...)`. Jobs — это runtime-triggered одношаговые задачи по расписанию (cron / delayed). Документация по Jobs — [jobs.md](./jobs.md).
+> **Не путать с Jobs.** Workflows — долгоживущие многошаговые процессы, которые запускает вызывающая сторона (`sb.workflow.start(...)`). Jobs — одношаговые задачи по расписанию. См. [jobs.md](./jobs.md).
 
 ## Содержание
 
-- [Концепция](#концепция)
-- [Регистрация workflow](#регистрация-workflow)
+- [Модель](#модель)
+- [Объявление workflow](#объявление-workflow)
 - [Типы шагов](#типы-шагов)
-- [Как ссылаться на данные (JsonExpression)](#как-ссылаться-на-данные-jsonexpression)
+- [Выражения (JsonExpression)](#выражения-jsonexpression)
 - [Группы: parallel / sequence / forEach](#группы-parallel--sequence--foreach)
-- [Compensation (rollback)](#compensation-rollback)
-- [Запуск, signal, cancel, await, query, replay](#caller-side-операции)
-- [Access policy](#access-policy)
+- [Повторы, таймауты, параллельность](#повторы-таймауты-параллельность)
+- [Компенсации](#компенсации)
+- [Запуск и управление прогоном](#запуск-и-управление-прогоном)
+- [Права](#права)
 - [Поведение при сбоях](#поведение-при-сбоях)
 - [Шпаргалка](#шпаргалка)
 
-## Концепция
+## Модель
 
-Workflow — это **frozen plan**: декларативный DAG шагов. Runner на стороне SDK тонкий: для каждого шага он делает `beginStep → eval JsonExpression → один вызов (`sb.rpc.call` / `sb.event.publish` / `sb.workflow.start` / park) → completeStep`. Никаких ретраев, backoff, circuit breaker на SDK-стороне — recovery (lease, heartbeat, dispatcher, compensation) полностью у runtime.
+- Определение кодируется в proto и уходит в runtime при регистрации сервиса. Runtime проверяет его (id шагов, ссылки `waitFor`, отсутствие циклов, глубина ≤ 10, ≤ 500 шагов, синтаксис путей и фильтров) и считает fingerprint. Невалидное определение — ошибка регистрации.
+- Прогон копирует замороженный план (frozen plan): новое объявление того же имени не меняет уже идущие прогоны.
+- Готовый шаг-задача (`local`, `call`, `publish`, компенсация) выдаётся одному живому инстансу сервиса-владельца с **lease на эту попытку**. Инстанс продлевает lease heartbeat'ом (интервал задаёт runtime) и сообщает результат. Если инстанс пропал — по истечении lease шаг выдаётся другому (at-least-once эффекта шага).
+- `sleep`, `wait_event`, `wait_signal`, вложенный `workflow` и группы держит runtime: падение любого инстанса во время ожидания ничего не теряет.
+- `version` определения нужен для `local`-шагов: функция не уходит в runtime, задача несёт версию, и инстанс без этой версии отвечает `UNSUPPORTED_VERSION`. Изменили функцию — поменяйте `version`.
 
-При `handle` SDK canonicalize'ит граф и считает SHA-256 (`contract_hash`). Runtime отвергает повторную регистрацию того же имени с другим хешем. Уже запущенные run'ы исполняются по своему сохранённому plan'у, поэтому новая версия определения их не ломает.
-
-## Регистрация workflow
+## Объявление workflow
 
 ```ts
 import { ServiceBridge } from "service-bridge";
 
 const sb = new ServiceBridge(url, key);
+sb.service("email", { rpc: ["Send"] });
+sb.service("accounts", { rpc: ["Create", "Delete"] });
 
 sb.workflow.handle("onboard-user", {
-  input: { userId: { type: "string" } },
+  version: "1",
+  input: { type: "object", required: ["userId"] },
   steps: [
     { type: "call", id: "send_welcome", service: "email", method: "Send",
       input: { template: "welcome", userId: "$.input.userId" } },
     { type: "call", id: "provision", service: "accounts", method: "Create",
-      input: { userId: "$.input.userId" }, waitFor: ["send_welcome"] },
-    { type: "publish", id: "notify", event: "user.onboarded",
-      input: { userId: "$.input.userId", accountId: "$.provision.id" },
-      waitFor: ["provision"] },
+      input: { userId: "$.input.userId" }, waitFor: ["send_welcome"],
+      compensate: { method: "Delete", input: { id: "$.provision.id" } } },
+    { type: "local", id: "summary", waitFor: ["provision"],
+      fn: (state) => ({ account: (state.provision as { id: string }).id }) },
   ],
 });
 
 await sb.start();
 ```
 
-`id` шага должен матчить `^[a-z0-9_]+$`. Вызывать `handle` нужно **до `sb.start()`**.
+Вызывать `handle` нужно **до `sb.start()`**. Имя workflow принадлежит сервису: если его уже объявляет другой сервис с живым инстансом, регистрация отклоняется.
 
-Поля `WorkflowDef`:
-
-| Поле | Тип | По умолчанию | Что делает |
+| Поле `WorkflowDef` | Тип | По умолчанию | Что делает |
 |------|-----|--------------|------------|
-| `steps` | `Step[]` | — (обязательно) | Шаги DAG. |
-| `input` | JSON Schema (объект) | нет | Схема входа run'а. Свободный JSON-Schema-объект; без `fieldNumber` (это не RPC/event-контракт). |
-| `retry` | `Partial<RetryOpts>` | runtime default | Workflow-level retry policy. |
-| `maxParallelism` | `number` | `0` (unlimited) | Лимит одновременно исполняемых шагов в run'е. |
-| `timeoutSec` | `number` | `0` (без override) | Wall-clock timeout всего run'а, в **секундах**. |
+| `steps` | `Step[]` | — | Шаги. |
+| `version` | `string` | `""` | Версия кода `local`-шагов; часть fingerprint. |
+| `input` | JSON Schema | нет | Схема входа; `start` с неподходящим входом отклоняется. |
+| `retry` | `RetryPolicy` | 1 попытка | Политика повторов задач без своей. |
+| `maxParallelism` | `number` | `0` (без лимита) | Сколько задач одного прогона исполняется одновременно. |
+| `timeoutMs` | `number` | `0` | Таймаут прогона; по истечении — статус `timed_out`. |
 
 ## Типы шагов
 
-| `type` | Семантика | Обязательные поля |
+| `type` | Что делает | Обязательные поля |
 |--------|-----------|-------------------|
-| `call` | RPC-вызов к другому сервису (`sb.rpc.call`). | `id`, `service`, `method`, `input` |
-| `publish` | Публикация события (`sb.event.publish`). | `id`, `event`, `input` |
-| `workflow` | Запускает nested workflow и ждёт его завершения. | `id`, `workflow`, `input` |
-| `sleep` | Durable-таймер: park run'а на `durationSec`, runtime будит. | `id`, `durationSec` |
-| `wait_event` | Park до входящего события по имени + опциональному `filter`. | `id`, `event` |
-| `wait_signal` | Park до внешнего `sb.workflow.signal(...)`. | `id`, `signal` |
-| `parallel` | Группа: все вложенные шаги стартуют сразу, шаг готов после всех. | `id`, `steps` |
-| `sequence` | Группа: вложенные шаги по порядку. | `id`, `steps` |
-| `local` | Локальная JS-функция без I/O. Её результат идёт в state. | `id`, `fn` |
+| `call` | RPC через `sb.rpc.call` на инстансе-владельце. | `service`, `method` |
+| `publish` | Событие через `sb.event.publish`; выход — `{ eventId }`. | `event` |
+| `local` | Ваша функция `fn(state, ctx)`; выход — её результат. | `fn` |
+| `sleep` | Durable-таймер в runtime. | `durationMs` |
+| `wait_event` | Ждёт событие `event`, подходящее под `filter`; выход — payload. | `event` |
+| `wait_signal` | Ждёт сигнал `signal`; выход — payload сигнала. | `signal` |
+| `workflow` | Runtime запускает вложенный прогон и ждёт его; выход — выход ребёнка. | `workflow` (+ `service`, по умолчанию свой) |
+| `parallel` / `sequence` | Группа шагов (`steps`), опционально `forEach`. | `steps` |
 
-Полей `payload`/`name`/`branches`/`do` нет — это распространённая ошибка. Везде, где шаг передаёт данные, поле называется `input`; имя nested-workflow — `workflow`; вложенные шаги группы — `steps`.
+Общие поля: `id` (`^[a-z0-9_]+$`, уникален в графе, не `input`), `waitFor` (id соседей в той же группе), `when` (предикат; ложь — шаг пропущен, выход `null`), `timeoutMs` (дедлайн шага; истёк — шаг и прогон падают), `retry` (для задач).
 
-Любой шаг может иметь:
+`local`: `fn(state, ctx)`, где `state` — `{ input, <id шага>: выход, ... }`, `ctx` — `{ signal, runId, stepId, attempt }`. `ctx.signal` срабатывает при потере lease, дедлайне шага и остановке клиента — прерывайте работу по нему.
 
-- `waitFor: string[]` — id шагов, после завершения которых этот шаг готов к запуску.
-- `when: Predicate` — условное выполнение. `Predicate` — это truthy-`JsonExpression` (строка) либо `{ not }` / `{ equals: [a, b] }` / `{ in: [value, array] }` / `{ and: [...] }` / `{ or: [...] }`. Если false → шаг пропускается, в state кладётся `null`.
-- `timeoutSec: number` — workflow-control timeout шага, в **секундах**. Для `wait_event` / `wait_signal` — таймаут ожидания.
-- `retry: Partial<RetryOpts>` — step-level retry policy.
-- `opts` — типизированная композиция над опциями нижележащего домена (`CallOpts` / `PublishOpts` / `WorkflowStartOpts`). Например `idempotencyKey`, `transport`, `timeout`.
-- `compensate` — compensation handler (только на `call` / `publish`).
+Опции `call` (`opts`): `timeoutMs`, `transport` (`auto`/`direct`/`proxy`), `idempotencyKey`, `requestId`, `retry` (повторы самого RPC внутри клиента). Опции `publish`: `idempotencyKey`, `partitionKey`, `headers`.
 
-`fn` у `local` получает текущий state-объект: `fn: (state) => Promise<unknown>`.
+## Выражения (JsonExpression)
 
-## Как ссылаться на данные (JsonExpression)
+Поля входа, целей, опций и фильтров принимают выражения, которые runtime вычисляет при активации шага:
 
-Любое поле, помеченное как `JsonExpression`, принимает:
+- строка с `$` — путь: `$.input.userId`, `$.provision.id`, `$.items[0]`, `$.items[*].id` (поле каждого элемента);
+- `{ literal: value }` — значение как есть (для строк, начинающихся с `$`);
+- объект или массив — вычисляется по членам;
+- остальное — литерал.
 
-1. **Literal** — обычное значение (`"hello"`, `42`, `{ ... }`). Объекты обходятся рекурсивно, так что вложенные `$.…` тоже резолвятся.
-2. **Path** — строка вида `$.<сегменты>`:
-   - `$.input.userId` — поле входа run'а.
-   - `$.<stepId>` — **выход шага** целиком (результат лежит в state прямо под id шага, без `.result`).
-   - `$.provision.id` — поле выхода шага `provision`.
-   - `$.items[0].name` — индекс.
-   - `$.items[*].id` — wildcard (для filter / forEach): мапит поле по всем элементам массива.
-3. **Literal-escape** — `{ literal: "$.looks-like-path" }`, чтобы передать строку, которая иначе распарсилась бы как path.
+Отсутствующий путь — «нет значения» (в объекте поле опускается, в массиве `null`). Внутри итерации `forEach` доступны имя `as` и короткие id соседей по итерации.
 
-Missing path резолвится в `undefined` (это не ошибка), а синтаксически неверный path бросает на этапе валидации. Резолв происходит на стороне runner'а перед `beginStep` — runtime получает уже materialized input snapshot.
+Предикат `when`: путь (истинно, если значение есть и не `false`/`0`/`""`/`null`), `{ not }`, `{ equals: [a, b] }`, `{ in: [value, list] }`, `{ and: [...] }`, `{ or: [...] }`.
+
+`wait_event.filter`: ключ — путь в payload события, значение — ожидаемое значение (выражение, вычисляемое при парковке). Совпасть должны все пары.
 
 ## Группы: parallel / sequence / forEach
 
-`forEach` — это **поле** шага `parallel` или `sequence`, а не отдельный тип шага. Без `forEach` группа выполняет свои `steps` один раз; с `forEach` — по разу на каждый элемент массива.
-
-### `parallel`
-
 ```ts
-{
-  type: "parallel",
-  id: "fan_out",
-  steps: [
-    { type: "call", id: "a", service: "svc-a", method: "Do", input: "$.input" },
-    { type: "call", id: "b", service: "svc-b", method: "Do", input: "$.input" },
-  ],
-}
-```
-
-Все `steps` стартуют одновременно (с учётом `maxParallelism`). Группа готова после завершения всех.
-
-### `sequence`
-
-```ts
-{
-  type: "sequence",
-  id: "pipeline",
-  steps: [
-    { type: "call", id: "step1", service: "svc", method: "Step1", input: "$.input" },
-    { type: "call", id: "step2", service: "svc", method: "Step2", input: "$.step1" },
-  ],
-}
-```
-
-### `forEach`
-
-```ts
-{
-  type: "parallel",
-  id: "process_items",
+{ type: "parallel", id: "ship_all",
   forEach: { from: "$.input.items", as: "item" },
   steps: [
-    { type: "call", id: "process", service: "worker", method: "Handle",
-      input: { item: "$.item" } },
-  ],
-}
+    { type: "call", id: "ship", service: "warehouse", method: "Ship", input: { sku: "$.item.sku" } },
+    { type: "local", id: "log", waitFor: ["ship"], fn: (s) => s.ship },
+  ] }
 ```
 
-Для каждого элемента `from` создаётся под-state, в который привязывается значение под именем `forEach.as` (здесь — `$.item`). На `parallel` итерации идут параллельно (в пределах `maxParallelism`), на `sequence` — по порядку. `as` должен матчить `^[a-z0-9_]+$`.
+Для каждого элемента создаются шаги `ship:0`, `log:0`, `ship:1`, ... Выход группы — карта id дочерних шагов → выход (`{ "ship:0": ..., "log:0": ... }`). `sequence` выполняет шаги по порядку (и итерации — одну за другой). Развёртка ограничена 10 000 шагов на прогон.
 
-## Compensation (rollback)
+## Повторы, таймауты, параллельность
 
-Шаг `call` или `publish` может декларировать `compensate` — обратное действие. Поле данных называется `input` (как и у самого шага):
+- `retry` шага (иначе `retry` определения): `maxAttempts`, `baseDelayMs`, `factor`, `maxDelayMs`, `jitter`. Runtime ставит следующую попытку через `min(maxDelayMs, baseDelayMs·factor^(n-1))·(1±jitter)`. Потеря lease попыткой не считается.
+- `timeoutMs` шага — дедлайн: задача получает его и отменяется, runtime помечает шаг `failed` с `TIMEOUT`.
+- `maxParallelism` ограничивает одновременно исполняемые задачи прогона — это делает runtime.
+
+## Компенсации
+
+`compensate` на `call`/`publish` — обратное действие при остановке прогона (падение шага, `cancel`, таймаут):
 
 ```ts
-{
-  type: "call",
-  id: "charge",
-  service: "payments",
-  method: "Charge",
-  input: { amount: "$.input.amount" },
-  compensate: {
-    service: "payments",
-    method: "Refund",
-    input: { chargeId: "$.charge.transactionId" },
-  },
-}
+compensate: { method: "Refund", input: { chargeId: "$.charge.id" }, retry: { maxAttempts: 3 } }
 ```
 
-`compensate` (`CompensateSpec`): `input` обязателен; опционально `type` (`"call"` | `"publish"`, по умолчанию совпадает с типом шага), `service`/`method` (для call), `event` (для publish), `retry`, `idempotencyKey`. Если `service`/`method`/`event` не заданы — берутся из самого шага.
+Без `type` компенсация зеркалит шаг (`call`/`publish`), пустые `service`/`method`/`event` берутся из шага. Runtime отменяет исполняемые задачи и ожидания, отменяет незавершённых детей, затем выполняет компенсации успешных шагов в обратном порядке завершения, каждую — со своей политикой повторов. Компенсированный шаг получает статус `compensated`.
 
-При `cancel` или провале runtime переводит run в `compensating` и шлёт SDK assignment с флагом компенсации. Runner идёт **в обратном порядке** по завершённым шагам и для каждого, у кого есть `compensate` и непустой output, вызывает обратную операцию через `sb.rpc.call` / `sb.event.publish`. Терминальный статус run'а после компенсации: `cancelled` (отмена пользователем) или `failed_compensated` (компенсация после падения шага).
+Итог: `failed` (упал шаг), `cancelled`, `timed_out` — если все компенсации прошли; `failed_compensated` — если какая-то исчерпала попытки (остальные всё равно выполняются). Такой прогон можно повторить: `sb.workflow.retryCompensation(runId)` (или из консоли).
 
-## Caller-side операции
+## Запуск и управление прогоном
 
-Caller-side операции доступны только **после `await sb.start()`** (до привязки gRPC-канала они бросают):
+Доступно после `await sb.start()`.
 
 ```ts
-const { runId } = await sb.workflow.start("onboard-user", { userId: "u-1" }, {
-  idempotencyKey: "onboard:u-1",   // повторный start с тем же ключом вернёт существующий runId
-  timeoutSec: 300,                 // секунды
+const { runId } = await sb.workflow.start("billing", "charge-order", { orderId: "o-1" }, {
+  idempotencyKey: "charge:o-1",
+  timeoutMs: 300_000,
 });
 
-await sb.workflow.signal(runId, "user-approved", { approvedBy: "admin" });
+const { duplicate } = await sb.workflow.signal(runId, "approved", { by: "admin" }, { signalId: "approve-o-1" });
 await sb.workflow.cancel(runId);
-
-// await: server-stream до терминального статуса. Резолвится final state'ом
-// ТОЛЬКО при статусе "success"; на failed/cancelled/failed_compensated — reject.
-const finalState = await sb.workflow.await(runId);
-
-// query: point-in-time снимок. status — строка, state — map, steps — массив.
-const { status, state, steps } = await sb.workflow.query(runId);
-
-// replay: новый run, форкнутый от runId с шага fromStepId ("" = с начала).
-const { runId: replayRunId } = await sb.workflow.replay(runId, { fromStepId: "provision" });
+const output = await sb.workflow.await(runId);            // success → карта выходов
+const snap = await sb.workflow.query(runId);              // статус, waitingReason, шаги, очередь сигналов
+const { runId: again } = await sb.workflow.replay(runId, { fromStepId: "provision" });
+await sb.workflow.retryCompensation(runId);
 ```
 
-Терминальный статус успеха — строка **`success`** (не `completed`/`succeeded`). Полный словарь run-статусов: `pending` / `running` / `waiting` / `success` / `failed` / `cancelling` / `cancelled` / `compensating` / `failed_compensated`. `compensated` — это статус **шага** (в `query().steps[].status`), а не run'а; у такого шага заполнено поле `compensatedBy`.
+- Статусы прогона: `active`, `compensating`, `success`, `failed`, `cancelled`, `timed_out`, `failed_compensated`. Статусы шагов: `pending`, `leased`, `parked`, `success`, `failed`, `compensated`.
+- `waitingReason` объясняет паузу: `no_instance` (нет живого инстанса с этой версией), `retry`, `sleep`, `signal`, `event`, `child`.
+- Сигналы — очередь: два одинаковых сигнала доставляются оба по порядку; `signalId` делает повторную отправку безопасной. Не больше 1000 непрочитанных сигналов на прогон.
+- `await` отклоняется `WorkflowRunFailedError` (`status`, `errorCode`, `errorMessage`) для любого исхода, кроме `success`.
 
-`query().steps[]` содержит: `stepId`, `status`, `output`, `lastError`, опциональный `compensatedBy`.
+| Ошибка | Когда |
+|--------|-------|
+| `WorkflowAccessDeniedError` | Отказ политики или чужой прогон. |
+| `WorkflowNotFoundError` | Нет такого workflow у сервиса или нет прогона. |
+| `WorkflowTerminalError` | `signal`/`cancel` завершённого прогона, `retryCompensation` не `failed_compensated`. |
+| `WorkflowRunFailedError` | `await` завершился не `success`. |
 
-Ошибки caller-side операций:
+## Права
 
-| Класс | Когда |
-|-------|-------|
-| `WorkflowAccessDeniedError` | gate #5 denial: peer не может стартовать/трогать чужой workflow (PERMISSION_DENIED). Поля `workflowName`, `reason`. |
-| `WorkflowNotFoundError` | `start` по незарегистрированному имени workflow (NOT_FOUND). |
-| `WorkflowTerminalError` | операция (`signal` / `cancel`) над уже терминальным run'ом, например `cancel` на `success` (FAILED_PRECONDITION). Поля `runId`, `status`. |
-
-## Access policy
-
-Workflows интегрированы с access policy (ADR-0004):
-
-- **Register-time walk.** При регистрации runtime проходит все `call` / `publish` / `workflow` шаги frozen plan'а и проверяет egress-policy каждого. Warnings приходят в первой `RegistrySnapshot` с `declaration = "workflow.<name>.step.<id>"`.
-- **Bilateral check на caller-side.** Когда peer ≠ owner, `start` / `signal` / `cancel` / `replay` проходят двусторонний check (egress вызывающего + acceptance владельца). По умолчанию — allow; denial → `WorkflowAccessDeniedError` и `policy_violation` с `declaration: "workflow.run"`.
+- `start` проходит двустороннюю проверку политики: egress `workflow.run` вызывающего и acceptance `workflow.handle` владельца.
+- `signal`, `query`, `await`, `cancel`, `replay`, `retryCompensation` разрешены владельцу workflow, сервису, запустившему прогон, и сервису с **явным** правилом egress `workflow.run` на этот workflow (отсутствие правил не считается). Остальные получают `WorkflowAccessDeniedError`.
+- При регистрации runtime проверяет цели шагов по политике и присылает предупреждения (`workflow.step.call` и т. п.).
 
 ## Поведение при сбоях
 
 | Сценарий | Что происходит |
 |----------|----------------|
-| Throw из `call` / `publish` шага | Runner шлёт `failStep` (без retriable-флага со своей стороны). Решение retry / fail / compensate принимает **runtime** по своей policy. |
-| Падение SDK-инстанса между шагами | Heartbeat истекает → runtime инкрементит `lease_epoch` и переотправляет run другому инстансу того же сервиса. Уже выполненные шаги отдают cached output через идемпотентность `beginStep` (он возвращает `alreadyDone`). |
-| Исчерпан retry-policy | Run переходит в `failed`; если есть `compensate`-шаги — runtime запускает компенсацию (итог `failed_compensated`). |
-| `cancel` во время выполнения | Run переходит в `compensating`, выполняется обратный проход по completed-шагам, итог — `cancelled`. |
+| Задача бросила ошибку | `FailTask` с кодом ошибки; runtime повторяет по политике или останавливает прогон. |
+| Инстанс упал во время задачи | Lease истекает, шаг выдаётся другому инстансу. |
+| Инстанс упал во время ожидания | Ничего: ожидание держит runtime, продолжение придёт любому живому инстансу. |
+| Lease потерян во время исполнения | Heartbeat возвращает токен как потерянный, `ctx.signal` срабатывает, результат не отправляется. |
+| Нет инстанса нужной версии | Прогон ждёт с `waitingReason: "no_instance"`. |
 
 ## Шпаргалка
 
 ```ts
-import { ServiceBridge } from "service-bridge";
-
-const sb = new ServiceBridge(url, key);
-
-// Owner side: объявить workflow (до sb.start()).
 sb.workflow.handle("onboard", {
+  version: "1",
   steps: [
-    { type: "call", id: "welcome", service: "email", method: "Send",
-      input: { userId: "$.input.userId" } },
     { type: "call", id: "provision", service: "accounts", method: "Create",
-      input: { userId: "$.input.userId" }, waitFor: ["welcome"],
-      compensate: { service: "accounts", method: "Delete",
-                    input: { id: "$.provision.id" } } },
-    { type: "publish", id: "notify", event: "user.onboarded",
-      input: { userId: "$.input.userId" }, waitFor: ["provision"] },
+      input: { userId: "$.input.userId" },
+      compensate: { method: "Delete", input: { id: "$.provision.id" } } },
+    { type: "wait_signal", id: "approve", signal: "approved", waitFor: ["provision"], timeoutMs: 86_400_000 },
+    { type: "publish", id: "notify", event: "user.onboarded", waitFor: ["approve"],
+      input: { userId: "$.input.userId" } },
   ],
 });
-
 await sb.start();
-
-// Caller side: запустить и дождаться терминального статуса (resolve на "success").
-const { runId } = await sb.workflow.start("onboard", { userId: "u-1" });
-const state = await sb.workflow.await(runId);
+const { runId } = await sb.workflow.start(sb.identity()!.serviceName, "onboard", { userId: "u-1" });
+await sb.workflow.signal(runId, "approved", {});
+const output = await sb.workflow.await(runId);
 ```
 
 → Дальше: [Jobs](./jobs.md) · [Integrations](./integrations.md)

@@ -572,7 +572,11 @@ describe("jobs", () => {
 				maxAttempts: 3,
 			},
 			async () => {
-				const result = await sb1.workflow.start(wfName, {});
+				const result = await sb1.workflow.start(
+					sb2.identity()!.serviceName,
+					wfName,
+					{},
+				);
 				runId = result.runId;
 				handlerCalled = true;
 			},

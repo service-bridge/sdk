@@ -17,10 +17,9 @@ import { InvalidEventNameError } from "./events/errors";
 import {
 	WorkflowAccessDeniedError,
 	WorkflowNotFoundError,
+	WorkflowRunFailedError,
 	WorkflowTerminalError,
 } from "./workflow/errors";
-import { JsonPathError } from "./workflow/jsonpath";
-import { WorkflowValidationError } from "./workflow/validate";
 
 describe("error hierarchy", () => {
 	const errors: [string, ServiceBridgeError, ErrorCode][] = [
@@ -57,14 +56,9 @@ describe("error hierarchy", () => {
 			"TERMINAL",
 		],
 		[
-			"WorkflowValidationError",
-			new WorkflowValidationError("bad graph"),
-			"VALIDATION",
-		],
-		[
-			"JsonPathError",
-			new JsonPathError("unexpected token", "$.["),
-			"VALIDATION",
+			"WorkflowRunFailedError",
+			new WorkflowRunFailedError("run-1", "failed", "X", "boom"),
+			"TERMINAL",
 		],
 	];
 

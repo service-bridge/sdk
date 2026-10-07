@@ -4,7 +4,7 @@
 
 Описание графа workflow: какие бывают шаги, что у них общего, от чего они зависят и какие значения читают из состояния прогона. Пакет — чистая декларация: типы, конструкторы предикатов и два строковых типа, разводящих выражение пути и строковый литерал.
 
-Не делает: не валидирует граф, не сериализует его, не считает отпечаток, не исполняет шаги и не ходит в рантайм. Всё это — `internal/workflow`.
+Не делает: не валидирует граф и не считает отпечаток (это runtime), не кодирует и не исполняет шаги (это `internal/workflow`).
 
 ## Публичный контракт
 
@@ -15,7 +15,7 @@
 | `Path` | `string` (именованный) | `""` | Выражение JSONPath-lite, читаемое из состояния прогона в момент исполнения шага. Грамматика: `$`, дальше любое число сегментов `.field`, `[N]`, `[*]`. `[*]` с последующим `.field` собирает поле каждого элемента в массив. |
 | `Name` | `string` (именованный) | `""` | Литеральное имя, записанное при объявлении. |
 | `Target` | interface | `nil` — отвергается валидацией | На что действует шаг: либо `Name`, либо `Path`. Маркер-метод неэкспортируемый, набор закрыт. |
-| `Predicate` | interface | `nil` — «условия нет, шаг выполняется» | Условие выполнения шага. `Node() any` отдаёт форму, которая едет в графе и которую разбирает раннер. Набор закрыт. |
+| `Predicate` | interface | `nil` — «условия нет, шаг выполняется» | Условие выполнения шага. `Node() any` отдаёт форму, из которой `internal/workflow` кодирует proto-предикат; вычисляет его runtime. Набор закрыт. |
 | `Truthy(p Path)` | `Predicate` | — | Значение по пути присутствует и не равно `false`, нулю или пустой строке. |
 | `Not(p Predicate)` | `Predicate` | — | Отрицание. |
 | `Equals(left, right any)` | `Predicate` | — | Обе стороны разрешаются в одно и то же JSON-значение. Любая сторона может быть `Path`, литералом или деревом из того и другого. |
@@ -28,34 +28,34 @@
 | Имя | Тип | По умолчанию | Что делает |
 |-----|-----|--------------|------------|
 | `Step` | interface | — | Узел графа. `Kind() string`, `Common() Control` и неэкспортируемый маркер. Набор закрыт: снаружи пакета `Step` не реализовать. |
-| `Control` | struct | все поля нулевые | Общее для всех видов: `ID`, `WaitFor`, `When`, `Compensate`, `TimeoutSec`, `Retry`. Встраивается в каждый вид, поэтому `Common()` достаётся ему бесплатно. |
+| `Control` | struct | все поля нулевые | Общее для всех видов: `ID`, `WaitFor`, `When`, `Compensate`, `Timeout` (дедлайн шага), `Retry` (повторы задачи). Встраивается в каждый вид, поэтому `Common()` достаётся ему бесплатно. |
 | `Call` | struct | — | Вызов метода другого сервиса: `Service`, `Method` (`Target`), `Input`, `Opts *CallOpts`. Названный метод должен быть объявлен зависимостью через `servicebridge.NewMethod`; `Input` пишется в форме JSON-зеркала сообщения запроса. |
 | `Publish` | struct | — | Публикация durable-события: `Event` (`Target`), `Input`, `Opts *PublishOpts`. |
-| `Sleep` | struct | — | Durable-таймер в рантайме: `DurationSec int64`. |
-| `WaitEvent` | struct | — | Ожидание события: `Event` (`Target`), `Filter map[string]any`. |
+| `Sleep` | struct | — | Durable-таймер в рантайме: `Duration time.Duration`. |
+| `WaitEvent` | struct | — | Ожидание события: `Event string`, `Filter map[string]any` (путь payload → значение или `Path`). |
 | `WaitSignal` | struct | — | Ожидание внешнего сигнала: `Signal string`. |
-| `SubWorkflow` | struct | — | Запуск другого workflow и ожидание его завершения: `Workflow` (`Target`), `Input`, `Opts *StartOpts`. |
+| `SubWorkflow` | struct | — | Вложенный прогон, который запускает и ждёт runtime: `Service` (`Target`, nil — свой сервис), `Workflow` (`Target`), `Input`, `IdempotencyKey`, `Timeout`. |
 | `Parallel` | struct | — | Группа: все вложенные шаги стартуют разом. `Steps []Step`, `ForEach *ForEach`. |
 | `Sequence` | struct | — | Группа: вложенные шаги идут один за другим. `Steps []Step`, `ForEach *ForEach`. |
 | `Local` | struct | — | Go-функция в объявляющем процессе: `Fn LocalFunc`. Замыкание не переживает сериализацию и в граф не попадает. |
-| `LocalFunc` | `func(ctx context.Context, state map[string]any) (any, error)` | — | Тело локального шага. `ctx` отменяется при отмене прогона и при остановке клиента. |
+| `LocalFunc` | `func(ctx context.Context, state map[string]any) (any, error)` | — | Тело локального шага. `ctx` отменяется при потере lease, дедлайне шага и остановке клиента. |
+| `Task`, `WithTask(ctx, t)`, `TaskOf(ctx)` | struct / func | — | Попытка, которую исполняет `LocalFunc`: `RunID`, `StepID`, `Attempt`. |
 | `KindCall` … `KindLocal` | `string` | — | Дискриминаторы, которые рантайм читает из `type`: `call`, `publish`, `sleep`, `wait_event`, `wait_signal`, `workflow`, `parallel`, `sequence`, `local`. |
 
 ### Определение и политики
 
 | Имя | Тип | По умолчанию | Что делает |
 |-----|-----|--------------|------------|
-| `Definition` | struct | все поля нулевые | Весь workflow: `Input` (JSON Schema входа прогона), `Steps`, `Retry`, `MaxParallelism`, `TimeoutSec`. Нулевое поле в граф не попадает — дефолт остаётся за рантаймом. |
-| `RetryPolicy` | struct | — | `MaxAttempts` (считая первую попытку), `BaseDelay`, `Factor`, `MaxDelay`, `Jitter`. Рантайм читает только `MaxAttempts`. |
-| `Compensation` | struct | — | Обратное действие шага: `Kind`, `Service`, `Method`, `Event`, `Input`, `Retry`, `IdempotencyKey`. Допустима только на `Call` и `Publish`. |
+| `Definition` | struct | все поля нулевые | Весь workflow: `Version`, `Input` (JSON Schema входа прогона), `Steps`, `Retry` (по умолчанию для задач), `MaxParallelism` (одновременных задач прогона), `Timeout` (прогона, затем `timed_out`). |
+| `RetryPolicy` | struct | `MaxAttempts=1`, `BaseDelay=200ms`, `Factor=2`, `MaxDelay=5s` | `MaxAttempts` (считая первую попытку), `BaseDelay`, `Factor`, `MaxDelay`, `Jitter`. Backoff применяет рантайм. |
+| `Compensation` | struct | — | Обратное действие шага: `Kind`, `Service`, `Method`, `Event`, `Input`, `Retry`, `CallOpts`, `PublishOpts`. Допустима только на `Call` и `Publish`. |
 | `CompensationKind` | `string` | пусто — «как у шага» | `CompensateCall`, `CompensatePublish`. |
 | `ForEach` | struct | — | Развёртка группы по списку: `From Path`, `As string` (алфавит идентификатора шага). Свойство группы, не отдельный вид шага. |
 | `CallOpts` | struct | — | `Timeout` (таймаут самого RPC, не шага), `Transport`, `IdempotencyKey`, `RequestID`, `Retry`. |
-| `PublishOpts` | struct | — | `IdempotencyKey`, `PartitionKey`, `FireAndForget`, `Headers`, `OccurredAtMs`. |
-| `StartOpts` | struct | — | `IdempotencyKey`, `TimeoutSec`. Родительский прогон проставляет раннер, в объявлении его нет. |
+| `PublishOpts` | struct | — | `IdempotencyKey`, `PartitionKey`, `Headers`. |
 | `Transport` | `string` | пусто | `TransportAuto`, `TransportDirect`, `TransportProxy`. |
 
-Единицы времени: `TimeoutSec`, `DurationSec`, `StartOpts.TimeoutSec` — секунды, потому что в контракте workflow это `timeout_sec` и `duration_sec`. `CallOpts.Timeout`, `RetryPolicy.BaseDelay` и `RetryPolicy.MaxDelay` — `time.Duration`, на провод уезжают как `int64` миллисекунды с суффиксом `Ms`. `OccurredAtMs` — unix-ms.
+Единицы времени: все длительности — `time.Duration`, на провод уезжают как `int64` миллисекунды (`*_ms`).
 
 ## Приватный контракт
 
@@ -69,17 +69,17 @@
 
 ## Архитектурные решения и почему
 
-**Закрытый набор шагов через неэкспортируемый маркер.** Рантайм разбирает граф и знает ровно девять значений `type` (`runtime/internal/workflow/register.go`). Открытый интерфейс позволил бы объявить десятый вид, который упал бы при регистрации. Маркер объявлен на каждом виде отдельно, а не на встраиваемом `Control`: продвижение неэкспортируемого метода из встроенной структуры сделало бы `Step` любым чужим типом, встроившим `Control`.
+**Закрытый набор шагов через неэкспортируемый маркер.** Рантайм разбирает граф и знает ровно девять значений `type` (`runtime/internal/workflow/plan.go`, oneof `Step.kind` в proto). Открытый интерфейс позволил бы объявить десятый вид, который упал бы при регистрации. Маркер объявлен на каждом виде отдельно, а не на встраиваемом `Control`: продвижение неэкспортируемого метода из встроенной структуры сделало бы `Step` любым чужим типом, встроившим `Control`.
 
 **`Path` — отдельный тип, а не строка.** В SDK, где и путь, и литерал суть строки, литерал вида `"$.foo"` приходится оборачивать в escape-объект вручную. В Go типы разводятся сами: `Path` — выражение, `string` — данные. Escape остаётся, но только на проводе и только в кодировщике — писать его руками не нужно.
 
 **`Target` вместо `any` у имён.** Сервис, метод, событие и имя workflow — это ровно «литерал или путь». Закрытый union ловит третий вариант компилятором, а не валидацией.
 
-**Предикат отдаёт `Node() any`.** У формы предиката один носитель: и отпечаток, и раннер, и валидатор читают одно и то же дерево. Вторая, «внутренняя» форма разошлась бы с проводом на первом же изменении.
+**Предикат отдаёт `Node() any`.** У формы предиката один носитель — кодировщик читает то же дерево, что строят конструкторы; вторая, «внутренняя» форма разошлась бы с проводом.
 
-**`ForEach` — поле группы, а не вид шага.** Так его читает рантайм (`seedStep.ForEach`), и так он и устроен по смыслу: развёртка — это свойство группы, а не работа.
+**`ForEach` — поле группы, а не вид шага.** Так его читает рантайм (`GroupStep.for_each`), и так он и устроен по смыслу: развёртка — это свойство группы, а не работа.
 
-**Замыкание живёт на шаге и не сериализуется.** Локальный шаг опознаётся по `ID`: рантайм присылает назначение, а тело подставляет локально объявленный граф. Поэтому два графа, различающиеся только замыканием, дают один отпечаток — они описывают одну и ту же работу.
+**Замыкание живёт на шаге и не сериализуется.** Локальный шаг опознаётся по `ID` и `Definition.Version`: рантайм присылает задачу, тело подставляет локально объявленный граф. Изменилось тело — меняйте `Version`, иначе старые прогоны исполнят новый код.
 
 **Нулевое поле — отсутствующее поле.** Дефолты держит рантайм. Копия дефолтов в SDK стала бы вторым источником правды и разошлась бы на первой же смене настроек.
 
@@ -87,6 +87,4 @@
 
 Опирается на: стандартную библиотеку (`context`, `time`). Больше ни на что — пакет описательный.
 
-На него опираются: `internal/workflow` (валидация, каноническая форма, вычисление выражений, раннер) и прикладной код, объявляющий workflow.
-
-Set `Definition.Version` explicitly for any graph containing Local functions. Version identifies executable code omitted from JSON. Keep prior versions registered side by side while their frozen runs exist; removal produces terminal unsupported_version for a raced assignment. MaxParallelism zero now defaults to64; positive values must be <=1024.
+На него опираются: `internal/workflow` (кодирование в proto, исполнение задач) и прикладной код, объявляющий workflow.

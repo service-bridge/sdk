@@ -17,16 +17,18 @@ type Definition struct {
 	// pushed down onto those steps when the graph is frozen, because the runtime
 	// reads a retry budget off the step and never off the graph.
 	Retry *RetryPolicy
-	// MaxParallelism caps how many steps of one run execute at once.
+	// MaxParallelism caps how many task steps (local, call, publish) of one run
+	// execute at once. Zero means no cap.
 	MaxParallelism int
-	// TimeoutSec caps the whole run.
-	TimeoutSec int
+	// Timeout caps the whole run; the run then ends timed_out.
+	Timeout time.Duration
 }
 
-// RetryPolicy is the exponential backoff applied to one operation.
+// RetryPolicy is the exponential backoff the runtime applies between attempts:
+// the attempt after n failures waits min(MaxDelay, BaseDelay·Factor^(n-1)),
+// spread by ±Jitter.
 type RetryPolicy struct {
-	// MaxAttempts counts the first try, not only the retries. It is the one
-	// field the runtime reads: it seeds the step's attempt budget at run start.
+	// MaxAttempts counts the first try, not only the retries. Zero means one.
 	MaxAttempts int
 	BaseDelay   time.Duration
 	Factor      float64
@@ -55,9 +57,9 @@ type Compensation struct {
 	Event   Target
 	Input   any
 	Retry   *RetryPolicy
-	// IdempotencyKey is a string or a Path; compensation runs at most once per
-	// key.
-	IdempotencyKey any
+	// CallOpts configures a call compensation, PublishOpts a publish one.
+	CallOpts    *CallOpts
+	PublishOpts *PublishOpts
 }
 
 // ForEach fans a group out over a list. Each element runs the group's steps
@@ -102,18 +104,6 @@ type PublishOpts struct {
 	// PartitionKey is a string or a Path; events sharing one are delivered in
 	// order.
 	PartitionKey any
-	// FireAndForget returns as soon as the event is queued locally.
-	FireAndForget bool
 	// Headers values are strings or Paths.
 	Headers map[string]any
-	// OccurredAtMs is the event time in unix milliseconds. Zero means "now".
-	OccurredAtMs int64
-}
-
-// StartOpts configures the run a workflow step starts. The parent run is set by
-// the runner, not declared here.
-type StartOpts struct {
-	// IdempotencyKey is a string or a Path.
-	IdempotencyKey any
-	TimeoutSec     int
 }

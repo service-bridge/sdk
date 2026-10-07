@@ -17,6 +17,7 @@ import {
   type Metadata,
   type UntypedServiceImplementation,
 } from "@grpc/grpc-js";
+import { WorkflowDefinition } from "./workflows";
 
 export enum MethodType {
   METHOD_TYPE_UNSPECIFIED = 0,
@@ -81,6 +82,12 @@ export interface IncomingMethod {
    * does not recompute. Empty for non-RPC method types (event/workflow/job/http).
    */
   contractHash: string;
+  /**
+   * Workflow definition of a METHOD_TYPE_WORKFLOW method. The runtime
+   * validates it and computes its fingerprint (input/output schema and
+   * contract_hash are unused for workflows).
+   */
+  workflow?: WorkflowDefinition | undefined;
 }
 
 export interface PublishedEvent {
@@ -421,6 +428,7 @@ function createBaseIncomingMethod(): IncomingMethod {
     outputSchemaJson: Buffer.alloc(0),
     streaming: false,
     contractHash: "",
+    workflow: undefined,
   };
 }
 
@@ -443,6 +451,9 @@ export const IncomingMethod: MessageFns<IncomingMethod> = {
     }
     if (message.contractHash !== "") {
       writer.uint32(50).string(message.contractHash);
+    }
+    if (message.workflow !== undefined) {
+      WorkflowDefinition.encode(message.workflow, writer.uint32(58).fork()).join();
     }
     return writer;
   },
@@ -508,6 +519,14 @@ export const IncomingMethod: MessageFns<IncomingMethod> = {
             message.contractHash = reader.string();
             continue;
           }
+          case 7: {
+            if (tag !== 58) {
+              break;
+            }
+
+            message.workflow = WorkflowDefinition.decode(reader, reader.uint32());
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -531,6 +550,9 @@ export const IncomingMethod: MessageFns<IncomingMethod> = {
     message.outputSchemaJson = object.outputSchemaJson ?? Buffer.alloc(0);
     message.streaming = object.streaming ?? false;
     message.contractHash = object.contractHash ?? "";
+    message.workflow = (object.workflow !== undefined && object.workflow !== null)
+      ? WorkflowDefinition.fromPartial(object.workflow)
+      : undefined;
     return message;
   },
 };

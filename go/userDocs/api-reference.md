@@ -292,31 +292,51 @@ func NonRetryable(err error) error
 
 ```go signature
 func (d *WorkflowDomain) Handle(name string, def wf.Definition) error
-func (d *WorkflowDomain) Start(ctx context.Context, name string, input any, opts ...StartOption) (string, error)
-func (d *WorkflowDomain) Signal(ctx context.Context, runID, signal string, payload any) error
+func (d *WorkflowDomain) Start(ctx context.Context, service, name string, input any, opts ...StartOption) (string, error)
+func (d *WorkflowDomain) Signal(ctx context.Context, runID, signal string, payload any, opts ...SignalOption) (bool, error)
 func (d *WorkflowDomain) Cancel(ctx context.Context, runID string) error
 func (d *WorkflowDomain) Await(ctx context.Context, runID string) (map[string]any, error)
 func (d *WorkflowDomain) Query(ctx context.Context, runID string) (RunSnapshot, error)
 func (d *WorkflowDomain) Replay(ctx context.Context, runID, fromStepID string) (string, error)
+func (d *WorkflowDomain) RetryCompensation(ctx context.Context, runID string) error
 
 func WithRunIdempotencyKey(key string) StartOption
-func WithRunTimeoutSec(sec int) StartOption
+func WithRunTimeout(d time.Duration) StartOption
+func WithSignalID(id string) SignalOption
 ```
 
 ```go signature
 type RunSnapshot struct {
-	RunID  string
-	Status string
-	State  map[string]any
-	Steps  []StepSnapshot
+	RunID, Service, Workflow       string
+	Status, StopReason             string
+	WaitingReason                  string
+	Input                          any
+	Output                         map[string]any
+	ErrorCode, ErrorMessage        string
+	ParentRunID                    string
+	StartedAtMs, EndedAtMs         int64
+	Steps                          []StepSnapshot
+	Signals                        []PendingSignal
 }
 
 type StepSnapshot struct {
-	StepID        string
-	Status        string
-	Output        any
-	LastError     string
-	CompensatedBy string
+	StepID, ParentStepID, Kind, Status string
+	Attempt                            int
+	Output                             any
+	ErrorCode, ErrorMessage            string
+	WaitingReason, WaitKey             string
+	ChildRunID, CompensatesStepID      string
+	StartedAtMs, EndedAtMs             int64
+}
+
+type PendingSignal struct {
+	Name, SignalID string
+	Payload        any
+	EnqueuedAtMs   int64
+}
+
+type RunFailedError struct { // Await on a run that did not succeed
+	RunID, Status, ErrorCode, ErrorMessage string
 }
 ```
 
@@ -329,7 +349,7 @@ type Definition struct {
 	Steps          []Step
 	Retry          *RetryPolicy
 	MaxParallelism int
-	TimeoutSec     int
+	Timeout        time.Duration
 }
 
 type Control struct {
@@ -337,12 +357,15 @@ type Control struct {
 	WaitFor    []string
 	When       Predicate
 	Compensate *Compensation
-	TimeoutSec int
+	Timeout    time.Duration
 	Retry      *RetryPolicy
 }
+
+type Task struct{ RunID, StepID string; Attempt int }
+func TaskOf(ctx context.Context) (Task, bool)
 ```
 
-Виды шагов: `Call`, `Publish`, `Sleep`, `WaitEvent`, `WaitSignal`, `SubWorkflow`, `Parallel`, `Sequence`, `Local`. Дискриминаторы: `KindCall`, `KindPublish`, `KindSleep`, `KindWaitEvent`, `KindWaitSignal`, `KindWorkflow`, `KindParallel`, `KindSequence`, `KindLocal`.
+Виды шагов: `Call`, `Publish`, `Sleep` (`Duration`), `WaitEvent` (`Event string`, `Filter`), `WaitSignal`, `SubWorkflow` (`Service`, `Workflow`, `Input`, `IdempotencyKey`, `Timeout`), `Parallel`, `Sequence`, `Local`. Дискриминаторы: `KindCall`, `KindPublish`, `KindSleep`, `KindWaitEvent`, `KindWaitSignal`, `KindWorkflow`, `KindParallel`, `KindSequence`, `KindLocal`.
 
 Выражения и цели: `Path`, `Name`, `Target`.
 
@@ -362,14 +385,7 @@ type CallOpts struct {
 type PublishOpts struct {
 	IdempotencyKey any
 	PartitionKey   any
-	FireAndForget  bool
 	Headers        map[string]any
-	OccurredAtMs   int64
-}
-
-type StartOpts struct {
-	IdempotencyKey any
-	TimeoutSec     int
 }
 
 type RetryPolicy struct {
@@ -381,13 +397,14 @@ type RetryPolicy struct {
 }
 
 type Compensation struct {
-	Kind           CompensationKind
-	Service        Target
-	Method         Target
-	Event          Target
-	Input          any
-	Retry          *RetryPolicy
-	IdempotencyKey any
+	Kind        CompensationKind
+	Service     Target
+	Method      Target
+	Event       Target
+	Input       any
+	Retry       *RetryPolicy
+	CallOpts    *CallOpts
+	PublishOpts *PublishOpts
 }
 
 type ForEach struct {

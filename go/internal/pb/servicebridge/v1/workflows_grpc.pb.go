@@ -20,44 +20,51 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Workflows_Start_FullMethodName        = "/servicebridge.v1.Workflows/Start"
-	Workflows_Cancel_FullMethodName       = "/servicebridge.v1.Workflows/Cancel"
-	Workflows_Signal_FullMethodName       = "/servicebridge.v1.Workflows/Signal"
-	Workflows_Query_FullMethodName        = "/servicebridge.v1.Workflows/Query"
-	Workflows_Await_FullMethodName        = "/servicebridge.v1.Workflows/Await"
-	Workflows_Replay_FullMethodName       = "/servicebridge.v1.Workflows/Replay"
-	Workflows_Subscribe_FullMethodName    = "/servicebridge.v1.Workflows/Subscribe"
-	Workflows_BeginStep_FullMethodName    = "/servicebridge.v1.Workflows/BeginStep"
-	Workflows_CompleteStep_FullMethodName = "/servicebridge.v1.Workflows/CompleteStep"
-	Workflows_CompleteRun_FullMethodName  = "/servicebridge.v1.Workflows/CompleteRun"
-	Workflows_FailStep_FullMethodName     = "/servicebridge.v1.Workflows/FailStep"
-	Workflows_Park_FullMethodName         = "/servicebridge.v1.Workflows/Park"
-	Workflows_Heartbeat_FullMethodName    = "/servicebridge.v1.Workflows/Heartbeat"
+	Workflows_Start_FullMethodName             = "/servicebridge.v1.Workflows/Start"
+	Workflows_Cancel_FullMethodName            = "/servicebridge.v1.Workflows/Cancel"
+	Workflows_Signal_FullMethodName            = "/servicebridge.v1.Workflows/Signal"
+	Workflows_Query_FullMethodName             = "/servicebridge.v1.Workflows/Query"
+	Workflows_Await_FullMethodName             = "/servicebridge.v1.Workflows/Await"
+	Workflows_Replay_FullMethodName            = "/servicebridge.v1.Workflows/Replay"
+	Workflows_RetryCompensation_FullMethodName = "/servicebridge.v1.Workflows/RetryCompensation"
+	Workflows_Subscribe_FullMethodName         = "/servicebridge.v1.Workflows/Subscribe"
+	Workflows_CompleteTask_FullMethodName      = "/servicebridge.v1.Workflows/CompleteTask"
+	Workflows_FailTask_FullMethodName          = "/servicebridge.v1.Workflows/FailTask"
+	Workflows_Heartbeat_FullMethodName         = "/servicebridge.v1.Workflows/Heartbeat"
 )
 
 // WorkflowsClient is the client API for Workflows service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// Workflows — durable workflow execution service.
-// Caller-side RPCs: Start, Cancel, Signal, Query, Await, Replay.
-// Owner-side RPCs: Subscribe, BeginStep, CompleteStep, FailStep, Park, Heartbeat.
+// Workflows — durable workflow execution (runtime ADR 0003).
+//
+// The runtime interprets the workflow DAG. SDKs declare definitions
+// (RegisterRequest.incoming[].workflow), steer runs (caller side) and execute
+// the step tasks the runtime leases to them (owner side).
 type WorkflowsClient interface {
-	// Caller-side
+	// Caller side. Start: bilateral workflow.run / workflow.handle policy. The
+	// rest: the owner service, the service that started the run, or a caller
+	// with an explicit workflow.run policy rule for the workflow.
 	Start(ctx context.Context, in *StartRunRequest, opts ...grpc.CallOption) (*StartRunResponse, error)
 	Cancel(ctx context.Context, in *CancelRunRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
-	Signal(ctx context.Context, in *SignalRunRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
-	Query(ctx context.Context, in *QueryRunRequest, opts ...grpc.CallOption) (*QueryRunResponse, error)
+	Signal(ctx context.Context, in *SignalRunRequest, opts ...grpc.CallOption) (*SignalRunResponse, error)
+	Query(ctx context.Context, in *QueryRunRequest, opts ...grpc.CallOption) (*RunSnapshot, error)
+	// Await sends the run status on subscribe and on every change; the stream
+	// ends after the first terminal status.
 	Await(ctx context.Context, in *AwaitRunRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RunStatusUpdate], error)
 	Replay(ctx context.Context, in *ReplayRunRequest, opts ...grpc.CallOption) (*ReplayRunResponse, error)
-	// Owner-side
-	Subscribe(ctx context.Context, in *SubscribeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RunAssignment], error)
-	BeginStep(ctx context.Context, in *BeginStepRequest, opts ...grpc.CallOption) (*BeginStepResponse, error)
-	CompleteStep(ctx context.Context, in *CompleteStepRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
-	CompleteRun(ctx context.Context, in *CompleteRunRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
-	FailStep(ctx context.Context, in *FailStepRequest, opts ...grpc.CallOption) (*FailStepResponse, error)
-	Park(ctx context.Context, in *ParkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
-	Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// RetryCompensation re-runs the failed compensations of a
+	// failed_compensated run.
+	RetryCompensation(ctx context.Context, in *RetryCompensationRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Owner side. Subscribe streams step tasks to one instance; every task is a
+	// lease on one step attempt identified by task_token.
+	Subscribe(ctx context.Context, in *SubscribeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StepTask], error)
+	CompleteTask(ctx context.Context, in *CompleteTaskRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	FailTask(ctx context.Context, in *FailTaskRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Heartbeat extends the leases of the given tokens and reports the tokens
+	// the runtime no longer recognizes; the SDK aborts those executions.
+	Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
 }
 
 type workflowsClient struct {
@@ -88,9 +95,9 @@ func (c *workflowsClient) Cancel(ctx context.Context, in *CancelRunRequest, opts
 	return out, nil
 }
 
-func (c *workflowsClient) Signal(ctx context.Context, in *SignalRunRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *workflowsClient) Signal(ctx context.Context, in *SignalRunRequest, opts ...grpc.CallOption) (*SignalRunResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(emptypb.Empty)
+	out := new(SignalRunResponse)
 	err := c.cc.Invoke(ctx, Workflows_Signal_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
@@ -98,9 +105,9 @@ func (c *workflowsClient) Signal(ctx context.Context, in *SignalRunRequest, opts
 	return out, nil
 }
 
-func (c *workflowsClient) Query(ctx context.Context, in *QueryRunRequest, opts ...grpc.CallOption) (*QueryRunResponse, error) {
+func (c *workflowsClient) Query(ctx context.Context, in *QueryRunRequest, opts ...grpc.CallOption) (*RunSnapshot, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(QueryRunResponse)
+	out := new(RunSnapshot)
 	err := c.cc.Invoke(ctx, Workflows_Query_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
@@ -137,13 +144,23 @@ func (c *workflowsClient) Replay(ctx context.Context, in *ReplayRunRequest, opts
 	return out, nil
 }
 
-func (c *workflowsClient) Subscribe(ctx context.Context, in *SubscribeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RunAssignment], error) {
+func (c *workflowsClient) RetryCompensation(ctx context.Context, in *RetryCompensationRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, Workflows_RetryCompensation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workflowsClient) Subscribe(ctx context.Context, in *SubscribeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StepTask], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &Workflows_ServiceDesc.Streams[1], Workflows_Subscribe_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
-	x := &grpc.GenericClientStream[SubscribeRequest, RunAssignment]{ClientStream: stream}
+	x := &grpc.GenericClientStream[SubscribeRequest, StepTask]{ClientStream: stream}
 	if err := x.ClientStream.SendMsg(in); err != nil {
 		return nil, err
 	}
@@ -154,61 +171,31 @@ func (c *workflowsClient) Subscribe(ctx context.Context, in *SubscribeRequest, o
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type Workflows_SubscribeClient = grpc.ServerStreamingClient[RunAssignment]
+type Workflows_SubscribeClient = grpc.ServerStreamingClient[StepTask]
 
-func (c *workflowsClient) BeginStep(ctx context.Context, in *BeginStepRequest, opts ...grpc.CallOption) (*BeginStepResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(BeginStepResponse)
-	err := c.cc.Invoke(ctx, Workflows_BeginStep_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *workflowsClient) CompleteStep(ctx context.Context, in *CompleteStepRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *workflowsClient) CompleteTask(ctx context.Context, in *CompleteTaskRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
-	err := c.cc.Invoke(ctx, Workflows_CompleteStep_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, Workflows_CompleteTask_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *workflowsClient) CompleteRun(ctx context.Context, in *CompleteRunRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *workflowsClient) FailTask(ctx context.Context, in *FailTaskRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
-	err := c.cc.Invoke(ctx, Workflows_CompleteRun_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, Workflows_FailTask_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *workflowsClient) FailStep(ctx context.Context, in *FailStepRequest, opts ...grpc.CallOption) (*FailStepResponse, error) {
+func (c *workflowsClient) Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(FailStepResponse)
-	err := c.cc.Invoke(ctx, Workflows_FailStep_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *workflowsClient) Park(ctx context.Context, in *ParkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(emptypb.Empty)
-	err := c.cc.Invoke(ctx, Workflows_Park_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *workflowsClient) Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(emptypb.Empty)
+	out := new(HeartbeatResponse)
 	err := c.cc.Invoke(ctx, Workflows_Heartbeat_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
@@ -220,25 +207,34 @@ func (c *workflowsClient) Heartbeat(ctx context.Context, in *HeartbeatRequest, o
 // All implementations should embed UnimplementedWorkflowsServer
 // for forward compatibility.
 //
-// Workflows — durable workflow execution service.
-// Caller-side RPCs: Start, Cancel, Signal, Query, Await, Replay.
-// Owner-side RPCs: Subscribe, BeginStep, CompleteStep, FailStep, Park, Heartbeat.
+// Workflows — durable workflow execution (runtime ADR 0003).
+//
+// The runtime interprets the workflow DAG. SDKs declare definitions
+// (RegisterRequest.incoming[].workflow), steer runs (caller side) and execute
+// the step tasks the runtime leases to them (owner side).
 type WorkflowsServer interface {
-	// Caller-side
+	// Caller side. Start: bilateral workflow.run / workflow.handle policy. The
+	// rest: the owner service, the service that started the run, or a caller
+	// with an explicit workflow.run policy rule for the workflow.
 	Start(context.Context, *StartRunRequest) (*StartRunResponse, error)
 	Cancel(context.Context, *CancelRunRequest) (*emptypb.Empty, error)
-	Signal(context.Context, *SignalRunRequest) (*emptypb.Empty, error)
-	Query(context.Context, *QueryRunRequest) (*QueryRunResponse, error)
+	Signal(context.Context, *SignalRunRequest) (*SignalRunResponse, error)
+	Query(context.Context, *QueryRunRequest) (*RunSnapshot, error)
+	// Await sends the run status on subscribe and on every change; the stream
+	// ends after the first terminal status.
 	Await(*AwaitRunRequest, grpc.ServerStreamingServer[RunStatusUpdate]) error
 	Replay(context.Context, *ReplayRunRequest) (*ReplayRunResponse, error)
-	// Owner-side
-	Subscribe(*SubscribeRequest, grpc.ServerStreamingServer[RunAssignment]) error
-	BeginStep(context.Context, *BeginStepRequest) (*BeginStepResponse, error)
-	CompleteStep(context.Context, *CompleteStepRequest) (*emptypb.Empty, error)
-	CompleteRun(context.Context, *CompleteRunRequest) (*emptypb.Empty, error)
-	FailStep(context.Context, *FailStepRequest) (*FailStepResponse, error)
-	Park(context.Context, *ParkRequest) (*emptypb.Empty, error)
-	Heartbeat(context.Context, *HeartbeatRequest) (*emptypb.Empty, error)
+	// RetryCompensation re-runs the failed compensations of a
+	// failed_compensated run.
+	RetryCompensation(context.Context, *RetryCompensationRequest) (*emptypb.Empty, error)
+	// Owner side. Subscribe streams step tasks to one instance; every task is a
+	// lease on one step attempt identified by task_token.
+	Subscribe(*SubscribeRequest, grpc.ServerStreamingServer[StepTask]) error
+	CompleteTask(context.Context, *CompleteTaskRequest) (*emptypb.Empty, error)
+	FailTask(context.Context, *FailTaskRequest) (*emptypb.Empty, error)
+	// Heartbeat extends the leases of the given tokens and reports the tokens
+	// the runtime no longer recognizes; the SDK aborts those executions.
+	Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
 }
 
 // UnimplementedWorkflowsServer should be embedded to have
@@ -254,10 +250,10 @@ func (UnimplementedWorkflowsServer) Start(context.Context, *StartRunRequest) (*S
 func (UnimplementedWorkflowsServer) Cancel(context.Context, *CancelRunRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method Cancel not implemented")
 }
-func (UnimplementedWorkflowsServer) Signal(context.Context, *SignalRunRequest) (*emptypb.Empty, error) {
+func (UnimplementedWorkflowsServer) Signal(context.Context, *SignalRunRequest) (*SignalRunResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Signal not implemented")
 }
-func (UnimplementedWorkflowsServer) Query(context.Context, *QueryRunRequest) (*QueryRunResponse, error) {
+func (UnimplementedWorkflowsServer) Query(context.Context, *QueryRunRequest) (*RunSnapshot, error) {
 	return nil, status.Error(codes.Unimplemented, "method Query not implemented")
 }
 func (UnimplementedWorkflowsServer) Await(*AwaitRunRequest, grpc.ServerStreamingServer[RunStatusUpdate]) error {
@@ -266,25 +262,19 @@ func (UnimplementedWorkflowsServer) Await(*AwaitRunRequest, grpc.ServerStreaming
 func (UnimplementedWorkflowsServer) Replay(context.Context, *ReplayRunRequest) (*ReplayRunResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Replay not implemented")
 }
-func (UnimplementedWorkflowsServer) Subscribe(*SubscribeRequest, grpc.ServerStreamingServer[RunAssignment]) error {
+func (UnimplementedWorkflowsServer) RetryCompensation(context.Context, *RetryCompensationRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method RetryCompensation not implemented")
+}
+func (UnimplementedWorkflowsServer) Subscribe(*SubscribeRequest, grpc.ServerStreamingServer[StepTask]) error {
 	return status.Error(codes.Unimplemented, "method Subscribe not implemented")
 }
-func (UnimplementedWorkflowsServer) BeginStep(context.Context, *BeginStepRequest) (*BeginStepResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method BeginStep not implemented")
+func (UnimplementedWorkflowsServer) CompleteTask(context.Context, *CompleteTaskRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method CompleteTask not implemented")
 }
-func (UnimplementedWorkflowsServer) CompleteStep(context.Context, *CompleteStepRequest) (*emptypb.Empty, error) {
-	return nil, status.Error(codes.Unimplemented, "method CompleteStep not implemented")
+func (UnimplementedWorkflowsServer) FailTask(context.Context, *FailTaskRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method FailTask not implemented")
 }
-func (UnimplementedWorkflowsServer) CompleteRun(context.Context, *CompleteRunRequest) (*emptypb.Empty, error) {
-	return nil, status.Error(codes.Unimplemented, "method CompleteRun not implemented")
-}
-func (UnimplementedWorkflowsServer) FailStep(context.Context, *FailStepRequest) (*FailStepResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method FailStep not implemented")
-}
-func (UnimplementedWorkflowsServer) Park(context.Context, *ParkRequest) (*emptypb.Empty, error) {
-	return nil, status.Error(codes.Unimplemented, "method Park not implemented")
-}
-func (UnimplementedWorkflowsServer) Heartbeat(context.Context, *HeartbeatRequest) (*emptypb.Empty, error) {
+func (UnimplementedWorkflowsServer) Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Heartbeat not implemented")
 }
 func (UnimplementedWorkflowsServer) testEmbeddedByValue() {}
@@ -408,103 +398,67 @@ func _Workflows_Replay_Handler(srv interface{}, ctx context.Context, dec func(in
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Workflows_RetryCompensation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RetryCompensationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkflowsServer).RetryCompensation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Workflows_RetryCompensation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkflowsServer).RetryCompensation(ctx, req.(*RetryCompensationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Workflows_Subscribe_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(SubscribeRequest)
 	if err := stream.RecvMsg(m); err != nil {
 		return err
 	}
-	return srv.(WorkflowsServer).Subscribe(m, &grpc.GenericServerStream[SubscribeRequest, RunAssignment]{ServerStream: stream})
+	return srv.(WorkflowsServer).Subscribe(m, &grpc.GenericServerStream[SubscribeRequest, StepTask]{ServerStream: stream})
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type Workflows_SubscribeServer = grpc.ServerStreamingServer[RunAssignment]
+type Workflows_SubscribeServer = grpc.ServerStreamingServer[StepTask]
 
-func _Workflows_BeginStep_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(BeginStepRequest)
+func _Workflows_CompleteTask_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CompleteTaskRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(WorkflowsServer).BeginStep(ctx, in)
+		return srv.(WorkflowsServer).CompleteTask(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: Workflows_BeginStep_FullMethodName,
+		FullMethod: Workflows_CompleteTask_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(WorkflowsServer).BeginStep(ctx, req.(*BeginStepRequest))
+		return srv.(WorkflowsServer).CompleteTask(ctx, req.(*CompleteTaskRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Workflows_CompleteStep_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(CompleteStepRequest)
+func _Workflows_FailTask_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FailTaskRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(WorkflowsServer).CompleteStep(ctx, in)
+		return srv.(WorkflowsServer).FailTask(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: Workflows_CompleteStep_FullMethodName,
+		FullMethod: Workflows_FailTask_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(WorkflowsServer).CompleteStep(ctx, req.(*CompleteStepRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _Workflows_CompleteRun_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(CompleteRunRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(WorkflowsServer).CompleteRun(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Workflows_CompleteRun_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(WorkflowsServer).CompleteRun(ctx, req.(*CompleteRunRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _Workflows_FailStep_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(FailStepRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(WorkflowsServer).FailStep(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Workflows_FailStep_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(WorkflowsServer).FailStep(ctx, req.(*FailStepRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _Workflows_Park_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ParkRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(WorkflowsServer).Park(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Workflows_Park_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(WorkflowsServer).Park(ctx, req.(*ParkRequest))
+		return srv.(WorkflowsServer).FailTask(ctx, req.(*FailTaskRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -555,24 +509,16 @@ var Workflows_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Workflows_Replay_Handler,
 		},
 		{
-			MethodName: "BeginStep",
-			Handler:    _Workflows_BeginStep_Handler,
+			MethodName: "RetryCompensation",
+			Handler:    _Workflows_RetryCompensation_Handler,
 		},
 		{
-			MethodName: "CompleteStep",
-			Handler:    _Workflows_CompleteStep_Handler,
+			MethodName: "CompleteTask",
+			Handler:    _Workflows_CompleteTask_Handler,
 		},
 		{
-			MethodName: "CompleteRun",
-			Handler:    _Workflows_CompleteRun_Handler,
-		},
-		{
-			MethodName: "FailStep",
-			Handler:    _Workflows_FailStep_Handler,
-		},
-		{
-			MethodName: "Park",
-			Handler:    _Workflows_Park_Handler,
+			MethodName: "FailTask",
+			Handler:    _Workflows_FailTask_Handler,
 		},
 		{
 			MethodName: "Heartbeat",

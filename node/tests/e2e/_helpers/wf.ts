@@ -5,6 +5,7 @@
 
 import type { ServiceBridge } from "../../../src/connection/service-bridge";
 import type { WorkflowsClient } from "../../../src/pb/servicebridge/v1/workflows";
+import type { RunSnapshot } from "../../../src/workflow/types";
 import { sleep } from "./fixtures";
 import { addRule, withDb } from "./policy-db";
 
@@ -31,15 +32,17 @@ const RETRYABLE_START_ERRORS = new Set([
 
 export async function startWorkflowWhenAllowed(
 	caller: ServiceBridge,
+	owner: ServiceBridge | string,
 	wfName: string,
 	input: unknown,
 	timeoutMs = 15_000,
 ): Promise<{ runId: string }> {
 	const deadline = Date.now() + timeoutMs;
+	const service = typeof owner === "string" ? owner : svcName(owner);
 	let lastErr: unknown;
 	for (;;) {
 		try {
-			return await caller.workflow.start(wfName, input);
+			return await caller.workflow.start(service, wfName, input);
 		} catch (err) {
 			if (!RETRYABLE_START_ERRORS.has((err as Error)?.name)) throw err;
 			lastErr = err;
@@ -73,42 +76,45 @@ export async function awaitRunStatus(
 	);
 }
 
-// LeaseRow — the lease-bearing columns of a workflow_runs row. Lease state has
-// no wire representation (Query returns status + steps only), so the lease
-// tests read it straight from Postgres.
-export interface LeaseRow {
-	status: string;
-	leaseEpoch: number;
-	leaseHolderInstanceId: string | null;
-	leaseExpiresAtMs: number | null;
+// svcName is the registered service name of a connected client.
+export function svcName(sb: ServiceBridge): string {
+	const id = sb.identity();
+	if (!id) throw new Error("svcName: client not connected");
+	return id.serviceName;
 }
 
-export async function leaseOf(runId: string): Promise<LeaseRow> {
-	return withDb(async (sql) => {
-		const rows = (await sql`
-			SELECT status,
-			       lease_epoch,
-			       lease_holder_instance_id,
-			       lease_expires_at
-			  FROM workflow_runs
-			 WHERE id = ${runId}
-		`) as Array<{
-			status: string;
-			lease_epoch: string | number;
-			lease_holder_instance_id: string | null;
-			lease_expires_at: Date | null;
-		}>;
-		const row = rows[0];
-		if (!row) throw new Error(`leaseOf(${runId}): run not in DB`);
-		return {
-			status: row.status,
-			leaseEpoch: Number(row.lease_epoch),
-			leaseHolderInstanceId: row.lease_holder_instance_id,
-			leaseExpiresAtMs: row.lease_expires_at
-				? row.lease_expires_at.getTime()
-				: null,
-		};
-	});
+// stateOf rebuilds the step-output map of a run snapshot: the run output on
+// success, every step's output otherwise.
+export function stateOf(q: RunSnapshot): Record<string, unknown> {
+	if (q.output) return q.output;
+	return Object.fromEntries(q.steps.map((s) => [s.stepId, s.output]));
+}
+
+// isParked reports a run that is waiting on the runtime (sleep, signal,
+// event, child) rather than executing.
+export function isParked(q: RunSnapshot): boolean {
+	return (
+		q.status === "active" &&
+		["sleep", "signal", "event", "child"].includes(q.waitingReason)
+	);
+}
+
+// awaitParked waits until the run is parked on the runtime.
+export async function awaitParked(
+	sb: ServiceBridge,
+	runId: string,
+	timeoutMs = 10_000,
+): Promise<RunSnapshot> {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		const q = await sb.workflow.query(runId);
+		if (isParked(q)) return q;
+		if (Date.now() >= deadline)
+			throw new Error(
+				`awaitParked(${runId}): status=${q.status} waiting=${q.waitingReason}`,
+			);
+		await sleep(50);
+	}
 }
 
 // stepStatus returns a workflow_steps row status, or null when the step row
@@ -126,43 +132,20 @@ export async function stepStatus(
 	});
 }
 
-// forceLeaseReclaim expires the lease in place, leaving status and holder
-// untouched. This is what a dead holder looks like to the runtime: the
-// LeaseManager sweep (running/waiting) and the dispatcher's stale-compensating
-// sweep both key off lease_expires_at <= now(), so this drives the real reclaim
-// paths instead of simulating their outcome.
-export async function forceLeaseReclaim(runId: string): Promise<void> {
+// expireTaskLeases expires every leased step of the run in place — what a dead
+// holder looks like to the runtime; the dispatcher re-leases the steps.
+export async function expireTaskLeases(runId: string): Promise<void> {
 	await withDb(async (sql) => {
 		await sql`
-			UPDATE workflow_runs
+			UPDATE workflow_steps
 			   SET lease_expires_at = now() - interval '1 minute'
-			 WHERE id = ${runId}
-		`;
-	});
-}
-
-// reclaimLeaseNow applies the LeaseManager's running-run reclaim outcome
-// synchronously: bump lease_epoch (fencing the current holder), drop the holder
-// and hand the run back to the dispatcher as 'pending'. Used where the test must
-// observe the fenced holder BEFORE the reclaim sweep's own interval elapses.
-export async function reclaimLeaseNow(runId: string): Promise<void> {
-	await withDb(async (sql) => {
-		await sql`
-			UPDATE workflow_runs
-			   SET lease_epoch              = lease_epoch + 1,
-			       lease_holder_instance_id = NULL,
-			       lease_expires_at         = NULL,
-			       status                   = 'pending'
-			 WHERE id = ${runId}
-			   AND status IN ('running', 'waiting')
+			 WHERE run_id = ${runId} AND status = 'leased'
 		`;
 	});
 }
 
 // workflowsWire exposes the WorkflowsClient a connected ServiceBridge already
-// owns. The checkpoint RPCs (BeginStep/CompleteStep/FailStep/Heartbeat) carry
-// lease_epoch and are the surface fencing acts on, but the SDK only ever calls
-// them from inside its runner — a fencing test has to issue them itself.
+// owns, for tests that issue task RPCs (CompleteTask/Heartbeat) themselves.
 export function workflowsWire(sb: ServiceBridge): WorkflowsClient {
 	const client = (sb as unknown as { _workflowsClient: WorkflowsClient | null })
 		._workflowsClient;
@@ -172,8 +155,7 @@ export function workflowsWire(sb: ServiceBridge): WorkflowsClient {
 	return client;
 }
 
-// GRPC_ABORTED — the code the runtime answers a fenced checkpoint with
-// (ErrLeaseFenced → codes.Aborted).
+// GRPC_ABORTED — the code the runtime answers a lost task lease with.
 export const GRPC_ABORTED = 10;
 
 // grpcCodeOf runs `call` and returns the gRPC status code it failed with, or

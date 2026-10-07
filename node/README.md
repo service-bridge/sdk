@@ -247,8 +247,8 @@ sb.on("connected", ({ serviceName }) => console.log(`up as ${serviceName}`));
 
 await sb.start();
 
-// Kick off a run and wait for the final state.
-const { runId } = await sb.workflow.start("checkout", { orderId: "o-1" });
+// Kick off a run and wait for its output.
+const { runId } = await sb.workflow.start(sb.identity()!.serviceName, "checkout", { orderId: "o-1" });
 const state = await sb.workflow.await(runId);
 console.log("done", state);
 ```
@@ -440,21 +440,22 @@ sb.workflow.handle("checkout", {
 });
 ```
 
-Top-level steps run in parallel by default; `waitFor` declares dependencies and defines the execution levels. Step types: `call`, `publish`, `sleep`, `wait_event`, `wait_signal`, `workflow` (sub-workflow), `parallel`, `sequence`, `local`. Inputs are JSON-path expressions (`"$.input"`, `"$.reserve.id"`) over the accumulated run state.
+Top-level steps run in parallel by default; `waitFor` declares dependencies. The runtime interprets the graph — readiness, timers, waits, child runs, retries and compensation — and leases task steps (`local`, `call`, `publish`, compensations) to an instance of the owner service. Step types: `call`, `publish`, `sleep`, `wait_event`, `wait_signal`, `workflow` (sub-workflow), `parallel`, `sequence`, `local`. Inputs are JSON-path expressions (`"$.input"`, `"$.reserve.id"`) the runtime resolves against run state.
 
 Driving a run:
 
 ```ts
-const { runId } = await sb.workflow.start("checkout", { orderId: "o-1" });
+const { runId } = await sb.workflow.start("orders", "checkout", { orderId: "o-1" });
 
-const state = await sb.workflow.await(runId);          // block until terminal
-const snap  = await sb.workflow.query(runId);          // { status, state, steps: [...] }
-await sb.workflow.signal(runId, "approval", { ok: 1 }); // resume a wait_signal step
-await sb.workflow.cancel(runId);                        // compensate in reverse
+const output = await sb.workflow.await(runId);         // output on success, WorkflowRunFailedError otherwise
+const snap   = await sb.workflow.query(runId);         // { status, waitingReason, steps, signals, ... }
+await sb.workflow.signal(runId, "approval", { ok: 1 }, { signalId: "approve-o-1" }); // queued, deduped by id
+await sb.workflow.cancel(runId);                       // compensate in reverse, ends cancelled
 const { runId: forked } = await sb.workflow.replay(runId, { fromStepId: "charge" });
+await sb.workflow.retryCompensation(runId);            // re-run failed compensations of a failed_compensated run
 ```
 
-Use `sb.workflow.query()` for the snapshot — there is no `getStatus`. `start()` with no permission throws `WorkflowAccessDeniedError`; an unknown name throws `WorkflowNotFoundError`; signalling/cancelling a finished run throws `WorkflowTerminalError`.
+Use `sb.workflow.query()` for the snapshot — there is no `getStatus`. `start()` with no permission throws `WorkflowAccessDeniedError`; an unknown name throws `WorkflowNotFoundError`; signalling/cancelling a finished run throws `WorkflowTerminalError`. Signal/query/await/cancel are allowed for the owner, the service that started the run and callers with an explicit `workflow.run` rule.
 
 ### Streaming
 

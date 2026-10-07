@@ -51,4 +51,4 @@
 ## Зависимости
 
 - Использует: ничего (`reconnect-ladder` — только `Math`; `semaphore` — только `Promise`/`AbortSignal`).
-- Используется: `sdk/node/src/events/subscriber.ts`, `sdk/node/src/job/subscriber.ts`, `sdk/node/src/workflow/subscriber.ts`, `sdk/node/src/registry/watch.ts`, `sdk/node/src/telemetry/transport.ts` (`reconnect-ladder`); `sdk/node/src/rpc/server.ts` (`semaphore`).
+- Используется: `sdk/node/src/events/subscriber.ts`, `sdk/node/src/job/subscriber.ts`, `sdk/node/src/workflow/executor.ts`, `sdk/node/src/registry/watch.ts`, `sdk/node/src/telemetry/transport.ts` (`reconnect-ladder`); `sdk/node/src/rpc/server.ts` (`semaphore`).

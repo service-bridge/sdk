@@ -102,6 +102,7 @@ new ServiceBridge(url: string, key: string, options?: ServiceBridgeOptions)
 - **Изоляция слушателей (NSDK-13).** Исключение в `sb.on(...)` логируется и не ломает ни бридж, ни другие слушатели.
 - **CSR без `@peculiar/x509`.** PKCS#10 для P-256 — несколько десятков строк DER поверх WebCrypto; библиотека тянула `reflect-metadata` глобально (NSDK-15).
 - **Identity читается по требованию.** Логгер, метрики, подписчики и транспорты получают геттеры: идентичность появляется на Welcome (и меняется только при свежем Provision после долгого простоя).
+- **Workflow-исполнитель**: `maybeStartWorkflowExecutor()` запускает `WorkflowExecutor` и передаёт `wrapSpan`, открывающий `USER.SUBOP` только вокруг локального шага и компенсации (`meta`: `step_id`, `workflow_run_id`, для компенсации `is_compensation: true` + `compensates_for_step_id`). Call/publish-шаги спана не получают: их RPC.CALL / EVENT.PUBLISH висит под корнем прогона.
 
 ## Зависимости
 

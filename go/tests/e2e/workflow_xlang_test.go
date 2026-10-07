@@ -4,86 +4,18 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	servicebridge "github.com/service-bridge/sdk/go"
-	intwf "github.com/service-bridge/sdk/go/internal/workflow"
 	"github.com/service-bridge/sdk/go/tests/e2e/e2epb"
 	wf "github.com/service-bridge/sdk/go/workflow"
 )
 
-// The runtime parses and validates the canonical workflow graph
-// (runtime/internal/workflow/register.go): the serialized shape the Go DSL
-// produces has to match what the Node SDK writes for the same graph, byte for
-// byte, because the persisted `graph` column and the `fingerprint` the runtime
-// stores are exactly those bytes and their hash. These tests close two gaps
-// left uncovered by workflow_test.go (same-language only) and crosslang_test.go
-// (RPC/events only, no workflow orchestration): a workflow declared in one
-// language reaching a step in the other, and canonical-byte agreement for an
-// equivalent graph.
-
-// TestWorkflowCanonicalFingerprintMatchesAcrossLanguages proves
-// go/internal/workflow/canonical.go and node/src/workflow/canonical.ts render
-// the identical canonical JSON — and therefore the identical fingerprint — for
-// the same graph. It needs no runtime: both sides are pure functions of the
-// declared graph, so this is the most direct test of the actual risk (a key
-// renamed, a field re-cased, a value re-typed silently changes contract_hash on
-// one side only) without a live registration's error message standing between
-// the assertion and the cause.
-func TestWorkflowCanonicalFingerprintMatchesAcrossLanguages(t *testing.T) {
-	ctx := testContext(t, time.Minute)
-
-	def := wf.Definition{Version: "test-v1",
-		Steps: []wf.Step{
-			wf.Call{
-				Control: wf.Control{ID: "invoke"},
-				Service: wf.Name("billing-svc"),
-				Method:  wf.Name("Charge"),
-				Input: map[string]any{
-					"amount":   4200,
-					"currency": "USD",
-					"orderId":  "ord-77",
-				},
-			},
-		},
-	}
-	frozen, err := intwf.Freeze("xlang-fingerprint-check", def)
-	if err != nil {
-		t.Fatalf("freeze Go graph: %v", err)
-	}
-
-	// The exact JS object node/src/workflow/domain.ts::handle builds before
-	// calling canonicalize/fingerprint: {graph, retry?, maxParallelism?,
-	// timeoutSec?, inputSchema?} with every absent field omitted. This graph
-	// declares none of them, so only "graph" is present — mirroring what Go's
-	// Freeze leaves in root when Definition carries no Retry/MaxParallelism/
-	// TimeoutSec/Input.
-	nodeGraph := map[string]any{"version": "test-v1",
-		"graph": []map[string]any{
-			{
-				"id":      "invoke",
-				"type":    "call",
-				"service": "billing-svc",
-				"method":  "Charge",
-				"input": map[string]any{
-					"amount":   4200,
-					"currency": "USD",
-					"orderId":  "ord-77",
-				},
-			},
-		},
-	}
-	nodeCanonical, nodeFingerprint := nodeWorkflowFingerprint(ctx, t, nodeGraph)
-
-	if string(frozen.JSON) != nodeCanonical {
-		t.Fatalf("canonical graphs differ:\n  go:   %s\n  node: %s", frozen.JSON, nodeCanonical)
-	}
-	if frozen.Fingerprint != nodeFingerprint {
-		t.Fatalf("fingerprints differ for byte-identical graphs (should be unreachable): go=%s node=%s",
-			frozen.Fingerprint, nodeFingerprint)
-	}
-}
+// A workflow declared in one language reaches a step served by the other, and
+// the same graph declared by both SDKs freezes to the same runtime fingerprint
+// (the runtime computes it; neither SDK canonicalizes anything).
 
 // TestWorkflowGoCallStepReachesNodeService closes the mirror of the case below:
 // a Go-declared workflow whose step calls a method a Node instance handles. The
@@ -123,7 +55,7 @@ func TestWorkflowGoCallStepReachesNodeService(t *testing.T) {
 	start(ctx, t, owner)
 	waitForMethod(ctx, t, owner, callee, method)
 
-	runID, err := owner.Workflow.Start(ctx, workflowName, map[string]any{})
+	runID, err := owner.Workflow.Start(ctx, serviceName(domainXLang, 3), workflowName, map[string]any{})
 	if err != nil {
 		t.Fatalf("start run: %v", err)
 	}
@@ -176,6 +108,24 @@ func TestWorkflowNodeCallStepReachesGoService(t *testing.T) {
 	if err != nil {
 		t.Fatalf("declare handler: %v", err)
 	}
+	// The same graph the agent declares, declared in Go under another name: the
+	// runtime must freeze both to one fingerprint (it computes it; neither SDK
+	// canonicalizes anything).
+	twin := workflowName + ".go"
+	if _, err := servicebridge.NewMethod[*e2epb.Echo, *e2epb.EchoReply](servicebridge.NewClient(provider, callee), method); err != nil {
+		t.Fatalf("declare dependency: %v", err)
+	}
+	if err := provider.Workflow.Handle(twin, wf.Definition{Version: "test-v1", Steps: []wf.Step{
+		wf.Call{
+			Control: wf.Control{ID: "call_target"},
+			Service: wf.Name(callee),
+			Method:  wf.Name(method),
+			Input:   map[string]any{"text": "from-node-workflow", "n": 77},
+			Opts:    &wf.CallOpts{Transport: wf.TransportProxy, Timeout: 20 * time.Second},
+		},
+	}}); err != nil {
+		t.Fatalf("declare twin workflow: %v", err)
+	}
 	start(ctx, t, provider)
 
 	cfg := newAgentConfig(t)
@@ -188,6 +138,13 @@ func TestWorkflowNodeCallStepReachesGoService(t *testing.T) {
 	callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	agent.awaitMethod(callCtx, t, callee, method)
+
+	rows := waitRows(ctx, t, rowTimeout, "both definitions", fmt.Sprintf(
+		`SELECT name, fingerprint FROM workflow_definitions WHERE name IN (%s, %s)`,
+		lit(t, workflowName), lit(t, twin)), 2)
+	if str(rows[0], "fingerprint") != str(rows[1], "fingerprint") {
+		t.Fatalf("the same graph froze to different fingerprints: %v", rows)
+	}
 
 	runID, err := agent.startWorkflow(callCtx, workflowName, map[string]any{})
 	if err != nil {

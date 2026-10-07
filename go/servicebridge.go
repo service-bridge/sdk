@@ -56,7 +56,7 @@ type Client struct {
 	callSchemas *registry.CallSchemas
 
 	graphMu sync.RWMutex
-	graphs  map[string][]wf.Step
+	graphs  map[string]localWorkflow
 
 	// Telemetry core. Built first because every other component records
 	// through it.
@@ -100,7 +100,7 @@ type Client struct {
 
 	// Jobs and workflows.
 	jobSub *jobi.Subscriber
-	wfSub  *wfi.Subscriber
+	wfExec *wfi.Executor
 	wfCall *wfi.Caller
 
 	// Job declares scheduled work. Workflow declares and steers runs.
@@ -155,7 +155,7 @@ func New(url, key string, opts ...Option) (*Client, error) {
 		dispatch:    rpc.NewDispatcher(cfg.logger),
 		jobDecls:    jobi.NewDeclarations(),
 		callSchemas: registry.NewCallSchemas(),
-		graphs:      map[string][]wf.Step{},
+		graphs:      map[string]localWorkflow{},
 		creds:       connection.NewCredentialRegistry(),
 	}
 
@@ -391,36 +391,21 @@ func (c *Client) buildDomains() error {
 	}
 	c.wfCall = caller
 
-	checkpoints, err := wfi.NewCheckpoints(wfi.CheckpointConfig{
-		Clients:  c.workflowCh,
-		Identity: c.workflowIdentity,
+	wfExec, err := wfi.NewExecutor(wfi.ExecutorConfig{
+		Clients:     c.workflowCh,
+		Identity:    c.workflowIdentity,
+		Definitions: (*executor)(c),
+		Effects:     (*executor)(c),
+		WrapSpan:    c.wrapSpan,
+		ErrorCode:   taskErrorCode,
+		Backoff:     c.backoff(),
+		OnError:     func(err error) { c.log.Warn("workflow executor failed", "error", err) },
+		Logger:      c.log,
 	})
 	if err != nil {
 		return err
 	}
-	runner, err := wfi.NewRunner(wfi.RunnerConfig{
-		Ops:      checkpoints,
-		Executor: (*executor)(c),
-		WrapStep: c.wrapStep,
-		Logger:   c.log,
-	})
-	if err != nil {
-		return err
-	}
-	wfSub, err := wfi.NewSubscriber(wfi.SubscriberConfig{
-		Clients:  c.workflowCh,
-		Identity: c.workflowIdentity,
-		Graphs:   c,
-		Runner:   runner,
-		Ops:      checkpoints,
-		Backoff:  c.backoff(),
-		OnError:  func(err error) { c.log.Warn("workflow stream failed", "error", err) },
-		Logger:   c.log,
-	})
-	if err != nil {
-		return err
-	}
-	c.wfSub = wfSub
+	c.wfExec = wfExec
 
 	tport, err := telemetry.NewTransport(telemetry.TransportConfig{
 		Open:       c.openTelemetryStream,
@@ -570,7 +555,7 @@ func (c *Client) startSubscriptions() error {
 		}
 	}
 	if c.workflowCount() > 0 {
-		if err := c.wfSub.Start(c.runCtx); err != nil {
+		if err := c.wfExec.Start(c.runCtx); err != nil {
 			return err
 		}
 	}
@@ -666,6 +651,7 @@ func (c *Client) shutdown(ctx context.Context, wasReady bool) error {
 	}
 	c.eventSub.Drain()
 	c.jobSub.Drain()
+	c.wfExec.Drain()
 	if wasReady && c.server != nil {
 		c.decls.SetCallEndpoint("")
 		reregCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -679,7 +665,7 @@ func (c *Client) shutdown(ctx context.Context, wasReady bool) error {
 	if c.server != nil {
 		errs = append(errs, c.server.Wait(ctx))
 	}
-	errs = append(errs, c.eventSub.Wait(ctx), c.jobSub.Wait(ctx))
+	errs = append(errs, c.eventSub.Wait(ctx), c.jobSub.Wait(ctx), c.wfExec.Wait(ctx))
 
 	// 3. The publish queue.
 	c.publisher.Close(ctx)
@@ -698,7 +684,7 @@ func (c *Client) shutdown(ctx context.Context, wasReady bool) error {
 		c.cancel()
 	}
 	c.sampler.Stop()
-	c.wfSub.Stop()
+	c.wfExec.Stop()
 	c.jobSub.Stop()
 	c.eventSub.Stop()
 	errs = append(errs, c.life.Stop(ctx))
@@ -1165,16 +1151,6 @@ func (c *Client) publishEnvelope(ctx context.Context, req *pb.PublishRequest) (*
 	return pb.NewEventsClient(conn).Publish(ctx, req)
 }
 
-// Steps satisfies workflow.GraphSource: a run is executed from the graph
-// declared in this process, because a Local step carries a Go closure no frozen
-// plan can hold.
-func (c *Client) Steps(name string, fingerprint string) ([]wf.Step, bool) {
-	c.graphMu.RLock()
-	defer c.graphMu.RUnlock()
-	steps, ok := c.graphs[name+":"+fingerprint]
-	return steps, ok
-}
-
 func (c *Client) workflowCount() int {
 	c.graphMu.RLock()
 	defer c.graphMu.RUnlock()
@@ -1194,7 +1170,9 @@ func (c *Client) checkCallDependencies() error {
 	const op = "Client.Start"
 	c.graphMu.RLock()
 	graphs := make(map[string][]wf.Step, len(c.graphs))
-	maps.Copy(graphs, c.graphs)
+	for name, w := range c.graphs {
+		graphs[name] = w.steps
+	}
 	c.graphMu.RUnlock()
 
 	// Sorted, so a service with two broken graphs is told about the same one on

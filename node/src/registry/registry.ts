@@ -12,6 +12,7 @@ import type {
 	RegisterRequest,
 } from "../pb/servicebridge/v1/registry";
 import { MethodType } from "../pb/servicebridge/v1/registry";
+import type { WorkflowDefinition as PbWorkflowDefinition } from "../pb/servicebridge/v1/workflows";
 import type {
 	DispatchPort,
 	RpcHandlerContext,
@@ -36,13 +37,6 @@ export interface RpcHandlerOpts {
 	// "none"). May only NARROW the runtime-pushed effective mode (privacy
 	// ordering none < errors < all), never widen it.
 	captureMode?: CaptureMode;
-}
-
-// WorkflowHandlerOpts — input-only schema. Workflow output never exists at the
-// transport level: каждый step возвращает обновлённый state (см.
-// `userDocs/workflows.md`). Финального output у workflow как сущности нет.
-export interface WorkflowHandlerOpts {
-	input?: Record<string, unknown>;
 }
 
 export interface ServiceDeps {
@@ -122,6 +116,8 @@ interface HandlerEntry {
 	// verbatim into IncomingMethod.contract_hash.
 	contractHashOverride?: string;
 	captureMode?: CaptureMode;
+	// workflow — the structured definition of a METHOD_TYPE_WORKFLOW entry.
+	workflow?: PbWorkflowDefinition;
 }
 
 // PublishedEntry stores a published event declaration plus its async-loaded
@@ -144,11 +140,6 @@ interface OutgoingEntry {
 	serviceName: string;
 	methodName: string;
 	type: MethodType;
-}
-
-function schemaToBuffer(schema?: Record<string, unknown>): Buffer | null {
-	if (!schema) return null;
-	return Buffer.from(JSON.stringify(schema));
 }
 
 // Handle — internal storage for incoming handler entries AND published-event
@@ -367,24 +358,17 @@ export class Handle {
 		}));
 	}
 
-	workflow(
-		name: string,
-		steps: unknown,
-		opts?: WorkflowHandlerOpts,
-		// Workflow-graph payload (ADR-W-002). When present, `graphJson`
-		// overrides the schema-derived input_schema_json (the graph IS the
-		// declaration), and `contractHash` is the canonical-graph fingerprint
-		// that travels as IncomingMethod.contract_hash.
-		graphJson?: Buffer,
-		contractHash?: string,
-	): void {
+	// workflow registers a workflow definition; the runtime validates it and
+	// computes its fingerprint.
+	// @internal — used by WorkflowDomain.handle.
+	workflow(name: string, definition: PbWorkflowDefinition): void {
 		this.addEntry({
 			type: MethodType.METHOD_TYPE_WORKFLOW,
 			name,
-			inputSchemaJson: graphJson ?? schemaToBuffer(opts?.input),
+			inputSchemaJson: null,
 			outputSchemaJson: null,
-			fn: steps,
-			contractHashOverride: contractHash,
+			fn: null,
+			workflow: definition,
 		});
 	}
 
@@ -432,6 +416,7 @@ export class Handle {
 				: e.schemaPair
 					? computeContractHash(e.schemaPair)
 					: "",
+			workflow: e.workflow,
 		}));
 	}
 

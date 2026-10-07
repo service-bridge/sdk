@@ -121,8 +121,7 @@ import {
   WorkflowAccessDeniedError, // workflow.start denied by policy
   WorkflowNotFoundError,     // workflow.start on unknown name
   WorkflowTerminalError,     // signal/cancel on a terminal run
-  WorkflowValidationError,   // workflow.handle on an invalid graph
-  JsonPathError,             // bad $. expression
+  WorkflowRunFailedError,    // workflow.await on a run that did not succeed
 } from "service-bridge";
 ```
 

@@ -283,7 +283,7 @@ describe("Handle.event", () => {
 	it("non-EVENT handlers still appear in incomingMethods alongside events", () => {
 		const h = new Handle();
 		h.event("payments.success", () => {});
-		h.workflow("processPayment", []);
+		h.workflow("processPayment", wfDef("processPayment"));
 		const methods = h.incomingMethods();
 		expect(methods).toHaveLength(1);
 		expect(methods[0]!.type).toBe(MethodType.METHOD_TYPE_WORKFLOW);
@@ -291,23 +291,28 @@ describe("Handle.event", () => {
 });
 
 describe("Handle.workflow", () => {
-	it("with input: inputSchemaJson set, outputSchemaJson empty (workflows have no top-level output)", () => {
+	it("carries the structured definition; schemas and contract hash stay empty", () => {
 		const h = new Handle();
-		h.workflow("processPayment", [], { input: { orderId: "string" } });
+		h.workflow("processPayment", wfDef("processPayment"));
 		const m = h.incomingMethods()[0]!;
 		expect(m.type).toBe(MethodType.METHOD_TYPE_WORKFLOW);
-		expect(m.inputSchemaJson.length).toBeGreaterThan(0);
-		expect(m.outputSchemaJson.length).toBe(0);
-	});
-
-	it("no opts: both fields empty", () => {
-		const h = new Handle();
-		h.workflow("noop", []);
-		const m = h.incomingMethods()[0]!;
+		expect(m.workflow?.name).toBe("processPayment");
 		expect(m.inputSchemaJson.length).toBe(0);
 		expect(m.outputSchemaJson.length).toBe(0);
+		expect(m.contractHash).toBe("");
 	});
 });
+
+function wfDef(name: string) {
+	return {
+		name,
+		version: "",
+		inputSchemaJson: Buffer.alloc(0),
+		steps: [],
+		maxParallelism: 0,
+		timeoutMs: 0,
+	};
+}
 
 // Handle.http removed (ADR 0001): HTTP routes live in user app, published via
 // integrations in src/http/{express,fastify,hono}/.

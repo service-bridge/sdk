@@ -32,7 +32,7 @@ import { RegistryClient as RegistryClientImpl } from "../pb/servicebridge/v1/reg
 import { TelemetryClient } from "../pb/servicebridge/v1/telemetry";
 import { WorkflowsClient } from "../pb/servicebridge/v1/workflows";
 import type { MethodDescriptor, ServiceDeps } from "../registry/registry";
-import { MethodType, Registry } from "../registry/registry";
+import { Registry } from "../registry/registry";
 import { WatchStream } from "../registry/watch";
 import { CircuitBreakerRegistry } from "../rpc/circuit-breaker";
 import type { CallOpts } from "../rpc/client";
@@ -75,9 +75,7 @@ import {
 import { formatXSbTrace, parseXSbTrace } from "../telemetry/wire-trace";
 import { reconnectDelay } from "../utils/reconnect-ladder";
 import { WorkflowDomain } from "../workflow/domain";
-import { makeRuntimeOps } from "../workflow/runtime-ops";
-import { WorkflowSubscriber } from "../workflow/subscriber";
-import type { Step } from "../workflow/types";
+import { WorkflowExecutor } from "../workflow/executor";
 import { PROTOCOL_VERSION } from "./handshake";
 import { parseBootstrapKey } from "./key";
 import type { ProvisionResult } from "./provision";
@@ -93,7 +91,6 @@ export type {
 	MethodType,
 	RpcHandlerOpts,
 	ServiceDeps,
-	WorkflowHandlerOpts,
 } from "../registry/registry";
 export type { CallOpts } from "../rpc/client";
 export type { AdvertiseConfig } from "../rpc/server";
@@ -434,7 +431,7 @@ export class ServiceBridge {
 	private publisher: Publisher | null = null;
 	private subscriber: Subscriber | null = null;
 	private jobSubscriber: JobSubscriber | null = null;
-	private workflowSubscriber: WorkflowSubscriber | null = null;
+	private workflowExecutor: WorkflowExecutor | null = null;
 	private telemetryTransport: TelemetryTransport | null = null;
 	private processSampler: ProcessSampler | null = null;
 
@@ -655,7 +652,7 @@ export class ServiceBridge {
 
 		this.subscriber?.stop();
 		await this.jobSubscriber?.stop();
-		this.workflowSubscriber?.close();
+		this.workflowExecutor?.close();
 		this.session?.close();
 		this.session = null;
 		this.watch.stop();
@@ -1275,68 +1272,52 @@ export class ServiceBridge {
 			});
 			this.jobSubscriber.start();
 		}
-		this.maybeStartWorkflowSubscriber(ch.workflows);
+		this.maybeStartWorkflowExecutor(ch.workflows);
 	}
 
-	// Owner-side workflow subscriber: started once, only when this service
-	// registered a workflow.
-	private maybeStartWorkflowSubscriber(rpc: WorkflowsClient): void {
-		if (this.workflowSubscriber) return;
-		const hasWorkflowHandlers = this._registry._handle._entries.some(
-			(e) => e.type === MethodType.METHOD_TYPE_WORKFLOW,
-		);
-		if (!hasWorkflowHandlers) return;
+	// Owner-side workflow executor: started once, only when this service
+	// declared a workflow. It executes leased step tasks; the runtime
+	// interprets the DAG (ADR 0003).
+	private maybeStartWorkflowExecutor(rpc: WorkflowsClient): void {
+		if (this.workflowExecutor) return;
+		if (this.workflow._size() === 0) return;
 		const telemetryApi = this.telemetryApi;
 		const log = this.log;
-		const sub = new WorkflowSubscriber({
+		const executor = new WorkflowExecutor({
 			rpc,
 			identity: () => this.currentIdentity,
-			deps: {
-				sb: { rpc: this.rpc, event: this.event, workflow: this.workflow },
-				ops: makeRuntimeOps(rpc, () => this.currentIdentity?.instanceId ?? ""),
-				// One USER.SUBOP span per executed unit (ADR-0003 nesting).
-				wrapStep: async (info, fn) => {
-					const meta: Record<string, unknown> = {
-						step_id: info.stepId,
-						step_name: info.stepName,
-						workflow_run_id: info.runId,
-					};
-					if (info.isCompensation) {
-						meta.is_compensation = true;
-						meta.compensates_for_step_id = info.compensatesForStepId ?? "";
-					}
-					const subject =
-						info.role === "compensation"
-							? `compensate:${info.compensatesForStepId ?? info.stepId}`
-							: `${info.role}:${info.stepId}`;
-					return telemetryApi
-						.startOp({
-							channel: Channel.USER,
-							kind: UserSubOp,
-							subject,
-							businessKey: info.runId,
-							metaJson: Buffer.from(JSON.stringify(meta)),
-						})
-						.run(fn);
-				},
+			sb: { rpc: this.rpc, event: this.event },
+			definition: (name) => this.workflow._definition(name),
+			// One USER.SUBOP span around a local step or a compensation; call and
+			// publish steps are traced by their own RPC.CALL / EVENT.PUBLISH op.
+			wrapSpan: (info, fn) => {
+				const meta: Record<string, unknown> = {
+					step_id: info.stepId,
+					workflow_run_id: info.runId,
+				};
+				if (info.isCompensation) {
+					meta.is_compensation = true;
+					meta.compensates_for_step_id = info.compensatesStepId;
+				}
+				return telemetryApi
+					.startOp({
+						channel: Channel.USER,
+						kind: UserSubOp,
+						subject: info.isCompensation
+							? `compensate:${info.compensatesStepId}`
+							: `step:${info.stepId}`,
+						businessKey: info.runId,
+						metaJson: Buffer.from(JSON.stringify(meta)),
+					})
+					.run(fn);
 			},
 			logger: {
 				warn: (m: string, ...args: unknown[]) => log.warn(m, { args }),
 				error: (m: string, ...args: unknown[]) => log.error(m, { args }),
 			},
-			lookupLocalGraph: (name, fingerprint) => {
-				const entry = this._registry._handle._entries.find(
-					(e) =>
-						e.type === MethodType.METHOD_TYPE_WORKFLOW &&
-						e.name === name &&
-						e.contractHashOverride === fingerprint,
-				);
-				return entry ? (entry.fn as unknown as Step[]) : null;
-			},
-			sb: this,
 		});
-		sub.start();
-		this.workflowSubscriber = sub;
+		executor.start();
+		this.workflowExecutor = executor;
 	}
 
 	// Runs a job/event handler inside the inbound trace so nested calls join it.

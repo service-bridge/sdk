@@ -66,3 +66,20 @@ func staticTarget(stepID string, service, method wf.Target) (CallTarget, bool) {
 	}
 	return CallTarget{StepID: stepID, Service: string(serviceName), Method: string(methodName)}, true
 }
+
+// compensationSuffix names the step a compensation of step X runs as.
+const compensationSuffix = ".compensate"
+
+// flattenSteps lists every step of the graph, groups included, depth first.
+func flattenSteps(steps []wf.Step, out []wf.Step) []wf.Step {
+	for _, step := range steps {
+		out = append(out, step)
+		switch s := step.(type) {
+		case wf.Parallel:
+			out = flattenSteps(s.Steps, out)
+		case wf.Sequence:
+			out = flattenSteps(s.Steps, out)
+		}
+	}
+	return out
+}

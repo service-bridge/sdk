@@ -238,7 +238,7 @@ sb.SubscribeEventRaw(c, pattern, fn)    sb.CallInfoFromContext(ctx)
 Everything that needs no type parameter stays a method on the domain it belongs to:
 
 ```
-c.Job.Handle(...)        c.Workflow.Handle/Start/Signal/Cancel/Await/Query/Replay(...)
+c.Job.Handle(...)        c.Workflow.Handle/Start/Signal/Cancel/Await/Query/Replay/RetryCompensation(...)
 c.Telemetry.StartOp/Logger/Counter/Gauge/Histogram(...)
 c.Identity()  c.ServiceMap()  c.PolicyEvaluation()  c.Start(ctx)  c.Ready(ctx)  c.Stop(ctx)
 ```
@@ -433,7 +433,7 @@ err := c.Workflow.Handle("checkout", wf.Definition{
 			Input:   wf.Path("$.input"),
 		},
 		wf.Call{
-			Control: wf.Control{ID: "charge", WaitFor: []string{"reserve"}, TimeoutSec: 30},
+			Control: wf.Control{ID: "charge", WaitFor: []string{"reserve"}, Timeout: 30 * time.Second},
 			Service: wf.Name("payment-svc"),
 			Method:  wf.Name("Charge"),
 			Input:   wf.Path("$.input"),
@@ -451,31 +451,32 @@ err := c.Workflow.Handle("checkout", wf.Definition{
 })
 ```
 
-Top-level steps start in parallel; `WaitFor` declares the dependencies that define the execution levels. Step kinds: `Call`, `Publish`, `Sleep`, `WaitEvent`, `WaitSignal`, `SubWorkflow`, `Parallel`, `Sequence`, `Local`. The set is closed — the marker method is unexported — so a graph can never carry a kind the runtime does not know.
+Top-level steps start in parallel; `WaitFor` declares the dependencies. The runtime interprets the graph — readiness, timers, waits, child runs, retries with backoff and compensation — and leases task steps (`Local`, `Call`, `Publish`, compensations) to an instance of the owner service, which renews the lease by heartbeat. Step kinds: `Call`, `Publish`, `Sleep`, `WaitEvent`, `WaitSignal`, `SubWorkflow`, `Parallel`, `Sequence`, `Local`. The set is closed — the marker method is unexported — so a graph can never carry a kind the runtime does not know.
 
 A `wf.Call` step reaches an ordinary `sb.Handle[Req, Resp]` handler, so the method it names must also be declared with `sb.NewMethod`: run state is JSON while the callee takes protobuf, and the declared pair of types is both the encoding and the contract hash the step routes at. The step's `Input` is written as the message's JSON mirror — 64-bit integers are strings, enums are value names — and the reply lands in run state in the same form. A target named literally and never declared is refused at `Start`, with the workflow, the step and the missing declaration in the message; a target computed from run state fails the same way inside the run, because its name does not exist any earlier.
 
 Two string types keep expressions and data apart: `wf.Path("$.reserve.id")` is read from run state when the step executes, `wf.Name("payment-svc")` is a literal written at declaration. A literal that happens to look like a path needs no escaping here; the type says which is which.
 
-`wf.Local` runs a Go closure in the declaring process. The closure is not part of the frozen graph or the fingerprint — the step is identified by its `ID`, and the locally declared graph supplies the function the assignment cannot carry.
+`wf.Local` runs a Go closure in the declaring process. The closure never reaches the runtime: a task names the step `ID` and the `Definition.Version`, and the locally declared graph supplies the function — bump `Version` whenever a closure changes. Its `ctx` is cancelled when the lease is lost, the step deadline passes or the client stops.
 
 Driving a run:
 
 ```go
-runID, err := c.Workflow.Start(ctx, "checkout",
+runID, err := c.Workflow.Start(ctx, "orders-svc", "checkout",
 	map[string]any{"orderId": "o-1"},
 	sb.WithRunIdempotencyKey("checkout-o-1"),
-	sb.WithRunTimeoutSec(600),
+	sb.WithRunTimeout(10*time.Minute),
 )
 
-state, err := c.Workflow.Await(ctx, runID)   // blocks until terminal
-snap, err := c.Workflow.Query(ctx, runID)    // RunSnapshot: Status, State, Steps
-err = c.Workflow.Signal(ctx, runID, "approval", map[string]any{"ok": true})
-err = c.Workflow.Cancel(ctx, runID)          // compensates in reverse
+out, err := c.Workflow.Await(ctx, runID)     // output on success; *sb.RunFailedError otherwise
+snap, err := c.Workflow.Query(ctx, runID)    // Status, WaitingReason, Steps, Signals
+dup, err := c.Workflow.Signal(ctx, runID, "approval", map[string]any{"ok": true}, sb.WithSignalID("approve-o-1"))
+err = c.Workflow.Cancel(ctx, runID)          // compensates in reverse, ends cancelled
 forked, err := c.Workflow.Replay(ctx, runID, "charge")
+err = c.Workflow.RetryCompensation(ctx, runID) // re-run failed compensations of a failed_compensated run
 ```
 
-An unknown workflow name is `CodeNotFound`, a refusal by the access policy is `CodeAccessDenied`, and signalling or cancelling a finished run is `CodeTerminal`. Run state is JSON throughout (that is what `Path` reads and what `Await` returns), so step inputs and outputs are plain Go values, not protobuf messages.
+An unknown workflow is `CodeNotFound`, a refusal by the access policy (or a caller that is neither the owner, the starter nor explicitly granted `workflow.run`) is `CodeAccessDenied`, and signalling or cancelling a finished run is `CodeTerminal`. Run statuses: `active`, `compensating`, `success`, `failed`, `cancelled`, `timed_out`, `failed_compensated`. Run state is JSON throughout (that is what `Path` reads and what `Await` returns), so step inputs and outputs are plain Go values, not protobuf messages.
 
 The full vocabulary — predicates, `ForEach`, compensation, retry policies — is in [`workflow/README.md`](./workflow/README.md).
 
@@ -732,7 +733,7 @@ The `job`, `sbhttp` and `sbtest` packages carry their own sentinels for what the
 
 Everything on the wire is `int64` **unix milliseconds** for instants and `int64` **milliseconds** for durations. In Go you write a `time.Duration` (`WithTimeout`, `WithLeaseTTL`, `CallOpts.Timeout`) and the SDK converts; where a field is already a number, its name says the unit — `OccurredAtMs`, `ScheduledAtUnixMs`, `UnhealthySinceMs`.
 
-Seconds appear in exactly one place and are always spelled out: the workflow contract's `TimeoutSec`, `DurationSec` and `WithRunTimeoutSec`. That is the runtime's unit for those fields, not a typo.
+Workflow durations are `time.Duration` too (`Control.Timeout`, `Definition.Timeout`, `Sleep.Duration`, `WithRunTimeout`).
 
 ---
 

@@ -280,4 +280,4 @@ func (e *Error) Retryable() bool
 
 Wire format is `int64` unix-ms for instants, `int64` ms for durations. Write `time.Duration` in Go; numeric fields spell their unit (`OccurredAtMs`, `ScheduledAtUnixMs`, `LeaseTTLMs`, `UnhealthySinceMs`, `InitialMs`, `MaxMs`).
 
-Seconds appear only in `wf.Control.TimeoutSec`, `wf.Definition.TimeoutSec`, `wf.Sleep.DurationSec`, `wf.StartOpts.TimeoutSec` and `sb.WithRunTimeoutSec`.
+Workflow durations are `time.Duration` as well (`wf.Control.Timeout`, `wf.Definition.Timeout`, `wf.Sleep.Duration`, `sb.WithRunTimeout`).

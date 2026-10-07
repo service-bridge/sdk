@@ -229,5 +229,4 @@ Codes: `CodeConfig`, `CodeState`, `CodeConnection`, `CodeTimeout`, `CodeCancelle
 
 Everything on the wire is `int64` unix-milliseconds for instants and `int64` milliseconds for durations. In Go you pass a `time.Duration` and the SDK converts; a numeric field spells its unit (`OccurredAtMs`, `ScheduledAtUnixMs`, `LeaseTTLMs`).
 
-Seconds appear in exactly five places, always spelled out — that is the workflow contract's unit:
-`wf.Control.TimeoutSec`, `wf.Definition.TimeoutSec`, `wf.Sleep.DurationSec`, `wf.StartOpts.TimeoutSec`, `sb.WithRunTimeoutSec`.
+Workflow durations are `time.Duration` too: `wf.Control.Timeout`, `wf.Definition.Timeout`, `wf.Sleep.Duration`, `sb.WithRunTimeout`.
