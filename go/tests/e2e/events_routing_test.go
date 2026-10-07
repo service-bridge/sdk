@@ -1,10 +1,7 @@
-//go:build e2e && runtime_next
+//go:build e2e
 
-// Tests in this file need a runtime that routes deliveries by
-// EventDelivery.matched_patterns and evaluates EventSubscription.filter (the
-// runtime's fix/data line). The SDK routes only by matched_patterns, so against
-// an older runtime every delivery is nacked. Run them with
-// `go test -tags 'e2e runtime_next'`.
+// Delivery routing by EventDelivery.matched_patterns and subscription filters
+// the runtime evaluates.
 
 package e2e
 

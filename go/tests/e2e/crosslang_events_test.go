@@ -1,7 +1,4 @@
-//go:build e2e && runtime_next
-
-// Needs a runtime that fills EventDelivery.matched_patterns; see
-// events_next_test.go.
+//go:build e2e
 
 package e2e
 

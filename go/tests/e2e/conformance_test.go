@@ -29,21 +29,15 @@ import (
 
 const domainConformance = "conformance"
 
-// runtimeNext is set by conformance_next_test.go under the runtime_next tag.
-// Scenarios marked `requires: runtime-next` need a runtime from that line and
-// are left out of a build without the tag, as the Go tests of the same kind.
-var runtimeNext bool
-
 type confFile struct {
 	Scenarios []confScenario `yaml:"scenarios"`
 }
 
 type confScenario struct {
-	Name     string     `yaml:"name"`
-	Requires string     `yaml:"requires"`
-	Caller   confCaller `yaml:"caller"`
-	Callee   confCallee `yaml:"callee"`
-	Steps    []confStep `yaml:"steps"`
+	Name   string     `yaml:"name"`
+	Caller confCaller `yaml:"caller"`
+	Callee confCallee `yaml:"callee"`
+	Steps  []confStep `yaml:"steps"`
 
 	file string
 	// ns prefixes every method, event and pattern of this scenario in one
@@ -228,13 +222,6 @@ func loadScenarios(t *testing.T) []confScenario {
 			t.Fatalf("parse %s: %v", path, err)
 		}
 		for _, s := range f.Scenarios {
-			if s.Requires != "" && s.Requires != "runtime-next" {
-				t.Fatalf("%s: scenario %q requires unknown %q", path, s.Name, s.Requires)
-			}
-			if s.Requires == "runtime-next" && !runtimeNext {
-				t.Logf("%s: %q needs -tags runtime_next, left out", filepath.Base(path), s.Name)
-				continue
-			}
 			s.file = filepath.Base(path)
 			out = append(out, s)
 		}
