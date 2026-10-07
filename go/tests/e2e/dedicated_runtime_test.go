@@ -302,7 +302,13 @@ func spawnDedicatedRuntime(ctx context.Context, t *testing.T, opts spawnDedicate
 	if err != nil {
 		t.Fatalf("locate runtime checkout: %v", err)
 	}
+	// In direct mode the suite's own DSN carries the credentials that reach
+	// the server; only the database differs. Docker mode dials the published
+	// port with the configured account.
 	dsn := fmt.Sprintf("postgres://%s:%s@localhost:%s/%s?sslmode=disable", pgUser(), pgPassword(), pgPort(), dbName)
+	if suite, direct := pgDirect(); direct {
+		dsn = dsnForDatabase(suite, dbName)
+	}
 
 	if err := runMigrateOnly(ctx, opts.BinaryPath, dsn); err != nil {
 		_ = dropIsolatedDatabase(ctx, dbName)
