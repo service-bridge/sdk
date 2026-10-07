@@ -12,6 +12,7 @@ func Interval(d time.Duration) (Trigger, error)
 func At(t time.Time) (Trigger, error)
 func NewSpec(t Trigger, opts ...Option) Spec
 
+func WithVersion(version string) Option // required
 func WithCatchup(p CatchupPolicy) Option
 func WithOverlap(p OverlapPolicy) Option
 func WithDeps(deps ...Dep) Option
@@ -25,7 +26,7 @@ func Event(name string) Dep
 func Workflow(name string) Dep
 ```
 
-Import: `github.com/service-bridge/sdk/go/job`.
+Import: `github.com/service-bridge/sdk/go/job`. The non-retryable marker lives in the root package: `func NonRetryable(err error) error`.
 
 ## Triggers
 
@@ -41,15 +42,20 @@ A `job.Trigger` can only come from one of three constructors, so a job carries e
 
 | Option | Default |
 |---|---|
+| `job.WithVersion(v)` | **required** — the immutable version of the handler's code |
 | `job.WithCatchup(p)` | runtime decides |
 | `job.WithOverlap(p)` | runtime decides |
 | `job.WithDeps(deps...)` | none |
 | `job.WithMaxAttempts(n)` | runtime decides |
 | `job.WithLeaseTTL(d)` | runtime decides |
-| `job.WithMaxConcurrent(n)` | runtime decides |
+| `job.WithMaxConcurrent(n)` | runtime decides; the SDK runs up to 32 handlers, one under `OverlapSkip`; at most 1024 |
 | `job.WithRetry(job.RetryPolicy{InitialMs, MaxMs, Multiplier, Jitter})` | runtime decides |
 
 **The SDK keeps no copy of the defaults.** An option never applied is simply absent from the spec and the runtime fills it in. Do not hard-code a "default" value you read somewhere.
+
+**`job.WithVersion` is required.** It enters the job's fingerprint: change the handler's logic, change the version. Only the latest declared version starts new fires; executions created earlier run on the version they were assigned to. A spec without a version fails at declaration with `job.ErrVersion` (`CodeValidation`).
+
+In `job.Spec` the limits are pointers — `MaxAttempts *int`, `LeaseTTLMs *int64`, `MaxConcurrent *int`, `Retry *RetryPolicy` — so "unset" (`nil`, left to the runtime) differs from an explicit `0`, which is sent. Build specs with `job.NewSpec` and the options; they fill the pointers.
 
 Policies: `job.CatchupSkip` / `CatchupFireOnce` / `CatchupFireAll`; `job.OverlapSkip` / `OverlapAllow` / `OverlapBufferOne`.
 
@@ -74,9 +80,9 @@ Jobs carry **no input and no output**. The only outcome is an error or its absen
 
 **Be idempotent by `IdempotencyKey`, never by `Attempt`.** The key is the same across every attempt of one scheduled fire; `Attempt` changes on each retry, so keying on it makes every retry look like new work.
 
-Wrap a failure in `job.ErrPermanent` to stop the runtime from spending the remaining attempts on it. The original error text still travels.
+Return `sb.NonRetryable(err)` to stop the runtime from spending the remaining attempts on it: the execution goes to the dead-letter queue at once. The original error text still travels. `sb.NonRetryable(nil)` is `nil`.
 
-`ctx` is cancelled when the client stops.
+`ctx` is cancelled when the client stops or the execution stream is lost.
 
 ## Complete program
 
@@ -86,7 +92,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log"
 	"os"
 	"time"
@@ -111,6 +116,7 @@ func main() {
 	}
 	if err := c.Job.Handle("nightly-rollup",
 		job.NewSpec(nightly,
+			job.WithVersion("v1"),
 			job.WithCatchup(job.CatchupFireOnce), // one fire for the whole gap
 			job.WithOverlap(job.OverlapSkip),     // never two at once
 			job.WithMaxAttempts(5),
@@ -132,7 +138,7 @@ func main() {
 			if err := rollup(ctx, exec.IdempotencyKey); err != nil {
 				if errors.Is(err, errPoisonedFeed) {
 					// Do not burn the remaining attempts on bad input.
-					return fmt.Errorf("%w: %w", job.ErrPermanent, err)
+					return sb.NonRetryable(err)
 				}
 				return err // retried by the runtime's backoff
 			}
@@ -146,7 +152,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := c.Job.Handle("heartbeat", job.NewSpec(beat, job.WithMaxConcurrent(1)),
+	if err := c.Job.Handle("heartbeat", job.NewSpec(beat, job.WithVersion("v1"), job.WithMaxConcurrent(1)),
 		func(ctx context.Context, exec job.Execution) error {
 			log.Printf("job=%s exec=%s attempt=%d scheduled=%d",
 				exec.Name, exec.ID, exec.Attempt, exec.ScheduledAtUnixMs)
@@ -160,7 +166,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := c.Job.Handle("migrate-v2", job.NewSpec(once),
+	if err := c.Job.Handle("migrate-v2", job.NewSpec(once, job.WithVersion("v1")),
 		func(ctx context.Context, exec job.Execution) error {
 			return migrate(ctx, exec.IdempotencyKey)
 		}); err != nil {
@@ -185,17 +191,20 @@ func migrate(ctx context.Context, key string) error               { return nil }
 
 Declare the job on every instance — that is the normal mode. The runtime hands one execution to **one** instance under a lease; the rest get nothing. If the holder goes silent past the lease TTL, the execution is reassigned, which is exactly why delivery is at-least-once and the handler must be idempotent. A result sent by a stale lease holder is dropped — that is the fencing.
 
-The client heartbeats the runtime every 5 seconds; three consecutive failures reopen the execution subscription.
+While the execution stream is open the client heartbeats the runtime, which extends the leases of every execution in flight. The first heartbeat goes at once; after that the runtime sets the interval (5 s until its first answer, never more often than every 100 ms). Three consecutive failures reopen the execution stream.
+
+During `Stop` the subscriber takes no new executions and leaves them unanswered, so the runtime hands them out again.
 
 ## Declaration errors
 
 All checked at declaration, all matched with `errors.Is`, all wrapped in `*sb.Error` with `CodeValidation`:
 
-`job.ErrNoTrigger`, `ErrCronFieldCount`, `ErrCronExpr`, `ErrCronTZ`, `ErrInterval`, `ErrRunAt`, `ErrCatchupPolicy`, `ErrOverlapPolicy`, `ErrDepKind`, `ErrDepTarget`, `ErrRetryInitial`, `ErrNegativeLimit`, `ErrEmptyName`, `ErrNoHandler`, `ErrDuplicateName`.
+`job.ErrVersion`, `ErrNoTrigger`, `ErrCronFieldCount`, `ErrCronExpr`, `ErrCronTZ`, `ErrInterval`, `ErrRunAt`, `ErrCatchupPolicy`, `ErrOverlapPolicy`, `ErrDepKind`, `ErrDepTarget`, `ErrRetryInitial`, `ErrNegativeLimit`, `ErrEmptyName`, `ErrNoHandler`, `ErrDuplicateName`.
 
 ## Gotchas
 
 - Six-field cron (with seconds) → `job.ErrCronFieldCount`. Use five.
 - `c.Job.Handle` after `Start` → `CodeState`.
+- No `job.WithVersion` → `job.ErrVersion` at declaration.
 - Do not invent default values for the runtime-owned options; leave them unset.
 - `job.Execution` has no payload — a job that needs input should read it from your own store.

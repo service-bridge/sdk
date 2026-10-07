@@ -38,6 +38,7 @@ import (
 func New(url, key string, opts ...Option) (*Client, error)
 
 func (c *Client) Start(ctx context.Context) error
+func (c *Client) Ready(ctx context.Context) error
 func (c *Client) Stop(ctx context.Context) error
 
 func (c *Client) Identity() Identity
@@ -145,9 +146,31 @@ func WithBusinessKey(key string) CallOption
 type Transport uint8
 
 const (
-	TransportDirect Transport = iota // по умолчанию
+	TransportAuto Transport = iota // по умолчанию: напрямую, до отправки — откат на прокси
+	TransportDirect
 	TransportProxy
 )
+```
+
+Контекст входящего вызова и бизнес-ошибка обработчика:
+
+```go signature
+type CallInfo struct {
+	RequestID        string
+	IdempotencyKey   string
+	CallerServiceID  string
+	CallerInstanceID string
+	Deadline         time.Time
+}
+
+func CallInfoFromContext(ctx context.Context) (CallInfo, bool)
+
+type HandlerError struct {
+	Code    string
+	Message string
+}
+
+func (e *HandlerError) Error() string
 ```
 
 ## События
@@ -160,11 +183,28 @@ func (e *Event[T]) Publish(ctx context.Context, payload T, opts ...PublishOption
 func PublishEvent[T proto.Message](ctx context.Context, c *Client, name string,
 	payload T, opts ...PublishOption) (string, error)
 
-func SubscribeEvent[T proto.Message](c *Client, name string,
-	fn func(ctx context.Context, event T) error) error
+func SubscribeEvent[T proto.Message](c *Client, pattern string,
+	fn func(ctx context.Context, event T) error, opts ...SubscribeOption) error
 
-func SubscribeEventRaw(c *Client, name string,
-	fn func(ctx context.Context, payload []byte) error) error
+func SubscribeEventRaw(c *Client, pattern string,
+	fn func(ctx context.Context, payload []byte) error, opts ...SubscribeOption) error
+
+func WithFilter(filter map[string]any) SubscribeOption
+
+func DeliveryFromContext(ctx context.Context) (DeliveryInfo, bool)
+```
+
+```go signature
+type DeliveryInfo struct {
+	EventID      string
+	EventName    string
+	Attempt      int32
+	DeliveryID   string
+	LeaseToken   string
+	PartitionKey string
+	Headers      map[string]string
+	OccurredAtMs int64
+}
 ```
 
 `PublishOption`:
@@ -192,6 +232,7 @@ func At(t time.Time) (Trigger, error)
 
 func NewSpec(t Trigger, opts ...Option) Spec
 
+func WithVersion(version string) Option // обязательна
 func WithCatchup(p CatchupPolicy) Option
 func WithOverlap(p OverlapPolicy) Option
 func WithDeps(deps ...Dep) Option
@@ -223,11 +264,29 @@ type RetryPolicy struct {
 	Multiplier float64
 	Jitter     float64
 }
+
+type Spec struct {
+	Version       string
+	Trigger       Trigger
+	Catchup       CatchupPolicy
+	Overlap       OverlapPolicy
+	Deps          []Dep
+	MaxAttempts   *int
+	LeaseTTLMs    *int64
+	MaxConcurrent *int
+	Retry         *RetryPolicy
+}
 ```
 
 Константы политик: `CatchupSkip`, `CatchupFireOnce`, `CatchupFireAll`; `OverlapSkip`, `OverlapAllow`, `OverlapBufferOne`.
 
-Сентинел: `job.ErrPermanent`. Ошибки объявления: `ErrNoTrigger`, `ErrCronFieldCount`, `ErrCronExpr`, `ErrCronTZ`, `ErrInterval`, `ErrRunAt`, `ErrCatchupPolicy`, `ErrOverlapPolicy`, `ErrDepKind`, `ErrDepTarget`, `ErrRetryInitial`, `ErrNegativeLimit`, `ErrEmptyName`, `ErrNoHandler`, `ErrDuplicateName`.
+Неретраебельный отказ обработчика — `sb.NonRetryable(err)` из корневого пакета:
+
+```go signature
+func NonRetryable(err error) error
+```
+
+Ошибки объявления: `ErrVersion`, `ErrNoTrigger`, `ErrCronFieldCount`, `ErrCronExpr`, `ErrCronTZ`, `ErrInterval`, `ErrRunAt`, `ErrCatchupPolicy`, `ErrOverlapPolicy`, `ErrDepKind`, `ErrDepTarget`, `ErrRetryInitial`, `ErrNegativeLimit`, `ErrEmptyName`, `ErrNoHandler`, `ErrDuplicateName`.
 
 ## Workflow (`c.Workflow`)
 
@@ -265,6 +324,7 @@ type StepSnapshot struct {
 
 ```go signature
 type Definition struct {
+	Version        string
 	Input          map[string]any
 	Steps          []Step
 	Retry          *RetryPolicy
@@ -359,6 +419,14 @@ func (g *Gauge) Set(value float64)
 func (h *Histogram) Observe(value float64)
 ```
 
+```go signature
+type TelemetryDrop struct {
+	ServerDrops       uint64
+	RingDrops         uint64
+	BackpressureLevel uint32
+}
+```
+
 ## Опции конструктора
 
 ```go signature
@@ -367,13 +435,13 @@ func WithCallerOnly() Option
 func WithCallDefaults(opts ...CallOption) Option
 func WithCallAttempts(n int) Option
 func WithFailOnPolicyViolation() Option
-func WithDataDir(dir string) Option
-func WithMaxOutboxRows(n int) Option
-func WithDrainBatchSize(n int) Option
+func WithMaxPendingPublishes(n int) Option
+func WithPublishTimeout(d time.Duration) Option
 func WithMaxInFlightEvents(n int) Option
-func WithInboundLimits(maxCalls, maxStreams int) Option
+func WithInboundLimits(maxCalls, maxQueued int) Option
 func WithReconnectAttempts(n int) Option
 func WithReconnectLadder(rungs ...time.Duration) Option
+func WithTelemetryDropHandler(fn func(TelemetryDrop)) Option
 func WithLogger(log *slog.Logger) Option
 ```
 
@@ -381,13 +449,14 @@ func WithLogger(log *slog.Logger) Option
 
 | Константа | Значение |
 |---|---|
-| `sb.DefaultDataDir` | `"./.servicebridge"` |
-| `sb.DefaultMaxOutboxRows` | `10000` |
-| `sb.DefaultDrainBatchSize` | `100` |
-| `sb.DefaultMaxInFlightEvents` | `32` |
-| `sb.DefaultMaxConcurrentCalls` | `512` |
-| `sb.DefaultMaxConcurrentStreams` | `512` |
+| `sb.DefaultCallTimeout` | `30 * time.Second` |
 | `sb.DefaultCallAttempts` | `3` |
+| `sb.DefaultMaxPendingPublishes` | `10_000` |
+| `sb.DefaultPublishTimeout` | `30 * time.Second` |
+| `sb.DefaultMaxInFlightEvents` | `32` |
+| `sb.DefaultMaxConcurrentCalls` | `256` |
+| `sb.DefaultMaxQueuedCalls` | `256` |
+| `sb.DefaultStopTimeout` | `10 * time.Second` |
 | `sb.DefaultAdvertiseHost` | `"127.0.0.1"` |
 
 ## HTTP-интеграции
@@ -397,9 +466,14 @@ func WithLogger(log *slog.Logger) Option
 ```go signature
 func New(rt Runtime, opts ...Option) (*Integration, error)
 func WithLogger(log *slog.Logger) Option
+func WithTrustTraceHeader() Option
+func WithRouteResolver(fn func(*http.Request) string) Option
+
+const UnmatchedRoute = "*"
+func RouteOf(r *http.Request) string
 
 func (i *Integration) Middleware(next http.Handler) http.Handler
-func (i *Integration) Begin(r *http.Request) (*http.Request, *Operation, error)
+func (i *Integration) Begin(r *http.Request, route string) (*http.Request, *Operation, error)
 func (i *Integration) Logger() *slog.Logger
 func (i *Integration) Publish(routes []Route, ep Endpoint) error
 func (i *Integration) PublishMux(m *Mux, ep Endpoint) error
@@ -410,6 +484,7 @@ func (m *Mux) Handle(pattern string, handler http.Handler)
 func (m *Mux) HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request))
 func (m *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request)
 func (m *Mux) Routes() []Route
+func (m *Mux) Route(r *http.Request) string
 
 func (o *Operation) Capturing() bool
 func (o *Operation) PayloadLimit() int
@@ -447,48 +522,80 @@ func Publish(integration *sbhttp.Integration, engine *gin.Engine, endpoint sbhtt
 
 ## Тестирование
 
+Пакет `sbtest`:
+
 ```go signature
-func New() *Harness
+func New(t TB, opts ...sb.Option) *Harness
+func (h *Harness) Start(ctx context.Context) error
 func (h *Harness) Reset()
-func NewRPC() *RPC
-func NewEvent() *Event
 
-func Handle[Req, Res any](r *RPC, method string, fn Handler[Req, Res]) error
-func Invoke[Req, Res any](ctx context.Context, r *RPC, method string, req Req) (Res, error)
-func Respond[Req, Res any](r *RPC, service, method string, fn Responder[Req, Res]) error
-func RespondWith[Res any](r *RPC, service, method string, res Res) error
-func Call[Req, Res any](ctx context.Context, r *RPC, service, method string, req Req) (Res, error)
-func (r *RPC) Calls() []CallRecord
-func (r *RPC) Reset()
+func Invoke[Req, Resp proto.Message](ctx context.Context, h *Harness, method string,
+	req Req, opts ...InvokeOption) (Resp, error)
+func InvokeStream[Req, Chunk proto.Message](ctx context.Context, h *Harness, method string,
+	req Req, opts ...InvokeOption) ([]Chunk, error)
+func WithCaller(serviceID, instanceID string) InvokeOption
+func WithRequestID(id string) InvokeOption
+func WithIdempotencyKey(key string) InvokeOption
 
-func Define[T any](e *Event, name string) error
-func Subscribe[T any](e *Event, name string, fn Subscriber[T]) error
-func Publish[T any](ctx context.Context, e *Event, name string, payload T) (Delivery, error)
-func (e *Event) Published() []PublishRecord
-func (e *Event) Deliveries() []Delivery
-func (e *Event) Reset()
+func Respond[Req, Resp proto.Message](h *Harness, service, method string,
+	fn func(ctx context.Context, req Req) (Resp, error)) error
+func RespondStream[Req, Chunk proto.Message](h *Harness, service, method string,
+	fn func(ctx context.Context, req Req) ([]Chunk, error)) error
+func (h *Harness) Calls() []CallRecord
+func DecodeCall[T proto.Message](rec CallRecord) (T, error)
+
+func (h *Harness) Published() []PublishedEvent
+func DecodePublished[T proto.Message](e PublishedEvent) (T, error)
+
+func (h *Harness) Deliver(ctx context.Context, name string, payload proto.Message,
+	opts ...DeliverOption) (DeliveryResult, error)
+func WithMatchedPatterns(patterns ...string) DeliverOption
+func WithAttempt(n int32) DeliverOption
+func WithDeliveryPartitionKey(key string) DeliverOption
+func WithDeliveryHeaders(headers map[string]string) DeliverOption
+func MatchPattern(pattern, name string) bool
 ```
 
 ```go signature
+type Harness struct {
+	Client *sb.Client
+	// неэкспортированные поля
+}
+
+type TB interface {
+	Helper()
+	Fatalf(format string, args ...any)
+	Cleanup(func())
+}
+
 type CallRecord struct {
-	Service string
-	Method  string
-	Input   any
+	Service        string
+	Method         string
+	Payload        []byte
+	IdempotencyKey string
+	BusinessKey    string
+	Transport      sb.Transport
 }
 
-type PublishRecord struct {
-	Name    string
-	Payload any
+type PublishedEvent struct {
+	ID             string
+	Name           string
+	Payload        []byte
+	PayloadJSON    []byte
+	PartitionKey   string
+	IdempotencyKey string
+	Headers        map[string]string
+	OccurredAtMs   int64
 }
 
-type Delivery struct {
-	Name  string
-	Acked bool
-	Err   error
+type DeliveryResult struct {
+	Acked           bool
+	Reason          string
+	MatchedPatterns []string
 }
 ```
 
-Сентинелы: `sbtest.ErrNoHandler`, `ErrNoResponse`, `ErrTypeMismatch`, `ErrDuplicate`, `ErrInvalidArg`.
+Сентинелы: `sbtest.ErrNoResponse`, `sbtest.ErrInvalidArg`.
 
 ## Ошибки
 
@@ -503,22 +610,31 @@ type Error struct {
 func (e *Error) Error() string
 func (e *Error) Unwrap() error
 func (e *Error) Is(target error) bool
+func (e *Error) Retryable() bool
 ```
 
-| Код | Сентинел | Когда |
-|---|---|---|
-| `CodeConfig` | `ErrConfig` | Конфигурация, с которой SDK отказывается работать. До лестницы переподключения не доходит: повторами это не лечится. |
-| `CodeState` | `ErrState` | Не та фаза жизненного цикла: объявление после `Start`, публикация до него, использование остановленного клиента. |
-| `CodeConnection` | `ErrConnection` | Провижининг, сессия или стрим не открываются. |
-| `CodeAccessDenied` | `ErrAccessDenied` | Политика доступа mesh отказала в вызове, публикации или запуске. |
-| `CodeNotFound` | `ErrNotFound` | Имени, для которого в mesh нет определения. |
-| `CodeValidation` | `ErrValidation` | Объявление или аргумент, который рантайм отверг бы, пойманный там, где он написан. |
-| `CodeTerminal` | `ErrTerminal` | Прогон workflow уже завершён. |
-| `CodeOutboxFull` | `ErrOutboxFull` | Локальный буфер событий на пределе. |
-| `CodeNoLiveInstance` | `ErrNoLiveInstance` | Вызову некуда идти. |
-| `CodeInvalidEventName` | `ErrInvalidEventName` | Имя, которое отвергает грамматика событий рантайма. |
-| `CodeHandler` | `ErrHandler` | Обработчик callee вернул ошибку. Это ответ, а не сбой транспорта. |
-| `CodeInternal` | `ErrInternal` | Всё остальное. |
+`Retryable()` истинен ровно для `CodeConnection`, `CodeNoLiveInstance`, `CodeOverloaded` и `CodeQueueFull`: ситуация временная и ничего не выполнено. `CodeTimeout` не ретраебельный — исход неизвестен, повтор безопасен только с ключом идемпотентности, и это решение вызывающего.
+
+| Код | Строка | Сентинел | Когда | `Retryable()` |
+|---|---|---|---|---|
+| `CodeConfig` | `CONFIG` | `ErrConfig` | Конфигурация, с которой SDK отказывается работать, или рантайм на другой версии протокола. До лестницы переподключения не доходит: повторами это не лечится. | нет |
+| `CodeState` | `STATE` | `ErrState` | Не та фаза жизненного цикла: объявление после `Start`, публикация до него, использование остановленного клиента. | нет |
+| `CodeConnection` | `CONNECTION` | `ErrConnection` | Рантайм или callee недостижимы (`UNAVAILABLE`), канал не стал готов, публикация осталась в очереди при `Stop`. | да |
+| `CodeTimeout` | `TIMEOUT` | `ErrTimeout` | Дедлайн истёк, исход неизвестен. | нет |
+| `CodeCancelled` | `CANCELLED` | `ErrCancelled` | Вызывающий отменил операцию. | нет |
+| `CodeAccessDenied` | `ACCESS_DENIED` | `ErrAccessDenied` | Политика доступа, отозванная идентичность или отвергнутые учётные данные. | нет |
+| `CodeNotFound` | `NOT_FOUND` | `ErrNotFound` | Имя, для которого в mesh нет определения. | нет |
+| `CodeValidation` | `VALIDATION` | `ErrValidation` | Объявление или аргумент, который отвергнут. | нет |
+| `CodeConflict` | `CONFLICT` | `ErrConflict` | Идентификатор уже использован с другим содержимым. | нет |
+| `CodeTerminal` | `TERMINAL` | `ErrTerminal` | Прогон workflow уже завершён. | нет |
+| `CodeNoLiveInstance` | `NO_LIVE_INSTANCE` | `ErrNoLiveInstance` | Вызову некуда идти. | да |
+| `CodeOverloaded` | `OVERLOADED` | `ErrOverloaded` | Callee или рантайм сбрасывают нагрузку. | да |
+| `CodeQueueFull` | `QUEUE_FULL` | `ErrQueueFull` | Очередь публикаций на пределе. | да |
+| `CodeInvalidEventName` | `INVALID_EVENT_NAME` | `ErrInvalidEventName` | Имя, которое отвергает грамматика событий. | нет |
+| `CodeHandler` | `HANDLER` | `ErrHandler` | Обработчик callee ответил ошибкой; `errors.As` достаёт `*sb.HandlerError` с его кодом. | нет |
+| `CodeInternal` | `INTERNAL` | `ErrInternal` | Всё остальное. | нет |
+
+gRPC-статус с той стороны отображается так: `CANCELLED`→`CANCELLED`; `INVALID_ARGUMENT`, `FAILED_PRECONDITION`, `OUT_OF_RANGE`→`VALIDATION`; `DEADLINE_EXCEEDED`→`TIMEOUT`; `NOT_FOUND`, `UNIMPLEMENTED`→`NOT_FOUND`; `ALREADY_EXISTS`→`CONFLICT`; `PERMISSION_DENIED`, `UNAUTHENTICATED`→`ACCESS_DENIED`; `RESOURCE_EXHAUSTED`→`OVERLOADED`; `UNAVAILABLE`→`CONNECTION`; `UNKNOWN`, `ABORTED`, `INTERNAL`, `DATA_LOSS`→`INTERNAL`. Коды и таблица одинаковы во всех SDK ServiceBridge.
 
 Пакеты `job`, `sbhttp` и `sbtest` несут собственные сентинелы для того, что они отвергают локально; сравниваются так же, через `errors.Is`.
 

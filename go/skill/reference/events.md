@@ -1,6 +1,6 @@
 # Events — Go SDK reference
 
-Durable publish/subscribe, at-least-once. Publishing is a local SQLite insert; delivery is asynchronous.
+Durable publish/subscribe, at-least-once. `PublishEvent` returns once the runtime has stored the event; delivery to subscribers is asynchronous.
 
 ## Signatures
 
@@ -10,21 +10,48 @@ func (e *Event[T]) Name() string
 func (e *Event[T]) Publish(ctx context.Context, payload T, opts ...PublishOption) (string, error)
 
 func PublishEvent[T proto.Message](ctx context.Context, c *Client, name string, payload T, opts ...PublishOption) (string, error)
-func SubscribeEvent[T proto.Message](c *Client, name string, fn func(ctx context.Context, event T) error) error
-func SubscribeEventRaw(c *Client, name string, fn func(ctx context.Context, payload []byte) error) error
+func SubscribeEvent[T proto.Message](c *Client, pattern string, fn func(ctx context.Context, event T) error, opts ...SubscribeOption) error
+func SubscribeEventRaw(c *Client, pattern string, fn func(ctx context.Context, payload []byte) error, opts ...SubscribeOption) error
+func WithFilter(filter map[string]any) SubscribeOption
+
+func DeliveryFromContext(ctx context.Context) (DeliveryInfo, bool)
+type DeliveryInfo struct {
+	EventID      string
+	EventName    string // the concrete name the publisher used
+	Attempt      int32
+	DeliveryID   string
+	LeaseToken   string // opaque delivery generation, not a business idempotency key
+	PartitionKey string
+	Headers      map[string]string
+	OccurredAtMs int64
+}
 ```
 
 ## The mental model
 
-`Publish` writes to an on-disk outbox and returns. **It does not touch the network.** A successful return means "written durably", not "delivered". An unreachable runtime never slows a publish down or fails it; a background drain ships batches when the connection is there.
+`Publish` hands the event to an in-memory queue and **waits for the runtime's acknowledgement**; the returned id means the event is in the runtime's store. While the runtime is unreachable the event waits in the queue. The queue is bounded (`sb.WithMaxPendingPublishes`, default `10000` → `CodeQueueFull` at once when full) and so is the wait (`sb.WithPublishTimeout`, default `30s` → `CodeTimeout`, and the message says whether the event was ever sent). Nothing is written to disk: an unacknowledged event dies with the process.
 
 Consequences:
-- Declare with `DefineEvent` **before** `Start`; publish **after** `Start` (before it there is no buffer → `CodeState`).
-- A policy refusal cannot be returned to the caller — it arrives through `c.OnPolicyViolation` and a Warn log.
+- Declare with `DefineEvent` **before** `Start`; publish **after** `Start` (before it → `CodeState`). `DefineEvent` is the publisher's declaration only — a subscriber never needs it.
+- A `CodeTimeout` after the event was sent means the outcome is unknown: repeat it only with `sb.WithEventIdempotencyKey`.
+- `Stop` flushes the queue within its deadline; leftovers fail with `CodeConnection` "client stopped".
+
+Runtime verdicts:
+
+| Verdict | `Publish` returns |
+|---|---|
+| accepted | the event id (UUIDv7, increasing in publish order) |
+| duplicate (same idempotency key) | success, with the **original** event's id |
+| conflict (same id, other content) | `CodeConflict` |
+| invalid name | `CodeInvalidEventName` |
+| forbidden by policy | `CodeAccessDenied`, and `c.OnPolicyViolation` fires |
+| no verdict / transport failure | retried with the same id (100 ms … 5 s, immediately on reconnect) |
+
+One batch of up to 100 events is in flight at a time, with at most one event per partition key per batch, so each key keeps its order across retries.
 
 ## Names and patterns
 
-Published names must match `^[a-z0-9_-]+(\.[a-z0-9_-]+)*$`, checked locally → `CodeInvalidEventName`. Wildcards are not allowed in a published name.
+Published names must match `^[a-z0-9_-]+(\.[a-z0-9_-]+)*$` → otherwise `CodeInvalidEventName`. A publish takes a name, never a pattern.
 
 Subscriptions **may** carry a pattern:
 
@@ -33,15 +60,28 @@ Subscriptions **may** carry a pattern:
 | `*` | exactly one segment |
 | `#` | zero or more segments |
 
-The runtime routes on the pattern; the SDK also matches it locally when picking handlers for an arriving delivery, so a family subscription works end to end. The delivery carries the **concrete** name the publisher used — if payload shapes differ across the family, use `SubscribeEventRaw`.
+**Routing is the runtime's.** Each delivery lists the patterns of this service it matched, and the SDK runs the handlers of exactly those patterns, each once; it does no wildcard matching of its own. The delivery is acked only if every one of them returns `nil`. If none of the matched patterns has a handler in this process, the delivery is nacked with `no handler for matched patterns`.
+
+**One pattern, one handler per process.** A second handler for the same pattern is `CodeValidation` at declaration. Several handlers for one event come from different patterns (`order.placed` and `order.*`).
+
+The payload is decoded into the subscriber's own type parameter. If payload shapes differ across a pattern's family, use `SubscribeEventRaw`.
+
+## Filters
+
+```go
+sb.SubscribeEvent(c, "order.placed", handle,
+	sb.WithFilter(map[string]any{"$.status": "paid", "$.region": "eu"}))
+```
+
+Only events whose JSON payload has every given path equal to its literal are delivered. The runtime evaluates the filter; the SDK only sends it. A filter the runtime refuses fails the registration and stops the client.
 
 ## PublishOption
 
 | Option | Default | Effect |
 |---|---|---|
-| `sb.WithEventIdempotencyKey(k)` | none | Runtime-side dedup of the publish. Named apart from `sb.WithIdempotencyKey` because the two travel to different places. |
+| `sb.WithEventIdempotencyKey(k)` | none | Runtime-side dedup of the publish: a repeat returns the original event's id. Named apart from `sb.WithIdempotencyKey` because the two travel to different places. |
 | `sb.WithPartitionKey(k)` | none | FIFO lane: events sharing a key are handled in publication order, serially. |
-| `sb.WithFireAndForget()` | off | Straight to the runtime, skipping the buffer and every retry with it. Lossy by design. |
+| `sb.WithFireAndForget()` | off | Return the id as soon as the event is queued, without waiting for the acknowledgement. Accepts loss: until acknowledged the event lives only in process memory, and a delivery failure is only logged. A full queue still fails. |
 | `sb.WithHeaders(map[string]string)` | none | Envelope metadata. |
 | `sb.WithOccurredAt(unixMs)` | now | When the event happened, unix-ms. |
 
@@ -49,21 +89,10 @@ The runtime routes on the pattern; the SDK also matches it locally when picking 
 
 - At-least-once. **Handlers must be idempotent.**
 - `nil` acks; an error nacks and the runtime redelivers later.
-- Several handlers may share a name; they run in registration order and the first failure nacks the whole delivery.
-- A delivery with no matching handler is acked, not nacked — routing is the runtime's.
 - A handler panic becomes a nack, not a process crash.
 - `sb.WithMaxInFlightEvents(n)` (default 32) is real backpressure: at the cap the SDK stops reading the delivery stream.
+- During `Stop` the subscriber takes no new deliveries and leaves them unanswered, so the runtime redelivers them without burning an attempt.
 - Retries, fan-out and DLQ belong to the runtime. There is no DLQ API in the SDK — operate it in the dashboard.
-
-## Outbox
-
-| Knob | Default |
-|---|---|
-| `sb.WithDataDir(dir)` | `./.servicebridge` (the file is `sdk.db`) |
-| `sb.WithMaxOutboxRows(n)` | `10000`; `0` lifts the cap |
-| `sb.WithDrainBatchSize(n)` | `100` |
-
-At the cap `Publish` returns `CodeOutboxFull` and nothing already buffered is discarded. The drain ladder is 1 s · 5 s · 30 s · 2 min · 10 min with jitter and the last rung repeats forever — a transport failure never exhausts a budget, because the publish already promised durability. Only meaningful verdicts are terminal: an invalid name and a policy refusal.
 
 ## Complete program
 
@@ -75,6 +104,7 @@ import (
 	"errors"
 	"log"
 	"os"
+	"time"
 
 	"example.com/orders/orderpb"
 	sb "github.com/service-bridge/sdk/go"
@@ -83,15 +113,15 @@ import (
 func main() {
 	c, err := sb.New("localhost:14445", os.Getenv("ORDERS_KEY"),
 		sb.WithAdvertise(os.Getenv("POD_IP"), 50051),
-		sb.WithDataDir("/var/lib/orders/sb"),
-		sb.WithMaxOutboxRows(50_000),
+		sb.WithMaxPendingPublishes(50_000),
+		sb.WithPublishTimeout(10*time.Second),
 		sb.WithMaxInFlightEvents(64),
 	)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// A refused publish cannot be returned to the caller — it arrives here.
+	// A refused publish also arrives here — the only signal for fire-and-forget.
 	c.OnPolicyViolation(func(v sb.PolicyViolation) {
 		log.Printf("policy refused %s %q (%s): %s", v.Declaration, v.Value, v.DenySide, v.Reason)
 	})
@@ -102,7 +132,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Exact-name subscription.
+	// Exact-name subscription, narrowed on the runtime by a filter.
 	if err := sb.SubscribeEvent(c, "order.shipped",
 		func(ctx context.Context, e *orderpb.OrderShipped) error {
 			// At-least-once: dedup on a domain key before doing anything
@@ -115,22 +145,17 @@ func main() {
 				return nil // already handled, ack
 			}
 			return notifyCustomer(ctx, e.GetOrderId(), e.GetCarrier())
-		}); err != nil {
+		},
+		sb.WithFilter(map[string]any{"$.region": "eu"})); err != nil {
 		log.Fatal(err)
 	}
 
-	// Pattern subscription: one segment.
-	if err := sb.SubscribeEvent(c, "order.*",
-		func(ctx context.Context, e *orderpb.OrderPlaced) error {
-			return audit(ctx, e.GetOrderId())
-		}); err != nil {
-		log.Fatal(err)
-	}
-
-	// Payload shape varies across the family: take it undecoded.
+	// Pattern subscription; the payload shape varies across the family, so
+	// take it undecoded.
 	if err := sb.SubscribeEventRaw(c, "audit.#",
 		func(ctx context.Context, payload []byte) error {
-			return archive(ctx, payload)
+			info, _ := sb.DeliveryFromContext(ctx)
+			return archive(ctx, info.EventName, payload)
 		}); err != nil {
 		log.Fatal(err)
 	}
@@ -147,26 +172,30 @@ func main() {
 		sb.WithPartitionKey("o-1"),                     // serialises this order's events
 		sb.WithEventIdempotencyKey("order-o-1-placed"), // dedup at the runtime
 	)
-	if errors.Is(err, sb.ErrOutboxFull) {
-		log.Println("local buffer is full — the runtime has been unreachable too long")
-	} else if err != nil {
+	switch {
+	case errors.Is(err, sb.ErrQueueFull):
+		log.Println("publish queue is full — the runtime has been unreachable too long")
+	case errors.Is(err, sb.ErrTimeout):
+		log.Println("no acknowledgement in time:", err) // the message says whether it was sent
+	case err != nil:
 		log.Fatal(err)
+	default:
+		log.Println("stored event", id)
 	}
-	log.Println("buffered event", id)
 
 	select {}
 }
 
 func insertIfAbsent(ctx context.Context, key string) (bool, error) { return true, nil }
 func notifyCustomer(ctx context.Context, orderID, carrier string) error { return nil }
-func audit(ctx context.Context, orderID string) error                   { return nil }
-func archive(ctx context.Context, payload []byte) error                 { return nil }
+func archive(ctx context.Context, name string, payload []byte) error    { return nil }
 ```
 
 ## Gotchas
 
 - `DefineEvent` / `SubscribeEvent` after `Start` → `CodeState`. `Publish` before `Start` → `CodeState`.
 - Publishing a name with `*` or `#` → `CodeInvalidEventName`.
+- A second handler for the same pattern → `CodeValidation`.
 - A partition key serialises its lane — pick it as fine-grained as the domain allows (`orderID`, not `"orders"`).
-- `sb.WithFireAndForget()` drops the buffer **and** the retries: use it for telemetry, never for domain state.
+- `sb.WithFireAndForget()` does not wait for the acknowledgement and accepts loss on a crash: use it for telemetry, never for domain state.
 - Runtime-side dedup (`WithEventIdempotencyKey`) protects against double **publish**; only your handler protects against double **delivery**.

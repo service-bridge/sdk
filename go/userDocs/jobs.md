@@ -37,6 +37,7 @@ func declareRollup(c *sb.Client) error {
 	}
 	return c.Job.Handle("nightly-rollup",
 		job.NewSpec(nightly,
+			job.WithVersion("v1"),
 			job.WithOverlap(job.OverlapSkip),
 			job.WithCatchup(job.CatchupFireOnce),
 			job.WithMaxAttempts(5),
@@ -53,6 +54,8 @@ func declareRollup(c *sb.Client) error {
 `c.Job.Handle` — метод, а не свободная функция: параметр типа тут не нужен, у задачи нет ни входа, ни выхода.
 
 Объявлять нужно **до** `Start`. Позже — `CodeState`.
+
+**`job.WithVersion` обязателен.** Это неизменяемая версия исполняемого кода обработчика: она входит в отпечаток задачи, и изменение логики обработчика требует новой версии. Новые срабатывания запускает только последняя объявленная версия; исполнения, созданные раньше, уходят той версии, под которую были назначены. Спецификация без версии отвергается при объявлении с `CodeValidation` (`job.ErrVersion`).
 
 Спецификация валидируется здесь же, при объявлении. Это важнее, чем кажется: cron-выражение с опечаткой зарегистрировалось бы как обычная строка, и задача просто никогда не сработала бы — без единой ошибки где-либо.
 
@@ -97,6 +100,7 @@ func declareTuned(c *sb.Client) error {
 	}
 	return c.Job.Handle("heartbeat",
 		job.NewSpec(beat,
+			job.WithVersion("v1"),
 			job.WithMaxAttempts(3),
 			job.WithLeaseTTL(2*time.Minute),
 			job.WithMaxConcurrent(1),
@@ -115,15 +119,18 @@ func declareTuned(c *sb.Client) error {
 
 | Опция | По умолчанию | Что делает |
 |---|---|---|
+| `job.WithVersion(v)` | нет — обязательна | Неизменяемая версия исполняемого кода обработчика. |
 | `job.WithCatchup(p)` | решает рантайм | Что делать с тиками, пропущенными пока рантайм лежал. |
 | `job.WithOverlap(p)` | решает рантайм | Что делать, если задача сработала, а предыдущий запуск ещё идёт. |
 | `job.WithDeps(deps...)` | нет | Исходящие вызовы, которые задача делает. Повторное применение добавляет. |
 | `job.WithMaxAttempts(n)` | решает рантайм | Сколько раз пробовать одно срабатывание. |
 | `job.WithLeaseTTL(d)` | решает рантайм | Сколько рантайм ждёт молчащий инстанс, прежде чем переназначить исполнение. |
-| `job.WithMaxConcurrent(n)` | решает рантайм | Потолок одновременных исполнений этой задачи — и на диспетчере рантайма, и на обработчиках SDK. |
+| `job.WithMaxConcurrent(n)` | решает рантайм; в SDK — 32 обработчика | Потолок одновременных исполнений этой задачи — и на диспетчере рантайма, и на обработчиках SDK. Не больше 1024. При `OverlapSkip` в SDK всегда работает один обработчик. |
 | `job.WithRetry(p)` | решает рантайм | Своя экспоненциальная задержка вместо серверной. `RetryPolicy{InitialMs, MaxMs, Multiplier, Jitter}`. |
 
 **Значений по умолчанию SDK не хранит.** Неприменённая опция просто не попадает в спецификацию, и её проставляет рантайм из своих настроек. Копия дефолтов в SDK стала бы вторым источником правды и разошлась бы с первой же правкой настроек рантайма — поэтому в таблице выше стоит «решает рантайм», а не число.
+
+В `job.Spec` лимиты — указатели (`MaxAttempts *int`, `LeaseTTLMs *int64`, `MaxConcurrent *int`, `Retry *RetryPolicy`): `nil` значит «не задано», и поле не уходит рантайму. Заданный лимит уходит, даже если он равен `0`. Стройте спецификацию через `job.NewSpec` и опции — они сами заполняют указатели.
 
 ## 5. Контекст исполнения
 
@@ -133,7 +140,7 @@ func declareWithContext(c *sb.Client) error {
 	if err != nil {
 		return err
 	}
-	return c.Job.Handle("expire-carts", job.NewSpec(daily),
+	return c.Job.Handle("expire-carts", job.NewSpec(daily, job.WithVersion("v1")),
 		func(ctx context.Context, exec job.Execution) error {
 			log.Printf("job %s exec %s attempt %d scheduled at %d",
 				exec.Name, exec.ID, exec.Attempt, exec.ScheduledAtUnixMs)
@@ -151,7 +158,7 @@ func declareWithContext(c *sb.Client) error {
 | `Attempt` | Номер попытки. Меняется на каждом ретрае. |
 | `IdempotencyKey` | Ключ, одинаковый для всех попыток одного планового срабатывания. |
 
-`ctx` отменяется при остановке клиента. Обработчик, игнорирующий отмену, задержит `Stop` ровно на столько, сколько он работает.
+`ctx` отменяется при остановке клиента и при потере потока исполнений. `Stop` ждёт работающие обработчики до своего дедлайна.
 
 ## 6. Идемпотентность
 
@@ -165,7 +172,7 @@ func declareIdempotent(c *sb.Client) error {
 	if err != nil {
 		return err
 	}
-	return c.Job.Handle("settle-payouts", job.NewSpec(hourly),
+	return c.Job.Handle("settle-payouts", job.NewSpec(hourly, job.WithVersion("v1")),
 		func(ctx context.Context, exec job.Execution) error {
 			fresh, err := insertIfAbsent(ctx, "payout:"+exec.IdempotencyKey)
 			if err != nil {
@@ -184,7 +191,7 @@ func declareIdempotent(c *sb.Client) error {
 
 Ошибка из обработчика означает «попробуй ещё раз»: рантайм повторит исполнение по своей политике задержек, пока не кончится бюджет попыток.
 
-Когда повторять бессмысленно — заворачивайте ошибку в `job.ErrPermanent`:
+Когда повторять бессмысленно — заворачивайте ошибку в `sb.NonRetryable`:
 
 ```go
 func declarePermanent(c *sb.Client) error {
@@ -192,11 +199,11 @@ func declarePermanent(c *sb.Client) error {
 	if err != nil {
 		return err
 	}
-	return c.Job.Handle("import-feed", job.NewSpec(daily),
+	return c.Job.Handle("import-feed", job.NewSpec(daily, job.WithVersion("v1")),
 		func(ctx context.Context, exec job.Execution) error {
 			if err := rollup(ctx, exec.IdempotencyKey); err != nil {
 				if errors.Is(err, errMalformedFeed) {
-					return fmt.Errorf("%w: %w", job.ErrPermanent, err)
+					return sb.NonRetryable(err)
 				}
 				return err
 			}
@@ -205,9 +212,9 @@ func declarePermanent(c *sb.Client) error {
 }
 ```
 
-Ошибка, обёрнутая в `job.ErrPermanent`, уезжает рантайму помеченной как неретраебельная, и оставшиеся попытки на неё не тратятся. Текст исходной ошибки при этом сохраняется.
+Ошибка, обёрнутая в `sb.NonRetryable`, уезжает рантайму помеченной как неретраебельная: оставшиеся попытки на неё не тратятся, и исполнение сразу уходит в DLQ. Текст исходной ошибки сохраняется. `sb.NonRetryable(nil)` возвращает `nil`.
 
-Клиент шлёт рантайму сигнал жизни каждые 5 секунд. Три подряд неудачных попытки — и подписка на исполнения переоткрывается: молчащий инстанс рантайм иначе сочтёт мёртвым и переназначит его исполнения, а в логах не останется объяснения, почему одна и та же задача выполняется дважды.
+Пока поток исполнений открыт, клиент шлёт рантайму сигнал жизни, и он продлевает лизы всех исполнений в работе. Первый сигнал уходит сразу, дальше период задаёт рантайм (до первого ответа — 5 секунд, не чаще раза в 100 мс). Три подряд неудачных сигнала — и поток переоткрывается: молчащий инстанс рантайм иначе сочтёт мёртвым и переназначит его исполнения, а в логах не останется объяснения, почему одна и та же задача выполняется дважды.
 
 ## 8. Пропущенные тики и наложение
 
@@ -241,6 +248,7 @@ func declareDeps(c *sb.Client) error {
 	}
 	return c.Job.Handle("nightly-billing",
 		job.NewSpec(daily,
+			job.WithVersion("v1"),
 			job.WithDeps(
 				job.RPC("billing-svc.Rollup"),
 				job.Event("billing.rolled_up"),
@@ -269,6 +277,7 @@ func declareDeps(c *sb.Client) error {
 
 | Сентинел | Причина |
 |---|---|
+| `job.ErrVersion` | Не задана версия (`job.WithVersion`). |
 | `job.ErrNoTrigger` | Спецификация без триггера. |
 | `job.ErrCronFieldCount` | В cron-выражении не пять полей. |
 | `job.ErrCronExpr` | Cron-выражение не разбирается. |
@@ -278,7 +287,7 @@ func declareDeps(c *sb.Client) error {
 | `job.ErrCatchupPolicy` · `job.ErrOverlapPolicy` | Неизвестное значение политики. |
 | `job.ErrDepKind` · `job.ErrDepTarget` | Зависимость не того вида или без цели. |
 | `job.ErrRetryInitial` | В политике повторов нет положительной начальной задержки. |
-| `job.ErrNegativeLimit` | Отрицательный лимит. |
+| `job.ErrNegativeLimit` | Отрицательный лимит или `MaxConcurrent` больше 1024. |
 | `job.ErrEmptyName` · `job.ErrNoHandler` | Пустое имя задачи или отсутствующий обработчик. |
 | `job.ErrDuplicateName` | Имя задачи уже объявлено. |
 
