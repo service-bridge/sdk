@@ -2,10 +2,10 @@
 #
 # bootstrap-e2e-keys.sh — provisions persistent service keys for the SDK e2e suite.
 #
-# The e2e tests hardcode two service names: `e2e-registry-svc` (callee /
-# provider) and `e2e-registry-consumer` (caller). This script guarantees that
-# those exact names exist in Postgres with fresh `active` keys and writes the
-# bootstrap material to <repo>/.env.e2e for the bun preload to pick up.
+# Every e2e domain (DOMAINS below) owns three services, e2e-<domain>-1..3.
+# This script guarantees that those exact names exist in Postgres with fresh
+# `active` keys and writes the bootstrap material to <repo>/.env.e2e, read by
+# the bun preload and by the Go e2e suite.
 #
 # Idempotency strategy:
 #   1. Any pre-existing `services` rows with these two names are FLAGGED
@@ -46,7 +46,11 @@
 #   RUNTIME_URL    default: localhost:14445
 #   GW_ADDR        default: http://127.0.0.1:14444 (sb UI-gateway address)
 #   SB_USER        default: admin (UI account used to create services)
-#   SB_PASSWORD    default: admin (dev account; created on first boot)
+#   SB_PASSWORD    default: admin (logs into an existing dev account; creating
+#                  the first account on an empty database needs >= 8 characters)
+#   SB_SETUP_TOKEN one-time setup token for the first account on an empty
+#                  database; the runtime prints it to its log or takes it from
+#                  SERVICEBRIDGE_UI_SETUP_TOKEN. `sb setup` reads it from env.
 #   PG_USER        default: postgres (Docker database user)
 #   PG_DATABASE    default: service-bridge (Docker database name)
 #   PG_CONTAINER   default: servicebridge2-pg (docker container name for psql)
@@ -131,8 +135,8 @@ sb_cli() {
   (cd "$RUNTIME_DIR" && go run ./cmd/sb --addr "$GW_ADDR" "$@")
 }
 
-# Authenticate the sb CLI once. The dev admin account is seeded on first boot;
-# `setup` initialises it, `login` re-uses it on subsequent runs.
+# Authenticate the sb CLI once. On an empty database `setup` creates the first
+# account (it needs SB_SETUP_TOKEN); afterwards `login` re-uses it.
 sb_login() {
   if sb_cli setup -u "$SB_USER" -p "$SB_PASSWORD" >/dev/null 2>&1; then
     return 0
