@@ -22,8 +22,8 @@ const RUNTIME_DIR = join(import.meta.dir, "../../../../../runtime");
 
 const PG_HOST = process.env.POSTGRES_HOST ?? "localhost";
 const PG_PORT = parseInt(process.env.POSTGRES_PORT ?? "5433", 10);
-const PG_USER = process.env.POSTGRES_USER ?? "servicebridge";
-const PG_PASSWORD = process.env.POSTGRES_PASSWORD ?? "servicebridge";
+const PG_USER = process.env.POSTGRES_USER ?? "postgres";
+const PG_PASSWORD = process.env.POSTGRES_PASSWORD ?? "postgres";
 
 /**
  * adminUrl builds a connection URL to the postgres maintenance database so we
@@ -72,7 +72,7 @@ async function dropDatabase(dbName: string): Promise<void> {
 const PG_MAIN_DB =
 	process.env.POSTGRES_DB ??
 	process.env.TEST_DATABASE_URL?.match(/\/([^/?]+)(\?|$)/)?.[1] ??
-	"service-bridge";
+	"service-bridge-v3";
 
 /**
  * seedServices copies all rows from the main services table into the isolated

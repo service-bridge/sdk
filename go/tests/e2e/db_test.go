@@ -26,9 +26,9 @@ import (
 // generated name and nothing to exec into, so it sets the direct mode.
 
 const (
-	defaultPGContainer = "servicebridge2-pg"
-	defaultPGUser      = "servicebridge"
-	defaultPGDatabase  = "service-bridge"
+	defaultPGContainer = "servicebridge-postgres-1"
+	defaultPGUser      = "postgres"
+	defaultPGDatabase  = "service-bridge-v3"
 	// dollarTag delimits string literals in generated SQL. Every value a test
 	// interpolates is a name it minted itself; the tag is asserted absent so a
 	// value can never close the quote.

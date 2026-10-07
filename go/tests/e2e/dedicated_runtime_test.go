@@ -37,7 +37,7 @@ import (
 // It has no bearing on psql run inside the container, which authenticates
 // there without a password — only the dedicated runtime binary, dialing
 // Postgres over TCP, needs it.
-const defaultPGPassword = "servicebridge"
+const defaultPGPassword = "postgres"
 
 func pgPassword() string {
 	if v := os.Getenv("SB_E2E_PG_PASSWORD"); v != "" {

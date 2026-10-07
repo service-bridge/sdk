@@ -24,8 +24,8 @@
 # Preconditions:
 #   - Postgres 18 reachable at $POSTGRES_DSN (default: local docker on :5433).
 #     If you need to (re)create the local container from scratch:
-#       docker rm -f servicebridge2-pg 2>/dev/null
-#       docker run -d --name servicebridge2-pg -p 5433:5432 \
+#       docker rm -f servicebridge-postgres-1 2>/dev/null
+#       docker run -d --name servicebridge-postgres-1 -p 5433:5432 \
 #         -e POSTGRES_PASSWORD=postgres postgres:18-alpine
 #   - psql reachable one of two ways, chosen by PG_MODE:
 #       docker (default) — run psql inside the $PG_CONTAINER container, so a
@@ -42,18 +42,17 @@
 #   bash scripts/bootstrap-e2e-keys.sh
 #
 # Environment overrides:
-#   POSTGRES_DSN   default: postgres://postgres:postgres@localhost:5433/service-bridge?sslmode=disable
+#   POSTGRES_DSN   default: postgres://postgres:postgres@localhost:5433/service-bridge-v3?sslmode=disable
 #   RUNTIME_URL    default: localhost:14445
 #   GW_ADDR        default: http://127.0.0.1:14444 (sb UI-gateway address)
 #   SB_USER        default: admin (UI account used to create services)
-#   SB_PASSWORD    default: admin (logs into an existing dev account; creating
-#                  the first account on an empty database needs >= 8 characters)
+#   SB_PASSWORD    default: adminadmin (passwords need >= 8 characters)
 #   SB_SETUP_TOKEN one-time setup token for the first account on an empty
 #                  database; the runtime prints it to its log or takes it from
 #                  SERVICEBRIDGE_UI_SETUP_TOKEN. `sb setup` reads it from env.
 #   PG_USER        default: postgres (Docker database user)
-#   PG_DATABASE    default: service-bridge (Docker database name)
-#   PG_CONTAINER   default: servicebridge2-pg (docker container name for psql)
+#   PG_DATABASE    default: service-bridge-v3 (Docker database name)
+#   PG_CONTAINER   default: servicebridge-postgres-1 (docker container name for psql)
 #   PG_MODE        default: docker — how to reach psql; `direct` uses system
 #                  psql against POSTGRES_DSN (CI)
 #   RUNTIME_DIR    default: <repo>/../runtime (checkout of the runtime repo)
@@ -66,15 +65,15 @@ cd "$REPO_ROOT"
 # The runtime is a sibling repo in the workspace (../runtime), not under sdk/.
 RUNTIME_DIR=${RUNTIME_DIR:-"$REPO_ROOT/../runtime"}
 
-POSTGRES_DSN=${POSTGRES_DSN:-'postgres://postgres:postgres@localhost:5433/service-bridge?sslmode=disable'}
+POSTGRES_DSN=${POSTGRES_DSN:-'postgres://postgres:postgres@localhost:5433/service-bridge-v3?sslmode=disable'}
 RUNTIME_URL=${RUNTIME_URL:-localhost:14445}
 GW_ADDR=${GW_ADDR:-http://127.0.0.1:14444}
 SB_USER=${SB_USER:-admin}
-SB_PASSWORD=${SB_PASSWORD:-admin}
-PG_CONTAINER=${PG_CONTAINER:-servicebridge2-pg}
+SB_PASSWORD=${SB_PASSWORD:-adminadmin}
+PG_CONTAINER=${PG_CONTAINER:-servicebridge-postgres-1}
 PG_MODE=${PG_MODE:-docker}
 PG_USER=${PG_USER:-postgres}
-PG_DATABASE=${PG_DATABASE:-service-bridge}
+PG_DATABASE=${PG_DATABASE:-service-bridge-v3}
 
 # Per-domain service identities. Each e2e domain runs as its own process
 # against its own three identities (e2e-<domain>-1/2/3, pool.ts roles

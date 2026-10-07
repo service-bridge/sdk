@@ -203,7 +203,7 @@ func dialRuntime(addr string) error {
 	if err != nil {
 		return fmt.Errorf("runtime is not listening on %s: %w\n"+
 			"       start it: cd runtime && go build -o /tmp/sb-runtime ./cmd/runtime && "+
-			"nohup /tmp/sb-runtime -pg-url postgres://servicebridge:servicebridge@localhost:5433/service-bridge?sslmode=disable > /tmp/sb-runtime.log 2>&1 & disown", addr, err)
+			"SERVICEBRIDGE_PG_URL='postgres://postgres:postgres@localhost:5433/service-bridge-v3?sslmode=disable' nohup /tmp/sb-runtime > /tmp/sb-runtime.log 2>&1 & disown", addr, err)
 	}
 	return conn.Close()
 }

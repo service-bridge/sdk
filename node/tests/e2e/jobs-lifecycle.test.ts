@@ -625,9 +625,17 @@ describe("jobs-lifecycle: stale lease_epoch rejected → execution re-dispatched
 		const execId = await runningId();
 		expect(execId).not.toBeNull();
 
-		// Bump lease_epoch to simulate a runtime reclaim mid-flight.
-		const epochs =
-			await db!`UPDATE job_executions SET lease_epoch = lease_epoch + 1 WHERE id = ${execId} RETURNING lease_epoch`;
+		// Simulate a runtime reclaim mid-flight exactly as the runtime writes it
+		// (jobs Repo.reclaimTx): back to pending under a new epoch with no
+		// holder. Bumping only the epoch would leave the row held by this
+		// instance, whose heartbeats keep extending every lease it holds, so it
+		// would never be re-dispatched.
+		const epochs = await db!`
+			UPDATE job_executions
+			   SET status = 'pending', lease_epoch = lease_epoch + 1, lease_holder_instance_id = NULL,
+			       lease_expires_at = NULL, next_attempt_at = now(), current_op_id = NULL
+			 WHERE id = ${execId}
+			RETURNING lease_epoch`;
 		expect(Number(epochs[0].lease_epoch)).toBeGreaterThan(1);
 
 		// Unblock — the SDK now ACKs with the OLD (stale) epoch.
