@@ -3,6 +3,7 @@
 import { createHash } from "node:crypto";
 import { ValidationError } from "../errors";
 import type { Registry } from "../registry/registry";
+import { cronError, timeZoneError } from "./cron";
 import type {
 	CatchupPolicy,
 	DeclaredDep,
@@ -193,11 +194,14 @@ function validateOpts(name: string, opts: JobOpts): void {
 		);
 	}
 	if ("cron" in t && typeof t.cron === "string") {
-		const fields = t.cron.trim().split(/\s+/);
-		if (fields.length !== 5) {
+		const err = cronError(t.cron);
+		if (err)
 			throw new ValidationError(
-				`sb.job.handle: cron must be 5-field (no seconds); got ${fields.length} fields`,
+				`sb.job.handle: cron ${JSON.stringify(t.cron)}: ${err}`,
 			);
+		if (typeof t.tz === "string" && t.tz !== "") {
+			const tzErr = timeZoneError(t.tz);
+			if (tzErr) throw new ValidationError(`sb.job.handle: cron tz: ${tzErr}`);
 		}
 	}
 	if ("interval" in t && typeof t.interval === "number") {

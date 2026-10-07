@@ -213,7 +213,7 @@ bash <(curl -fsSL https://servicebridge.dev/install.sh)
 
 It pulls the runtime container, wires it to PostgreSQL 18+, and exposes the gRPC control plane on `:14445` and the dashboard on `:14444`. Open the dashboard, create a service, and copy its **bootstrap service key** — that opaque string is the second argument to `new ServiceBridge(url, key)`.
 
-Each instance authenticates with its key: the SDK calls `Bootstrap.Provision`, receives a short-lived leaf certificate, opens an mTLS gRPC channel and registers. Certificates rotate automatically with overlap (the new session is live before the old one closes), so long-running instances never drop traffic at renewal.
+Each instance authenticates with its key: the SDK calls `Bootstrap.Provision`, receives a short-lived leaf certificate, opens an mTLS gRPC channel and registers. The certificate is renewed before it expires; open connections and streams keep running and only new connections use the new certificate, so long-running instances never drop traffic at renewal.
 
 Full self-hosting docs live at **[servicebridge.dev/docs](https://servicebridge.dev/docs)**.
 
@@ -398,14 +398,14 @@ Scheduled work: cron, fixed interval, or one-shot delay. The runtime owns the sc
 
 ```ts
 sb.job.handle("nightly-rollup",
-  { trigger: { cron: "0 3 * * *", tz: "UTC" } },     // 5-field cron, no seconds
+  { version: "v1", trigger: { cron: "0 3 * * *", tz: "UTC" } },     // 5-field cron, no seconds
   async (ctx) => { await rollup(ctx.scheduledAt); },
 );
 
-sb.job.handle("heartbeat", { trigger: { interval: 30_000 } }, async () => { await ping(); });
+sb.job.handle("heartbeat", { version: "v1", trigger: { interval: 30_000 } }, async () => { await ping(); });
 
 sb.job.handle("send-reminder",
-  { trigger: { delayed: { at: Date.now() + 60_000 } } }, // Date | number | ISO string
+  { version: "v1", trigger: { delayed: { at: Date.now() + 60_000 } } }, // Date | number | ISO string
   async (ctx) => { await remind(ctx.idempotencyKey); },
 );
 ```
@@ -414,9 +414,10 @@ The handler receives a `JobHandlerCtx`: `{ jobName, executionId, scheduledAt, lo
 
 | `JobOpts` | Type | Default | Description |
 |---|---|---|---|
+| `version` | `string` | required | Executable version of the job; a new version is a new contract. |
 | `trigger` | `{cron, tz?} \| {delayed:{at}} \| {interval}` | required | Exactly one trigger; `interval` is in ms. |
 | `catchup` | `"skip" \| "fire_once" \| "fire_all"` | `skip` | What to do for fire times missed during downtime. |
-| `overlap` | `"skip" \| "allow" \| "buffer_one"` | `allow` | Behaviour when a previous run is still in flight. |
+| `overlap` | `"skip" \| "allow" \| "buffer_one"` | `skip` | Behaviour when a previous run is still in flight. |
 | `deps` | `DeclaredDep[]` | none | Outgoing deps: `{ rpc }`, `{ event }`, `{ workflow }`. |
 | `maxAttempts` / `leaseTtlMs` / `maxConcurrent` / `retry` | — | runtime default | Execution limits and `{ initialMs, maxMs, multiplier, jitter }` retry. |
 

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { Registry } from "../registry/registry";
+import { cronError } from "./cron";
 import { JobDomain } from "./domain";
 import type { JobOpts, Trigger } from "./types";
 
@@ -417,4 +418,31 @@ describe("canonical job spec — cross-SDK vectors", () => {
 			expect(entry.contractHash).toBe(v.sha256);
 		});
 	}
+});
+
+// sdk/cron-vectors.json is shared with the Go SDK, which validates with the
+// runtime's own parser: both must accept and reject the same expressions.
+describe("cron grammar — cross-SDK vectors", () => {
+	const { vectors } = JSON.parse(
+		readFileSync(
+			new URL("../../../cron-vectors.json", import.meta.url),
+			"utf8",
+		),
+	) as { vectors: { expr: string; valid: boolean }[] };
+	for (const v of vectors) {
+		test(`${JSON.stringify(v.expr)} is ${v.valid ? "valid" : "invalid"}`, () => {
+			expect(cronError(v.expr) === null).toBe(v.valid);
+		});
+	}
+});
+
+test("an unknown cron time zone is rejected at declaration", () => {
+	const { domain } = newDomain();
+	expect(() =>
+		domain.handle(
+			"tz",
+			{ version: "v1", trigger: { cron: "0 3 * * *", tz: "Mars/Olympus" } },
+			noop,
+		),
+	).toThrow(/time zone/);
 });

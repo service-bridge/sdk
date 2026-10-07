@@ -116,3 +116,27 @@ func TestCanonicalSpecMatchesTheSharedVectors(t *testing.T) {
 		})
 	}
 }
+
+// TestCronVectors pins the cron grammar to sdk/cron-vectors.json, which the
+// Node SDK checks too: an expression is valid in both SDKs or in neither.
+func TestCronVectors(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "cron-vectors.json"))
+	if err != nil {
+		t.Fatalf("read cron vectors: %v", err)
+	}
+	var file struct {
+		Vectors []struct {
+			Expr  string `json:"expr"`
+			Valid bool   `json:"valid"`
+		} `json:"vectors"`
+	}
+	if err := json.Unmarshal(raw, &file); err != nil {
+		t.Fatalf("decode cron vectors: %v", err)
+	}
+	for _, v := range file.Vectors {
+		_, err := job.NewCronTrigger(v.Expr, "")
+		if (err == nil) != v.Valid {
+			t.Errorf("%q: valid=%v, want %v (err: %v)", v.Expr, err == nil, v.Valid, err)
+		}
+	}
+}
