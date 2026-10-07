@@ -20,10 +20,25 @@ import { sleep } from "./fixtures";
 
 const RUNTIME_DIR = join(import.meta.dir, "../../../../../runtime");
 
-const PG_HOST = process.env.POSTGRES_HOST ?? "localhost";
-const PG_PORT = parseInt(process.env.POSTGRES_PORT ?? "5433", 10);
-const PG_USER = process.env.POSTGRES_USER ?? "postgres";
-const PG_PASSWORD = process.env.POSTGRES_PASSWORD ?? "postgres";
+// TEST_DATABASE_URL is the one connection every e2e caller passes (CI, ci-local);
+// its host, port, account and database win, so a lifecycle runtime reaches the
+// same Postgres as the shared runtime. POSTGRES_* and the dev defaults apply only
+// when it is absent.
+const TEST_DB = process.env.TEST_DATABASE_URL
+	? new URL(process.env.TEST_DATABASE_URL)
+	: null;
+
+const PG_HOST = TEST_DB?.hostname || (process.env.POSTGRES_HOST ?? "localhost");
+const PG_PORT = parseInt(
+	TEST_DB?.port || (process.env.POSTGRES_PORT ?? "5433"),
+	10,
+);
+const PG_USER = TEST_DB
+	? decodeURIComponent(TEST_DB.username)
+	: (process.env.POSTGRES_USER ?? "postgres");
+const PG_PASSWORD = TEST_DB
+	? decodeURIComponent(TEST_DB.password)
+	: (process.env.POSTGRES_PASSWORD ?? "postgres");
 
 /**
  * adminUrl builds a connection URL to the postgres maintenance database so we
@@ -69,10 +84,9 @@ async function dropDatabase(dbName: string): Promise<void> {
 	}
 }
 
-const PG_MAIN_DB =
-	process.env.POSTGRES_DB ??
-	process.env.TEST_DATABASE_URL?.match(/\/([^/?]+)(\?|$)/)?.[1] ??
-	"service-bridge-v3";
+const PG_MAIN_DB = TEST_DB
+	? decodeURIComponent(TEST_DB.pathname.slice(1))
+	: (process.env.POSTGRES_DB ?? "service-bridge-v3");
 
 /**
  * seedServices copies all rows from the main services table into the isolated
