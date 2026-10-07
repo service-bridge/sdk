@@ -33,15 +33,15 @@ ServiceBridge различает **unary** (один запрос → один �
 
 ## 1. Регистрация хендлеров
 
-Все регистрации **до `sb.start()`**. SDK отправляет полную декларацию в первом `RegisterRequest` и на каждом reconnect.
+Все регистрации **до `sb.start()`**. SDK отправляет полную декларацию в первом `RegisterRequest` и на каждом reconnect. Второй хендлер на то же имя — `ValidationError`.
 
 ### Unary
 
 ```ts
 sb.rpc.handle<Req, Res>(
   name: string,
-  fn: (req: Req) => Promise<Res>,
-  opts: { schema: SchemaSpec },
+  fn: (req: Req, ctx: RpcHandlerContext) => Promise<Res> | Res,
+  opts: { schema: SchemaSpec; captureMode?: "all" | "errors" | "none" },
 ): void
 ```
 
@@ -53,12 +53,35 @@ sb.rpc.handle<{ userId: string; amount: number }, { transactionId: string; ok: b
 );
 ```
 
+### Контекст вызова
+
+Второй аргумент хендлера — `ctx`:
+
+```ts
+interface RpcHandlerContext {
+  signal: AbortSignal;        // прерывается, когда вызывающий отменил вызов или истёк дедлайн
+  deadline: number | null;    // абсолютный дедлайн, unix-ms; null — вызывающий не задал
+  requestId: string;          // CallOpts.requestId вызывающего
+  idempotencyKey: string;     // CallOpts.idempotencyKey вызывающего; "" если не задан
+  caller: { serviceId: string; instanceId: string } | null;
+}
+```
+
+`caller` — проверенная идентичность пира из его сертификата. При вызове через runtime proxy `instanceId` пустой. `null` — идентичность установить не удалось.
+
+```ts
+sb.rpc.handle("Charge", async (req: { orderId: string; amount: number }, ctx) => {
+  const res = await fetch(BANK_URL, { method: "POST", body: JSON.stringify(req), signal: ctx.signal });
+  return { ok: res.ok };
+}, { schema: { protoFile: "./payment.proto" } });
+```
+
 ### Server-side streaming
 
 ```ts
 sb.rpc.handleStream<Req, Chunk>(
   name: string,
-  fn: (req: Req) => AsyncGenerator<Chunk>,
+  fn: (req: Req, ctx: RpcHandlerContext) => AsyncIterable<Chunk>,
   opts: { schema: SchemaSpec },
 ): void
 ```
@@ -75,11 +98,11 @@ sb.rpc.handleStream<{ prompt: string }, { token: string }>(
 );
 ```
 
-**Cancellation:** когда caller прерывает stream, следующий `yield` бросит исключение — обрабатывайте через `try/finally` для очистки ресурсов:
+**Cancellation:** когда caller прерывает stream или истекает дедлайн, `ctx.signal` прерывается, а у генератора вызывается `return()`. Освобождайте ресурсы в `try/finally`:
 
 ```ts
-sb.rpc.handleStream("Generate", async function* (req) {
-  const upstream = llm.start(req.prompt);
+sb.rpc.handleStream("Generate", async function* (req, ctx) {
+  const upstream = llm.start(req.prompt, { signal: ctx.signal });
   try {
     for await (const t of upstream) yield { token: t };
   } finally {
@@ -90,20 +113,24 @@ sb.rpc.handleStream("Generate", async function* (req) {
 
 ### Возврат ошибок из хендлера
 
-Любой `throw` из хендлера → caller получает ошибку с `err.name === "INTERNAL"` и тем же `message`. Выбрать произвольный gRPC-код из хендлера нельзя.
+Бизнес-ошибку бросайте как `HandlerError(handlerCode, message)`. Код уходит вызывающему как есть, и тот получает `HandlerError` с тем же `handlerCode`:
 
 ```ts
+import { HandlerError } from "service-bridge";
+
 sb.rpc.handle("Charge", async (req) => {
-  if (req.amount <= 0) {
-    throw new Error("amount must be positive"); // caller: err.name === "INTERNAL"
-  }
+  if (req.amount <= 0) throw new HandlerError("INVALID_AMOUNT", "amount must be positive");
   // ...
 }, { schema: { protoFile: "./payment.proto" } });
 ```
 
-> **Важно про коды.** Ошибки от callee (throw из хендлера, провал декода payload) приходят как `Error` со **строковым** `err.name` (`"INTERNAL"`, `"INVALID_ARGUMENT"`, …) и **без** числового `err.code`. Числовой `err.code` (gRPC status) есть только у ошибок транспорта/рантайма: недоступность, таймаут, отказ политики, rate limit. Различайте callee-ошибки по `err.name`, транспортные — по `err.code` (см. §9).
+Любая другая брошенная ошибка доходит до вызывающего как `HandlerError` с `handlerCode: "INTERNAL"` и тем же `message`. Это касается и `HandlerError`, который хендлер получил из своего вложенного вызова и пробросил дальше: бизнес-код чужого сервиса не становится ответом этого (у такой ошибки `remote === true`).
 
-Декод payload по схеме провалился → `err.name === "INVALID_ARGUMENT"`. Access policy запретила вызов → отдельный класс `RpcAccessDeniedError` (маппится из gRPC `PERMISSION_DENIED`, §9). Бизнес-валидацию доносите до caller через поля ответа, а не через код.
+Отказы до запуска хендлера идут gRPC-статусом, а не `HandlerError`: неизвестный метод — `NOT_FOUND`, unary-вызов streaming-метода — `VALIDATION`, недекодируемый запрос — `VALIDATION`, отказ политики — `ACCESS_DENIED` (см. §9).
+
+### Ограничения callee
+
+Входящие вызовы ограничены опциями конструктора: `rpcMaxConcurrentCalls` (по умолчанию 256 хендлеров одновременно) и `rpcMaxQueuedCalls` (по умолчанию столько же в очереди). Сверх очереди вызывающий получает `OVERLOADED`, и этот отказ безопасно повторяется на другом инстансе. До первого snapshot реестра (политика ещё неизвестна) и во время `stop()` callee отвечает `UNAVAILABLE` с той же пометкой «не отправлено в хендлер».
 
 ---
 
@@ -283,13 +310,16 @@ sb.stream<Req, Chunk>(
 
 ```ts
 interface CallOpts {
-  timeout?: string;                              // "500ms" | "10s" | "2m"  — default "30s"
-  requestId?: string;                            // auto UUID v4, если не задан
-  idempotencyKey?: string;                       // opt-in; по умолчанию "" = без dedup (см. §7)
+  signal?: AbortSignal;                          // отмена вызова — ServiceBridgeError с кодом CANCELLED
+  timeout?: string;                              // "500ms" | "10s" | "2m" — default "30s", на весь логический вызов
+  requestId?: string;                            // auto UUID, если не задан; доходит до ctx.requestId
+  idempotencyKey?: string;                       // доходит до ctx.idempotencyKey и до дедупа runtime proxy (§7)
   transport?: "direct" | "proxy" | "auto";       // default "auto" (см. §5)
   retry?: Partial<RetryOpts>;                    // см. §6
 }
 ```
+
+`timeout` покрывает все попытки вместе с паузами между ними. Неверная строка — `ConfigurationError`.
 
 ### Глобальные дефолты + per-call override
 
@@ -306,7 +336,7 @@ await sb.rpc.call(svc, m, payload);                          // использу
 await sb.rpc.call(svc, m, payload, { timeout: "30s" });      // 30s переопределяет 5s
 ```
 
-Иерархия (от низшей к высшей): `ServiceBridgeOptions.callDefaults` → `sb.client(...).callDefaults` → per-call `opts`.
+Иерархия (от низшей к высшей): `ServiceBridgeOptions.callDefaults` → `sb.client(...).callDefaults` → per-call `opts`. `callDefaults` действуют на `sb.rpc.call`, `sb.stream` и typed-клиенты.
 
 ---
 
@@ -314,19 +344,19 @@ await sb.rpc.call(svc, m, payload, { timeout: "30s" });      // 30s переоп
 
 | Значение | Поведение |
 |---------|-----------|
-| `"auto"` (default) | Direct, если у callee известен `call_endpoint`. Иначе proxy. |
-| `"direct"` | Только direct. Кидает `transport="direct" requested but no endpoint...`, если endpoint неизвестен. |
-| `"proxy"` | Только proxy — всегда через runtime `Invoke`, даже если direct возможен. |
+| `"auto"` (default) | Direct к выбранному инстансу, если у него есть `call_endpoint`. Если direct-попытка провалилась до отправки запроса, следующая попытка сразу (без паузы) идёт через runtime proxy, а недоступный инстанс runtime пробует последним. |
+| `"direct"` | Только direct, никогда через runtime. |
+| `"proxy"` | Всегда через runtime `Invoke`, даже если direct возможен. |
 
 ### Когда выбрать что
 
-- **`"auto"`** — default, для большинства случаев.
-- **`"direct"`** — fail-fast если callee misconfig'нут (нет advertise).
-- **`"proxy"`** — нужна централизованная idempotency через runtime cache (§7), либо отладка через единую точку логирования.
+- **`"auto"`** — default, для большинства случаев. Локальный снимок реестра может ещё держать мёртвый под, а runtime уже знает живой — `auto` переживает это без ошибки.
+- **`"direct"`** — когда вызов не должен идти через runtime.
+- **`"proxy"`** — нужна дедупликация повторов силами runtime (§7) или одна точка наблюдения.
 
 ### advertise (у callee)
 
-Чтобы callee принимал direct-вызовы, нужен inbound CallServer. Управляется опцией `advertise` в `ServiceBridgeOptions`:
+Чтобы callee принимал вызовы, нужен inbound CallServer. Управляется опцией `advertise` в `ServiceBridgeOptions`:
 
 ```ts
 new ServiceBridge(URL, KEY, { advertise: { host, port } | false })
@@ -338,6 +368,8 @@ new ServiceBridge(URL, KEY, { advertise: { host, port } | false })
 | `{ host, port }` | Явный bind. `port: 0` = ОС подбирает. **Рекомендуется для production.** |
 | `false` | Caller-only mode. CallServer не поднимается, runtime не получает `call_endpoint`. |
 
+Балансировщик выбирает только инстансы с `call_endpoint`, в том числе для `transport: "proxy"`. Инстанс с `advertise: false` вызвать нельзя: вызывающий получит `NoLiveInstanceError` «the callee advertises no inbound address».
+
 ⚠️ Не используйте `0.0.0.0` как **advertise host** — другие сервисы попытаются буквально подключиться к `0.0.0.0:port`.
 
 ### mTLS и SPIFFE
@@ -347,7 +379,7 @@ Direct-вызов = mTLS:
 - Server cert (callee leaf) валидируется по CA-цепочке.
 - SPIFFE SAN в server cert проверяется: `spiffe://servicebridge/service/<service_id>/instance/<instance_id>` — защита от подмены инстанса.
 
-Никаких токенов или auth-headers — identity полностью встроена в сертификат.
+Никаких токенов или auth-headers — identity полностью встроена в сертификат. Callee видит идентичность вызывающего в `ctx.caller`.
 
 ---
 
@@ -355,19 +387,22 @@ Direct-вызов = mTLS:
 
 ### Load Balancer
 
-**Power-of-Two-Choices (P2C)** по inflight: SDK берёт два случайных eligible-инстанса и шлёт вызов туда, где меньше активных запросов. При одном кандидате — берёт его; при равном inflight — берёт первый из двух выбранных (а так как оба выбраны случайно, выбор всё равно случайный). Per-pod state, inflight считается по `instanceId`.
+**Power-of-Two-Choices (P2C)** по inflight: SDK берёт два случайных eligible-инстанса и шлёт вызов туда, где меньше активных запросов. При одном кандидате — берёт его. Per-pod state, inflight считается по `instanceId`.
 
 Инстанс eligible только если:
 1. У него есть `call_endpoint`.
 2. CB не в OPEN.
 3. Runtime не пометил его unhealthy в последние 60s (health-hint).
 4. `contract_hash` совпадает с caller's local hash (фильтр до P2C, см. §8).
+5. Ни сервис, ни инстанс не отозваны runtime.
+
+Если health-hint исключил всех кандидатов, которые иначе подходят, выбор идёт среди них: ошибочный hint вероятнее, чем мёртвый весь флот.
 
 Inflight общий по инстансу, не разбит по методам.
 
 ### Circuit Breaker
 
-Per-instance state (`{serviceId}:{instanceId}`), sliding window 10s из 10 buckets:
+Per-instance state (`{serviceId}:{instanceId}`), sliding window 10s:
 
 | Параметр | Значение |
 |---------|---------|
@@ -382,13 +417,21 @@ CLOSED ──≥10 req & >50% errors / 10s──► OPEN ──30s──► HALF
                                                           └──1 failure──► OPEN
 ```
 
-В HALF_OPEN пропускается ровно один пробный вызов — остальные ждут его исхода. Failure = любой throw из transport ИЛИ application-error от callee. Success = успешно декодированный response. Порог в ≥10 запросов значит, что на малом трафике CB не откроется от пары случайных ошибок.
+Failure для breaker — только отказ транспорта: `CONNECTION`, `TIMEOUT`, `OVERLOADED`, `INTERNAL`-статус. Ответ хендлера (`HandlerError`), отказ политики или валидации — success: инстанс жив и ответил. Breaker учитывает только direct-вызовы.
 
 Per-pod, без synchronization между caller-подами. См. [ADR 0001](../../../runtime/docs/adr/0001-rpc.md).
 
 ### Retry
 
-Только для unary. Дефолты:
+Только для unary. SDK повторяет вызов **только** когда доказано, что хендлер не запускался:
+
+- нет подходящего кандидата (`NO_LIVE_INSTANCE`);
+- канал к callee или к runtime не стал готов в пределах оставшегося дедлайна — запрос не ушёл;
+- callee или runtime ответил статусом с трейлером `x-sb-not-dispatched: 1`: callee ещё без политики, в дренаже или перегружен.
+
+Всё остальное — голый `UNAVAILABLE`, истёкший дедлайн, ответ хендлера, отказ политики — возвращается вызывающему без повтора: исход неизвестен или повтор ответит тем же. `idempotencyKey` этого не меняет.
+
+Дефолты:
 
 ```ts
 interface RetryOpts {
@@ -400,74 +443,72 @@ interface RetryOpts {
 }
 ```
 
-Формула: `delay = round(min(baseDelayMs * factor^attempt, maxDelayMs) * (1 ± jitter))`, `attempt` с нуля. `maxAttempts` — это всего попыток, включая первую: при дефолтном `3` будет первая попытка + 2 ретрая с паузами ~200ms и ~400ms (±30%). `maxAttempts: 1` отключает ретраи.
-
-| gRPC код | Всегда | Только с `idempotencyKey` |
-|---------|--------|--------------------------|
-| `UNAVAILABLE` (14), `RESOURCE_EXHAUSTED` (8), `DEADLINE_EXCEEDED` (4) | ✅ | ✅ |
-| `INTERNAL` (13), `ABORTED` (10), `UNKNOWN` (2) | ❌ | ✅ |
-| Все остальные (`INVALID_ARGUMENT`, `NOT_FOUND`, `PERMISSION_DENIED`, ...) | ❌ | ❌ |
-
-Retry смотрит только на **числовой** `err.code`. Ошибки без него — non-retryable всегда. Сюда попадают **все ошибки от callee**: throw из хендлера (`err.name === "INTERNAL"`) и провал декода (`err.name === "INVALID_ARGUMENT"`) идут в теле ответа со строковым `name`, без `code` — поэтому даже с `idempotencyKey` они **не** ретраятся. Строка `INTERNAL`/`ABORTED`/`UNKNOWN` в таблице ретраится только когда числовой код пришёл от транспорта или рантайма (например, рантайм недоступен), а не когда хендлер бросил исключение.
+Пауза перед попыткой `n` (с нуля): `min(baseDelayMs * factor^n, maxDelayMs)` с разбросом `±jitter`, но не дольше остатка дедлайна. `maxAttempts` — всего попыток, включая первую. `maxAttempts: 1` отключает ретраи. Переход `auto` с direct на proxy после pre-dispatch отказа тратит попытку, но идёт без паузы.
 
 ```ts
 // Отключить retry
 await sb.rpc.call(svc, m, payload, { retry: { maxAttempts: 1 } });
 
-// Агрессивный
+// Больше попыток в пределах того же дедлайна
 await sb.rpc.call(svc, m, payload, { retry: { maxAttempts: 10, baseDelayMs: 100 } });
 
 // Глобальный override
 new ServiceBridge(URL, KEY, { callDefaults: { retry: { maxAttempts: 5 } } });
 ```
 
+Повторить вызов, который завершился `TIMEOUT` или `CONNECTION` после отправки, может только ваш код, и только если эффект на стороне callee идемпотентен (§7).
+
 ---
 
 ## 7. Идемпотентность
 
-`idempotencyKey` дедуплицирует replay-вызовы в **proxy mode**. Это **opt-in**: по умолчанию ключ пустой (`""`) — runtime dedup выключен, и расширенный retry (`INTERNAL`/`ABORTED`/`UNKNOWN` по числовому коду, §6) не включается. Задаёте ключ — он едет на runtime и переиспользуется через все retry внутри одного `sb.rpc.call`. Один и тот же ключ в разных вызовах = намеренная дедупликация; разные эффекты должны получать разные ключи.
+`idempotencyKey` — opt-in, по умолчанию пустой. Заданный ключ:
 
-### Proxy mode — runtime дедуплицирует
+- доходит до хендлера в `ctx.idempotencyKey` — callee дедуплицирует по нему сам;
+- через runtime proxy (`transport: "proxy"`) участвует в дедупе на стороне runtime.
 
-Runtime хранит `{key → response}` в Postgres с TTL из настройки `rpc.idempotency_rpc_ttl_ms` (default `300000` = 5 мин; правится в UI /settings, не через env). Replay с тем же ключом в окне TTL возвращает закешированный response, **не доходя до callee**.
+Ключ не включает автоматических повторов: SDK повторяет только pre-dispatch отказы (§6) с ключом и без. Один и тот же ключ в разных вызовах = намеренная дедупликация; разные эффекты должны получать разные ключи.
 
-```ts
-const r1 = await sb.rpc.call("pay-svc", "charge", payload, {
-  idempotencyKey: "order-123",
-  transport: "proxy",
-});
+### Дедуп на стороне callee
 
-// в течение 5 мин — кеш-хит, callee НЕ вызывается
-const r2 = await sb.rpc.call("pay-svc", "charge", payload, {
-  idempotencyKey: "order-123",
-  transport: "proxy",
-});
-```
-
-### Direct mode — runtime не дедуплицирует
-
-Caller минует runtime → централизованного кеша нет. Хендлер получает только `req` (второго `ctx`-аргумента нет — `idempotencyKey` до тела хендлера не доходит). Если нужна дедупликация на direct-пути, передавайте бизнес-ключ как поле payload и дедуплицируйте по нему сами:
+Работает на любом транспорте. Атомарность — в том же хранилище, где живёт эффект:
 
 ```ts
-sb.rpc.handle("Charge", async (req: { orderId: string; amount: number }) => {
-  const cached = await redis.get(`idemp:${req.orderId}`);
-  if (cached) return JSON.parse(cached);
-
-  const result = await processCharge(req);
-  await redis.setex(`idemp:${req.orderId}`, 300, JSON.stringify(result));
-  return result;
+sb.rpc.handle("Charge", async (req: { orderId: string; amount: number }, ctx) => {
+  const key = ctx.idempotencyKey || req.orderId;
+  const done = await db.query(
+    "INSERT INTO charges (idempotency_key, amount) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING id",
+    [key, req.amount],
+  );
+  if (done.rows.length === 0) return await loadChargeResult(key); // повтор — вернуть сохранённый ответ
+  return await processCharge(req);
 }, { schema: { protoFile: "./payment.proto" } });
 ```
 
-Нужна дедупликация силами рантайма — используйте `transport: "proxy"` с `idempotencyKey` (выше).
+### Дедуп в runtime proxy
+
+Runtime хранит ответы по ключу в Postgres с TTL из настройки `rpc.idempotency_rpc_ttl_ms` (default `300000` = 5 мин; правится в UI /settings, не через env). Повтор с тем же ключом в окне TTL получает сохранённый ответ, не доходя до callee.
+
+```ts
+const r1 = await sb.rpc.call("pay-svc", "Charge", payload, {
+  idempotencyKey: "order-123",
+  transport: "proxy",
+});
+
+// в течение TTL — ответ из runtime, callee не вызывается
+const r2 = await sb.rpc.call("pay-svc", "Charge", payload, {
+  idempotencyKey: "order-123",
+  transport: "proxy",
+});
+```
 
 ### Кейсы
 
 | Что хотите | Что использовать |
 |-----------|------------------|
-| Бизнес-ID гарантирует уникальность | `idempotencyKey: \`order-${orderId}\`` + `transport: "proxy"` |
-| Защита от дубля при retry + расширенный retry на `INTERNAL`/`ABORTED` | задать `idempotencyKey` (любой стабильный для этого вызова) |
-| Без dedup (default) | не задавать `idempotencyKey` (он `""`) |
+| Безопасно повторить вызов после `TIMEOUT` своим кодом | Тот же `idempotencyKey` в повторе + дедуп на callee или `transport: "proxy"` |
+| Бизнес-ID гарантирует уникальность | `idempotencyKey: \`order-${orderId}\`` |
+| Без dedup (default) | не задавать `idempotencyKey` |
 
 ---
 
@@ -481,7 +522,7 @@ sb.rpc.handle("Charge", async (req: { orderId: string; amount: number }) => {
 2. Хеш отправляется в `RegisterRequest.incoming[].contract_hash` → runtime хранит как opaque строку.
 3. **Caller** при `useSchema(...)` / `sb.client(...)` тоже вычисляет хеш локально.
 4. LB фильтрует кандидатов: `descriptor.contractHash === callerLocalHash`.
-5. Ни одного матча → `rpc: no instance of <svc>/<method> matches caller contract <hash>` (retryable как `UNAVAILABLE`).
+5. Ни одного матча → `NoLiveInstanceError` «rpc: no live instance of <svc>/<method> matches caller contract <hash>» (`retryable: true`: SDK повторяет в пределах `retry` и дедлайна, callee может как раз стартовать).
 
 ### Пример: blue-green
 
@@ -542,97 +583,101 @@ Runtime хранит хеш как opaque-строку, не парсит и н�
 
 ### Структура
 
-Ошибки из `sb.rpc.call` / `sb.stream` / typed-client бывают **двух форм** — различать их обязательно:
+Каждая ошибка из `sb.rpc.call` / `sb.stream` / typed-client — `ServiceBridgeError` с полями `code` и `retryable`. Различайте по `err.code` или по классу:
 
-- **Ошибки от callee** (throw из хендлера, провал декода payload) — `Error` со **строковым** `err.name` (`"INTERNAL"`, `"INVALID_ARGUMENT"`, `"NOT_FOUND"`, `"FAILED_PRECONDITION"`). Числового `err.code` и `.details` у них **нет** — они едут в теле ответа, а не как gRPC status. Различайте по `err.name`.
-- **Ошибки транспорта/рантайма** (недоступность, таймаут, rate limit, отказ политики) — обычные gRPC-js-ошибки с числовым `err.code` (gRPC status) и `.details`. Различайте по `err.code` (числу из таблицы ниже).
+| Класс / `code` | Когда | `retryable` |
+|---|---|---|
+| `HandlerError` / `HANDLER` | Хендлер callee ответил ошибкой. `handlerCode` — код из `HandlerError` callee или `"INTERNAL"`. | нет |
+| `NoLiveInstanceError` / `NO_LIVE_INSTANCE` | Некуда отправить: callee offline, нет инстанса с совпадающим `contract_hash`, нет `call_endpoint`, все кандидаты circuit-open. | да |
+| `AccessDeniedError` / `ACCESS_DENIED` | Отказ политики доступа или вызывающий отозван. Дополнительно эмитится `policy_violation`. | нет |
+| `TimeoutError` / `TIMEOUT` | Дедлайн истёк. Хендлер мог отработать. | нет |
+| `ServiceBridgeError` / `CONNECTION` | Канал оборвался или runtime недоступен. | да |
+| `ServiceBridgeError` / `OVERLOADED` | Callee или runtime перегружен (`RESOURCE_EXHAUSTED`). | да |
+| `ServiceBridgeError` / `CANCELLED` | Вызов отменён через `opts.signal`. | нет |
+| `ValidationError` / `VALIDATION` | Недекодируемый запрос, `call` на streaming-методе (и наоборот), отказ runtime по аргументу. | нет |
+| `ServiceBridgeError` / `NOT_FOUND` | У callee нет такого метода. | нет |
+| `ServiceBridgeError` / `CONFLICT` | `ALREADY_EXISTS` от runtime. | нет |
+| `ServiceBridgeError` / `INTERNAL` | Неклассифицированный сбой. | нет |
+| `ConfigurationError` / `CONFIG` | Нет схемы вызывающего, неверный `timeout`. | нет |
+| `StateError` / `STATE` | Вызов до `start()`. | нет |
 
-Имена в таблице кодов ниже — это и строковые `err.name` от callee, и имена соответствующих gRPC-статусов; число рядом — `err.code`, который есть **только** у транспортных/рантайм-ошибок.
-
-Отдельный публичный класс — только для отказа политики:
-
-```ts
-class RpcAccessDeniedError extends Error {  // export из index
-  serviceName: string;
-  methodName: string;
-  reason: string;
-}
-```
-
-Он бросается, когда access policy запретила вызов (маппится из gRPC `PERMISSION_DENIED` / code 7). `ConnectionError` (тоже export из index) несёт только числовой `.code` и используется на уровне lifecycle-соединения, а не на каждом RPC-вызове — у него нет полей `name`-как-gRPC-имя или `retryable`.
+`retryable: true` значит: повтор того же запроса позже может пройти, и предыдущая попытка точно не имела эффекта. SDK уже повторил такие отказы в пределах `retry` и дедлайна (§6) — до вас они доходят, когда попытки кончились.
 
 ### Базовая обработка
 
 ```ts
+import { HandlerError, ServiceBridgeError } from "service-bridge";
+
 try {
   await payment.Charge(payload);
-} catch (err: any) {
-  // Callee-ошибки приходят строковым err.name (без числового err.code):
-  switch (err.name) {
-    case "INVALID_ARGUMENT": return badRequest(err.message); // плохой payload (декод)
-    case "NOT_FOUND":        return notFound(err.message);
-    case "INTERNAL":         log.error("callee threw", err.message); throw err;
+} catch (err) {
+  if (err instanceof HandlerError) {
+    switch (err.handlerCode) {
+      case "INVALID_AMOUNT": return badRequest(err.message);  // бизнес-код callee
+      case "INTERNAL":       log.error("callee failed", { message: err.message }); throw err;
+    }
   }
-  // Транспорт/рантайм — числовой err.code (gRPC status):
-  switch (err.code) {
-    case 14: return await fallback();          // UNAVAILABLE — рантайм/сеть недоступны
-    case 4:  log.warn("timeout"); throw err;   // DEADLINE_EXCEEDED
-    default: throw err;
+  if (err instanceof ServiceBridgeError) {
+    if (err.code === "TIMEOUT") { /* исход неизвестен — повтор только с idempotencyKey */ }
+    if (err.retryable) return await retryLater(payload);
   }
+  throw err;
 }
 ```
 
-Отказ access policy на `rpc.call` приходит отдельным классом `RpcAccessDeniedError` (с `serviceName`/`methodName`/`reason`), а не gRPC-ошибкой с `code === 7` — ловите его через `instanceof`, если нужно различать.
+### Отображение gRPC-статусов
 
-### Полная таблица gRPC-кодов
+Статусы от callee или runtime переводятся в коды одинаково в Node и Go SDK:
 
-Колонка «Форма»: `name` — callee-ошибка, у неё `err.name` = это имя, числового `err.code` нет; `code` — транспорт/рантайм, у неё `err.code` = это число. Retryable относится только к форме `code` (см. §6).
+| gRPC-статус | `code` |
+|---|---|
+| `CANCELLED` (1) | `CANCELLED` |
+| `UNKNOWN` (2) | `INTERNAL` |
+| `INVALID_ARGUMENT` (3) | `VALIDATION` |
+| `DEADLINE_EXCEEDED` (4) | `TIMEOUT` |
+| `NOT_FOUND` (5) | `NOT_FOUND` |
+| `ALREADY_EXISTS` (6) | `CONFLICT` |
+| `PERMISSION_DENIED` (7) | `ACCESS_DENIED` |
+| `RESOURCE_EXHAUSTED` (8) | `OVERLOADED` |
+| `FAILED_PRECONDITION` (9) | `VALIDATION` |
+| `ABORTED` (10) | `INTERNAL` |
+| `OUT_OF_RANGE` (11) | `VALIDATION` |
+| `UNIMPLEMENTED` (12) | `NOT_FOUND` |
+| `INTERNAL` (13) | `INTERNAL` |
+| `UNAVAILABLE` (14) | `CONNECTION` |
+| `DATA_LOSS` (15) | `INTERNAL` |
+| `UNAUTHENTICATED` (16) | `ACCESS_DENIED` |
 
-| Код | Имя | Форма | Retryable | Когда |
-|----|------|-------|-----------|------|
-| 1 | `CANCELLED` | code | ❌ | Caller прервал (timeout, abort) |
-| 2 | `UNKNOWN` | code | с `idempotencyKey` | Неклассифицированная ошибка |
-| 3 | `INVALID_ARGUMENT` | name (декод callee) / code (рантайм) | ❌ | Плохой payload |
-| 4 | `DEADLINE_EXCEEDED` | code | ✅ | Timeout |
-| 5 | `NOT_FOUND` | name | ❌ | Нет хендлера метода у callee |
-| 6 | `ALREADY_EXISTS` | code | ❌ | Idempotency-ключ уже в работе (proxy) |
-| 7 | `PERMISSION_DENIED` | code → `RpcAccessDeniedError` | ❌ | Access policy запретила |
-| 8 | `RESOURCE_EXHAUSTED` | code | ✅ | Rate limit / quota |
-| 9 | `FAILED_PRECONDITION` | name | ❌ | Вызов `call` на streaming-методе |
-| 10 | `ABORTED` | code | с `idempotencyKey` | Concurrent conflict |
-| 11 | `OUT_OF_RANGE` | code | ❌ | Out-of-bounds |
-| 12 | `UNIMPLEMENTED` | code | ❌ | Метод не реализован |
-| 13 | `INTERNAL` | name (throw хендлера) / code (рантайм) | с `idempotencyKey`* | Callee throw / runtime error |
-| 14 | `UNAVAILABLE` | code | ✅ | Network / no eligible instance |
-| 16 | `UNAUTHENTICATED` | code | ❌ | Bootstrap key invalid (lifecycle, не RPC) |
+Ответ хендлера приходит не статусом, а в теле ответа (`error_code`) и всегда становится `HandlerError`.
 
-\* `INTERNAL` ретраится с `idempotencyKey` **только** в форме `code` (его выдал рантайм). Самый частый источник — throw хендлера — приходит формой `name` и **не** ретраится.
+### Сообщения SDK
 
-### SDK-специфичные ошибки
-
-| Сообщение начинается с | Когда |
-|-----------------------|------|
-| `rpc: no descriptor for ...` | Метод не в `serviceMap()`: не подписан или callee offline. |
-| `rpc: no SchemaPair for ...` | Не вызван `useSchema()`. |
-| `rpc: ... is a streaming method — use sb.stream()` | Вы вызвали `call` на stream-методе. |
-| `rpc: no instance of ... matches caller contract <hash>` | Все инстансы имеют другой `contract_hash` (см. §8). |
-| `rpc: transport="direct" requested but no endpoint ...` | `transport: "direct"` явный, но callee без advertise. |
-| `serde: cannot resolve input/output for <proto> (method=...)` | Auto-resolve не нашёл messages: нет service-блока и нет явных `input`/`output` (см. §2.4). |
-| `rpc: client(...): no service block found` | `sb.client()` на `.proto` без `service`. |
+| Сообщение начинается с | Класс | Когда |
+|-----------------------|-------|------|
+| `rpc: no schema for <svc>/<method>` | `ConfigurationError` | Не вызван `sb.client()` / `sb.useSchema()`. |
+| `rpc: <svc>/<method> is a streaming method — use sb.stream()` | `ValidationError` | `call` на stream-методе. |
+| `rpc: <svc>/<method> is not a streaming method — use sb.rpc.call()` | `ValidationError` | `stream` на unary-методе. |
+| `rpc: no live instance of <svc>/<method> matches caller contract <hash>` | `NoLiveInstanceError` | Нет инстанса с этим `contract_hash`: callee offline или другая версия (см. §8). |
+| `rpc: no live instance of <svc>/<method> — all candidates circuit-open` | `NoLiveInstanceError` | Breaker открыт у всех инстансов. |
+| `rpc: no endpoint for <svc>/<method> — the callee advertises no inbound address` | `NoLiveInstanceError` | Callee запущен с `advertise: false`. |
+| `rpc: invalid timeout <value>` | `ConfigurationError` | `timeout` не в формате `<n>ms` / `<n>s` / `<n>m`. |
+| `rpc: call before start()` | `StateError` | Вызов до `sb.start()`. |
+| `serde: cannot resolve input/output for <proto>` | — | Auto-resolve не нашёл messages: нет service-блока и нет явных `input`/`output` (см. §2.4). |
+| `rpc: client(<proto>): no service block found` | — | `sb.client()` на `.proto` без `service`. |
 
 ### Stream errors
 
 ```ts
 try {
   for await (const chunk of sb.stream(svc, m, payload)) { ... }
-} catch (err: any) {
+} catch (err) {
   // chunks ДО ошибки уже обработаны.
-  // callee-ошибка → err.name (строка); обрыв транспорта → err.code (число).
-  console.error("stream failed:", err.name ?? err.code, err.message);
+  // HandlerError — хендлер бросил; иначе err.code — отказ транспорта или runtime.
+  console.error("stream failed:", (err as ServiceBridgeError).code, (err as Error).message);
 }
 ```
 
-Network drop mid-stream → транспортный `UNAVAILABLE` (`err.code === 14`, не retryable для streams). Throw из stream-хендлера → `err.name === "INTERNAL"`.
+Обрыв сети посреди стрима → `CONNECTION`; стримы не ретраятся. Throw из stream-хендлера → `HandlerError` (`handlerCode` из `HandlerError` хендлера или `"INTERNAL"`).
 
 ---
 
@@ -678,19 +723,21 @@ await sb.client("payment-svc", "./payment.proto", { methods: ["Charge"] });
 
 ```ts
 for await (const chunk of payment.Generate({ prompt }, { timeout: "60s" })) {
-  if (shouldStop()) break;   // callee получит CANCELLED
+  if (shouldStop()) break;   // ctx.signal у callee прерывается
   process.stdout.write(chunk.token);
 }
 ```
 
-### Idempotent retry
+### Повтор после TIMEOUT
 
 ```ts
-await payment.Charge(payload, {
-  idempotencyKey: `order-${orderId}`,
-  transport: "proxy",          // нужно для runtime-side dedup
-  retry: { maxAttempts: 5 },
-});
+const opts = { idempotencyKey: `order-${orderId}`, transport: "proxy" as const };
+try {
+  await payment.Charge(payload, opts);
+} catch (err) {
+  if ((err as ServiceBridgeError).code !== "TIMEOUT") throw err;
+  await payment.Charge(payload, opts);   // тот же ключ — runtime вернёт сохранённый ответ
+}
 ```
 
 → Дальше: [Events](./events.md)

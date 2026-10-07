@@ -20,9 +20,12 @@
 
 Описывают внутренние контракты SDK-модулей (для разработчиков SDK):
 
-- [`src/connection/README.md`](../src/connection/README.md) — connection lifecycle, session, cert rotation
+- [`src/connection/README.md`](../src/connection/README.md) — connection lifecycle, session, cert rotation, порядок stop
 - [`src/registry/README.md`](../src/registry/README.md) — WatchStream, registry cache
-- [`src/rpc/README.md`](../src/rpc/README.md) — CallServer, RpcClient, transports
+- [`src/rpc/README.md`](../src/rpc/README.md) — CallServer, RpcClient, transports, retry
+- [`src/events/README.md`](../src/events/README.md) — Publisher (очередь и ACK), Subscriber
+- [`src/http/README.md`](../src/http/README.md) — общий код HTTP-интеграций
+- [`src/testing/README.md`](../src/testing/README.md) — харнесс `service-bridge/testing`
 - [`src/serde/README.md`](../src/serde/README.md) — protobufjs-based codec
 
 ## Runtime
@@ -34,12 +37,13 @@
 
 ## Требования
 
-| | Минимум |
+| | Версия |
 |--|--|
-| Bun | 1.x |
-| Node.js | 18+ (альтернатива Bun) |
-| TypeScript | 5 |
+| Node.js | 22, 24 или 26 |
+| Bun | ≥ 1.3.13 (кроме интеграции Fastify — она только на Node) |
 | Postgres | 18+ (нужен рантайму, не SDK) |
+
+Типы TypeScript входят в пакет; `typescript` как зависимость не нужен. Express, Fastify и Hono — опциональные peer-зависимости, ставятся только для своей интеграции.
 
 ## Внешние ресурсы
 

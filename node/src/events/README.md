@@ -34,7 +34,7 @@ SDK-сторона Durable Events: namespace `sb.event` (`EventDomain`), отп�
 | `Publisher` | class (`@internal`) | — | Очередь + отправитель. `publish`, `kick()` (сразу повторить, вызывается на Welcome), `close(deadlineMs)` (дослать, остаток — `CONNECTION` «client stopped»), `pending()`. |
 | `PublisherDeps` | interface (`@internal`) | — | `client()`, `schemaIndex`, `logger`, `timeoutMs`, `maxPending`, `xSbTraceFn()`, `onPolicyViolation`, `now?` (тест). |
 | `SchemaIndex` | interface (`@internal`) | — | `get(name) → { contractHash, pair }` — схемы объявленных событий. |
-| `Subscriber` | class (`@internal`) | — | `start`, `restart`, `drain(timeoutMs)` (новые доставки — Nack, ждать запущенные), `stop`. |
+| `Subscriber` | class (`@internal`) | — | `start`, `restart`, `drain(timeoutMs)` (новые доставки остаются без ответа, ждать запущенные), `stop`. |
 | `SubscriberDeps` | interface (`@internal`) | — | `client()`, `identity()`, `subscription(pattern)`, `maxInFlight`, `logger`, `runWithTrace`, `reconnectOpts?`, `onSchedule?` (тест). |
 | `DEFAULT_PUBLISH_TIMEOUT_MS` / `DEFAULT_MAX_PENDING_PUBLISHES` / `DEFAULT_EVENTS_MAX_IN_FLIGHT` | const | `30000` / `10000` / `32` | Дефолты, те же в Go SDK. |
 | `uuidv7()` | function | — | Реэкспорт пакета `uuidv7`: монотонные id в порядке publish (runtime упорядочивает партицию по id). |
@@ -47,11 +47,11 @@ SDK-сторона Durable Events: namespace `sb.event` (`EventDomain`), отп�
 
 **Ответы сопоставляются по позиции.** `results[i]` отвечает `events[i]` (гарантия runtime): для дубля runtime возвращает id исходного события, поэтому id не может быть ключом сопоставления.
 
-**Подписчик со своей схемой, маршрутизация по `matched_patterns` (NSDK-08).** Подписчик не объявляет чужое событие (раньше это давало ложное ребро «публикует» в Service Map) и не матчит шаблоны сам (ADR-0002): runtime присылает в доставке список совпавших шаблонов этого сервиса, прошедших фильтр, и SDK вызывает handler каждого, который есть у процесса. Ни одного — Nack (rolling deploy: доставка уйдёт на повтор, вероятно, к другому инстансу). Ack — только если все вызванные handler'ы успешны.
+**Подписчик со своей схемой, маршрутизация по `matched_patterns` (NSDK-08).** Подписчик не объявляет чужое событие (иначе в Service Map появилось бы ложное ребро «публикует») и не матчит шаблоны сам (ADR-0002): runtime присылает в доставке список совпавших шаблонов этого сервиса, прошедших фильтр, и SDK вызывает handler каждого, который есть у процесса. Ни одного — Nack (rolling deploy: доставка уйдёт на повтор, вероятно, к другому инстансу). Ack — только если все вызванные handler'ы успешны.
 
 **payload_json всегда.** JSON-вид payload заполняется при каждой публикации: по нему runtime вычисляет фильтры подписок и `wait_event` workflow.
 
-**Drain при остановке.** `Subscriber.drain` перестаёт брать новые доставки (Nack, runtime передоставит другому инстансу), а стрим остаётся открытым, пока запущенные handler'ы не отправят свои Ack.
+**Drain при остановке.** `Subscriber.drain` перестаёт брать новые доставки и не отвечает на них: их лиз истекает, и runtime передоставляет их другому инстансу. Nack здесь не годится — он тратил бы попытку доставки на остановку процесса. Стрим остаётся открытым, пока запущенные handler'ы не отправят свои Ack.
 
 **Жизненный цикл стрима — `registry/StreamSupervisor`.** Лестница переподключения `utils/reconnect-ladder` (1s, 5s, 15s, 30s, 60s ±20%), identity-guard стрима, один таймер; общая с jobs и workflow.
 

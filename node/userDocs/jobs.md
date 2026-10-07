@@ -41,6 +41,7 @@ const sb = new ServiceBridge(url, serviceKey);
 sb.job.handle(
   "daily-report",
   {
+    version: "1",
     trigger: { cron: "0 9 * * *", tz: "Europe/Moscow" },
     catchup: "fire_once",
     overlap: "skip",
@@ -55,7 +56,9 @@ sb.job.handle(
 await sb.start();
 ```
 
-`sb.job.handle(...)` **должен** вызываться ДО `sb.start()`. Дубликат имени job выбрасывает исключение сразу при регистрации.
+`sb.job.handle(...)` **должен** вызываться ДО `sb.start()`. Повторная регистрация того же имени с теми же опциями — `ValidationError` сразу при регистрации; то же имя с другой `version` — ещё одна зарегистрированная версия.
+
+`version` обязательна (без неё — `ValidationError`): строка, которая называет неизменяемое поведение handler-а. Меняется handler — меняется `version`. Выполнения, уже назначенные под старой версией, отдаются только инстансам с точно той же версией и опциями расписания; чтобы дать им доработать, держите старую версию зарегистрированной под тем же именем, пока они не закончатся. Выполнение версии, которой у инстанса нет, завершается неповторяемым отказом `unsupported_version`.
 
 ## Триггеры
 
@@ -135,7 +138,7 @@ async (ctx) => {
 
 Retry-policy задаётся per-job (default: exponential 1s → 600s, multiplier=2, jitter=25%).
 
-Чтобы пометить ошибку как **не**-retryable (сразу в DLQ):
+Не-retryable — ошибка, у которой `retryable === false` (сразу в DLQ):
 
 ```ts
 async (ctx) => {
@@ -146,6 +149,8 @@ async (ctx) => {
   }
 };
 ```
+
+Это поле есть и у каждой ошибки SDK (`ServiceBridgeError.retryable`). Проброшенная из handler-а ошибка вложенного вызова с неповторяемым кодом — например `HandlerError`, `TimeoutError`, `AccessDeniedError` — тоже завершит выполнение без retry. Если такой отказ стоит повторить по расписанию retry-policy, оберните его в обычный `Error`.
 
 ## Catchup policy
 
@@ -173,6 +178,7 @@ async (ctx) => {
 sb.job.handle(
   "heavy-etl",
   {
+    version: "1",
     trigger: { interval: 60_000 },
     overlap: "allow",
     maxConcurrent: 5, // до 5 параллельных запусков
@@ -189,6 +195,7 @@ sb.job.handle(
 sb.job.handle(
   "send-reminders",
   {
+    version: "1",
     trigger: { cron: "0 8 * * *" },
     deps: [
     { rpc: "notifications.SendEmail" },
@@ -226,6 +233,7 @@ Cron с tz `America/New_York` в ночь fall-back: локальное `02:30` 
 sb.job.handle(
   "ny-daily",
   {
+    version: "1",
     trigger: { cron: "0 2 * * *", tz: "America/New_York" }
   },
   async (ctx) => { /* ровно один вызов в день, в т.ч. в дни DST */ },
@@ -304,6 +312,7 @@ Runtime ведёт по каждому job in-memory счётчики (ключ 
 sb.job.handle(
   "daily-report",
   {
+    version: "1",
     trigger: { cron: "0 9 * * *", tz: "Europe/Moscow" },
     catchup: "fire_once",
     deps: [{ rpc: "billing.GenerateReport" }]
@@ -317,6 +326,7 @@ sb.job.handle(
 sb.job.handle(
   "send-reminder",
   {
+    version: "1",
     trigger: { delayed: { at: Date.now() + 24 * 3600_000 } }
   },
   async (ctx) => { /* ... */ },
@@ -326,6 +336,7 @@ sb.job.handle(
 sb.job.handle(
   "poll-status",
   {
+    version: "1",
     trigger: { interval: 5_000 },
     overlap: "skip"
   },

@@ -7,7 +7,7 @@
 ## Содержание
 
 - [1. Конструктор и опции](#1-конструктор-и-опции)
-- [2. Lifecycle: start / stop](#2-lifecycle-start--stop)
+- [2. Lifecycle: start / ready / stop](#2-lifecycle-start--ready--stop)
 - [3. События](#3-события)
 - [4. Identity и serviceMap](#4-identity-и-servicemap)
 - [5. Inbound CallServer (advertise)](#5-inbound-callserver-advertise)
@@ -26,37 +26,31 @@ import { ServiceBridge } from "service-bridge";
 new ServiceBridge(url: string, key: string, options?: ServiceBridgeOptions)
 ```
 
-```ts
-interface ServiceBridgeOptions {
-  reconnectIntervalMs?: number;        // default 3000
-  reconnectAttempts?: number;          // default 3 (0 = безлимит)
-  advertise?: { host: string; port: number } | false; // default: 127.0.0.1 на свободном порту (+warning)
-  callDefaults?: CallOpts;             // default {}
-  failOnPolicyViolation?: boolean;     // default false
-  dataDir?: string;                    // default "./.servicebridge"
-  maxOutboxRows?: number;              // default 100000
-  eventsDrainerBatch?: number;         // default 50
-  eventsMaxInFlight?: number;          // default 32
-}
-```
+`url` — адрес runtime `host:port` (например `localhost:14445`), `key` — bootstrap-ключ (§6). Конструктор проверяет оба и числовые опции; неверное значение — `ConfigurationError` сразу.
 
-| Поле | Что делает |
-|------|-----------|
-| `reconnectIntervalMs` | Задержка между попытками reconnect. |
-| `reconnectAttempts` | Максимум попыток. По исчерпании — `disconnected` с `reason: "exhausted"`. `0` = бесконечный. |
-| `advertise` | Inbound CallServer. См. §5. |
-| `callDefaults` | Дефолтные `CallOpts` для всех `sb.rpc.call`/`sb.stream`. См. [RPC §4](./rpc.md#4-callopts). |
-| `failOnPolicyViolation` | `true` → нарушение политики в первом снапшоте обрывает `start()` (`disconnected`, `reason: "policy"`). По умолчанию `false` — только событие `policy_violation`. |
-| `dataDir` | Каталог локального SQLite-outbox. По умолчанию `"./.servicebridge"`. |
-| `maxOutboxRows` | Потолок строк в event-outbox до back-pressure на publish. По умолчанию `100000`. |
-| `eventsDrainerBatch` | Сколько строк дренер событий тянет за тик. По умолчанию `50`. |
-| `eventsMaxInFlight` | Максимум параллельно обрабатываемых inbound-событий. По умолчанию `32`. |
+| Опция | Тип | По умолчанию | Что делает |
+|------|-----|--------------|-----------|
+| `reconnectIntervalMs` | `number` | лестница 1s, 5s, 15s, 30s, 60s ±20% | Плоская задержка между попытками reconnect вместо лестницы. |
+| `reconnectAttempts` | `number` | `0` (без лимита) | Сколько **подряд идущих** неудач допустимо; счётчик сбрасывается на каждом Welcome. Превышение → `disconnected` и остановка. |
+| `advertise` | `{ host, port } \| false` | `127.0.0.1` на свободном порту + warning | Inbound CallServer. См. §5. |
+| `callDefaults` | `CallOpts` | `{}` | Дефолтные `CallOpts` для `sb.rpc.call`, `sb.stream` и typed-клиентов. См. [RPC §4](./rpc.md#4-callopts). |
+| `failOnPolicyViolation` | `boolean` | `false` | `true` → warning политики в snapshot останавливает бридж (`AccessDeniedError`). Иначе — только событие `policy_violation`. См. [Access Policy](./access-policy.md). |
+| `publishTimeoutMs` | `number` | `30000` | Сколько `publish` ждёт ACK runtime. См. [Events §9](./events.md#9-очередь-публикаций-и-повторы-sdk-side). |
+| `maxPendingPublishes` | `number` | `10000` | Событий в очереди до `QUEUE_FULL`. |
+| `eventsMaxInFlight` | `number` | `32` | Параллельно обрабатываемые доставки событий. |
+| `rpcMaxConcurrentCalls` | `number` | `256` | Одновременные входящие RPC-хендлеры. |
+| `rpcMaxQueuedCalls` | `number` | = `rpcMaxConcurrentCalls` | Очередь входящих вызовов; сверх — вызывающий получает `OVERLOADED`. |
+| `startTimeoutMs` | `number` | `30000` | Дедлайн `start()`. |
+| `stopTimeoutMs` | `number` | `10000` | Дедлайн дренажа в `stop()`. |
+| `logger` | `Logger` | warn/error в консоль | Куда SDK пишет свою диагностику (§3). |
+| `telemetry.onDrop` | `(info) => void` | нет | Сообщение о потерянной телеметрии (§9). |
 
 Telemetry on/off и payload cap управляются runtime-настройками UI (Settings → Telemetry):
 - `telemetry.enable` (`true`/`false`) — рантайм пушит в SDK через `CaptureModes.telemetry_enabled`. Когда `false`, transport не стартует (ops/logs/metrics буферизуются в ring, не отправляются). Fail-safe до первого снапшота: включён.
 - `telemetry.payload_max_bytes` — per-direction cap payload'а в байтах. Пушится в SDK через `CaptureModes.payload_max_bytes`. Fail-safe до первого снапшота: `65536`.
+- Режим захвата payload по каналам (`none` / `errors` / `all`) — тоже runtime-настройка, по умолчанию `errors`. SDK передаёт payload как есть; маскирование секретов делает runtime при приёме.
 
-Overlap-rotation leaf-сертификата выполняется автоматически (за 30 минут до expiry) — публичной опции у неё нет.
+Продление leaf-сертификата выполняется автоматически (за 30 минут до expiry) — публичной опции у него нет.
 
 ### Типичные пресеты
 
@@ -67,8 +61,8 @@ const sb = new ServiceBridge(URL, KEY);
 // Production callee
 const sb = new ServiceBridge(URL, KEY, {
   advertise: { host: process.env.POD_IP!, port: 7777 },
-  reconnectAttempts: 0,
   callDefaults: { timeout: "5s", retry: { maxAttempts: 3 } },
+  logger: appLogger,   // { debug, info, warn, error }
 });
 
 // Caller-only сервис
@@ -77,27 +71,48 @@ const sb = new ServiceBridge(URL, KEY, { advertise: false });
 
 ---
 
-## 2. Lifecycle: start / stop
+## 2. Lifecycle: start / ready / stop
 
 ```ts
 await sb.start();
+await sb.ready();
 await sb.stop();
 ```
 
 ### Что делает start()
 
-1. Парсит `key` → извлекает `(key_id, secret, ca_cert)`.
-2. Открывает временный TLS-канал, зовёт `Bootstrap.Provision` → получает signed leaf cert.
-3. Открывает long-lived mTLS-канал.
-4. (Если `advertise !== false`) поднимает локальный CallServer.
-5. Отправляет `RegisterRequest` со всеми хендлерами и зависимостями.
-6. Ждёт `Welcome` от рантайма — после этого вызовы безопасны.
+1. Дожидается загрузки всех схем, объявленных до `start()`; ошибка загрузки схемы бросается отсюда.
+2. Обменивает ключ на leaf-сертификат (`Bootstrap.Provision`).
+3. (Если `advertise !== false`) поднимает локальный CallServer.
+4. Открывает сессию `Control.Open` и стрим реестра, отправляет все хендлеры и зависимости.
+5. Резолвится, когда runtime прислал `Welcome` **и** первый snapshot реестра (вид на mesh и политику доступа) — после этого вызовы безопасны.
 
-`start()` **НЕ** бросает на не-retryable connect-ошибки (`UNAUTHENTICATED`, `PERMISSION_DENIED`, `NOT_FOUND`, `INVALID_ARGUMENT`) — они приходят через `disconnected` event.
+Если за `startTimeoutMs` (по умолчанию 30 с) этого не случилось или runtime ответил неустранимой ошибкой, бридж останавливается и `start()` бросает: `TimeoutError`, `ConnectionError` (например, `UNAUTHENTICATED` — ключ неверен), `ConfigurationError` (несовместимый протокол runtime), `ValidationError` (runtime отклонил декларации), `AccessDeniedError` (`failOnPolicyViolation`). Повторный `start()` или `start()` после `stop()` — `StateError`; для нового запуска создайте новый `ServiceBridge`.
+
+### ready()
+
+`sb.ready()` резолвится, когда текущая сессия жива и её snapshot применён — сразу, если это уже так. После обрыва связи он ждёт переподключения. Отклоняется, если бридж остановлен.
+
+```ts
+await sb.ready();   // например, в health-check перед приёмом трафика
+```
+
+### Reconnect
+
+Потеря сессии → повторное подключение по лестнице 1s, 5s, 15s, 30s, 60s ±20% (или плоско `reconnectIntervalMs`). Считаются **подряд идущие** неудачи, счётчик сбрасывается на Welcome; по умолчанию попытки не ограничены. Бридж останавливается без reconnect только на неустранимых ответах runtime: `UNAUTHENTICATED`, `PERMISSION_DENIED`, `NOT_FOUND`, `INVALID_ARGUMENT` (в том числе невалидный фильтр подписки), `FAILED_PRECONDITION` (несовместимый протокол).
 
 ### Что делает stop()
 
-Graceful shutdown: heartbeat off → cert refresh таймеры off → CallServer останавливается с graceful drain → mTLS-канал закрывается.
+Упорядоченная остановка в пределах `stopTimeoutMs` (по умолчанию 10 с):
+
+1. Снимает анонс: перерегистрируется с пустым `call_endpoint`, чтобы пиры перестали выбирать этот инстанс.
+2. CallServer отвечает на новые вызовы `UNAVAILABLE` с пометкой «не отправлено в хендлер» — вызывающий повторит их на другом инстансе. Подписчики событий и jobs перестают брать новую работу; runtime передоставит её другим инстансам.
+3. Ждёт выполняющиеся входящие вызовы, event-хендлеры и jobs.
+4. Досылает очередь `publish`; не подтверждённые runtime события отклоняются `CONNECTION`.
+5. Отправляет остаток телеметрии и ждёт ACK последней пачки (не дольше 2 с).
+6. Закрывает стримы, каналы и сервер.
+
+`stop()` идемпотентен.
 
 ### Graceful shutdown
 
@@ -111,37 +126,53 @@ process.on("SIGINT",  async () => { await sb.stop(); process.exit(0); });
 ## 3. События
 
 ```ts
-sb.on("connected",    (e: { sessionId, serviceId, serviceName }) => {});
-sb.on("reconnecting", (e: { attempt, delayMs, reason }) => {});
-sb.on("disconnected", (e: { reason, error }) => {});
+sb.on("connected",        (e: { sessionId, serviceId, serviceName, runtimeVersion }) => {});
+sb.on("reconnecting",     (e: { attempt, delayMs, reason }) => {});
+sb.on("draining",         (e: { reason }) => {});
+sb.on("disconnected",     (e: { reason, error }) => {});
+sb.on("policy_violation", (e: { declaration, value, denySide, reason }) => {});
 ```
 
 `connected` не несёт `instanceId` — его берите из `sb.identity()` (см. §4).
 
 | Событие | Когда |
 |---------|-------|
-| `connected` | После `Welcome`. Срабатывает на первом connect И на каждом успешном reconnect (включая overlap-rotation). |
-| `reconnecting` | Соединение упало, переподключаемся с backoff. `attempt` начинается с 1. |
-| `disconnected` | Сессии больше нет. См. таблицу `reason` ниже. |
+| `connected` | После `Welcome`. Срабатывает на первом connect И на каждом успешном reconnect. Продление сертификата его не вызывает — сессия не переоткрывается. |
+| `reconnecting` | Сессия потеряна или попытка не удалась; `attempt` — номер подряд идущей неудачи, начиная с 1. |
+| `draining` | Runtime объявил остановку (`Drain`). Reconnect последует сам, когда runtime закроет стрим. |
+| `disconnected` | Бридж остановился окончательно: неустранимая ошибка, исчерпан `reconnectAttempts` или `failOnPolicyViolation`. `reason` — текст ошибки, `error` — `ServiceBridgeError` (`ConnectionError`, `ValidationError`, `ConfigurationError`, `AccessDeniedError`). Обычный `sb.stop()` его не эмитит. |
+| `policy_violation` | Warning политики из snapshot и отказы политики во время вызова (`rpc.call`, `event.publish`). |
 
-### reason values
-
-| `reason` | Что произошло |
-|----------|---------------|
-| `"stopped"` | Вы вызвали `sb.stop()`. |
-| `"drain"` | Runtime запросил graceful drain (рестарт runtime / удаление сервиса). |
-| `"exhausted"` | Все `reconnectAttempts` исчерпаны. |
-| `"error"` | Не-retryable ошибка (`UNAUTHENTICATED`, `PERMISSION_DENIED`, `NOT_FOUND`, `INVALID_ARGUMENT`). |
+Исключение в слушателе логируется и не влияет ни на бридж, ни на других слушателей.
 
 ### Пример: критическая остановка
 
 ```ts
 sb.on("disconnected", ({ reason, error }) => {
-  if (reason === "drain" || reason === "stopped") return;
-  console.error("[fatal]", error?.name, error?.message);
+  console.error("[fatal]", error?.code, reason);
   process.exit(1);   // pod restart
 });
 ```
+
+### Диагностика SDK: logger
+
+Свою диагностику (reconnect, отказы политики, сбои publish, предупреждения advertise) SDK пишет только в `options.logger`. По умолчанию — warn/error в консоль с префиксом `[servicebridge]`, debug/info отбрасываются. Подключите свой логгер, чтобы направить её в общий поток логов приложения:
+
+```ts
+import pino from "pino";
+const log = pino();
+
+const sb = new ServiceBridge(URL, KEY, {
+  logger: {
+    debug: (msg, attrs) => log.debug(attrs ?? {}, msg),
+    info:  (msg, attrs) => log.info(attrs ?? {}, msg),
+    warn:  (msg, attrs) => log.warn(attrs ?? {}, msg),
+    error: (msg, attrs) => log.error(attrs ?? {}, msg),
+  },
+});
+```
+
+Это не то же, что `sb.logger`: `sb.logger` — структурные логи вашего приложения, которые уходят в runtime (§9).
 
 ---
 
@@ -153,38 +184,43 @@ sb.on("disconnected", ({ reason, error }) => {
 sb.identity(): { sessionId, serviceId, serviceName, instanceId } | null
 ```
 
-`null` до первого `connected` и после `stop()`.
+`null` до первого `connected` и после `stop()`. `instanceId` не меняется ни при reconnect, ни при продлении сертификата. Новый `instanceId` появляется, только если сертификат успел истечь (долгий обрыв) и SDK получил новый через `Provision`.
 
 ```ts
-sb.on("connected", () => {
-  const id = sb.identity()!;
-  sb.logger.info("ready", { service: id.serviceName, instance: id.instanceId });
-});
+await sb.start();
+const id = sb.identity()!;
+sb.logger.info("ready", { service: id.serviceName, instance: id.instanceId });
 ```
 
-`instanceId` (12-символьная Crockford-base32 строка сессии) доступен также напрямую через `sb.instanceIdString()` — пустая строка до первого `connected`.
+`instanceId` доступен также напрямую через `sb.instanceIdString()` — пустая строка до первого `connected`.
 
 ### serviceMap()
 
 ```ts
-sb.serviceMap(): ReadonlyMap<string, MethodDescriptor>
-```
+sb.serviceMap(): ReadonlyMap<string, ServiceMapEntry>   // ключ — имя сервиса
 
-Живой snapshot всех методов, на которые этот сервис подписан. Автообновляется при connect/disconnect провайдеров (через `RegisterAndWatch`).
+interface ServiceMapEntry {
+  methods: MethodDescriptor[];                       // видимые этому сервису методы
+  instances: ServiceInstanceInfo[];                  // живые инстансы: callEndpoint, httpEndpoint, status, ...
+  eventSubscriptions: EventSubscriptionDescriptor[];
+  outgoingCalls: OutgoingCallDescriptor[];
+}
 
-```ts
 interface MethodDescriptor {
   serviceName: string;
   serviceId: string;
   instanceId: string;
-  type: "rpc" | "stream" | "event" | "workflow" | "job" | "http";
+  type: MethodType;          // enum METHOD_TYPE_*
   name: string;
+  contractHash: string;      // "v2:<hex>" или ""
   published: boolean;
+  inputSchema: Buffer;
+  outputSchema: Buffer;
   streaming: boolean;
-  contractHash: string;     // "v1:<hex>" или ""
-  callEndpoint: string;     // host:port или "" если callee без advertise
 }
 ```
+
+Живой snapshot: обновляется при connect/disconnect провайдеров (через `RegisterAndWatch`). Видны собственный сервис и сервисы из исходящих зависимостей. Адрес инстанса — `instances[].callEndpoint`, не поле метода.
 
 ### Ожидание появления метода
 
@@ -192,16 +228,12 @@ interface MethodDescriptor {
 async function waitForMethod(sb: ServiceBridge, svc: string, name: string, timeoutMs = 5000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    for (const d of sb.serviceMap().values()) {
-      if (d.serviceName === svc && d.name === name) return;
-    }
+    if (sb.serviceMap().get(svc)?.methods.some((m) => m.name === name)) return;
     await new Promise((r) => setTimeout(r, 50));
   }
   throw new Error(`timeout waiting for ${svc}/${name}`);
 }
 ```
-
----
 
 ---
 
@@ -234,11 +266,11 @@ new ServiceBridge(URL, KEY, { advertise: { host: "127.0.0.1", port: 0 } });
 
 ### Что попадает в реестр
 
-После старта CallServer, `Descriptor.call_endpoint = "host:port"` (с фактическим портом если был `0`). Это значение видят все другие SDK через `serviceMap()` и используют для direct-вызовов.
+После старта CallServer, `call_endpoint = "host:port"` (с фактическим портом если был `0`). Это значение видят все другие SDK через `serviceMap()` и используют для вызовов.
 
 ```ts
-for (const d of caller.serviceMap().values()) {
-  console.log(d.serviceName, "→", d.callEndpoint || "(proxy-only)");
+for (const [name, entry] of caller.serviceMap()) {
+  for (const i of entry.instances) console.log(name, "→", i.callEndpoint || "(no inbound)");
 }
 ```
 
@@ -270,10 +302,10 @@ SERVICEBRIDGE_SERVICE_KEY=sb.Cgj...XYZ
 ### mTLS lifecycle
 
 После `sb.start()`:
-1. Bootstrap.Provision → получаем leaf cert (TTL 1 час).
-2. Long-lived mTLS-канал с runtime.
-3. За 30 минут до expiry — **overlap rotation**: новый канал с новым cert, ждём первый `Welcome`, переключаемся, старый канал drain.
-4. Все этапы — без потери in-flight вызовов. На каждой rotation эмитится повторный `connected`.
+1. `Bootstrap.Provision` → короткоживущий leaf-сертификат и `instance_id`. Ключ и сертификат живут только в памяти, на диск SDK ничего не пишет.
+2. Каналы к runtime и к другим инстансам строятся один раз и берут TLS-материал из общего хранилища сертификатов.
+3. За 30 минут до expiry (±5 мин разброса) — `Control.RefreshCert`: новый leaf для того же `instance_id`. Меняется только то, что предъявит следующее TLS-рукопожатие; ни сессия, ни стримы, ни каналы не пересоздаются, `connected` не эмитится. Отказ из-за лимита частоты или временной недоступности повторяется через 60 с.
+4. Reconnect переиспользует действующий leaf. Новый `Provision` (и новый `instance_id`) нужен, только если сертификат успел истечь.
 
 ### SPIFFE identity
 
@@ -286,12 +318,14 @@ spiffe://servicebridge/service/<service_id>/instance/<instance_id>
 
 ### Ротация скомпрометированного ключа
 
-Создайте новый ключ для того же сервиса через дашборд (**Services → Create service**) и обновите env-переменные.
+Выпустите новый ключ того же сервиса: `sb service key rotate <name>` (новый ключ показывается один раз) или в дашборде. Ротация отзывает прежние креды: инстансы со старым ключом переподключиться не смогут.
 
-После rotation:
-1. Обновите env-переменную.
-2. Restart сервиса (SDK подхватит новый ключ).
-3. Удалите старую запись через runtime API/dashboard — инвалидирует leaf certs со старым `key_id`.
+1. Обновите секрет с ключом.
+2. Перезапустите сервис — SDK получит leaf по новому ключу.
+
+### Отзыв сервисов и инстансов
+
+Runtime сообщает SDK об отозванных сервисах и инстансах. Отозванные не выбираются целями вызовов, их прямые каналы закрываются, их входящие вызовы отклоняются `ACCESS_DENIED` сразу. Отзыв инстанса действует до конца жизни процесса; отзыв сервиса снимается, когда у него появляется новый инстанс.
 
 ### Несколько процессов с одним ключом
 
@@ -312,19 +346,7 @@ spiffe://servicebridge/service/<service_id>/instance/<instance_id>
 
 ### Runtime
 
-Из env рантайм читает **только** Postgres-подключение — единственное, что не может жить в БД. Остальное (порты gRPC `14445` и UI gateway `14444`, shutdown-таймаут, session TTL, idempotency TTL) — настройки в БД, редактируются в UI на странице Settings.
-
-| Переменная | Default | Что делает |
-|-----------|---------|-----------|
-| `POSTGRES_HOST` | — (required) | Postgres host. |
-| `POSTGRES_PORT` | — (required) | Postgres port. |
-| `POSTGRES_USER` | — (required) | DB user. |
-| `POSTGRES_PASSWORD` | — (required) | DB password. |
-| `POSTGRES_DB` | — (required) | DB name. |
-| `POSTGRES_SSLMODE` | `disable` | libpq-режим: `disable` / `allow` / `prefer` / `require` / `verify-ca` / `verify-full`. |
-| `POSTGRES_MAX_CONNS` | `10` | Pool max conns. |
-| `POSTGRES_MIN_CONNS` | `0` | Pool min conns. |
-| `POSTGRES_CONNECT_TIMEOUT` | `5s` | DB connect timeout. |
+Подключение рантайма к Postgres задаётся не через env, а флагом `-pg-url` (по умолчанию `postgres://postgres:postgres@postgres:5432/service-bridge?sslmode=disable` — контейнер `postgres` из поставляемого docker-compose). Остальное (порты gRPC `14445` и UI gateway `14444`, таймауты, idempotency TTL, режимы захвата payload) — настройки в БД, редактируются в UI на странице Settings.
 
 > Требуется PostgreSQL 18+.
 
@@ -332,42 +354,39 @@ spiffe://servicebridge/service/<service_id>/instance/<instance_id>
 
 ## 8. Troubleshooting
 
-### disconnected сразу после start()
+### start() бросает ConnectionError
 
-`error.code = 16 (UNAUTHENTICATED)` → bootstrap key invalid:
+`err.grpcCode === 16` (`UNAUTHENTICATED`) → bootstrap key invalid:
 - Пустая/обрезанная env-переменная.
 - Запись удалена из БД runtime.
 - БД runtime пересоздана.
 
 Сгенерируйте новый ключ через дашборд рантайма (**Services → Create service**), обновите env.
 
-### no descriptor for `<svc>/<method>`
+### start() бросает TimeoutError
 
-Метод не в `serviceMap()`:
-1. Не вызван `sb.service(svc, { rpc: [...] })` или `sb.client(svc, ...)`.
-2. Callee offline / не зарегистрировал handler.
-3. Опечатка в имени (case-sensitive).
+Runtime не прислал `Welcome` и первый snapshot за `startTimeoutMs`: runtime недоступен по `url`, порт не тот, сеть режет gRPC. Проверьте `url` (`host:port` control plane, по умолчанию `14445`).
+
+### rpc: no schema for `<svc>/<method>`
+
+Caller не вызвал `useSchema()` (и не использует typed client). Решение: `await sb.useSchema(svc, method, { protoFile: "..." })` или `await sb.client(svc, "...")` до `start()`.
+
+### rpc: no live instance of `<svc>/<method>` matches caller contract `<hash>`
+
+Ни у одного живого инстанса нет метода с этим `contract_hash`:
+1. Callee offline / не зарегистрировал handler.
+2. Опечатка в имени (case-sensitive).
+3. Callee на другой версии схемы — см. [RPC §8](./rpc.md#8-версионирование-контракта).
 
 ```ts
-console.log("snapshot:");
-for (const d of sb.serviceMap().values()) {
-  console.log(" ", d.serviceName, d.type, d.name);
+for (const [name, entry] of sb.serviceMap()) {
+  for (const m of entry.methods) console.log(name, m.name, m.contractHash);
 }
 ```
 
-### no SchemaPair for `<svc>/<method>`
+### rpc: no endpoint for `<svc>/<method>`
 
-Caller не вызвал `useSchema()` (и не использует typed client). Решение: `await sb.useSchema(svc, method, { protoFile: "..." })` или `await sb.client(svc, "...")`.
-
-### no instance ... matches caller contract `<hash>`
-
-Все инстансы callee имеют другой `contract_hash` — version mismatch. См. [RPC §8](./rpc.md#8-версионирование-контракта). Обычно решается deploy совместимой версии callee.
-
-### transport="direct" requested but no endpoint
-
-Callee запущен с `advertise: false` или без advertise (в loopback default). Решения:
-- Используйте `transport: "auto"` для fallback на proxy.
-- Включите advertise на callee (production: `{ host: POD_IP, port: ... }`).
+Callee запущен с `advertise: false` — его нельзя вызвать ни напрямую, ни через proxy. Включите advertise на callee (production: `{ host: POD_IP, port: ... }`).
 
 ### no service block found
 
@@ -381,16 +400,16 @@ Auto-resolve не нашёл messages. Укажите явно: `{ protoFile, in
 
 Не указана `advertise`, поэтому inbound CallServer сел на недостижимый `127.0.0.1`. Для production: задайте `advertise: { host, port }` явно. Для caller-only: `advertise: false`.
 
-### Все retry исчерпались с UNAVAILABLE
+### Вызов падает с CONNECTION или NO_LIVE_INSTANCE
 
 1. Все инстансы реально offline?
-2. CB всех инстансов в OPEN?
+2. CB всех инстансов в OPEN («all candidates circuit-open»)?
 3. Все инстансы имеют несовместимый `contract_hash`?
 4. Network partition?
 
 ```ts
-for (const d of sb.serviceMap().values()) {
-  console.log(d.serviceName, d.name, d.callEndpoint, d.contractHash);
+for (const [name, entry] of sb.serviceMap()) {
+  for (const i of entry.instances) console.log(name, i.instanceId, i.callEndpoint, i.status);
 }
 ```
 
@@ -402,9 +421,9 @@ for (const d of sb.serviceMap().values()) {
 
 Добавьте timeout: `sb.stream(svc, m, payload, { timeout: "30s" })`.
 
-### Reconnect-loop при ротации сертификатов
+### Reconnect-loop
 
-Это **нормально** — overlap rotation выглядит как mini-reconnect. Признак: за `reconnecting` идёт `connected` без error. Реальная проблема — `disconnected` с error.
+Продление сертификата сессию не трогает, поэтому повторяющиеся `reconnecting` — это реальные обрывы: runtime перезапускается (перед этим приходит `draining`), сеть рвёт долгие соединения, балансировщик между SDK и runtime режет HTTP/2. Бридж продолжает попытки, пока не получит неустранимую ошибку; тогда приходит `disconnected`.
 
 ### Memory leak при долгоживущем процессе
 
@@ -458,7 +477,7 @@ latency.observe(0.137);
 Встроенных операций хватает почти всегда, но иногда полезно увидеть в трейсе свой этап — «сверка», «пересчёт корзины» — как один узел, внутри которого лежат его вызовы.
 
 ```ts
-import { Channel, UserSubOp } from "service-bridge";
+import { Channel, Status, UserSubOp } from "service-bridge";
 
 await sb.telemetry
   .startOp({ channel: Channel.USER, kind: UserSubOp, subject: "reconcile" })
@@ -509,7 +528,22 @@ In-flight операция стартует в `PENDING`; завершается
 | `TIMEOUT` | Превысила дедлайн. |
 | `ABANDONED` | Инстанс пропал, не закрыв операцию — рантайм сам помечает такие операции при disconnect-sweep. |
 
-> Эмиссия самих START/END-кадров операций — внутренняя забота SDK и его доменных слоёв; в публичный пакет `servicebridge` низкоуровневый op-API не экспортируется. Из пользовательского кода вы добавляете наблюдаемость через логи и метрики выше, а операции получаете бесплатно от встроенных доменов.
+> Из пользовательского кода SDK принимает только свои спаны `Channel.USER` / `UserSubOp` (через `startOp` выше), логи и метрики. Операции RPC, HTTP, событий, workflow и jobs пишут встроенные домены.
+
+### Потеря телеметрии: onDrop
+
+Телеметрия копится в кольцевом буфере в памяти; при переполнении или когда runtime отбрасывает пачки, данные теряются. Узнать об этом можно через `telemetry.onDrop` — колбэк получает приращения с прошлого вызова:
+
+```ts
+const sb = new ServiceBridge(URL, KEY, {
+  telemetry: {
+    onDrop: ({ serverDrops, ringDrops, backpressureLevel }) =>
+      appLogger.warn("telemetry dropped", { serverDrops, ringDrops, backpressureLevel }),
+  },
+});
+```
+
+Те же потери SDK отправляет в runtime метрикой `sb_sdk_telemetry_dropped_total{source="ring"|"server"}`.
 
 ---
 

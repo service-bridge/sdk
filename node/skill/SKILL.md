@@ -14,7 +14,7 @@ This SDK is the **backend** client for that runtime. The npm package is **`servi
 A `ServiceBridge` instance has two phases. Get this wrong and nothing connects.
 
 1. **Before `start()` — declare.** Register incoming handlers (`rpc.handle`, `event.handle`, `workflow.handle`, `job.handle`), declare outgoing dependencies (`service()`, `client()`, `useSchema()`), attach HTTP frameworks. These ride along in the first registration to the runtime.
-2. **`await sb.start()`** — connect, authenticate (mTLS from the bootstrap key), register everything atomically.
+2. **`await sb.start()`** — connect, authenticate (mTLS from the bootstrap key), register everything atomically. Resolves once the runtime has welcomed the session and sent the first registry snapshot; throws (and stops the bridge) otherwise.
 3. **After `start()` — act.** Make outgoing calls: `rpc.call`, `event.publish`, `workflow.start`. These need a live connection.
 
 ```ts
@@ -46,9 +46,12 @@ await sb.start();
 - **The SDK reads NO env vars.** You pass `url`, `key`, and the advertise host explicitly (e.g. `process.env.PAYMENT_KEY!` in your own code). There is no env-var fallback inside the SDK.
 - **Get the bootstrap key from the dashboard.** Open the runtime dashboard (`http://localhost:14444`) → **Services → Create service** → copy the `sb.…` string. That opaque value is the second constructor arg.
 - **Every RPC handler needs a `schema`.** `rpc.handle(name, fn, { schema })` — schema is required. Without it, registration fails.
-- **`event.handle` matches the EXACT event name**, not a wildcard. Wildcard routing is configured server-side, not in the handler string.
+- **`event.handle(pattern, fn, { schema, filter })`** takes an exact name or an AMQP pattern (`order.*`, `order.#`). The runtime matches patterns and evaluates the filter; one handler per pattern. The subscriber passes its own `schema` and does **not** call `event.define` (that declares *publishing*).
 - **Event and job handlers must be idempotent.** Delivery is at-least-once. For jobs, dedup on `ctx.idempotencyKey`, never on `ctx.attempt`.
-- **Declare before `start()`, call after `start()`.** Outgoing `rpc.call`/`event.publish`/`workflow.start` before `start()` throw "not ready".
+- **Declare before `start()`, call after `start()`.** Outgoing `rpc.call`/`event.publish`/`workflow.start` before `start()` throw `StateError`.
+- **Every SDK error is a `ServiceBridgeError`** with `code` and `retryable`. Business errors from a handler: `throw new HandlerError("CODE", "message")` — the caller gets a `HandlerError` with the same `handlerCode`; any other throw reaches the caller as `handlerCode: "INTERNAL"`.
+- **The SDK retries an RPC only when the handler provably did not run.** An `idempotencyKey` does not make a dispatched call retryable; `TIMEOUT` means the outcome is unknown.
+- **`event.publish` resolves after the runtime stored the event.** While the runtime is unreachable events wait in a bounded in-memory queue (`QUEUE_FULL` when full, `TimeoutError` after `publishTimeoutMs`). Nothing is written to disk.
 - **Teardown is `await sb.stop()`.** There is no `close()`.
 - **Set `advertise` in production.** If a service handles RPC, pass `{ advertise: { host, port } }` (e.g. the pod IP). Omitting it falls back to `127.0.0.1` (local-only) with a warning. A pure caller can pass `advertise: false`.
 
@@ -57,6 +60,8 @@ await sb.start();
 ```sh
 npm i service-bridge      # or: bun add service-bridge
 ```
+
+Runs on Node.js 22, 24, 26 and Bun ≥ 1.3.13 (the Fastify integration needs Node).
 
 The runtime must be running. One-line install of the runtime:
 
@@ -75,8 +80,8 @@ Dashboard at `http://localhost:14444` (create your admin account on first open, 
 | Multi-step orchestration (DAG, compensation, signals, replay) | `sb.workflow` | [reference/workflows.md](reference/workflows.md) |
 | Cron / delayed / interval scheduled work | `sb.job` | [reference/jobs.md](reference/jobs.md) |
 | Expose your Express/Fastify/Hono app to Service Map + discovery | `service-bridge/{express,fastify,hono}` | [reference/http-integrations.md](reference/http-integrations.md) |
-| Unit-test a registered RPC/event handler without a live runtime | `service-bridge/testing` | [reference/testing.md](reference/testing.md) |
-| Constructor options, error types, capacity tuning | `ServiceBridgeOptions` | [reference/configuration.md](reference/configuration.md) |
+| Unit-test a registered RPC/event handler without a live runtime | `service-bridge/testing` (`createTestHarness`) | [reference/testing.md](reference/testing.md) |
+| Constructor options, lifecycle, error codes, capacity tuning | `ServiceBridgeOptions` | [reference/configuration.md](reference/configuration.md) |
 
 Read the matching reference file before writing code for a domain — each has exact signatures, defaults, and a runnable recipe. When a task spans domains, the lifecycle rule above still holds: one `ServiceBridge` per process, declare everything, then `start()`.
 
