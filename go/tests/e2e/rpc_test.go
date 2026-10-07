@@ -256,10 +256,9 @@ func TestOneOperationRowPerCall(t *testing.T) {
 		t.Fatalf("call: %v", err)
 	}
 
-	rows := waitRows(ctx, t, rowTimeout, "the call's operation row", fmt.Sprintf(
-		`SELECT trace_id::text AS trace_id, op_id::text AS op_id, channel, kind, status,
-		        actor_service_id::text AS actor_service_id, peer_service_id::text AS peer_service_id
-		   FROM operations WHERE subject = %s`, lit(t, subject)), 1)
+	rows := finishedOpRows(ctx, t, "the call's operation row",
+		`trace_id::text AS trace_id, op_id::text AS op_id, channel, kind, status,
+		 actor_service_id::text AS actor_service_id, peer_service_id::text AS peer_service_id`, subject)
 
 	if len(rows) != 1 {
 		t.Fatalf("the call produced %d operation rows, want exactly 1: %v", len(rows), rows)

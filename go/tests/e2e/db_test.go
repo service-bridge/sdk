@@ -179,6 +179,21 @@ func waitRows(ctx context.Context, t *testing.T, timeout time.Duration, what, qu
 	return found
 }
 
+// finishedOpRows waits until an operation with the subject has finished, then
+// returns every row the subject matches. An operation row is written when the
+// work starts and finished by a later update, so asserting its status right
+// after the row first appears races that update.
+func finishedOpRows(ctx context.Context, t *testing.T, what, columns, subject string) []map[string]any {
+	t.Helper()
+	waitRows(ctx, t, rowTimeout, what, fmt.Sprintf(
+		`SELECT 1 FROM operations WHERE subject = %s AND finished_at IS NOT NULL`, lit(t, subject)), 1)
+	rows, err := queryRows(ctx, fmt.Sprintf(`SELECT %s FROM operations WHERE subject = %s`, columns, lit(t, subject)))
+	if err != nil {
+		t.Fatalf("read %s: %v", what, err)
+	}
+	return rows
+}
+
 // str reads a text column. A NULL and an absent column both answer "", which is
 // what every caller here compares against.
 func str(row map[string]any, column string) string {

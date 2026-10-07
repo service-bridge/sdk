@@ -29,9 +29,8 @@ func TestUserOperationAndLogShareOneTrace(t *testing.T) {
 	c.Telemetry.Logger().InfoContext(opCtx, message, "stage", "e2e")
 	op.End()
 
-	rows := waitRows(ctx, t, rowTimeout, "the user operation row", fmt.Sprintf(
-		`SELECT trace_id::text AS trace_id, op_id::text AS op_id, channel, kind, status, business_key
-		   FROM operations WHERE subject = %s`, lit(t, subject)), 1)
+	rows := finishedOpRows(ctx, t, "the user operation row",
+		`trace_id::text AS trace_id, op_id::text AS op_id, channel, kind, status, business_key`, subject)
 	if len(rows) != 1 {
 		t.Fatalf("the operation produced %d rows, want 1: %v", len(rows), rows)
 	}
