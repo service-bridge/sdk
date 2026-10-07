@@ -159,7 +159,7 @@ export class RpcClient {
 			yield* streamWithContext(childCtx, decoded);
 			if (useDirect) this.d.cb.recordSuccess(cbKey(candidate.instance));
 		} catch (err) {
-			const failure = asFailure(err, opts.signal);
+			const failure = asFailure(err, opts.signal, deadline.getTime());
 			endStatus = Status.ERROR;
 			endMsg = failure.error.message;
 			if (useDirect) this.recordOutcome(candidate, failure);
@@ -282,7 +282,7 @@ export class RpcClient {
 				if (useDirect) this.d.cb.recordSuccess(cbKey(candidate.instance));
 				return result;
 			} catch (err) {
-				const failure = asFailure(err, opts.signal);
+				const failure = asFailure(err, opts.signal, deadlineAt);
 				if (useDirect) this.recordOutcome(candidate, failure);
 				if (!failure.preDispatch) {
 					op.end(Status.ERROR, failure.error.message);
@@ -389,12 +389,30 @@ function directTarget(candidate: Candidate) {
 }
 
 // asFailure normalises whatever a transport threw. An abort by the caller's
-// signal is CANCELLED and never retried.
-function asFailure(err: unknown, signal?: AbortSignal): CallFailure {
+// signal is CANCELLED and never retried. A CANCELLED status the caller did not
+// ask for, arriving once the call's deadline has passed, is the callee giving
+// up on that deadline (its server resets the stream, possibly before the local
+// deadline timer fires): it is TIMEOUT, like the local expiry.
+function asFailure(
+	err: unknown,
+	signal: AbortSignal | undefined,
+	deadlineAt: number,
+): CallFailure {
 	if (signal?.aborted)
 		return new CallFailure(
 			new ServiceBridgeError("CANCELLED", "rpc: call cancelled by the caller", {
 				cause: err,
+			}),
+			false,
+		);
+	if (
+		err instanceof CallFailure &&
+		err.error.code === "CANCELLED" &&
+		Date.now() >= deadlineAt
+	)
+		return new CallFailure(
+			new ServiceBridgeError("TIMEOUT", err.error.message, {
+				cause: err.error,
 			}),
 			false,
 		);

@@ -351,6 +351,35 @@ describe("RpcClient.call errors and options", () => {
 		expect(call.deadline.getTime() - before).toBeGreaterThan(4_000);
 	});
 
+	it("a CANCELLED reset arriving after the deadline is TIMEOUT; before it, CANCELLED", async () => {
+		const cancelled = () =>
+			new CallFailure(
+				new ServiceBridgeError("CANCELLED", "Call cancelled"),
+				false,
+			);
+		const late = makeClient({
+			direct: async (call) => {
+				await Bun.sleep(Math.max(0, call.deadline.getTime() - Date.now()) + 5);
+				throw cancelled();
+			},
+		});
+		const timeout = await late.client
+			.call(SVC, METHOD, {}, { timeout: "50ms" })
+			.catch((e) => e);
+		expect((timeout as ServiceBridgeError).code).toBe("TIMEOUT");
+		expect((timeout as ServiceBridgeError).retryable).toBe(false);
+
+		const early = makeClient({
+			direct: async () => {
+				throw cancelled();
+			},
+		});
+		const err = await early.client
+			.call(SVC, METHOD, {}, { timeout: "5s" })
+			.catch((e) => e);
+		expect((err as ServiceBridgeError).code).toBe("CANCELLED");
+	});
+
 	it("an invalid timeout string is a configuration error", async () => {
 		const { client } = makeClient({});
 		await expect(
