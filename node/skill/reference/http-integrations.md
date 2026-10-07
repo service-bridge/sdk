@@ -10,12 +10,17 @@ import { sbFastify }    from "service-bridge/fastify";
 import { attachHono }   from "service-bridge/hono";
 ```
 
-All three: parse the `X-SB-Trace` header so handler-internal `sb.rpc.call`/`sb.event.publish` join the same trace, emit an `HTTP.HANDLE` op per request (status + optional body capture), and publish your routes + advertise endpoint. Safe to call before `sb.start()` — the endpoint queues into the first registration.
+All three: open a trace scope per request so handler-internal `sb.rpc.call`/`sb.event.publish` join the request's trace, emit an `HTTP.HANDLE` op per request, and publish your routes + advertise endpoint. Safe to call before `sb.start()` — the endpoint queues into the first registration.
+
+- The op subject is `http.handle:<METHOD>/<route template>` (`*` when no route matched), meta `{ method, route, status }`, businessKey = the `Idempotency-Key` header or `"<METHOD> <route template>"` — never the raw path or query. Status: `SUCCESS` below 400, `ERROR` from 400, `TIMEOUT` on client abort.
+- Request/response bodies are captured as-is according to the runtime-pushed HTTP capture mode (default `errors`); the runtime masks secrets on ingest.
+- **Incoming `X-SB-Trace` is ignored by default** — a public endpoint must not let clients graft requests into arbitrary traces. For an HTTP server called only by other ServiceBridge services, pass `trustTraceHeader: true` (option of all three integrations) to continue the caller's trace.
+- **No perimeter protection**: no rate limiting, scanner blocking or auth. Put that in your ingress or middleware.
 
 ## Express
 
 ```ts
-attachExpress(app: Express, sb: ServiceBridge, endpoint: { host?: string; port: number }): void
+attachExpress(app: Express, sb: ServiceBridge, endpoint: { host?: string; port: number; trustTraceHeader?: boolean }): void
 ```
 
 Call **after** all routes are registered. `port` is required (Express can bind `0`, so the plugin can't infer it). Mount a body parser (`express.json()`) before routes so request bodies are captured.
@@ -39,10 +44,10 @@ app.listen(3000);
 ## Fastify
 
 ```ts
-await app.register(sbFastify, { sb: ServiceBridge, host?: string });
+await app.register(sbFastify, { sb: ServiceBridge, host?: string, trustTraceHeader?: boolean });
 ```
 
-Register the plugin (it collects routes via the `onRoute` hook regardless of registration order, since `fastify-plugin` un-encapsulates the hook) — the advertise endpoint is published after `app.listen()` via the `onListen` hook, so the real port (even `0`) is known automatically. Supports Fastify 4.x and 5.x.
+Register the plugin; it runs in the parent scope, so its `onRoute` hook sees every route of the app. The advertise endpoint is published after `app.listen()` via the `onListen` hook, so the real port (even `0`) is known automatically; without `host` the bound socket address is used. Supports Fastify 4.x and 5.x, on Node.js only (Bun does not report client disconnects the integration relies on).
 
 ```ts
 import Fastify from "fastify";
@@ -62,7 +67,7 @@ await app.listen({ port: 3000 });
 ## Hono
 
 ```ts
-attachHono(app: Hono, sb: ServiceBridge, endpoint: { host?: string; port: number }): void
+attachHono(app: Hono, sb: ServiceBridge, endpoint: { host?: string; port: number; trustTraceHeader?: boolean }): void
 ```
 
 Call **after** routes are registered. Hono doesn't bind a socket itself, so `port` must be passed and must match what you give `Bun.serve` / `@hono/node-server` / `Deno.serve`. Routes declared with `app.all(...)` are not collected (no concrete method).
@@ -84,4 +89,4 @@ export default { port: 3000, fetch: app.fetch }; // Bun
 
 ## Advertise host
 
-`host` is optional on all three. If omitted, the plugin falls back to `127.0.0.1` (with a one-time warning). Pass an explicit reachable host (e.g. the pod IP) in production.
+`host` is optional on all three. If omitted, Express and Hono fall back to `127.0.0.1` (with a one-time warning); Fastify uses the bound socket address, then `127.0.0.1`. Pass an explicit reachable host (e.g. the pod IP) in production.

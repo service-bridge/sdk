@@ -63,9 +63,11 @@ export class InstanceCache {
 		this.refresh();
 		const unsubscribeInstances = watch.onInstancesChange(() => this.refresh());
 		const unsubscribeMethods = watch.onMethodsChange(() => this.refresh());
+		const unsubscribeRevoked = watch.onRevoked(() => this.refresh());
 		this.unsubscribe = () => {
 			unsubscribeInstances();
 			unsubscribeMethods();
+			unsubscribeRevoked();
 		};
 	}
 
@@ -111,6 +113,8 @@ export class InstanceCache {
 		this.instances.clear();
 		const liveKeys = new Set<string>();
 		for (const [id, info] of watch.instancesSnapshot()) {
+			// A revoked peer is never a target (decision 12).
+			if (watch.isRevoked(info.serviceId, id)) continue;
 			const instance: Instance = {
 				...info,
 				isUnhealthyAt: info.isUnhealthySinceUnixMs

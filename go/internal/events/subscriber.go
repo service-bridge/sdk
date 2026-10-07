@@ -2,9 +2,12 @@ package events
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
+	"sync/atomic"
 
 	pb "github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1"
 	"github.com/service-bridge/sdk/go/internal/stream"
@@ -26,14 +29,17 @@ type SubscribeStream interface {
 // Handler processes one decoded event.
 type Handler[T any] func(ctx context.Context, event T) error
 
-// rawHandler is what the dispatch path actually holds: decoding is closed over
-// by Subscribe so the delivery loop stays free of type parameters.
+// DeliveryInfo describes the delivery a handler is processing. LeaseToken is an
+// opaque delivery generation, not a business idempotency guarantee.
 type DeliveryInfo struct {
-	Attempt    int32
-	DeliveryID string
-	EventID    string
-	EventName  string
-	LeaseToken string
+	EventID      string
+	EventName    string
+	Attempt      int32
+	DeliveryID   string
+	LeaseToken   string
+	PartitionKey string
+	Headers      map[string]string
+	OccurredAtMs int64
 }
 type deliveryContextKey struct{}
 
@@ -43,7 +49,13 @@ func DeliveryFromContext(ctx context.Context) (DeliveryInfo, bool) {
 	return d, ok
 }
 
+// rawHandler is what the dispatch path actually holds: decoding is closed over
+// by Subscribe so the delivery loop stays free of type parameters.
 type rawHandler func(ctx context.Context, payload []byte) error
+
+// ErrDuplicatePattern marks a second handler for a pattern this process
+// already subscribed to.
+var ErrDuplicatePattern = errors.New("events: pattern already has a handler")
 
 // SubscriberConfig wires the delivery stream. See ./README.md.
 type SubscriberConfig struct {
@@ -64,13 +76,18 @@ type SubscriberConfig struct {
 }
 
 // Subscriber holds the delivery stream open and dispatches every inbound event
-// to the handlers registered for its exact name.
+// to the handlers of the patterns the runtime says it matched.
 type Subscriber struct {
 	cfg SubscriberConfig
 	sup *stream.Supervisor[*pb.SubscribeServerMessage, SubscribeStream]
 
 	mu       sync.RWMutex
-	handlers map[string][]rawHandler
+	handlers map[string]rawHandler
+	filters  map[string]string
+
+	// draining stops new deliveries from being taken: they stay unacked and
+	// the runtime hands them out again once this stream is gone.
+	draining atomic.Bool
 
 	// sendMu serializes writes: gRPC forbids concurrent Send on one stream and
 	// acks come off many handler goroutines.
@@ -114,7 +131,8 @@ func NewSubscriber(cfg SubscriberConfig) (*Subscriber, error) {
 
 	s := &Subscriber{
 		cfg:      cfg,
-		handlers: make(map[string][]rawHandler),
+		handlers: make(map[string]rawHandler),
+		filters:  make(map[string]string),
 		slots:    make(chan struct{}, cfg.MaxInFlight),
 		chains:   make(map[string]chan struct{}),
 	}
@@ -133,50 +151,62 @@ func NewSubscriber(cfg SubscriberConfig) (*Subscriber, error) {
 	return s, nil
 }
 
-// Subscribe registers a typed handler for one exact event name. Several
-// handlers may share a name; they run in registration order and one failure
-// rejects the delivery.
-//
-// Routing is server-side (ADR-0002): there is no local pattern matching, so the
-// name must be the one the runtime delivers.
-func Subscribe[T any](s *Subscriber, name string, fn Handler[T]) error {
+// Subscription is one declared pattern and its filter, as it goes into the
+// RegisterRequest.
+type Subscription struct {
+	Pattern string
+	// Filter is the JSON filter expression, empty for none.
+	Filter string
+}
+
+// Subscribe registers the handler for one pattern. The pattern goes to the
+// runtime verbatim — wildcards included — and routing is the runtime's: a
+// delivery names the patterns it matched and only those handlers run. A
+// second handler for the same pattern is refused.
+func Subscribe[T any](s *Subscriber, pattern, filter string, fn Handler[T]) error {
 	if s == nil {
-		return fmt.Errorf("events: subscribe %q: nil subscriber: %w", name, ErrInvalidConfig)
+		return fmt.Errorf("events: subscribe %q: nil subscriber: %w", pattern, ErrInvalidConfig)
 	}
 	if fn == nil {
-		return fmt.Errorf("events: subscribe %q: nil handler: %w", name, ErrInvalidConfig)
+		return fmt.Errorf("events: subscribe %q: nil handler: %w", pattern, ErrInvalidConfig)
 	}
-	// A subscription may carry a wildcard where a publish may not: the runtime
-	// routes on the pattern, and refusing it here would drop a capability the
-	// wire contract offers.
-	if !ValidEventPattern(name) {
-		return fmt.Errorf("events: subscribe %q: %w", name, ErrInvalidName)
+	if !ValidEventPattern(pattern) {
+		return fmt.Errorf("events: subscribe %q: %w", pattern, ErrInvalidName)
 	}
 	codec := s.cfg.Codec
-	s.addHandler(name, func(ctx context.Context, payload []byte) error {
+	h := func(ctx context.Context, payload []byte) error {
 		var event T
-		decodeName := name
+		name := pattern
 		if info, ok := DeliveryFromContext(ctx); ok {
-			decodeName = info.EventName
+			name = info.EventName
 		}
-		if err := codec.Decode(decodeName, payload, &event); err != nil {
+		if err := codec.Decode(name, payload, &event); err != nil {
 			return fmt.Errorf("decode %q: %w", name, err)
 		}
 		return fn(ctx, event)
-	})
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, taken := s.handlers[pattern]; taken {
+		return fmt.Errorf("events: subscribe %q: %w", pattern, ErrDuplicatePattern)
+	}
+	s.handlers[pattern] = h
+	s.filters[pattern] = filter
 	return nil
 }
 
-// Names returns the event names with at least one handler, so the caller can
-// declare them to the registry.
-func (s *Subscriber) Names() []string {
+// Subscriptions returns every declared pattern with its filter, sorted, so the
+// caller can declare them to the registry.
+func (s *Subscriber) Subscriptions() []Subscription {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	names := make([]string, 0, len(s.handlers))
-	for name := range s.handlers {
-		names = append(names, name)
+	out := make([]Subscription, 0, len(s.handlers))
+	for pattern := range s.handlers {
+		out = append(out, Subscription{Pattern: pattern, Filter: s.filters[pattern]})
 	}
-	return names
+	sort.Slice(out, func(i, j int) bool { return out[i].Pattern < out[j].Pattern })
+	return out
 }
 
 // Start opens the delivery stream and keeps it open until ctx ends or Stop.
@@ -187,6 +217,25 @@ func (s *Subscriber) Start(ctx context.Context) error {
 	return nil
 }
 
+// Drain stops taking new deliveries. Handlers already running finish; what
+// arrives meanwhile is left unacked for the runtime to hand out again.
+func (s *Subscriber) Drain() { s.draining.Store(true) }
+
+// Wait blocks until every running handler returned or ctx ends.
+func (s *Subscriber) Wait(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("events: wait for handlers: %w", ctx.Err())
+	}
+}
+
 // Stop closes the stream and waits for every in-flight handler. Terminal.
 // Handlers see a cancelled context, so one that ignores cancellation holds Stop
 // for as long as it runs.
@@ -195,22 +244,20 @@ func (s *Subscriber) Stop() {
 	s.wg.Wait()
 }
 
-func (s *Subscriber) addHandler(name string, h rawHandler) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.handlers[name] = append(s.handlers[name], h)
-}
-
-// handlersFor collects every handler whose subscription covers the delivered
-// name. Exact names hit the map directly; a wildcard subscription is stored
-// under its pattern and only a match finds it.
-func (s *Subscriber) handlersFor(name string) []rawHandler {
+// handlersFor collects the handlers of every matched pattern this process
+// subscribed to, each once, in the order the runtime listed them.
+func (s *Subscriber) handlersFor(matched []string) []rawHandler {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := s.handlers[name]
-	for pattern, hs := range s.handlers {
-		if pattern != name && MatchEventPattern(pattern, name) {
-			out = append(out, hs...)
+	out := make([]rawHandler, 0, len(matched))
+	seen := make(map[string]struct{}, len(matched))
+	for _, pattern := range matched {
+		if _, dup := seen[pattern]; dup {
+			continue
+		}
+		seen[pattern] = struct{}{}
+		if h, ok := s.handlers[pattern]; ok {
+			out = append(out, h)
 		}
 	}
 	return out
@@ -243,7 +290,7 @@ func (s *Subscriber) open(ctx context.Context) (SubscribeStream, error) {
 // what stops the stream being drained past the limit.
 func (s *Subscriber) onData(ctx context.Context, msg *pb.SubscribeServerMessage, st SubscribeStream) {
 	delivery := msg.GetDelivery()
-	if delivery == nil {
+	if delivery == nil || s.draining.Load() {
 		return
 	}
 	if !s.acquire(ctx) {
@@ -318,25 +365,48 @@ func (s *Subscriber) process(ctx context.Context, d *pb.EventDelivery, st Subscr
 		s.nack(st, d.GetDeliveryId(), "", "missing envelope", d.GetLeaseToken())
 		return
 	}
-	handlers := s.handlersFor(env.GetName())
-	if len(handlers) == 0 {
-		s.nack(st, d.GetDeliveryId(), env.GetId(), "no registered handler", d.GetLeaseToken())
+	acked, reason := s.Handle(ctx, d)
+	if ctx.Err() != nil {
 		return
 	}
+	if acked {
+		s.ack(st, d.GetDeliveryId(), env.GetId(), d.GetLeaseToken())
+		return
+	}
+	s.nack(st, d.GetDeliveryId(), env.GetId(), reason, d.GetLeaseToken())
+}
 
+// NoHandlerReason is the nack reason of a delivery none of whose matched
+// patterns this process handles.
+const NoHandlerReason = "no handler for matched patterns"
+
+// Handle runs one delivery through the handlers of its matched patterns and
+// reports the verdict: ack only if every handler succeeded, otherwise the
+// reason of the first failure. It is the whole delivery contract minus the
+// stream, which is what the test harness drives.
+func (s *Subscriber) Handle(ctx context.Context, d *pb.EventDelivery) (acked bool, reason string) {
+	env := d.GetEnvelope()
+	handlers := s.handlersFor(d.GetMatchedPatterns())
+	if len(handlers) == 0 {
+		return false, NoHandlerReason
+	}
 	handlerCtx := s.traceContext(ctx, env.GetXSbTrace())
-	handlerCtx = context.WithValue(handlerCtx, deliveryContextKey{}, DeliveryInfo{Attempt: d.GetAttempt(), DeliveryID: d.GetDeliveryId(), EventID: env.GetId(), EventName: env.GetName(), LeaseToken: d.GetLeaseToken()})
+	handlerCtx = context.WithValue(handlerCtx, deliveryContextKey{}, DeliveryInfo{
+		EventID:      env.GetId(),
+		EventName:    env.GetName(),
+		Attempt:      d.GetAttempt(),
+		DeliveryID:   d.GetDeliveryId(),
+		LeaseToken:   d.GetLeaseToken(),
+		PartitionKey: env.GetPartitionKey(),
+		Headers:      env.GetHeaders(),
+		OccurredAtMs: env.GetOccurredAtUnixMs(),
+	})
 	for _, h := range handlers {
 		if err := invokeHandler(handlerCtx, h, env.GetPayload()); err != nil {
-			if ctx.Err() == nil {
-				s.nack(st, d.GetDeliveryId(), env.GetId(), err.Error(), d.GetLeaseToken())
-			}
-			return
+			return false, err.Error()
 		}
 	}
-	if ctx.Err() == nil {
-		s.ack(st, d.GetDeliveryId(), env.GetId(), d.GetLeaseToken())
-	}
+	return true, ""
 }
 
 // traceContext puts the publisher's trace into the handler context so nested

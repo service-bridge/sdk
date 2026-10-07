@@ -8,12 +8,15 @@ import (
 	"net"
 	"reflect"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
 	pb "github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1"
@@ -1493,5 +1496,114 @@ func TestWatchCacheIsFailSafeBeforeItStarts(t *testing.T) {
 	}
 	if w.Cache().Policy() != nil {
 		t.Fatal("policy is known only from the runtime")
+	}
+}
+
+func TestRevocationsAreTrackedAndAServiceComesBack(t *testing.T) {
+	c := registry.NewCache()
+	if c.Ready() {
+		t.Fatal("ready before the first snapshot")
+	}
+	c.ApplySnapshot(&pb.RegistrySnapshot{Instances: []*pb.ServiceInstanceInfo{si("i1", "s1", "svc")}})
+	if !c.Ready() {
+		t.Fatal("not ready after the snapshot")
+	}
+
+	ch := c.ApplyUpdate(&pb.RegistryUpdate{RevokedServices: []string{"s1"}, RevokedInstances: []string{"i9"}})
+	if len(ch.RevokedServices) != 1 || len(ch.RevokedInstances) != 1 {
+		t.Fatalf("change does not report the revocations: %+v", ch)
+	}
+	if !c.Revoked("s1", "i1") || !c.Revoked("other", "i9") || c.Revoked("s2", "i2") || c.Revoked("", "") {
+		t.Fatal("revocation lookup is wrong")
+	}
+	services, instances := c.RevokedSets()
+	if len(services) != 1 || len(instances) != 1 {
+		t.Fatalf("sets: %v %v", services, instances)
+	}
+
+	// An instance of the revoked service re-registers: the service is back. A
+	// revoked instance stays revoked for the life of the process.
+	c.ApplyUpdate(&pb.RegistryUpdate{AddedInstances: []*pb.ServiceInstanceInfo{si("i2", "s1", "svc")}})
+	if c.Revoked("s1", "i2") {
+		t.Fatal("the service stayed revoked after an instance of it came back")
+	}
+	c.ApplySnapshot(&pb.RegistrySnapshot{Instances: []*pb.ServiceInstanceInfo{si("i9", "s3", "svc")}})
+	if !c.Revoked("s3", "i9") {
+		t.Fatal("a revoked instance came back")
+	}
+}
+
+func TestWatchTerminalFailureEndsReadyAndIsReported(t *testing.T) {
+	client, srv := startRegistry(t, func(int, pb.Registry_RegisterAndWatchServer) error {
+		return status.Error(codes.InvalidArgument, "invalid subscription filter")
+	})
+	terminal := make(chan error, 1)
+	w, err := registry.NewWatch(registry.WatchConfig{
+		Clients:    staticClients{client: client},
+		Request:    func() *pb.RegisterRequest { return &pb.RegisterRequest{} },
+		OnTerminal: func(err error) { terminal <- err },
+		Backoff:    testBackoff(),
+		Logger:     quietLogger(),
+	})
+	if err != nil {
+		t.Fatalf("new watch: %v", err)
+	}
+	if err := w.Start(t.Context()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer w.Stop()
+
+	if got := recvWithin(t, terminal, "terminal report"); status.Code(got) != codes.InvalidArgument {
+		t.Fatalf("terminal cause %v", got)
+	}
+	if err := w.Ready(t.Context()); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("Ready after a terminal failure: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if n := srv.calls.Load(); n != 1 {
+		t.Fatalf("reopened %d times after a terminal failure", n)
+	}
+}
+
+func TestReregisterWaitsForTheNextSnapshot(t *testing.T) {
+	client, srv := startRegistry(t, func(_ int, s pb.Registry_RegisterAndWatchServer) error {
+		if err := s.Send(snapshotEvent(&pb.RegistrySnapshot{})); err != nil {
+			return err
+		}
+		<-s.Context().Done()
+		return nil
+	})
+	endpoint := "10.0.0.1:1"
+	var mu sync.Mutex
+	w, err := registry.NewWatch(registry.WatchConfig{
+		Clients: staticClients{client: client},
+		Request: func() *pb.RegisterRequest {
+			mu.Lock()
+			defer mu.Unlock()
+			return &pb.RegisterRequest{CallEndpoint: endpoint}
+		},
+		Backoff: testBackoff(),
+		Logger:  quietLogger(),
+	})
+	if err != nil {
+		t.Fatalf("new watch: %v", err)
+	}
+	if err := w.Start(t.Context()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer w.Stop()
+	if err := w.Ready(t.Context()); err != nil {
+		t.Fatalf("ready: %v", err)
+	}
+	recvWithin(t, srv.requests, "first registration")
+
+	mu.Lock()
+	endpoint = ""
+	mu.Unlock()
+	if err := w.Reregister(t.Context()); err != nil {
+		t.Fatalf("reregister: %v", err)
+	}
+	if req := recvWithin(t, srv.requests, "re-registration"); req.GetCallEndpoint() != "" {
+		t.Fatalf("re-registration advertised %q", req.GetCallEndpoint())
 	}
 }

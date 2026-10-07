@@ -1,57 +1,25 @@
-import { describe, expect, it, mock } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import { EventEmitter } from "node:events";
-import type { EventHandlerFn } from "../registry/registry";
-import type { SubscriberDeps } from "./subscriber";
-import { Subscriber } from "./subscriber";
+import { silentLogger } from "../logger";
+import type { EventsClient } from "../pb/servicebridge/v1/events";
+import type {
+	EventHandlerContext,
+	EventHandlerFn,
+	SubscriptionEntry,
+} from "../registry/registry";
+import type { SchemaPair } from "../serde/serializer";
+import { Subscriber, type SubscriberDeps } from "./subscriber";
 
-// -- helpers --
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-// handlersFor builds the pattern-indexed fan-out lookup the subscriber expects,
-// mirroring Handle.eventHandlers: exact-name buckets in registration order,
-// empty for anything unregistered. Wildcards never match locally (ADR-0002).
-function handlersFor(
-	entries: Array<{ pattern: string; fn: EventHandlerFn }>,
-): (pattern: string) => readonly EventHandlerFn[] {
-	const byPattern = new Map<string, EventHandlerFn[]>();
-	for (const e of entries) {
-		const bucket = byPattern.get(e.pattern);
-		if (bucket) bucket.push(e.fn);
-		else byPattern.set(e.pattern, [e.fn]);
-	}
-	return (pattern) => byPattern.get(pattern) ?? [];
-}
-
-// Captured before any spy replaces the global, so test waits never show up in
-// the recorded reconnect delays.
-const realSetTimeout = globalThis.setTimeout;
-const wait = (ms: number): Promise<void> =>
-	new Promise((resolve) => {
-		realSetTimeout(resolve, ms);
-	});
-
-function makeSchema() {
-	return {
-		input: {
-			encode: (_val: unknown) => new Uint8Array(),
-			decode: (_buf: Uint8Array) => ({ amount: 42 }),
-			toJsonSchema: () => ({}),
-		},
-		output: {
-			encode: (_val: unknown) => new Uint8Array(),
-			decode: (_buf: Uint8Array) => ({}),
-			toJsonSchema: () => ({}),
-		},
-	};
-}
-
-function makeFakeStream() {
+function fakeStream() {
 	const emitter = new EventEmitter();
-	const written: unknown[] = [];
+	const written: Record<string, unknown>[] = [];
 	return {
 		emitter,
 		written,
 		stream: {
-			write: (msg: unknown) => written.push(msg),
+			write: (msg: Record<string, unknown>) => written.push(msg),
 			cancel: () => {},
 			end: () => {},
 			on: (event: string, cb: (...args: unknown[]) => void) =>
@@ -60,598 +28,306 @@ function makeFakeStream() {
 	};
 }
 
-// makeTraceCtx returns a valid trace context for test envelopes.
-// Per ADR 0006 §3 runtime always injects trace context into EventEnvelope.
-function makeTraceCtx(): {
-	traceId: Uint8Array;
-	spanId: Uint8Array;
-	traceFlags: number;
-} {
-	const traceId = new Uint8Array(16);
-	const spanId = new Uint8Array(8);
-	crypto.getRandomValues(traceId);
-	crypto.getRandomValues(spanId);
-	return { traceId, spanId, traceFlags: 1 };
+const decodingPair = {
+	input: { decode: (_b: Uint8Array) => ({ amount: 42 }) },
+} as unknown as SchemaPair;
+
+function entry(
+	pattern: string,
+	fn: EventHandlerFn,
+	schemaPair?: SchemaPair,
+): SubscriptionEntry {
+	return { pattern, filter: "", fn, schemaPair };
 }
 
-function makeDelivery(
-	deliveryId: string,
-	name = "order.created",
-	payload = new Uint8Array([1, 2, 3]),
-): {
-	delivery: {
-		deliveryId: string;
-		envelope: {
-			id: string;
-			name: string;
-			payload: Uint8Array;
-			traceId: Uint8Array;
-			spanId: Uint8Array;
-			traceFlags: number;
-		};
-		attempt: number;
-	};
-} {
+function delivery(
+	id: string,
+	matchedPatterns: string[],
+	over: { partitionKey?: string } = {},
+) {
 	return {
 		delivery: {
-			deliveryId,
-			envelope: { id: `ev-${deliveryId}`, name, payload, ...makeTraceCtx() },
+			deliveryId: id,
 			attempt: 1,
+			leaseToken: `lt-${id}`,
+			matchedPatterns,
+			envelope: {
+				id: `ev-${id}`,
+				name: "order.created",
+				payload: new Uint8Array([1, 2, 3]),
+				payloadJson: new Uint8Array(),
+				contractHash: "",
+				partitionKey: over.partitionKey ?? "",
+				idempotencyKey: "",
+				headers: { h: "v" },
+				occurredAtUnixMs: 1700000000000,
+				xSbTrace: "",
+			},
 		},
 	};
 }
 
-function makeDeps(
-	overrides: Partial<SubscriberDeps> & {
-		handlers?: SubscriberDeps["handlers"];
-		streamOverride?: ReturnType<typeof makeFakeStream>["stream"];
-		extraSchemas?: Record<
-			string,
-			{ contractHash: string; pair: ReturnType<typeof makeSchema> }
-		>;
-	} = {},
-): {
-	deps: SubscriberDeps;
-	fake: ReturnType<typeof makeFakeStream>;
-} {
-	const fake = makeFakeStream();
-	const streamRef = overrides.streamOverride ?? fake.stream;
-	const builtInSchemas: Record<
-		string,
-		{ contractHash: string; pair: ReturnType<typeof makeSchema> }
-	> = {
-		"order.created": { contractHash: "hash1", pair: makeSchema() },
-		"payment.charged": { contractHash: "hash2", pair: makeSchema() },
-		"payment.refunded": { contractHash: "hash3", pair: makeSchema() },
-	};
-	const allSchemas = { ...builtInSchemas, ...(overrides.extraSchemas ?? {}) };
+function makeSubscriber(
+	entries: SubscriptionEntry[],
+	over: Partial<SubscriberDeps> = {},
+) {
+	const streams: ReturnType<typeof fakeStream>[] = [];
+	const byPattern = new Map(entries.map((e) => [e.pattern, e]));
 	const deps: SubscriberDeps = {
-		rpcClient: {
-			subscribe: () => streamRef,
-			// biome-ignore lint/suspicious/noExplicitAny: minimal stub
-		} as any,
-		schemaIndex: {
-			get: (name: string) => allSchemas[name],
-		},
+		client: () =>
+			({
+				subscribe: () => {
+					const f = fakeStream();
+					streams.push(f);
+					return f.stream;
+				},
+			}) as unknown as EventsClient,
 		identity: () => ({ serviceId: "svc-1", instanceId: "inst-1" }),
-		handlers: overrides.handlers ?? (() => []),
+		subscription: (p) => byPattern.get(p),
 		maxInFlight: 32,
-		logger: { warn: () => {}, error: () => {} },
+		logger: silentLogger,
 		runWithTrace: (_x, fn) => fn(),
+		reconnectOpts: { ladder: [1], jitterRatio: 0 },
+		...over,
 	};
-	return { deps, fake };
+	const sub = new Subscriber(deps);
+	sub.start();
+	const current = () =>
+		streams[streams.length - 1] as ReturnType<typeof fakeStream>;
+	return { sub, streams, current };
 }
 
-// -- tests --
+const acks = (s: ReturnType<typeof fakeStream>) =>
+	s.written
+		.filter((m) => "ack" in m)
+		.map((m) => m.ack as { deliveryId: string });
+const nacks = (s: ReturnType<typeof fakeStream>) =>
+	s.written
+		.filter((m) => "nack" in m)
+		.map((m) => m.nack as { deliveryId: string; errorMessage: string });
 
-describe("Subscriber", () => {
-	it("HandlerSuccess_SendsAck", async () => {
-		const handlerFn = mock(async () => {});
-		const { deps, fake } = makeDeps({
-			handlers: handlersFor([
-				{
-					pattern: "order.created",
-					fn: handlerFn,
+describe("Subscriber routing by matched_patterns", () => {
+	it("opens the stream with SubscribeInit and acks a handled delivery", async () => {
+		const seen: unknown[] = [];
+		const { sub, current } = makeSubscriber([
+			entry(
+				"order.created",
+				(p) => {
+					seen.push(p);
 				},
-			]),
+				decodingPair,
+			),
+		]);
+		expect(current().written[0]).toMatchObject({
+			init: {
+				subscriberServiceId: "svc-1",
+				subscriberInstanceId: "inst-1",
+				maxInFlight: 32,
+			},
 		});
-
-		const sub = new Subscriber(deps);
-		sub.start();
-
-		fake.emitter.emit("data", makeDelivery("d-1"));
-		await Bun.sleep(10);
-
-		expect(handlerFn).toHaveBeenCalledTimes(1);
-		const acked = fake.written.find(
-			// biome-ignore lint/suspicious/noExplicitAny: test assertion
-			(m: any) => m.ack?.deliveryId === "d-1",
-		);
-		expect(acked).toBeDefined();
-		await sub.stop();
-	});
-
-	it("HandlerThrows_SendsNack", async () => {
-		const { deps, fake } = makeDeps({
-			handlers: handlersFor([
-				{
-					pattern: "order.created",
-					fn: async () => {
-						throw new Error("processing failed");
-					},
-				},
-			]),
-		});
-
-		const sub = new Subscriber(deps);
-		sub.start();
-
-		fake.emitter.emit("data", makeDelivery("d-2"));
-		await Bun.sleep(10);
-
-		const nacked = fake.written.find(
-			// biome-ignore lint/suspicious/noExplicitAny: test assertion
-			(m: any) => m.nack?.deliveryId === "d-2",
-		);
-		expect(nacked).toBeDefined();
-		await sub.stop();
-	});
-
-	it("MultiHandler_AllCalledOnce", async () => {
-		const fn1 = mock(async () => {});
-		const fn2 = mock(async () => {});
-		const { deps, fake } = makeDeps({
-			handlers: handlersFor([
-				{ pattern: "order.created", fn: fn1 },
-				{ pattern: "order.created", fn: fn2 },
-			]),
-		});
-
-		const sub = new Subscriber(deps);
-		sub.start();
-
-		fake.emitter.emit("data", makeDelivery("d-3"));
-		await Bun.sleep(10);
-
-		expect(fn1).toHaveBeenCalledTimes(1);
-		expect(fn2).toHaveBeenCalledTimes(1);
-		await sub.stop();
-	});
-
-	it("DuplicateDelivery_HandlerCalledEachTime", async () => {
-		// At-least-once: server is single source of truth (ADR-0002). SDK no
-		// longer dedups — handler contract requires idempotency.
-		const fn = mock(async () => {});
-		const { deps, fake } = makeDeps({
-			handlers: handlersFor([{ pattern: "order.created", fn }]),
-		});
-
-		const sub = new Subscriber(deps);
-		sub.start();
-
-		fake.emitter.emit("data", makeDelivery("d-4"));
-		await Bun.sleep(10);
-		expect(fn).toHaveBeenCalledTimes(1);
-
-		// Same envelope re-delivered — handler invoked again.
-		fake.emitter.emit("data", makeDelivery("d-4"));
-		await Bun.sleep(10);
-		expect(fn).toHaveBeenCalledTimes(2);
-
-		await sub.stop();
-	});
-
-	it("NoSchema_Nack", async () => {
-		const { deps, fake } = makeDeps({
-			handlers: handlersFor([
-				{
-					pattern: "unknown.event",
-					fn: async () => {},
-				},
-			]),
-		});
-
-		const sub = new Subscriber(deps);
-		sub.start();
-
-		fake.emitter.emit("data", makeDelivery("d-5", "unknown.event"));
-		await Bun.sleep(10);
-
-		const nacked = fake.written.find(
-			// biome-ignore lint/suspicious/noExplicitAny: test assertion
-			(m: any) => m.nack?.deliveryId === "d-5",
-		);
-		expect(nacked).toBeDefined();
-		await sub.stop();
-	});
-
-	it("Stop_NoReconnect", async () => {
-		let connectCount = 0;
-		const fakes: ReturnType<typeof makeFakeStream>[] = [];
-
-		const { deps } = makeDeps();
-		const depsMod: SubscriberDeps = {
-			...deps,
-			rpcClient: {
-				subscribe: () => {
-					connectCount++;
-					const f = makeFakeStream();
-					fakes.push(f);
-					return f.stream;
-				},
-				// biome-ignore lint/suspicious/noExplicitAny: minimal stub
-			} as any,
+		current().emitter.emit("data", delivery("d1", ["order.created"]));
+		await wait(5);
+		expect(seen).toEqual([{ amount: 42 }]);
+		expect(acks(current())).toHaveLength(1);
+		const ack = acks(current())[0] as {
+			deliveryId: string;
+			leaseToken?: string;
 		};
-
-		const sub = new Subscriber(depsMod);
-		sub.start();
-		await sub.stop();
-
-		fakes[0]?.emitter.emit("error", new Error("closed"));
-		await Bun.sleep(100);
-
-		expect(connectCount).toBe(1);
+		expect(ack.deliveryId).toBe("d1");
+		sub.stop();
 	});
 
-	it("ExactName_OnlyDispatchesOnEqual", async () => {
-		// Dispatch is by exact event-name match. Wildcards live on the server.
-		const handlerFn = mock(async () => {});
-		const { deps, fake } = makeDeps({
-			handlers: handlersFor([{ pattern: "payment.charged", fn: handlerFn }]),
-		});
+	it("without a schema the handler gets the raw payload bytes", async () => {
+		let got: unknown;
+		const { sub, current } = makeSubscriber([
+			entry("order.*", (p) => {
+				got = p;
+			}),
+		]);
+		current().emitter.emit("data", delivery("d1", ["order.*"]));
+		await wait(5);
+		expect(got).toEqual(new Uint8Array([1, 2, 3]));
+		sub.stop();
+	});
 
-		const sub = new Subscriber(deps);
-		sub.start();
-
-		fake.emitter.emit("data", makeDelivery("d-wc-1", "payment.charged"));
-		await Bun.sleep(10);
-
-		expect(handlerFn).toHaveBeenCalledTimes(1);
-		const acked = fake.written.find(
-			// biome-ignore lint/suspicious/noExplicitAny: test assertion
-			(m: any) => m.ack?.deliveryId === "d-wc-1",
+	it("runs the handler of every matched pattern once, ack only after all", async () => {
+		const calls: string[] = [];
+		const { sub, current } = makeSubscriber([
+			entry("order.created", () => {
+				calls.push("exact");
+			}),
+			entry("order.*", () => {
+				calls.push("wildcard");
+			}),
+		]);
+		current().emitter.emit(
+			"data",
+			delivery("d1", ["order.created", "order.*"]),
 		);
-		expect(acked).toBeDefined();
-		await sub.stop();
+		await wait(5);
+		expect(calls).toEqual(["exact", "wildcard"]);
+		expect(acks(current())).toHaveLength(1);
+		sub.stop();
 	});
 
-	it("NameMismatch_NackWithoutSilentLoss", async () => {
-		const handlerFn = mock(async () => {});
-		const { deps, fake } = makeDeps({
-			handlers: handlersFor([{ pattern: "payment.charged", fn: handlerFn }]),
-		});
+	it("never matches wildcards locally: a pattern absent from matched_patterns is not run", async () => {
+		const calls: string[] = [];
+		const { sub, current } = makeSubscriber([
+			entry("order.*", () => {
+				calls.push("wildcard");
+			}),
+			entry("order.created", () => {
+				calls.push("exact");
+			}),
+		]);
+		current().emitter.emit("data", delivery("d1", ["order.created"]));
+		await wait(5);
+		expect(calls).toEqual(["exact"]);
+		sub.stop();
+	});
 
-		const sub = new Subscriber(deps);
-		sub.start();
-
-		// "order.created" does not equal "payment.charged".
-		fake.emitter.emit("data", makeDelivery("d-wc-2", "order.created"));
-		await Bun.sleep(10);
-
-		expect(handlerFn).not.toHaveBeenCalled();
-		const acked = fake.written.find(
-			// biome-ignore lint/suspicious/noExplicitAny: test assertion
-			(m: any) => m.nack?.deliveryId === "d-wc-2",
+	it("nacks when none of the matched patterns has a handler here (rolling deploy)", async () => {
+		const { sub, current } = makeSubscriber([entry("order.created", () => {})]);
+		current().emitter.emit("data", delivery("d1", ["invoice.*"]));
+		await wait(5);
+		expect(acks(current())).toHaveLength(0);
+		expect(nacks(current())[0]?.errorMessage).toContain(
+			"no handler for matched patterns",
 		);
-		expect(acked).toBeDefined();
-		await sub.stop();
+		sub.stop();
 	});
 
-	it("Ack_PopulatesEventId", async () => {
-		const handlerFn = mock(async () => {});
-		const { deps, fake } = makeDeps({
-			handlers: handlersFor([{ pattern: "order.created", fn: handlerFn }]),
-		});
+	it("nacks with the handler's message when it throws", async () => {
+		const { sub, current } = makeSubscriber([
+			entry("order.created", () => {
+				throw new Error("db down");
+			}),
+		]);
+		current().emitter.emit("data", delivery("d1", ["order.created"]));
+		await wait(5);
+		expect(nacks(current())[0]?.errorMessage).toBe("db down");
+		sub.stop();
+	});
 
-		const sub = new Subscriber(deps);
-		sub.start();
-
-		fake.emitter.emit("data", makeDelivery("d-eid-1"));
-		await Bun.sleep(10);
-
-		const acked = fake.written.find(
-			// biome-ignore lint/suspicious/noExplicitAny: test assertion
-			(m: any) => m.ack?.deliveryId === "d-eid-1",
+	it("hands the handler the delivery context", async () => {
+		let ctx: EventHandlerContext | undefined;
+		const { sub, current } = makeSubscriber([
+			entry("order.created", (_p, c) => {
+				ctx = c;
+			}),
+		]);
+		current().emitter.emit(
+			"data",
+			delivery("d1", ["order.created"], { partitionKey: "o-1" }),
 		);
-		expect(acked).toBeDefined();
-		// biome-ignore lint/suspicious/noExplicitAny: test assertion
-		const eventIdBuf: Buffer = (acked as any).ack.eventId;
-		expect(Buffer.isBuffer(eventIdBuf)).toBe(true);
-		expect(eventIdBuf.toString()).toBe("ev-d-eid-1");
-		await sub.stop();
+		await wait(5);
+		expect(ctx).toMatchObject({
+			eventId: "ev-d1",
+			eventName: "order.created",
+			attempt: 1,
+			deliveryId: "d1",
+			leaseToken: "lt-d1",
+			partitionKey: "o-1",
+			headers: { h: "v" },
+			occurredAtMs: 1700000000000,
+		});
+		expect(ctx?.signal.aborted).toBe(false);
+		sub.stop();
 	});
 
-	it("Nack_PopulatesEventId", async () => {
-		const { deps, fake } = makeDeps({
-			handlers: handlersFor([
-				{
-					pattern: "order.created",
-					fn: async () => {
-						throw new Error("fail");
-					},
-				},
-			]),
-		});
-
-		const sub = new Subscriber(deps);
-		sub.start();
-
-		fake.emitter.emit("data", makeDelivery("d-eid-2"));
-		await Bun.sleep(10);
-
-		const nacked = fake.written.find(
-			// biome-ignore lint/suspicious/noExplicitAny: test assertion
-			(m: any) => m.nack?.deliveryId === "d-eid-2",
+	it("serialises deliveries sharing a partition key", async () => {
+		const order: string[] = [];
+		const { sub, current } = makeSubscriber([
+			entry("order.created", async (_p, c) => {
+				order.push(`start ${c.deliveryId}`);
+				await wait(c.deliveryId === "d1" ? 20 : 1);
+				order.push(`end ${c.deliveryId}`);
+			}),
+		]);
+		current().emitter.emit(
+			"data",
+			delivery("d1", ["order.created"], { partitionKey: "k" }),
 		);
-		expect(nacked).toBeDefined();
-		// biome-ignore lint/suspicious/noExplicitAny: test assertion
-		const eventIdBuf: Buffer = (nacked as any).nack.eventId;
-		expect(Buffer.isBuffer(eventIdBuf)).toBe(true);
-		expect(eventIdBuf.toString()).toBe("ev-d-eid-2");
-		await sub.stop();
-	});
-
-	it("StreamError_Reconnects", async () => {
-		let connectCount = 0;
-		const fakes: ReturnType<typeof makeFakeStream>[] = [];
-
-		const deps: SubscriberDeps = {
-			rpcClient: {
-				subscribe: () => {
-					connectCount++;
-					const f = makeFakeStream();
-					fakes.push(f);
-					return f.stream;
-				},
-				// biome-ignore lint/suspicious/noExplicitAny: minimal stub
-			} as any,
-			schemaIndex: { get: () => undefined },
-			identity: () => ({ serviceId: "svc-1", instanceId: "inst-1" }),
-			handlers: handlersFor([]),
-			maxInFlight: 32,
-			logger: { warn: () => {}, error: () => {} },
-			runWithTrace: (_x, fn) => fn(),
-		};
-
-		const sub = new Subscriber(deps);
-		sub.start();
-
-		fakes[0]?.emitter.emit("error", new Error("test error"));
-		await Bun.sleep(10);
-		await sub.stop();
-
-		expect(connectCount).toBeGreaterThanOrEqual(1);
-	});
-
-	it("ErrorPlusEnd_SchedulesSingleReconnectPerCycle", async () => {
-		// grpc-js emits both "error" and "end" for one broken stream. Each cycle
-		// must schedule exactly one reconnect — a second timer doubles the live
-		// reconnect loops every cycle (exponential runaway, gigabytes of heap).
-		let connectCount = 0;
-		const fakes: ReturnType<typeof makeFakeStream>[] = [];
-
-		const deps: SubscriberDeps = {
-			rpcClient: {
-				subscribe: () => {
-					connectCount++;
-					const f = makeFakeStream();
-					fakes.push(f);
-					return f.stream;
-				},
-				// biome-ignore lint/suspicious/noExplicitAny: minimal stub
-			} as any,
-			schemaIndex: { get: () => undefined },
-			identity: () => ({ serviceId: "svc-1", instanceId: "inst-1" }),
-			handlers: handlersFor([]),
-			maxInFlight: 32,
-			logger: { warn: () => {}, error: () => {} },
-			runWithTrace: (_x, fn) => fn(),
-			reconnectOpts: { ladder: [1], jitterRatio: 0 },
-		};
-
-		const sub = new Subscriber(deps);
-		sub.start();
-		expect(connectCount).toBe(1);
-
-		for (let cycle = 0; cycle < 3; cycle++) {
-			const current = fakes[fakes.length - 1];
-			current?.emitter.emit("error", new Error("broken"));
-			current?.emitter.emit("end");
-			await Bun.sleep(20);
-			// One reconnect per cycle. The doubling bug yields 2^cycle extra
-			// connects here (1 → 3 → 7 → 15).
-			expect(connectCount).toBe(cycle + 2);
-		}
-
-		await sub.stop();
-	});
-
-	it("CleanCloses_ClimbTheLadder", async () => {
-		// A runtime that drains streams gracefully must not be reconnected to
-		// once per second forever: only a data frame proves progress, a clean
-		// close does not.
-		const fakes: ReturnType<typeof makeFakeStream>[] = [];
-		const { deps } = makeDeps();
-		const depsMod: SubscriberDeps = {
-			...deps,
-			rpcClient: {
-				subscribe: () => {
-					const f = makeFakeStream();
-					fakes.push(f);
-					return f.stream;
-				},
-				// biome-ignore lint/suspicious/noExplicitAny: minimal stub
-			} as any,
-			reconnectOpts: { ladder: [4, 12, 24], jitterRatio: 0 },
-		};
-
-		// Read from the supervisor rather than a spy on the global timer: one
-		// test process also holds the subscribers of every other file, and their
-		// reconnect timers land in the spy too.
-		const delays: number[] = [];
-		const sub = new Subscriber({
-			...depsMod,
-			onSchedule: (ms) => delays.push(ms),
-		});
-		sub.start();
-		for (let i = 0; i < 3; i++) {
-			fakes[fakes.length - 1]?.emitter.emit("end");
-			await wait(30);
-		}
-		await sub.stop();
-
-		expect(delays.slice(0, 3)).toEqual([4, 12, 24]);
-	});
-
-	it("DataFrame_ResetsLadder", async () => {
-		const fakes: ReturnType<typeof makeFakeStream>[] = [];
-		const { deps } = makeDeps();
-		const depsMod: SubscriberDeps = {
-			...deps,
-			rpcClient: {
-				subscribe: () => {
-					const f = makeFakeStream();
-					fakes.push(f);
-					return f.stream;
-				},
-				// biome-ignore lint/suspicious/noExplicitAny: minimal stub
-			} as any,
-			reconnectOpts: { ladder: [4, 12, 24], jitterRatio: 0 },
-		};
-
-		const delays: number[] = [];
-		const sub = new Subscriber({
-			...depsMod,
-			onSchedule: (ms) => delays.push(ms),
-		});
-		sub.start();
-		fakes[fakes.length - 1]?.emitter.emit("end");
-		await wait(20);
-		fakes[fakes.length - 1]?.emitter.emit("data", makeDelivery("d-ladder"));
-		fakes[fakes.length - 1]?.emitter.emit("end");
-		await wait(20);
-		await sub.stop();
-
-		expect(delays.slice(0, 2)).toEqual([4, 4]);
-	});
-
-	it("LateEndFromReplacedStream_DoesNotOpenAThirdStream", async () => {
-		// grpc-js flushes buffered frames before "end", so a dead stream can
-		// outlive a ladder rung. Without the identity guard the late "end" from
-		// stream A drops the live stream B (stop() can no longer cancel it) and
-		// opens a third the runtime rejects with ALREADY_EXISTS.
-		const fakes: ReturnType<typeof makeFakeStream>[] = [];
-		const cancels: number[] = [];
-		const { deps } = makeDeps();
-		const depsMod: SubscriberDeps = {
-			...deps,
-			rpcClient: {
-				subscribe: () => {
-					const f = makeFakeStream();
-					const idx = fakes.push(f) - 1;
-					cancels[idx] = 0;
-					f.stream.cancel = () => {
-						cancels[idx] = (cancels[idx] ?? 0) + 1;
-					};
-					return f.stream;
-				},
-				// biome-ignore lint/suspicious/noExplicitAny: minimal stub
-			} as any,
-			reconnectOpts: { ladder: [4], jitterRatio: 0 },
-		};
-
-		const sub = new Subscriber(depsMod);
-		sub.start();
-		fakes[0]?.emitter.emit("error", new Error("broken"));
-		await wait(25);
-		expect(fakes).toHaveLength(2);
-
-		fakes[0]?.emitter.emit("end");
-		await wait(25);
-		expect(fakes).toHaveLength(2);
-
-		await sub.stop();
-		expect(cancels[1]).toBe(1);
-	});
-
-	it("NoIdentity_RetriesUntilAvailable", async () => {
-		const fakes: ReturnType<typeof makeFakeStream>[] = [];
-		let id: { serviceId: string; instanceId: string } | null = null;
-		const { deps } = makeDeps();
-		const depsMod: SubscriberDeps = {
-			...deps,
-			identity: () => id,
-			rpcClient: {
-				subscribe: () => {
-					const f = makeFakeStream();
-					fakes.push(f);
-					return f.stream;
-				},
-				// biome-ignore lint/suspicious/noExplicitAny: minimal stub
-			} as any,
-			reconnectOpts: { ladder: [4], jitterRatio: 0 },
-		};
-
-		const sub = new Subscriber(depsMod);
-		sub.start();
-		expect(fakes).toHaveLength(0);
-
-		id = { serviceId: "svc-1", instanceId: "inst-1" };
-		await wait(25);
-		expect(fakes).toHaveLength(1);
-		await sub.stop();
+		current().emitter.emit(
+			"data",
+			delivery("d2", ["order.created"], { partitionKey: "k" }),
+		);
+		await wait(40);
+		expect(order).toEqual(["start d1", "end d1", "start d2", "end d2"]);
+		sub.stop();
 	});
 });
 
-it("enforces cross-partition credits, exposes attempt/token and aborts active stream work", async () => {
-	let seen: import("../registry/registry").EventHandlerContext | undefined;
-	let started = 0;
-	let release!: () => void;
-	const waiting = new Promise<void>((resolve) => {
-		release = resolve;
-	});
-	const { deps, fake } = makeDeps({
-		handlers: () => [
-			async (_payload, context) => {
-				started++;
-				seen = context;
-				await waiting;
-			},
-		],
-	});
-	const sub = new Subscriber({ ...deps, maxInFlight: 1 });
-	sub.start();
-	const delivery = {
-		...makeDelivery("first").delivery,
-		attempt: 7,
-		leaseToken: "token-one",
-	};
-	fake.emitter.emit("data", { delivery });
-	fake.emitter.emit("data", {
-		delivery: { ...delivery, deliveryId: "overflow", leaseToken: "token-two" },
-	});
-	await wait(5);
-	expect(started).toBe(1);
-	expect(seen?.attempt).toBe(7);
-	expect(seen?.leaseToken).toBe("token-one");
-	expect(fake.written).toContainEqual(
-		expect.objectContaining({
-			nack: expect.objectContaining({
-				deliveryId: "overflow",
-				leaseToken: "token-two",
+describe("Subscriber drain and lifecycle", () => {
+	it("drain leaves new deliveries unanswered and waits for the running ones", async () => {
+		let release!: () => void;
+		let finished = false;
+		const { sub, current } = makeSubscriber([
+			entry("order.created", async () => {
+				await new Promise<void>((r) => {
+					release = r;
+				});
+				finished = true;
 			}),
-		}),
-	);
-	fake.emitter.emit("end");
-	expect(seen?.signal.aborted).toBe(true);
-	release();
-	await wait(5);
-	expect(
-		fake.written.some(
-			(message) =>
-				(message as { ack?: { deliveryId: string } }).ack?.deliveryId ===
-				"first",
-		),
-	).toBe(false);
-	await sub.stop();
+		]);
+		current().emitter.emit("data", delivery("d1", ["order.created"]));
+		await wait(2);
+		const draining = sub.drain(1_000);
+		current().emitter.emit("data", delivery("d2", ["order.created"]));
+		await wait(2);
+		expect(nacks(current())).toHaveLength(0);
+		release();
+		await draining;
+		expect(finished).toBe(true);
+		expect(acks(current()).map((a) => a.deliveryId)).toEqual(["d1"]);
+		sub.stop();
+	});
+
+	it("drain gives up at its deadline", async () => {
+		const { sub, current } = makeSubscriber([
+			entry("order.created", () => new Promise(() => {})),
+		]);
+		current().emitter.emit("data", delivery("d1", ["order.created"]));
+		await wait(2);
+		const started = Date.now();
+		await sub.drain(20);
+		expect(Date.now() - started).toBeLessThan(500);
+		sub.stop();
+	});
+
+	it("reopens the stream once per broken cycle", async () => {
+		const { sub, streams } = makeSubscriber([entry("order.created", () => {})]);
+		for (let cycle = 0; cycle < 3; cycle++) {
+			const s = streams[streams.length - 1];
+			s?.emitter.emit("error", new Error("broken"));
+			s?.emitter.emit("end");
+			await wait(15);
+			expect(streams).toHaveLength(cycle + 2);
+		}
+		sub.stop();
+	});
+
+	it("waits for an identity before opening the stream", async () => {
+		let identity: { serviceId: string; instanceId: string } | null = null;
+		const { sub, streams } = makeSubscriber(
+			[entry("order.created", () => {})],
+			{
+				identity: () => identity,
+			},
+		);
+		await wait(5);
+		expect(streams).toHaveLength(0);
+		identity = { serviceId: "s", instanceId: "i" };
+		await wait(15);
+		expect(streams.length).toBeGreaterThan(0);
+		sub.stop();
+	});
+
+	it("stop opens no further streams", async () => {
+		const { sub, streams } = makeSubscriber([entry("order.created", () => {})]);
+		sub.stop();
+		streams[0]?.emitter.emit("error", new Error("x"));
+		await wait(15);
+		expect(streams).toHaveLength(1);
+	});
 });

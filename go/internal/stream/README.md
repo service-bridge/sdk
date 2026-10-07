@@ -18,6 +18,7 @@
 | `Config[M, S].OnData` | `func(ctx, M, S)` | — | Кадр текущего стрима вместе с самим стримом, чтобы двунаправленный обработчик мог ответить в тот же вызов. Выполняется на горутине супервизора: блокирующий обработчик блокирует весь жизненный цикл. |
 | `Config[M, S].OnError` | `func(error)` | nil | Уведомление об обрыве. Решение о переподключении принимает супервизор. Чистое закрытие ошибкой не считается и сюда не приходит. |
 | `Config[M, S].OnBackoff` | `func(int, time.Duration)` | nil | Выбранная задержка перед следующим открытием. |
+| `Config[M, S].Terminal` · `.OnTerminal` | `func(error) bool` · `func(error)` | nil | Отказ, который переоткрытие не исправит: супервизор останавливается и отдаёт его в `OnTerminal` вместо лестницы. Так registry-поток останавливает клиент при `INVALID_ARGUMENT` от рантайма. |
 | `Config[M, S].Backoff` | `Backoff` | `NewBackoff()` | Лестница переподключения. |
 | `Config[M, S].Logger` | `*slog.Logger` | `slog.Default()` | |
 | `NewSupervisor[M, S]` | `(Config) (*Supervisor, error)` | — | `ErrInvalidConfig`, если не заданы `Open` или `OnData`. |

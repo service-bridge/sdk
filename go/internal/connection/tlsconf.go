@@ -4,6 +4,9 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"time"
+
+	"google.golang.org/grpc/keepalive"
 )
 
 // PinnedTLSConfig trusts exactly one root — the CA carried by the bootstrap key.
@@ -30,11 +33,36 @@ func PinnedTLSConfig(ca *x509.Certificate) *tls.Config {
 	}
 }
 
-// MutualTLSConfig is PinnedTLSConfig plus the client cert issued by Provision.
+// MutualTLSConfig is PinnedTLSConfig plus one fixed client certificate.
 func MutualTLSConfig(ca *x509.Certificate, clientCert tls.Certificate) *tls.Config {
+	return RotatingTLSConfig(ca, func() *tls.Certificate { return &clientCert })
+}
+
+// RotatingTLSConfig is PinnedTLSConfig whose client certificate is read on
+// every handshake. A rotation therefore reaches every NEW connection of every
+// channel built from it while the connections already up keep serving: no
+// stream, channel or session has to be rebuilt to adopt a renewed leaf.
+func RotatingTLSConfig(ca *x509.Certificate, current func() *tls.Certificate) *tls.Config {
 	cfg := PinnedTLSConfig(ca)
-	cfg.Certificates = []tls.Certificate{clientCert}
+	cfg.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+		if c := current(); c != nil {
+			return c, nil
+		}
+		return nil, fmt.Errorf("connection: no client certificate published yet")
+	}
 	return cfg
+}
+
+// ClientKeepalive is the keepalive every SDK channel dials with: a ping after
+// 30 s of silence, dead after 10 s without an answer, pings allowed with no
+// call in flight. It matches the callee and runtime enforcement policies
+// (MinTime 20 s / 10 s), so no server answers it with GOAWAY too_many_pings.
+func ClientKeepalive() keepalive.ClientParameters {
+	return keepalive.ClientParameters{
+		Time:                30 * time.Second,
+		Timeout:             10 * time.Second,
+		PermitWithoutStream: true,
+	}
 }
 
 func VerifyServerChain(roots *x509.CertPool) func(tls.ConnectionState) error {

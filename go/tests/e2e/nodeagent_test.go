@@ -27,7 +27,6 @@ import (
 type agentConfig struct {
 	URL              string     `json:"url"`
 	Key              string     `json:"key"`
-	DataDir          string     `json:"dataDir"`
 	ProtoFile        string     `json:"protoFile"`
 	RPCMethod        string     `json:"rpcMethod"`
 	SubOpSubject     string     `json:"subOpSubject"`
@@ -95,6 +94,8 @@ type agentMessage struct {
 
 	Attempt        int    `json:"attempt"`
 	IdempotencyKey string `json:"idempotencyKey"`
+
+	Pattern string `json:"pattern"`
 }
 
 type nodeAgent struct {
@@ -111,13 +112,24 @@ type nodeAgent struct {
 
 	mu      sync.Mutex
 	results map[int64]chan agentMessage
-	nextID  atomic.Int64
+	// deliveries and served are what the conformance agent observed; the
+	// cross-language agent never reports either.
+	deliveries []confDelivery
+	served     map[string]int
+	nextID     atomic.Int64
 }
 
 // startNodeAgent launches the agent and blocks until it reports a live session.
 // A failure to come up is fatal here rather than at the first assertion: the
 // agent's stderr is the only place a Node-side stack trace exists.
 func startNodeAgent(ctx context.Context, t *testing.T, cfg agentConfig) *nodeAgent {
+	t.Helper()
+	return spawnNodeAgent(ctx, t, "agent.ts", cfg)
+}
+
+// spawnNodeAgent launches one of the nodeagent scripts with cfg as its
+// configuration and blocks until it reports a live session.
+func spawnNodeAgent(ctx context.Context, t *testing.T, scriptName string, cfg any) *nodeAgent {
 	t.Helper()
 
 	bun, err := exec.LookPath("bun")
@@ -128,7 +140,7 @@ func startNodeAgent(ctx context.Context, t *testing.T, cfg agentConfig) *nodeAge
 	if err != nil {
 		t.Fatalf("resolve package directory: %v", err)
 	}
-	script := filepath.Join(root, "nodeagent", "agent.ts")
+	script := filepath.Join(root, "nodeagent", scriptName)
 	if _, err := os.Stat(script); err != nil {
 		t.Fatalf("agent script %s is missing: %v", script, err)
 	}
@@ -169,6 +181,7 @@ func startNodeAgent(ctx context.Context, t *testing.T, cfg agentConfig) *nodeAge
 		rpcs:    make(chan agentRPC, 64),
 		jobs:    make(chan agentJob, 64),
 		results: map[int64]chan agentMessage{},
+		served:  map[string]int{},
 	}
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start agent: %v", err)
@@ -222,6 +235,20 @@ func (a *nodeAgent) read(stdout io.Reader, ready chan<- agentReady, fatal chan<-
 			a.rpcs <- agentRPC{Method: msg.Method, Req: msg.Req}
 		case "job":
 			a.jobs <- agentJob{Name: msg.Name, Attempt: msg.Attempt, IdempotencyKey: msg.IdempotencyKey}
+		case "delivery":
+			a.mu.Lock()
+			a.deliveries = append(a.deliveries, confDelivery{
+				Pattern:  msg.Pattern,
+				Event:    msg.Name,
+				OrderID:  fmt.Sprint(msg.Payload["orderId"]),
+				Amount:   toFloat(msg.Payload["amount"]),
+				Currency: fmt.Sprint(msg.Payload["currency"]),
+			})
+			a.mu.Unlock()
+		case "served":
+			a.mu.Lock()
+			a.served[msg.Method]++
+			a.mu.Unlock()
 		case "result":
 			a.mu.Lock()
 			ch, ok := a.results[msg.ID]

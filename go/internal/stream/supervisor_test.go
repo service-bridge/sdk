@@ -431,3 +431,40 @@ func TestNewSupervisorRejectsIncompleteConfig(t *testing.T) {
 		t.Fatalf("missing OnData: got %v, want ErrInvalidConfig", err)
 	}
 }
+
+func TestTerminalFailureStopsTheSupervisor(t *testing.T) {
+	var opens atomic.Int32
+	terminal := make(chan error, 1)
+	sup, err := stream.NewSupervisor(stream.Config[string, *fakeStream]{
+		Name: "terminal",
+		Open: func(context.Context) (*fakeStream, error) {
+			opens.Add(1)
+			return nil, errFatal
+		},
+		OnData:     func(context.Context, string, *fakeStream) {},
+		Terminal:   func(err error) bool { return errors.Is(err, errFatal) },
+		OnTerminal: func(err error) { terminal <- err },
+		Backoff:    stream.NewBackoff(stream.WithLadder(time.Millisecond), stream.WithJitterRatio(0)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sup.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer sup.Stop()
+	select {
+	case got := <-terminal:
+		if !errors.Is(got, errFatal) {
+			t.Fatalf("terminal cause %v", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no terminal report")
+	}
+	time.Sleep(20 * time.Millisecond)
+	if n := opens.Load(); n != 1 {
+		t.Fatalf("reopened %d times after a terminal failure", n)
+	}
+}
+
+var errFatal = errors.New("fatal")

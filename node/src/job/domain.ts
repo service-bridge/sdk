@@ -1,7 +1,9 @@
 // @public — см. ./README.md
 
 import { createHash } from "node:crypto";
+import { ValidationError } from "../errors";
 import type { Registry } from "../registry/registry";
+import { cronError, timeZoneError } from "./cron";
 import type {
 	CatchupPolicy,
 	DeclaredDep,
@@ -38,7 +40,7 @@ export class JobDomain {
 		const contractHash = sha256Hex(json);
 		const key = `${name}:${contractHash}`;
 		if (this._byName.has(key)) {
-			throw new Error(
+			throw new ValidationError(
 				`sb.job.handle: duplicate job name ${JSON.stringify(name)}`,
 			);
 		}
@@ -134,7 +136,7 @@ function canonicalTrigger(t: Trigger): CanonicalTrigger {
 		else if (typeof at === "number") ms = at;
 		else ms = new Date(at).getTime();
 		if (Number.isNaN(ms)) {
-			throw new Error(
+			throw new ValidationError(
 				"sb.job.handle: delayed.at is not a valid Date / number / string",
 			);
 		}
@@ -143,25 +145,31 @@ function canonicalTrigger(t: Trigger): CanonicalTrigger {
 	if ("interval" in t) {
 		return { interval: { everyMs: t.interval } };
 	}
-	throw new Error("sb.job.handle: trigger must be cron | delayed | interval");
+	throw new ValidationError(
+		"sb.job.handle: trigger must be cron | delayed | interval",
+	);
 }
 
 function depToCanonical(d: DeclaredDep): { kind: string; target: string } {
 	if ("rpc" in d) return { kind: "rpc", target: d.rpc };
 	if ("event" in d) return { kind: "event", target: d.event };
 	if ("workflow" in d) return { kind: "workflow", target: d.workflow };
-	throw new Error("sb.job.handle: dep must be {rpc} | {event} | {workflow}");
+	throw new ValidationError(
+		"sb.job.handle: dep must be {rpc} | {event} | {workflow}",
+	);
 }
 
 function validateOpts(name: string, opts: JobOpts): void {
 	if (!name || typeof name !== "string") {
-		throw new Error("sb.job.handle: name is required");
+		throw new ValidationError("sb.job.handle: name is required");
 	}
 	if (!opts || typeof opts !== "object") {
-		throw new Error("sb.job.handle: opts is required");
+		throw new ValidationError("sb.job.handle: opts is required");
 	}
 	if (typeof opts.version !== "string" || !opts.version.trim()) {
-		throw new Error("sb.job.handle: explicit executable version is required");
+		throw new ValidationError(
+			"sb.job.handle: explicit executable version is required",
+		);
 	}
 	if (
 		opts.maxConcurrent !== undefined &&
@@ -169,33 +177,36 @@ function validateOpts(name: string, opts: JobOpts): void {
 			opts.maxConcurrent < 0 ||
 			opts.maxConcurrent > 1024)
 	) {
-		throw new Error(
+		throw new ValidationError(
 			"sb.job.handle: maxConcurrent must be an integer from 0 to 1024",
 		);
 	}
 	if (!opts.trigger) {
-		throw new Error("sb.job.handle: opts.trigger is required");
+		throw new ValidationError("sb.job.handle: opts.trigger is required");
 	}
 	const t = opts.trigger as Record<string, unknown>;
 	const keys = ["cron", "delayed", "interval"].filter(
 		(k) => t[k] !== undefined,
 	);
 	if (keys.length !== 1) {
-		throw new Error(
+		throw new ValidationError(
 			`sb.job.handle: trigger must have exactly one of cron|delayed|interval, got ${keys.length}`,
 		);
 	}
 	if ("cron" in t && typeof t.cron === "string") {
-		const fields = t.cron.trim().split(/\s+/);
-		if (fields.length !== 5) {
-			throw new Error(
-				`sb.job.handle: cron must be 5-field (no seconds); got ${fields.length} fields`,
+		const err = cronError(t.cron);
+		if (err)
+			throw new ValidationError(
+				`sb.job.handle: cron ${JSON.stringify(t.cron)}: ${err}`,
 			);
+		if (typeof t.tz === "string" && t.tz !== "") {
+			const tzErr = timeZoneError(t.tz);
+			if (tzErr) throw new ValidationError(`sb.job.handle: cron tz: ${tzErr}`);
 		}
 	}
 	if ("interval" in t && typeof t.interval === "number") {
 		if (t.interval <= 0) {
-			throw new Error("sb.job.handle: interval must be > 0 ms");
+			throw new ValidationError("sb.job.handle: interval must be > 0 ms");
 		}
 	}
 }

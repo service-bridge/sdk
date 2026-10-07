@@ -18,6 +18,9 @@ const (
 	KindProvision Kind = "PROVISION"
 	KindTLS       Kind = "TLS"
 	KindIdentity  Kind = "IDENTITY"
+	// KindProtocol marks a runtime speaking a wire revision this SDK does not.
+	// It is terminal: reconnecting to the same runtime cannot change it.
+	KindProtocol Kind = "PROTOCOL"
 )
 
 // Error is the only error type this package returns.
@@ -35,6 +38,7 @@ var (
 	ErrProvision = &Error{Kind: KindProvision}
 	ErrTLS       = &Error{Kind: KindTLS}
 	ErrIdentity  = &Error{Kind: KindIdentity}
+	ErrProtocol  = &Error{Kind: KindProtocol}
 )
 
 func (e *Error) Error() string {

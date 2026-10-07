@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { NoLiveInstanceError } from "../errors";
 import type {
 	MethodDescriptor,
 	ServiceInstanceInfo,
@@ -9,13 +10,7 @@ import {
 	MIN_REQUESTS,
 	OPEN_DURATION_MS,
 } from "./circuit-breaker";
-import {
-	type Candidate,
-	cbKey,
-	HEALTH_HINT_TTL_MS,
-	LoadBalancer,
-	NoLiveInstanceError,
-} from "./lb";
+import { type Candidate, cbKey, HEALTH_HINT_TTL_MS, LoadBalancer } from "./lb";
 
 function inst(id: string, endpoint: string): ServiceInstanceInfo {
 	return {

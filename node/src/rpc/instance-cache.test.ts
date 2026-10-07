@@ -37,6 +37,10 @@ function stubWatch(
 		onInstancesChange(): () => void {
 			return () => {};
 		},
+		onRevoked(): () => void {
+			return () => {};
+		},
+		isRevoked: () => false,
 	} as unknown as WatchStream;
 }
 

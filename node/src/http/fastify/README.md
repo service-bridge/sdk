@@ -2,7 +2,7 @@
 
 ## Зона ответственности
 
-Интеграция SDK с Fastify 4 / 5 через нативный plugin (`fastify-plugin`). Собирает роуты через `onRoute`-хук в `sb.routes`, публикует `http_endpoint` после `fastify.listen()` через `onListen`-хук (ADR 0001). Дополнительно ведёт HTTP.HANDLE op-lifecycle на каждый request: ставит ALS trace-scope из `X-SB-Trace`, стартует/закрывает op по статус-коду и захватывает payload запроса/ответа.
+Интеграция SDK с Fastify 4 / 5 через нативный plugin (без зависимости от `fastify-plugin`: символы `skip-override`/`plugin-meta` выставлены вручную). Собирает роуты через `onRoute`-хук в `sb.routes`, публикует `http_endpoint` после `fastify.listen()` через `onListen`-хук (ADR 0001). Дополнительно ведёт HTTP.HANDLE op-lifecycle на каждый request: ставит ALS trace-scope op (с `X-SB-Trace` вызывающего — только при `trustTraceHeader`), стартует/закрывает op по статус-коду и захватывает payload запроса/ответа.
 
 Не делает: не запускает HTTP-сервер (`fastify.listen({...})` остаётся за пользователем); не вмешивается в маршрутизацию и сериализацию ответа.
 
@@ -12,12 +12,12 @@
 
 | Имя | Тип | По умолчанию | Что делает |
 |-----|-----|--------------|------------|
-| `sbFastify` | `fastify-plugin`-обёрнутый `FastifyPluginAsync<SbFastifyOptions>` | — | Регистрируется через `fastify.register(sbFastify, { sb })`. Хуки: `onRoute` (собирает роут в `sb.routes` — поддерживает `method: string \| string[]`, HEAD отсекает); `onListen` (читает `fastify.server.address()` → `sb.routes.publishHttp({ host, port })`); `preHandler`/`onSend`/`onResponse`/`onRequestAbort` (HTTP.HANDLE op + payload capture). Совместимость декларирована `{ fastify: "4.x \|\| 5.x" }`. |
+| `sbFastify` | `FastifyPluginAsync<SbFastifyOptions>` (parent scope) | — | Регистрируется через `fastify.register(sbFastify, { sb })`. Хуки: `onRoute` (собирает роут в `sb.routes` — поддерживает `method: string \| string[]`, HEAD отсекает); `onListen` (читает `fastify.server.address()` → `sb.routes.publishHttp({ host, port })`); `preHandler`/`onSend`/`onResponse`/`onRequestAbort` (HTTP.HANDLE op + payload capture). Совместимость декларирована `{ fastify: "4.x \|\| 5.x" }`. |
 | `SbFastifyOptions.sb` | `ServiceBridge` | — (обязательно) | Инстанс SDK-клиента, через который публикуются роуты (`sb.routes`) и стартует телеметрия (`sb.telemetry`). |
 | `SbFastifyOptions.host` | `string` | bound socket address из `fastify.server.address()` | Явный host для публикуемого `http_endpoint`. Если опущен — `resolveHttpAdvertiseHost(addr.address)`: фактический bound-address сокета (если непустой) → `127.0.0.1` (с одноразовым warn). |
-| `SbFastifyOptions.security` | `HttpSecurityOptions` | scanner block + 300 req/min/client | `onRequest`-защита до body parsing, route handler и HTTP telemetry. |
+| `SbFastifyOptions.trustTraceHeader` | `boolean` | `false` | Принимать входящий `X-SB-Trace` и встраивать запрос в trace вызывающего. По умолчанию заголовок игнорируется (публичный edge не даёт клиентам встраиваться в чужие trace); включать для HTTP-сервера, к которому ходят только другие сервисы ServiceBridge. |
 
-Событийный API: плагин аугментирует `FastifyRequest` полями `sbTraceCtx?: TraceContext` (распарсенный/свежий root trace-контекст), `sbHttpHandle?: OpHandle` (in-flight HTTP.HANDLE op) и `sbHttpCapturing?: boolean` (`OpHandle.capturing` этого op'а — захват тел имеет смысл). Заполняются в `preHandler`, доступны в пользовательских хуках/хендлерах.
+Плагин аугментирует `FastifyRequest` полем `sbHttpOp?: HttpOp` (in-flight HTTP.HANDLE op) — заполняется в `preHandler`. Шаблон роута — `req.routeOptions.url` (`"*"`, если роут не найден); subject `http.handle:<METHOD>/<route>`, meta `{method, route, status}`, businessKey — `Idempotency-Key` или `"<METHOD> <route>"`.
 
 ### Пример использования
 

@@ -8,12 +8,12 @@
 
 - Запущенный ServiceBridge runtime (см. `runtime/README.md`).
 - PostgreSQL 18+.
-- Bun 1.x или Node 18+.
+- Node.js 22 / 24 / 26 или Bun ≥ 1.3.13.
 
 ## 1. Установка
 
 ```sh
-bun add service-bridge
+npm i service-bridge      # или bun add service-bridge
 ```
 
 ## 2. Получение bootstrap-ключей
@@ -113,11 +113,13 @@ bun run checkout-svc.ts
 
 ## Что произошло под капотом
 
-1. `sb.start()` сделал bootstrap: parsed key → request leaf cert from runtime → установил mTLS-канал.
+1. `sb.start()` сделал bootstrap: разобрал ключ → получил leaf-сертификат от runtime → открыл mTLS-сессию и дождался `Welcome` и первого snapshot реестра.
 2. Callee отправил `RegisterRequest` с одной `incoming.rpc = "Charge"` + её `contract_hash`.
 3. Caller через `sb.client()` зарегистрировал `outgoing.deps = [payment-svc.Charge]`, runtime через `RegisterAndWatch` прислал ему snapshot всех инстансов `payment-svc`.
-4. `payment.Charge(...)` сериализовал payload в Protobuf, по умолчанию `transport: "auto"` выбрал direct (callee имеет `call_endpoint` от default-advertise), отправил mTLS-вызов на CallServer callee.
+4. `payment.Charge(...)` сериализовал payload в Protobuf, по умолчанию `transport: "auto"` выбрал direct (callee имеет `call_endpoint` от default-advertise `127.0.0.1` — оба процесса на одной машине), отправил mTLS-вызов на CallServer callee.
 5. Callee декодировал payload, вызвал handler, закодировал ответ, вернул.
+
+Бизнес-ошибку хендлер возвращает через `throw new HandlerError("CODE", "message")` — вызывающий получит `HandlerError` с тем же `handlerCode`. Подробнее — [RPC §1](./rpc.md#возврат-ошибок-из-хендлера).
 
 ## Дальше
 

@@ -2,7 +2,7 @@
 
 ← [RPC](./rpc.md) · Дальше: [Workflows](./workflows.md) →
 
-Полный гайд по Durable Events: декларация, подписка, эмиссия, гарантии доставки (at-least-once), wildcard routing, идемпотентность, partition ordering, fire-and-forget, DLQ + replay, schema versioning, ошибки. Читается линейно. Для операционных тем — [Operations](./operations.md).
+Полный гайд по Durable Events: декларация, подписка, эмиссия, гарантии доставки (at-least-once), wildcard routing и фильтры, идемпотентность, partition ordering, fire-and-forget, очередь публикаций, DLQ + replay, schema versioning, ошибки. Читается линейно. Для операционных тем — [Operations](./operations.md).
 
 ## Содержание
 
@@ -15,7 +15,7 @@
 - [6. Идемпотентность](#6-идемпотентность)
 - [7. Partition key и ordering](#7-partition-key-и-ordering)
 - [8. Fire-and-forget](#8-fire-and-forget)
-- [9. Outbox и retries (SDK side)](#9-outbox-и-retries-sdk-side)
+- [9. Очередь публикаций и повторы (SDK side)](#9-очередь-публикаций-и-повторы-sdk-side)
 - [10. DLQ и replay](#10-dlq-и-replay)
 - [11. Schema versioning](#11-schema-versioning)
 - [12. Ошибки](#12-ошибки)
@@ -27,35 +27,33 @@
 
 ServiceBridge Events — это **durable** pub/sub поверх runtime с гарантией **at-least-once**:
 
-- **Publisher** декларирует событие через `sb.event.define(name, spec?)` и эмитирует через `sb.event.publish(name, payload, opts?)`.
-- **Subscriber** регистрирует обработчик через `sb.event.handle(pattern, fn)`.
-- Runtime **гарантирует доставку**: каждое событие падает в локальный SQLite outbox SDK до отправки, runtime пишет в Postgres `event_log` + `event_deliveries` (по строке на каждого matching подписчика) в одной транзакции.
+- **Publisher** декларирует событие через `sb.event.define(name, spec)` и эмитирует через `sb.event.publish(name, payload, opts?)`. `publish` резолвится, когда runtime записал событие в Postgres.
+- **Subscriber** регистрирует обработчик через `sb.event.handle(pattern, fn, opts?)` со своей схемой и, при желании, фильтром.
+- Runtime пишет `event_log` + `event_deliveries` (по строке на каждого matching подписчика) в одной транзакции, вычисляет шаблоны и фильтры подписок.
 - Доставка идёт **push'ом** через long-lived bidi gRPC stream. Subscriber отвечает `Ack` после успеха или `Nack` при ошибке. При сбое — redelivery после **visibility timeout** или после crash'а consumer'а.
 - Когда число попыток достигает порога `events.max_attempts` (default 5) — событие уходит в **DLQ** с копией payload.
 - Один SDK-инстанс может одновременно быть publisher и subscriber для разных событий.
 
 > Visibility timeout, max attempts, DLQ retention и backoff-лестница — это **настройки рантайма** (`events.*`), а не вшитые константы. Они правятся в UI `/settings` без рестарта. Значения ниже — дефолты.
 
-> **Архитектурный аксиом:** runtime в системе всегда один. Горизонтальное масштабирование — на стороне SDK-консьюмеров (см. [`CLAUDE.md`](../../../CLAUDE.md)).
+> **Архитектурный аксиом:** runtime в системе всегда один. Горизонтальное масштабирование — на стороне SDK-консьюмеров.
 
 ---
 
 ## 1. Декларация: event.define
 
-Перед эмиссией событие нужно объявить — это формирует service map runtime'а и регистрирует Protobuf-схему, по которой SDK кодирует и декодирует payload.
+Publisher объявляет каждое событие, которое публикует, — это формирует service map runtime'а и регистрирует Protobuf-схему, по которой SDK кодирует payload. Subscriber `define` не вызывает (см. §2).
 
 ```ts
 sb.event.define(
   name: string,
-  spec?: SchemaSpec,
+  spec: SchemaSpec,
 ): void
 ```
 
 `SchemaSpec` — тот же тип, что и у `sb.rpc.handle`: либо `.proto` файл (`ProtoFileSpec`), либо `.schema.json` (`JsonSchemaFileSpec`) c явными `fieldNumber`. Inline JSON Schema не поддерживается (ADR-0002).
 
-Вызывать **до `sb.start()`**.
-
-`spec` опционален. Если вызвать `define(name)` без spec — регистрируется только имя (schema-less). Это валидно для service map, но реально публиковать/принимать такое событие нельзя: `publish` без схемы бросит «no schema registered», а subscriber ответит `Nack` `no_schema`. Для рабочего события spec обязателен. Повторный `define` с тем же объектом spec — no-op; с другим spec — бросает.
+Вызывать **до `sb.start()`**. Повторный `define` с тем же объектом spec — no-op; с другим spec — `ValidationError`. Publish события, которое не объявлено через `define`, — `StateError`.
 
 ### Через `.proto` файл
 
@@ -110,7 +108,7 @@ sb.event.define("payment.charged", {
 sb.event.define("payment.charged", { schemaFile: "schemas/payment.json" });
 ```
 
-SDK строит Protobuf `Type` через `protobufjs`, считает `contract_hash` по структуре payload-а (у события нет ответа, поэтому вторую половину пары всегда занимает пустое сообщение — точно так же считает Go SDK), регистрирует имя + хеш в runtime и хранит compiled `SchemaPair` локально. При `publish` payload кодируется в Protobuf binary, `type.verify()` ловит невалидный объект до записи в outbox — `await sb.event.publish(...)` rejected'ится этой ошибкой ещё до попадания в outbox.
+SDK строит Protobuf `Type` через `protobufjs`, считает `contract_hash` по структуре payload-а (у события нет ответа, поэтому вторую половину пары всегда занимает пустое сообщение — точно так же считает Go SDK), регистрирует имя + хеш в runtime и хранит compiled `SchemaPair` локально. При `publish` payload кодируется в Protobuf binary; объект, который не кодируется схемой, отклоняется `ValidationError` до постановки в очередь.
 
 ### Имя события
 
@@ -121,7 +119,7 @@ SDK строит Protobuf `Type` через `protobufjs`, считает `contra
 | Без пустых сегментов | `payment.charged` ✅, `payment..charged` ❌ |
 | Без leading/trailing dot | `payment.charged` ✅, `.payment` / `payment.` ❌ |
 
-Имя проверяется на SDK-стороне при `publish` (`InvalidEventNameError` до RPC). Если имя всё же дошло до runtime невалидным — он отвечает `REJECTED_INVALID_NAME`, и drainer помечает row `failed` (terminal).
+Имя проверяется на SDK-стороне при `publish` (`InvalidEventNameError` до отправки). Если runtime всё же ответил `REJECTED_INVALID_NAME`, `publish` отклоняется той же `InvalidEventNameError`.
 
 ---
 
@@ -130,39 +128,67 @@ SDK строит Protobuf `Type` через `protobufjs`, считает `contra
 ```ts
 sb.event.handle(
   pattern: string,
-  fn: (payload: unknown) => Promise<void> | void,
+  fn: (payload: unknown, ctx: EventHandlerContext) => Promise<void> | void,
+  opts?: { schema?: SchemaSpec; filter?: Record<string, unknown> },
 ): void
 ```
 
-Вызывать **до `sb.start()`**. Опций нет: для decode payload-а subscriber должен сам объявить `sb.event.define(name, spec)` с той же схемой, что у publisher'а — иначе на delivery он ответит `Nack` `no_schema`. Handler получает только декодированный payload (headers и метаданные envelope в handler не передаются).
+Вызывать **до `sb.start()`**. `pattern` — точное имя события или AMQP-шаблон (`*`, `#`, см. §4).
 
-### Точное совпадение имени
-
-```ts
-sb.event.define("payment.charged", { protoFile: "schemas/payment.proto", method: "PaymentCharged" });
-
-sb.event.handle("payment.charged", async (payload) => {
-  await sendReceipt((payload as { transactionId: string }).transactionId);
-});
-```
-
-### Wildcard-подписки
-
-Wildcard-pattern (`payment.*`, `order.#`) задаёт, **какие** события runtime будет слать этому сервису — server-side routing через `TopicMatch` (см. §4). Но фактический вызов handler'а в SDK идёт по **точному имени события**: SDK вызывает handler, чей `pattern` буквально равен имени пришедшего события. Поэтому, чтобы реально обработать `payment.charged`, нужен handler с `pattern === "payment.charged"` и `define("payment.charged", spec)` для decode.
+- **Один хендлер на шаблон** в процессе: повторный `handle` с тем же `pattern` — `ValidationError`.
+- **`opts.schema`** — схема подписчика для декодирования payload. Subscriber не вызывает `define`: `define` объявляет «этот сервис публикует событие». Без `schema` хендлер получает сырые байты (`Uint8Array`). Для `.proto` без service-блока задайте `input` и `output` (или `method`) явно — имя шаблона не может быть именем rpc.
+- **`opts.filter`** — Filter Expression: объект `{"$.path": literal}`, все условия — равенства. Runtime вычисляет его по JSON-виду payload до доставки; событие, не прошедшее фильтр, этому подписчику не доставляется. Невалидный фильтр runtime отклоняет при регистрации, и бридж останавливается с `ValidationError`.
 
 ```ts
-sb.event.handle("payment.charged", auditCharge);
-sb.event.handle("payment.charged", trackMetrics);
-// оба вызываются на доставку payment.charged, последовательно; один Ack за delivery
+sb.event.handle(
+  "payment.charged",
+  async (payload, ctx) => {
+    const { transactionId } = payload as { transactionId: string };
+    await sendReceipt(transactionId, { attempt: ctx.attempt });
+  },
+  {
+    schema: { protoFile: "schemas/payment.proto", method: "PaymentCharged" },
+    filter: { "$.currency": "USD" },
+  },
+);
 ```
 
-Несколько handler'ов на одно и то же точное имя — runtime отдаёт **один delivery**, SDK вызывает все matching handlers последовательно. Один Ack за весь delivery; любой throw → `Nack` всего delivery (runtime ретраит и при исчерпании попыток уводит в DLQ).
+### Контекст доставки
+
+```ts
+interface EventHandlerContext {
+  eventId: string;
+  eventName: string;            // конкретное имя, под которым событие опубликовано
+  attempt: number;              // номер попытки доставки
+  deliveryId: string;
+  leaseToken: string;
+  partitionKey: string;
+  headers: Record<string, string>;   // PublishOpts.headers издателя
+  occurredAtMs: number;         // PublishOpts.occurredAtMs издателя, unix-ms
+  signal: AbortSignal;          // обрыв стрима доставки или остановка бриджа
+}
+```
+
+### Маршрутизация
+
+Шаблоны матчит runtime (ADR-0002). В каждой доставке он присылает список шаблонов этого сервиса, которые совпали с именем события и прошли фильтр. SDK вызывает хендлер каждого такого шаблона, который есть у процесса, по очереди:
+
+```ts
+const paymentSpec = { protoFile: "schemas/payment.proto", method: "PaymentCharged" };
+sb.event.handle("payment.*", auditPayment, { schema: paymentSpec });
+sb.event.handle("payment.charged", sendReceipt, { schema: paymentSpec });
+// payment.charged → одна доставка, вызываются оба хендлера; один Ack за доставку
+```
+
+Ack уходит, только если все вызванные хендлеры успешны; первый throw → `Nack` с текстом ошибки (runtime ретраит и при исчерпании попыток уводит в DLQ). Если у процесса нет хендлера ни для одного совпавшего шаблона (rolling deploy: другой инстанс того же сервиса уже подписан на новый шаблон) — `Nack` «no handler for matched patterns», и runtime передоставит событие, вероятно, другому инстансу.
+
+Доставки с одним `partitionKey` обрабатываются в инстансе строго по очереди; без ключа — параллельно, не больше `eventsMaxInFlight` (по умолчанию 32) одновременно.
 
 ---
 
 ## 3. Эмиссия: event.publish
 
-`sb.event.publish(name, payload, opts?)` отправляет событие. Должно быть вызвано **после `sb.start()`** и для имени, ранее задекларированного через `sb.event.define(name, spec)`.
+`sb.event.publish(name, payload, opts?)` отправляет событие. Вызывается **после `sb.start()`** (вызов до него — `StateError`) и для имени, задекларированного через `sb.event.define(name, spec)`.
 
 ```ts
 sb.event.publish<T>(
@@ -173,7 +199,7 @@ sb.event.publish<T>(
 ```
 
 ```ts
-await sb.event.publish("payment.charged", {
+const { eventId } = await sb.event.publish("payment.charged", {
   transactionId: "tx-7",
   amount: 42.0,
   userId: "u-1",
@@ -183,24 +209,23 @@ await sb.event.publish("payment.charged", {
 
 ### Что происходит под капотом (default режим)
 
-1. SDK проверяет имя по regex и существование декларации в локальном schema-index.
-2. SDK кодирует payload через `SchemaPair` (Protobuf binary, тот же путь, что у RPC). `type.verify()` бросает на невалидный payload **до** записи в outbox — `await sb.event.publish(...)` rejected'ится сразу.
-3. SDK INSERT'ит row в локальный SQLite `event_outbox` (WAL mode, `synchronous=NORMAL`). Возврат из `event.publish` происходит после COMMIT.
-4. Фоновой drainer SDK читает pending rows батчами и шлёт runtime через `Events.Publish`.
+1. SDK проверяет имя по regex и наличие декларации. Нарушение — отказ сразу.
+2. SDK кодирует payload через `SchemaPair` (Protobuf binary, тот же путь, что у RPC) и кладёт рядом JSON-вид payload — по нему runtime вычисляет фильтры подписок и условия `wait_event` workflow.
+3. Событие встаёт в очередь в памяти и получает `eventId` — UUIDv7, монотонный в порядке вызовов `publish`.
+4. Отправитель шлёт очередь в `Events.Publish` пачками до 100 событий, один запрос в полёте.
 5. Runtime дедупает по `idempotency_key` и INSERT'ит `event_log` + `event_deliveries` (по строке на каждый matching consumer service) в **одной транзакции**. Payload — opaque bytes; runtime не декодит и не валидирует (ADR-0002).
-6. Dispatcher push'ит deliveries через open Subscribe stream подписчикам. Subscriber декодирует payload через свой `SchemaPair` (тот же `define(name, spec)` на subscriber-стороне).
+6. По ответу runtime `publish` резолвится `{ eventId }` или отклоняется ошибкой (§9).
+7. Dispatcher push'ит deliveries через open Subscribe stream подписчикам. Subscriber декодирует payload своей схемой из `opts.schema`.
 
 ### PublishOpts
 
 | Поле | Тип | По умолчанию | Что делает |
 |---|---|---|---|
-| `idempotencyKey` | `string` | `""` | Дедупликация на ingest (TTL 24h). Два publish с одним ключом от одного publisher service → один event_log. |
-| `partitionKey` | `string` | `""` | FIFO-гарантия в рамках key для одного consumer service (см. §7). |
-| `fireAndForget` | `boolean` | `false` | Пропустить outbox, отправить sync (см. §8). |
-| `headers` | `Record<string,string>` | `{}` | Метаданные envelope. Едут по wire в `EventEnvelope.headers`, но в handler subscriber'а **не передаются** (handler получает только декодированный payload). |
-| `occurredAtMs` | `number` | `Date.now()` | Время бизнес-события (а не ingest), unix-ms. Едет в `EventEnvelope.occurred_at_unix_ms`. |
-
-`event.publish` возвращает `{ eventId }` — UUID v7 через npm-пакет `uuidv7` (монотонен в пределах одной миллисекунды).
+| `idempotencyKey` | `string` | `""` | Дедупликация на ingest (TTL 24h). Повтор с тем же ключом и тем же содержимым — успех с `eventId` исходного события; с другим содержимым — `CONFLICT`. |
+| `partitionKey` | `string` | `""` | FIFO-гарантия в рамках key (см. §7). |
+| `fireAndForget` | `boolean` | `false` | Резолв сразу после постановки в очередь, без ожидания ACK runtime (см. §8). |
+| `headers` | `Record<string,string>` | `{}` | Метаданные envelope. Подписчик получает их в `ctx.headers`. |
+| `occurredAtMs` | `number` | `Date.now()` | Время бизнес-события (а не ingest), unix-ms. Подписчик получает его в `ctx.occurredAtMs`. |
 
 ---
 
@@ -215,7 +240,7 @@ Pattern — `[a-z0-9_-]+(\.[a-z0-9_-]+)*` плюс два специальных
 
 Wildcards комбинируются: `order.*.created` ловит `order.online.created`, не ловит `order.created` и не ловит `order.x.y.created`.
 
-> Матчинг patterns — **только на стороне runtime** (`registry.TopicMatch`, ADR-0002); в SDK matcher'а нет. SDK лишь регистрирует pattern как подписку и диспатчит входящие deliveries по точному имени события (см. §2).
+> Матчинг patterns — **только на стороне runtime** (`registry.TopicMatch`, ADR-0002); в SDK matcher'а нет. SDK регистрирует pattern как подписку и вызывает хендлеры тех шаблонов, которые runtime перечислил в доставке (см. §2).
 
 ---
 
@@ -224,7 +249,7 @@ Wildcards комбинируются: `order.*.created` ловит `order.online
 | Свойство | Поведение |
 |---|---|
 | Доставка | **At-least-once.** Идемпотентность — на стороне consumer'а (см. §6). |
-| Persistence | SDK коммитит row в локальный SQLite (WAL) до возврата из `event.publish`; runtime INSERT в Postgres `event_log` + `event_deliveries` атомарно. |
+| Persistence | `event.publish` резолвится после того, как runtime атомарно записал `event_log` + `event_deliveries` в Postgres. До этого событие живёт только в памяти процесса. |
 | Push vs pull | Push через bidi gRPC stream + Ack/Nack от consumer'а. |
 | Visibility timeout | Если consumer не Ack'нул за `events.visibility_timeout_ms` (default 30 000ms) — runtime считает что упал и redeliver. |
 | Conditional Ack | Late Ack (после visibility expired) — игнорируется, не клобберит уже redelivered delivery. Возвращается OK клиенту (idempotent semantics). |
@@ -255,15 +280,17 @@ sb.event.handle("payment.charged", async (payload) => {
 
 ### Publisher-side idempotency
 
-`idempotencyKey` дедупит на ingest в пределах одного publisher service. Второй publish с тем же ключом runtime отвечает `REJECTED_DUPLICATE` — повторного INSERT в `event_log` и повторного fanout нет:
+`idempotencyKey` дедупит на ingest в пределах одного publisher service. Второй publish с тем же ключом runtime отвечает `REJECTED_DUPLICATE` — повторного INSERT в `event_log` и повторного fanout нет, а `publish` резолвится успешно с `eventId` **исходного** события:
 
 ```ts
-await sb.event.publish("payment.charged", payload, { idempotencyKey: "tx-7" });
-await sb.event.publish("payment.charged", payload, { idempotencyKey: "tx-7" });
-// → один event_log, один fanout
+const a = await sb.event.publish("payment.charged", payload, { idempotencyKey: "tx-7" });
+const b = await sb.event.publish("payment.charged", payload, { idempotencyKey: "tx-7" });
+// a.eventId === b.eventId → один event_log, один fanout
 ```
 
-Каждый вызов `publish()` всё равно возвращает свой локально сгенерированный `eventId` (SDK минтит uuidv7 до отправки); дедуп происходит на стороне runtime, не в возвращаемом значении. TTL ключа — настройка рантайма `rpc.idempotency_event_ttl_ms` (default 24h).
+Тот же ключ с другим содержимым — `ServiceBridgeError` с кодом `CONFLICT`. TTL ключа — настройка рантайма `rpc.idempotency_event_ttl_ms` (default 24h).
+
+Ключ делает безопасным повтор после `TimeoutError` «outcome unknown» (§9): если первая попытка дошла до runtime, повтор вернёт её `eventId`.
 
 ---
 
@@ -282,6 +309,7 @@ await sb.event.publish("order.line.removed", payload, { partitionKey: "order-42"
 - **FIFO в рамках key.** Dispatcher не claim'ит новую delivery с `partitionKey="order-42"` для того же consumer service, пока предыдущая `in_flight`. Реализовано через `NOT EXISTS` gate в SQL claim'е.
 - **Sticky instance.** Pick инстанса детерминирован: `hash(partitionKey) mod len(connected_instances)`. Все события с одним key уходят на один pod.
 - **Параллелизм между разными keys.** Разные `partitionKey` — независимые потоки, обрабатываются параллельно.
+- **Порядок на стороне SDK.** Издатель отправляет события одного ключа в порядке вызовов `publish`, даже если какие-то попытки отправки упали (§9); подписчик обрабатывает доставки одного ключа последовательно (§2).
 
 ### Цена
 
@@ -302,57 +330,60 @@ await sb.event.publish("metric.counter", { name: "page_view", value: 1 }, {
 
 | | default (`fireAndForget=false`) | `fireAndForget=true` |
 |---|---|---|
-| Persistence в SDK SQLite | да (outbox, WAL) | **нет** — прямой gRPC-вызов |
-| Гарантия доставки | ALO | **best-effort** (теряется при runtime down) |
-| Latency | + outbox INSERT + drainer tick | минимум — один RPC round-trip |
+| Когда резолвится `publish` | после ACK runtime (событие в Postgres) | сразу после постановки в очередь в памяти |
+| Отправка | очередь + повторы до `publishTimeoutMs` | та же очередь, те же повторы |
+| Падение процесса до ACK | вызывающий не получил `eventId` — знает, что событие не подтверждено | событие **теряется** молча |
+| Терминальный отказ runtime (`CONFLICT`, `ACCESS_DENIED`, ...) | ошибка вызывающему | только warn в `logger` |
 | Use case | бизнес-события | метрики, аудит-лог |
 
-> При `fireAndForget=true` SDK всё равно проводит schema validation на ingest. Runtime сохраняет `event_log` для аудита; deliveries fanout'ятся как обычно.
+`QUEUE_FULL` при переполненной очереди бросается и в режиме fire-and-forget. Валидация имени и схемы — тоже.
 
 ---
 
-## 9. Outbox и retries (SDK side)
+## 9. Очередь публикаций и повторы (SDK side)
 
-### Локальный SQLite outbox
+SDK не пишет события на диск. Пока runtime не подтвердил событие, оно живёт в ограниченной очереди в памяти процесса.
 
-SDK хранит outbox в `<dataDir>/sdk.db`, где `dataDir` — опция конструктора (default `./.servicebridge`, т. е. `./.servicebridge/sdk.db`):
+### Очередь и таймаут
 
-| Колонка | Назначение |
+| Опция конструктора | По умолчанию | Что делает |
+|---|---|---|
+| `maxPendingPublishes` | `10000` | Сколько событий может ждать ACK. Сверх — `publish` сразу отклоняется `ServiceBridgeError` с кодом `QUEUE_FULL` (`retryable: true`). |
+| `publishTimeoutMs` | `30000` | Сколько одно событие ждёт ACK. Истёк — `TimeoutError`. |
+
+Текст `TimeoutError` говорит, ушло ли событие в runtime:
+
+- «not sent» — запрос с событием не отправлялся ни разу, событие удалено из очереди. Повтор безопасен.
+- «outcome unknown» — запрос ушёл, ответа нет; runtime мог сохранить событие. Повтор безопасен только с тем же `idempotencyKey` (§6).
+
+### Повторы
+
+Транспортная ошибка или ответ `UNSPECIFIED` — повтор того же envelope (тот же `eventId`) с паузами 100, 250, 500, 1000, 2000, 5000 мс (дальше 5000), пока не истёк `publishTimeoutMs`. После reconnect повтор идёт сразу. Повтор события, которое runtime уже сохранил, получает `REJECTED_DUPLICATE` и резолвится успешно.
+
+### Порядок
+
+В полёте один запрос `Publish`; в запросе не больше одного события на непустой `partitionKey`. Если событие ключа получило временный отказ, следующие события того же ключа ждут за ним — runtime получает события ключа в порядке вызовов `publish`.
+
+### Статусы ответа runtime
+
+| Ответ runtime | Результат `publish` |
 |---|---|
-| `id` | UUID v7 (monotonic) |
-| `status` | `pending` / `inflight` / `failed`. Успех — row **удаляется** (отдельного `done` нет). |
-| `attempts` | счётчик попыток (для backoff) |
-| `next_attempt_at_ms` | когда drainer может попробовать снова |
-| `last_error` | terminal или transient ошибка |
+| `ACCEPTED` | `{ eventId }` |
+| `REJECTED_DUPLICATE` | `{ eventId }` исходного события |
+| `REJECTED_CONFLICT` | `ServiceBridgeError` `CONFLICT` — тот же ключ/id с другим содержимым |
+| `REJECTED_INVALID_NAME` | `InvalidEventNameError` |
+| `REJECTED_FORBIDDEN` | `AccessDeniedError` + событие `policy_violation` (`declaration: "event.publish"`, `denySide: "self_egress"`) |
+| Сетевая ошибка / `UNSPECIFIED` | повтор с backoff до `publishTimeoutMs` |
 
-### Crash recovery
+Отдельных schema-отказов в протоколе нет (ADR-0002): payload валидируется на SDK-стороне в момент кодирования.
 
-При `Storage.open()` SDK выполняет:
-```sql
-UPDATE event_outbox SET status='pending' WHERE status='inflight';
-```
-Это закрывает разрыв ALO: если процесс упал между `UPDATE status='inflight'` и `Events.Publish` RPC ack, следующий запуск drainer'а заберёт row.
+### Остановка
 
-### Backoff на сетевые сбои
+`sb.stop()` досылает очередь в пределах `stopTimeoutMs`. То, что не успело получить ACK, отклоняется `ServiceBridgeError` с кодом `CONNECTION` («client stopped before the runtime acknowledged it»).
 
-Drainer пытается до 5 раз с лестницей `[1s, 5s, 30s, 2m, 10m]` ± 25% jitter. После 5 неудач → `status='failed'`, terminal (видно через outbox metrics).
+### Транзакционная граница
 
-### Статусы ответа runtime (drainer)
-
-| Ответ runtime | SDK action |
-|---|---|
-| `ACCEPTED` / `REJECTED_DUPLICATE` | DELETE row (успех / идемпотентный дубль) |
-| `REJECTED_INVALID_NAME` | `status='failed'`, terminal — НЕ retry |
-| `REJECTED_FORBIDDEN` | `status='failed'`, terminal; SDK дёргает `onPolicyViolation` (publish — это access-policy `event.publish`, denied) |
-| Сетевая ошибка / `UNSPECIFIED` | retry с backoff до `MAX_ATTEMPTS` |
-
-Отдельных schema-отказов в протоколе нет (ADR-0002): payload валидируется на SDK-стороне в момент `encode()` (Protobuf `type.verify()`), невалидные payload-ы вообще не попадают в outbox.
-
-> `REJECTED_FORBIDDEN` — это асинхронный отказ: `publish()` уже вернул OK (row в outbox), поэтому ошибку нельзя бросить вызывающему. SDK помечает row `failed` и логирует warn; owner может подключить callback `onPolicyViolation`, чтобы заэмитить `policy_violation`.
-
-### Outbox cap
-
-Если runtime недоступен надолго и outbox растёт — при достижении опции `maxOutboxRows` (default 100000) `event.publish` бросает `OutboxFullError`. Это явный сигнал, что что-то не так — лучше fail-fast, чем disk-full.
+`publish` не атомарен с транзакцией в вашей базе. Если бизнес-изменение и событие должны зафиксироваться вместе, сохраните намерение опубликовать в той же транзакции, что и изменение, и публикуйте из своей таблицы с `idempotencyKey` = id записи.
 
 ---
 
@@ -412,7 +443,7 @@ sb.event.define("payment.charged", {
 });
 ```
 
-Runtime хранит две строки в `service_methods` с одинаковым `method_name='payment.charged'` и разными `contract_hash`. Publisher v1 шлёт envelopes с hash v1, publisher v2 — с hash v2. Subscriber декодирует каждое событие через тот `SchemaPair`, который сам объявил под этим именем — версии работают параллельно, но subscriber видит только ту версию, которую сам понимает.
+Runtime хранит две строки в `service_methods` с одинаковым `method_name='payment.charged'` и разными `contract_hash`. Publisher v1 шлёт envelopes с hash v1, publisher v2 — с hash v2. Subscriber декодирует каждое событие схемой своей подписки (`opts.schema`) — версии работают параллельно; новые поля v2, которых нет в схеме подписчика, при декодировании отбрасываются.
 
 ### Cleanup
 
@@ -428,14 +459,18 @@ Runtime хранит две строки в `service_methods` с одинако�
 
 | Ситуация | SDK / Runtime | Что делать |
 |---|---|---|
-| Невалидное имя | `InvalidEventNameError` (SDK) до RPC | Поменять имя на `[a-z0-9_-]+(\.[a-z0-9_-]+)*` |
-| Outbox переполнен | `OutboxFullError` (SDK) | Поднять опцию `maxOutboxRows` или диагностировать почему drainer не катится |
-| `event.publish` до `start()` | `Error: events publisher not ready` (SDK) | Перенести вызов после `await sb.start()` |
-| Имя не задекларировано / без spec | `Error: events: no schema registered for event "..."` (SDK, до RPC) | Добавить `sb.event.define(name, spec)` (со spec) до `start()` |
-| Невалидный payload | encode `type.verify()` throws (SDK, до outbox) | Поправить payload под схему |
-| Runtime down | drainer ретраит с backoff | Outbox пишет → publish возвращает OK; данные доедут после recovery |
-| Publish запрещён политикой | runtime `REJECTED_FORBIDDEN` → drainer `status='failed'` + `onPolicyViolation` | Дать сервису action-rule `event.publish` на это имя |
-| Subscriber без схемы | `Nack` `no_schema` → runtime ретраит → DLQ | Объявить `sb.event.define(name, spec)` на subscriber-стороне |
+| Невалидное имя | `InvalidEventNameError` (SDK) до отправки | Поменять имя на `[a-z0-9_-]+(\.[a-z0-9_-]+)*` |
+| `event.publish` до `start()` | `StateError` «events: publish before start()» | Перенести вызов после `await sb.start()` |
+| Имя не задекларировано | `StateError` «events: no schema for event "..."» | Добавить `sb.event.define(name, spec)` до `start()` |
+| Невалидный payload | `ValidationError` «payload of "..." does not match its schema» (SDK, до очереди) | Поправить payload под схему |
+| Очередь переполнена | `ServiceBridgeError` `QUEUE_FULL` (`retryable`) | Runtime недоступен дольше, чем выдерживает очередь: подождать и повторить, поднять `maxPendingPublishes` |
+| Runtime не ответил вовремя | `TimeoutError` «not sent» / «outcome unknown» | Повторить; после «outcome unknown» — с тем же `idempotencyKey` |
+| Тот же `idempotencyKey`, другое содержимое | `ServiceBridgeError` `CONFLICT` | Разным событиям — разные ключи |
+| Publish запрещён политикой | `AccessDeniedError` + `policy_violation` | Дать сервису право `event.publish` на это имя |
+| Остановка с непосланными событиями | `ServiceBridgeError` `CONNECTION` | Увеличить `stopTimeoutMs` |
+| Дубль `handle` на тот же шаблон | `ValidationError` при регистрации | Один хендлер на шаблон |
+| Невалидный `filter` | runtime отклоняет регистрацию → бридж останавливается, `ValidationError` | Исправить фильтр |
+| Subscriber не смог декодировать payload | `Nack` «decode for pattern ...» → runtime ретраит → DLQ | Согласовать схему подписчика со схемой издателя |
 | Handler throws | `Nack` (с текстом ошибки) → runtime ретраит с backoff → DLQ | Сделать handler идемпотентным |
 
 ---
@@ -454,7 +489,7 @@ sb.event.define("payment.charged", { schemaFile: "schemas/payment.json" });
 
 await sb.start();
 
-await sb.event.publish("payment.charged", {
+const { eventId } = await sb.event.publish("payment.charged", {
   transactionId: "tx-7",
   amount: 42.0,
 }, {
@@ -470,13 +505,13 @@ import { ServiceBridge } from "service-bridge";
 
 const sb = new ServiceBridge(URL, SERVICE_KEY);
 
-// Subscriber объявляет ту же схему — для decode входящего payload.
-sb.event.define("payment.charged", { schemaFile: "schemas/payment.json" });
-
-// Handler вызывается по ТОЧНОМУ имени события (см. §2).
-sb.event.handle("payment.charged", async (payload) => {
-  // idempotent business work
-  await processPayment(payload);
+// Схема подписчика — в opts.schema; define на стороне подписчика не нужен.
+sb.event.handle("payment.*", async (payload, ctx) => {
+  // idempotent business work, ключ дедупа — ctx.eventId или бизнес-id
+  await processPayment(payload, ctx.eventId);
+}, {
+  schema: { schemaFile: "schemas/payment.json" },
+  filter: { "$.currency": "USD" },
 });
 
 await sb.start();

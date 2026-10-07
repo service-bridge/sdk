@@ -80,6 +80,12 @@ func (f *fakeStream) closeSendCount() int {
 	return f.closeSend
 }
 
+func (f *fakeStream) sentBatches() []*pb.TelemetryBatch {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]*pb.TelemetryBatch(nil), f.batches...)
+}
+
 func (f *fakeStream) batchCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -446,9 +452,12 @@ func TestTransportReportsRisingDropCounts(t *testing.T) {
 	ring := NewRing(Budgets{})
 	drops := make(chan DropInfo, 4)
 
+	metrics := NewMetrics(ring)
 	_, sf := startTransport(t, TransportConfig{
-		Ring:   ring,
-		OnDrop: func(info DropInfo) { drops <- info },
+		Ring:       ring,
+		Metrics:    metrics,
+		OnDrop:     func(info DropInfo) { drops <- info },
+		InstanceID: func() string { return "inst-1" },
 	})
 	st := sf.at(0)
 
@@ -467,11 +476,74 @@ func TestTransportReportsRisingDropCounts(t *testing.T) {
 	st.acks <- &pb.TelemetryAck{DropCountServerSide: 9}
 	select {
 	case info := <-drops:
-		if info.ServerDropped != 9 {
-			t.Fatalf("drop info = %+v, want only the rise to 9", info)
+		if info.ServerDropped != 2 {
+			t.Fatalf("drop info = %+v, want the delta of 2", info)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for the second drop report")
+	}
+
+	// The same deltas reach the runtime as a counter.
+	var total float64
+	// Counter points are per-window deltas. Nothing was acknowledged, so the
+	// ring still holds every flushed window; the aggregator holds the rest.
+	points := metrics.Drain(time.Now().UnixMilli())
+	for _, p := range ring.Peek(100).Metrics {
+		points = append(points, p.Msg)
+	}
+	for _, p := range points {
+		if p.GetName() == DroppedMetric && p.GetLabels()["source"] == "server" {
+			total += p.GetValue()
+		}
+	}
+	if total != 9 {
+		t.Fatalf("%s{source=server} = %v, want 9", DroppedMetric, total)
+	}
+}
+
+// Close writes what is buffered and waits for the acknowledgement of the last
+// batch before it stops.
+func TestTransportCloseWaitsForTheLastAck(t *testing.T) {
+	ring := NewRing(Budgets{})
+	tr, sf := startTransport(t, TransportConfig{Ring: ring})
+	st := sf.at(0)
+
+	ring.PushOp(&pb.OpReport{OpId: "op-1"})
+	closed := make(chan struct{})
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		tr.Close(ctx)
+		close(closed)
+	}()
+
+	waitFor(t, "the final batch", func() bool { return len(st.sentBatches()) > 0 })
+	select {
+	case <-closed:
+		t.Fatal("Close returned before the acknowledgement")
+	case <-time.After(30 * time.Millisecond):
+	}
+	st.acks <- &pb.TelemetryAck{AcknowledgedSequence: st.sentBatches()[len(st.sentBatches())-1].GetSequence()}
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not return after the acknowledgement")
+	}
+	if ring.Len(RingOps) != 0 {
+		t.Fatal("the acknowledged op is still buffered")
+	}
+}
+
+func TestTransportCloseGivesUpAtTheDeadline(t *testing.T) {
+	ring := NewRing(Budgets{})
+	tr, _ := startTransport(t, TransportConfig{Ring: ring})
+	ring.PushOp(&pb.OpReport{OpId: "op-1"})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	tr.Close(ctx)
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("Close outlived its deadline")
 	}
 }
 

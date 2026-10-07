@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -99,6 +100,7 @@ func delivery(id, name, partitionKey string, payload []byte) *pb.EventDelivery {
 			Payload:      payload,
 			PartitionKey: partitionKey,
 		},
+		MatchedPatterns: []string{name},
 	}
 }
 
@@ -180,7 +182,7 @@ func TestSubscribeInitCarriesTheLiveIdentity(t *testing.T) {
 		return Identity{ServiceID: "svc-1", InstanceID: fmt.Sprintf("inst-%d", instance.Add(1))}
 	}}
 	s := newTestSubscriber(t, h, func(c *SubscriberConfig) { c.MaxInFlight = 4 })
-	if err := Subscribe(s, "order.created", func(context.Context, order) error { return nil }); err != nil {
+	if err := Subscribe(s, "order.created", "", func(context.Context, order) error { return nil }); err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
 
@@ -222,7 +224,7 @@ func TestDeliveryReachesTheHandlerAndIsAcked(t *testing.T) {
 
 	got := make(chan order, 1)
 	traces := make(chan telemetry.TraceContext, 1)
-	err := Subscribe(s, "order.created", func(ctx context.Context, ev order) error {
+	err := Subscribe(s, "order.created", "", func(ctx context.Context, ev order) error {
 		if tc, ok := telemetry.FromContext(ctx); ok {
 			traces <- tc
 		}
@@ -304,13 +306,13 @@ func TestDecodeFailureAndPanicRejectTheDelivery(t *testing.T) {
 	h := &subHarness{}
 	s := newTestSubscriber(t, h)
 
-	if err := Subscribe(s, "order.created", func(context.Context, order) error { return nil }); err != nil {
+	if err := Subscribe(s, "order.created", "", func(context.Context, order) error { return nil }); err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
-	if err := Subscribe(s, "order.exploded", func(context.Context, order) error { panic("boom") }); err != nil {
+	if err := Subscribe(s, "order.exploded", "", func(context.Context, order) error { panic("boom") }); err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
-	if err := Subscribe(s, "order.failed", func(context.Context, order) error {
+	if err := Subscribe(s, "order.failed", "", func(context.Context, order) error {
 		return errors.New("handler said no")
 	}); err != nil {
 		t.Fatalf("Subscribe: %v", err)
@@ -399,7 +401,7 @@ func TestSharedPartitionKeyIsHandledInOrder(t *testing.T) {
 		active    atomic.Int32
 		maxActive atomic.Int32
 	)
-	err := Subscribe(s, "order.created", func(_ context.Context, ev order) error {
+	err := Subscribe(s, "order.created", "", func(_ context.Context, ev order) error {
 		n := active.Add(1)
 		for {
 			peak := maxActive.Load()
@@ -456,7 +458,7 @@ func TestEmptyPartitionKeyRunsInParallel(t *testing.T) {
 
 	arrived := make(chan struct{}, events)
 	release := make(chan struct{})
-	err := Subscribe(s, "order.created", func(context.Context, order) error {
+	err := Subscribe(s, "order.created", "", func(context.Context, order) error {
 		arrived <- struct{}{}
 		<-release
 		return nil
@@ -504,7 +506,7 @@ func TestMaxInFlightRejectsExcessWithoutBlockingStream(t *testing.T) {
 	var releaseOnce sync.Once
 	unblock := func() { releaseOnce.Do(func() { close(release) }) }
 	var handled atomic.Int64
-	err := Subscribe(s, "order.created", func(context.Context, order) error {
+	err := Subscribe(s, "order.created", "", func(context.Context, order) error {
 		<-release
 		handled.Add(1)
 		return nil
@@ -563,7 +565,7 @@ func TestStopWaitsForHandlersAndLeaksNothing(t *testing.T) {
 	running := make(chan struct{}, 1)
 	finished := make(chan struct{})
 	var done atomic.Bool
-	err := Subscribe(s, "order.created", func(ctx context.Context, _ order) error {
+	err := Subscribe(s, "order.created", "", func(ctx context.Context, _ order) error {
 		running <- struct{}{}
 		<-ctx.Done()
 		done.Store(true)
@@ -611,7 +613,7 @@ func TestSubscriberDrainsChainsWhenTheStreamDies(t *testing.T) {
 
 	blocked := make(chan struct{})
 	entered := make(chan struct{}, 1)
-	err := Subscribe(s, "order.created", func(context.Context, order) error {
+	err := Subscribe(s, "order.created", "", func(context.Context, order) error {
 		select {
 		case entered <- struct{}{}:
 		default:
@@ -663,55 +665,118 @@ func TestSubscribeValidatesItsArguments(t *testing.T) {
 	h := &subHarness{}
 	s := newTestSubscriber(t, h)
 
-	if err := Subscribe[order](s, "Order.Created", func(context.Context, order) error { return nil }); !errors.Is(err, ErrInvalidName) {
+	if err := Subscribe[order](s, "Order.Created", "", func(context.Context, order) error { return nil }); !errors.Is(err, ErrInvalidName) {
 		t.Fatalf("Subscribe with a malformed name = %v, want ErrInvalidName", err)
 	}
-	if err := Subscribe[order](s, "order.created", nil); !errors.Is(err, ErrInvalidConfig) {
+	if err := Subscribe[order](s, "order.created", "", nil); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("Subscribe with a nil handler = %v, want ErrInvalidConfig", err)
 	}
-	if err := Subscribe[order](nil, "order.created", func(context.Context, order) error { return nil }); !errors.Is(err, ErrInvalidConfig) {
+	if err := Subscribe[order](nil, "order.created", "", func(context.Context, order) error { return nil }); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("Subscribe on a nil subscriber = %v, want ErrInvalidConfig", err)
 	}
-	if err := Subscribe(s, "order.created", func(context.Context, order) error { return nil }); err != nil {
+	if err := Subscribe(s, "order.created", `{"$.total":3}`, func(context.Context, order) error { return nil }); err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
-	names := s.Names()
-	if len(names) != 1 || names[0] != "order.created" {
-		t.Fatalf("Names() = %v", names)
+	if err := Subscribe(s, "order.created", "", func(context.Context, order) error { return nil }); !errors.Is(err, ErrDuplicatePattern) {
+		t.Fatalf("a second handler for one pattern = %v, want ErrDuplicatePattern", err)
+	}
+	if err := Subscribe(s, "order.*", "", func(context.Context, order) error { return nil }); err != nil {
+		t.Fatalf("Subscribe wildcard: %v", err)
+	}
+	subs := s.Subscriptions()
+	if len(subs) != 2 || subs[0] != (Subscription{Pattern: "order.*"}) ||
+		subs[1] != (Subscription{Pattern: "order.created", Filter: `{"$.total":3}`}) {
+		t.Fatalf("Subscriptions() = %+v", subs)
 	}
 }
 
-func TestFanOutRunsEveryHandlerForOneName(t *testing.T) {
+// Routing is the runtime's: the delivery names the patterns it matched and
+// exactly those handlers run — every one of them, each once.
+func TestDeliveryRunsTheHandlersOfItsMatchedPatterns(t *testing.T) {
 	h := &subHarness{}
 	s := newTestSubscriber(t, h)
 
-	var calls atomic.Int64
-	for range 3 {
-		err := Subscribe(s, "order.created", func(context.Context, order) error {
-			calls.Add(1)
+	var mu sync.Mutex
+	var ran []string
+	record := func(name string) Handler[order] {
+		return func(context.Context, order) error {
+			mu.Lock()
+			ran = append(ran, name)
+			mu.Unlock()
 			return nil
-		})
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
+		}
+	}
+	for _, pattern := range []string{"order.created", "order.*", "#", "billing.#"} {
+		if err := Subscribe(s, pattern, "", record(pattern)); err != nil {
+			t.Fatalf("Subscribe %s: %v", pattern, err)
 		}
 	}
 
+	d := delivery("d-1", "order.created", "", encodePayload(t, order{}))
+	d.MatchedPatterns = []string{"order.*", "order.created", "order.*", "unknown.pattern"}
+	acked, reason := s.Handle(context.Background(), d)
+	if !acked {
+		t.Fatalf("not acked: %s", reason)
+	}
+	sort.Strings(ran)
+	if fmt.Sprint(ran) != "[order.* order.created]" {
+		t.Fatalf("ran %v, want exactly the matched patterns this process has", ran)
+	}
+
+	d.MatchedPatterns = []string{"unknown.pattern"}
+	if acked, reason := s.Handle(context.Background(), d); acked || reason != NoHandlerReason {
+		t.Fatalf("no matched handler: acked=%v reason=%q", acked, reason)
+	}
+	d.MatchedPatterns = nil
+	if acked, _ := s.Handle(context.Background(), d); acked {
+		t.Fatal("a delivery naming no pattern must be rejected, never matched locally")
+	}
+}
+
+func TestOneFailingHandlerRejectsTheDelivery(t *testing.T) {
+	s := newTestSubscriber(t, &subHarness{})
+	if err := Subscribe(s, "order.*", "", func(context.Context, order) error { return errors.New("boom") }); err != nil {
+		t.Fatal(err)
+	}
+	if err := Subscribe(s, "order.created", "", func(context.Context, order) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	d := delivery("d-1", "order.created", "", encodePayload(t, order{}))
+	d.MatchedPatterns = []string{"order.created", "order.*"}
+	if acked, reason := s.Handle(context.Background(), d); acked || !contains(reason, "boom") {
+		t.Fatalf("acked=%v reason=%q", acked, reason)
+	}
+}
+
+func TestDrainLeavesNewDeliveriesUntouched(t *testing.T) {
+	h := &subHarness{}
+	s := newTestSubscriber(t, h)
+	var calls atomic.Int64
+	if err := Subscribe(s, "order.created", "", func(context.Context, order) error {
+		calls.Add(1)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if err := s.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+		t.Fatal(err)
 	}
 	defer s.Stop()
-
 	st := h.stream(t, 0)
 	st.nextFrame(t)
-	st.push(t, delivery("d-1", "order.created", "", encodePayload(t, order{})))
 
-	if st.nextFrame(t).GetAck() == nil {
-		t.Fatal("the delivery was not acked")
+	s.Drain()
+	st.push(t, delivery("d-1", "order.created", "", encodePayload(t, order{})))
+	time.Sleep(50 * time.Millisecond)
+	if calls.Load() != 0 || len(st.frames()) != 1 {
+		t.Fatalf("a draining subscriber took new work: %d calls, %d frames", calls.Load(), len(st.frames()))
 	}
-	if calls.Load() != 3 {
-		t.Fatalf("%d of 3 handlers ran", calls.Load())
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), time.Second)
+	defer waitCancel()
+	if err := s.Wait(waitCtx); err != nil {
+		t.Fatalf("Wait: %v", err)
 	}
 }
 
@@ -831,7 +896,7 @@ func TestAckWriteFailureDoesNotStopTheSubscriber(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSubscriber: %v", err)
 	}
-	err = Subscribe(s, "order.created", func(context.Context, order) error {
+	err = Subscribe(s, "order.created", "", func(context.Context, order) error {
 		handled <- struct{}{}
 		return nil
 	})
@@ -854,7 +919,7 @@ func TestAckWriteFailureDoesNotStopTheSubscriber(t *testing.T) {
 	if st == nil {
 		t.Fatal("the stream was never opened")
 	}
-	st.fakeStream.push(t, delivery("d-1", "order.created", "", encodePayload(t, order{})))
+	st.push(t, delivery("d-1", "order.created", "", encodePayload(t, order{})))
 
 	select {
 	case <-handled:
@@ -867,7 +932,7 @@ func TestDeliveryMetadataAndRejectionEchoLeaseGeneration(t *testing.T) {
 	h := &subHarness{}
 	s := newTestSubscriber(t, h)
 	seen := make(chan DeliveryInfo, 1)
-	if err := Subscribe(s, "order.*", func(ctx context.Context, _ order) error {
+	if err := Subscribe(s, "order.*", "", func(ctx context.Context, _ order) error {
 		info, ok := DeliveryFromContext(ctx)
 		if !ok {
 			return errors.New("missing attempt metadata")
@@ -885,14 +950,19 @@ func TestDeliveryMetadataAndRejectionEchoLeaseGeneration(t *testing.T) {
 	defer s.Stop()
 	st := h.stream(t, 0)
 	st.nextFrame(t)
-	st.push(t, delivery("d", "order.created", "", encodePayload(t, order{ID: "o"})))
+	d := delivery("d", "order.created", "pk", encodePayload(t, order{ID: "o"}))
+	d.MatchedPatterns = []string{"order.*"}
+	d.Envelope.Headers = map[string]string{"h": "v"}
+	d.Envelope.OccurredAtUnixMs = 1234
+	st.push(t, d)
 	frame := st.nextFrame(t)
 	if frame.GetNack() == nil || frame.GetNack().GetLeaseToken() != "lease-d" {
 		t.Fatalf("NACK lost exact lease generation: %v", frame)
 	}
 	select {
 	case info := <-seen:
-		if info.Attempt != 3 || info.DeliveryID != "d" || info.EventName != "order.created" || info.LeaseToken != "lease-d" {
+		if info.Attempt != 3 || info.DeliveryID != "d" || info.EventName != "order.created" || info.LeaseToken != "lease-d" ||
+			info.EventID != "evt-d" || info.PartitionKey != "pk" || info.Headers["h"] != "v" || info.OccurredAtMs != 1234 {
 			t.Fatalf("metadata lost: %v", info)
 		}
 	case <-time.After(time.Second):

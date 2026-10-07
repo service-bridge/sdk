@@ -1,138 +1,128 @@
 # Testing — unit-test handlers without a live runtime
 
-`service-bridge/testing` is an in-memory double for `sb.rpc` and `sb.event`. No network, no SQLite, no runtime process. Use it to unit-test the handlers you register with `rpc.handle` / `event.handle`, including their outbound side effects (`rpc.call`, `event.publish`).
+`service-bridge/testing` gives `createTestHarness()`: a real `ServiceBridge` started against an in-memory runtime. Only the network is replaced. Handlers register through the normal API (`sb.rpc.handle`, `sb.rpc.handleStream`, `sb.event.handle`, `sb.event.define`, `sb.client`, `sb.useSchema`), and every call goes through production code — schema encode/decode, error mapping, Publisher, Subscriber. A schema mistake fails the unit test instead of e2e.
 
 ```ts
 import { createTestHarness } from "service-bridge/testing";
 ```
 
-## RPC handler: register and invoke
+## API
 
 ```ts
-harness.rpc.handle<Req, Res>(name: string, fn: (req: Req) => Promise<Res> | Res): void
-harness.rpc.invoke<Req, Res>(name: string, req: Req): Promise<Res>
-```
+createTestHarness(opts?: { callDefaults?: CallOpts; publishTimeoutMs?: number }): TestHarness
 
-`fn` is the exact `RpcHandlerFn` type `sb.rpc.handle(name, fn, opts)` accepts in production — `opts.schema` is not needed here, the harness skips wire encode/decode and calls `fn(req)` with the typed object directly. `invoke()` propagates the handler's own thrown error unchanged (no `errorCode`/`errorMessage` wire mapping — that's `CallServer`'s job, not the handler's).
-
-```ts
-const harness = createTestHarness();
-harness.rpc.handle("Charge", async (req: { userId: string; amount: number }) => {
-  if (req.amount <= 0) throw new Error("amount must be positive");
-  return { transactionId: `tx-${req.userId}`, ok: true };
-});
-
-const res = await harness.rpc.invoke("Charge", { userId: "u-1", amount: 42 });
-// { transactionId: "tx-u-1", ok: true }
-```
-
-`invoke()` throws `no RPC handler registered for "..."` if nothing was registered under that name.
-
-## Outbound RPC calls: mock + record
-
-```ts
-harness.rpc.mockResponse(serviceName: string, methodName: string, responder: Res | ((payload, opts?) => Res | Promise<Res>)): void
-harness.rpc.calls(): readonly { serviceName; methodName; payload; opts? }[]
-```
-
-```ts
-harness.rpc.mockResponse("fraud-svc", "Check", { blocked: false });
-// inside the handler under test: await deps.rpc.call("fraud-svc", "Check", { userId });
-
-expect(harness.rpc.calls()).toEqual([
-  { serviceName: "fraud-svc", methodName: "Check", payload: { userId: "u-1" } },
-]);
-```
-
-Calling `call()` for a `(serviceName, methodName)` pair with no configured mock throws — a forgotten mock fails the test immediately instead of resolving to `undefined`.
-
-## Event handler: deliver + ack/nack
-
-```ts
-harness.event.handle(pattern: string, fn: (payload: unknown) => Promise<void> | void): void
-harness.event.deliver(name: string, payload: unknown): Promise<{ outcome: "ack" } | { outcome: "nack"; reason: string }>
-```
-
-`deliver()` reproduces the exact ack/nack contract of `Subscriber.handleDelivery` in production: no handler registered for the exact name → `ack` (routing is server-side); a handler throws → `nack` with `String(error)`, remaining handlers for that delivery are skipped; every handler succeeds → `ack`. Multiple handlers on the same pattern run in registration order.
-
-```ts
-harness.event.handle("payment.charged", async (payload) => {
-  const { transactionId } = payload as { transactionId: string };
-  await sendReceipt(transactionId); // must be idempotent — delivery is at-least-once
-});
-
-await harness.event.deliver("payment.charged", { transactionId: "tx-1" });
-// { outcome: "ack" }
-```
-
-There is no `attempt` number in the real `EventHandlerFn` contract (`sb.event.handle`'s `fn` only receives the decoded payload) — a retry attempt is simulated by calling `deliver()` again with the same handler and asserting the outcome of each call:
-
-```ts
-let dbDown = true;
-harness.event.handle("payment.charged", async () => {
-  if (dbDown) throw new Error("db unavailable");
-});
-
-await harness.event.deliver("payment.charged", {}); // { outcome: "nack", reason: "Error: db unavailable" }
-dbDown = false;
-await harness.event.deliver("payment.charged", {}); // { outcome: "ack" }
-```
-
-## Outbound event publishing
-
-```ts
-harness.event.publish<T>(name: string, payload: T, opts?: PublishOpts): Promise<{ eventId: string }>
-harness.event.published(): readonly { name; payload; opts? }[]
-```
-
-```ts
-// inside the handler under test: await deps.event.publish("payment.charged", { transactionId, amount });
-
-expect(harness.event.published()).toEqual([
-  { name: "payment.charged", payload: { transactionId: "tx-u-1", amount: 42 } },
-]);
-```
-
-`publish()` only records the call and returns a freshly generated `eventId` — it does not validate the event name or encode the payload. It's an observation point for "what did the handler publish", not a `Publisher` replacement.
-
-## Pattern: testable handler factory
-
-Write handlers that need an outbound channel as a factory over a narrow dependency, not a closure over a global `sb`:
-
-```ts
-import type { EventDomain, RpcDomain } from "service-bridge";
-
-function makeChargeHandler(deps: {
-  rpc: Pick<RpcDomain, "call">;
-  event: Pick<EventDomain, "publish">;
-}) {
-  return async (req: { userId: string; amount: number }) => {
-    const fraud = await deps.rpc.call<{ userId: string }, { blocked: boolean }>(
-      "fraud-svc", "Check", { userId: req.userId },
-    );
-    if (fraud.blocked) throw new Error(`user ${req.userId} blocked`);
-
-    const transactionId = `tx-${req.userId}`;
-    await deps.event.publish("payment.charged", { transactionId, amount: req.amount });
-    return { transactionId, ok: true };
-  };
+interface TestHarness {
+  sb: ServiceBridge;                                   // register handlers/deps on it before start()
+  start(): Promise<void>;                              // loads schemas; no network
+  invoke<Req, Res>(method: string, req: Req, opts?: InvokeOpts): Promise<Res>;
+  invokeStream<Req, Chunk>(method: string, req: Req, opts?: InvokeOpts): Promise<Chunk[]>;
+  respond<Req, Res>(service: string, method: string, fn: (req: Req, call: CallRecord) => Res | Promise<Res>): void;
+  respondStream<Req, Chunk>(service: string, method: string, fn: (req: Req, call: CallRecord) => AsyncIterable<Chunk> | Iterable<Chunk>): void;
+  calls(): readonly CallRecord[];                      // outbound calls: { service, method, payload, opts }
+  published(): readonly PublishedRecord[];             // { id, name, payload, payloadJson, partitionKey, idempotencyKey, headers, occurredAtMs }
+  deliver(name: string, payload: unknown, opts?: DeliverOpts): Promise<DeliveryResult>;
+  reset(): void;                                       // forget calls and publishes; registrations stay
+  stop(): Promise<void>;
 }
 
-// production: sb.rpc.handle("Charge", makeChargeHandler(sb), { schema: ... });
-// test:       harness.rpc.handle("Charge", makeChargeHandler(harness));
+interface InvokeOpts { caller?: { serviceId: string; instanceId: string }; requestId?: string; idempotencyKey?: string; signal?: AbortSignal; deadline?: number }
+interface DeliverOpts { matchedPatterns?: string[]; attempt?: number; partitionKey?: string; headers?: Record<string, string> }
+interface DeliveryResult { acked: boolean; reason: string; matchedPatterns: string[] }
 ```
 
-`Pick<RpcDomain, "call">` / `Pick<EventDomain, "publish">` are structural types — `harness.rpc` / `harness.event` satisfy them without a cast, because `TestRpcDomain.call` / `TestEventDomain.publish` share the exact same signature as the production methods.
+Also exported: `matchPattern(pattern, name)` (the runtime's routing rule) and `TEST_IDENTITY`.
+
+## Behaviour to rely on
+
+- `invoke` encodes `req` with the handler's schema, dispatches it for real, decodes the answer. `InvokeOpts` become the handler's `ctx`.
+- Errors arrive as the caller would see them: `HandlerError` with the handler's `handlerCode` (or `"INTERNAL"` for any other throw); a refusal before the handler is a `ServiceBridgeError` with a status code (`NOT_FOUND` for an unknown method, `VALIDATION` for an undecodable request).
+- `respond`/`respondStream` answer outbound `sb.rpc.call` / typed client / `sb.stream`. The caller schema is required (`sb.client` or `sb.useSchema`), otherwise `ConfigurationError` — same as production. A call without a responder is recorded and fails with `NO_LIVE_INSTANCE`.
+- `deliver` goes through the real Subscriber. Matched patterns follow the runtime rules (`*` one segment, `#` zero or more); subscription filters are not evaluated. The payload is encoded with the first matched subscription's schema (or pass a `Uint8Array`). `acked: false` with the error text in `reason` when a handler throws; "no handler for matched patterns" when nothing matched.
+- `published()` records events that went through the real Publisher (name check, `define` required, schema encode); the in-memory runtime acknowledges each one.
+
+## Example (from `src/testing/example.test.ts`)
+
+```ts
+import { join } from "node:path";
+import { HandlerError } from "service-bridge";
+import { createTestHarness } from "service-bridge/testing";
+
+const SHOP = join(import.meta.dir, "testdata", "shop.proto");
+
+async function setup() {
+  const h = createTestHarness();
+  const { sb } = h;
+  // The production wiring, unchanged.
+  await sb.client("fraud-svc", SHOP, { methods: ["Check"] });
+  sb.event.define("payment.charged", { protoFile: SHOP, input: "PaymentCharged", output: "PaymentCharged" });
+  sb.rpc.handle(
+    "Charge",
+    async (req: { userId: string; amount: number }) => {
+      const verdict = await sb.rpc.call<{ userId: string }, { blocked: boolean }>(
+        "fraud-svc", "Check", { userId: req.userId },
+      );
+      if (verdict.blocked) throw new HandlerError("BLOCKED", `user ${req.userId} is blocked`);
+      const transactionId = `tx-${req.userId}`;
+      await sb.event.publish("payment.charged", { transactionId, amount: req.amount });
+      return { transactionId, ok: true };
+    },
+    { schema: { protoFile: SHOP, method: "Charge" } },
+  );
+  await h.start();
+  return h;
+}
+
+it("checks fraud, publishes payment.charged and returns the transaction", async () => {
+  const h = await setup();
+  h.respond("fraud-svc", "Check", () => ({ blocked: false }));
+
+  const res = await h.invoke("Charge", { userId: "u-1", amount: 42 });
+
+  expect(res).toEqual({ transactionId: "tx-u-1", ok: true });
+  expect(h.calls().map((c) => [c.service, c.method, c.payload])).toEqual([
+    ["fraud-svc", "Check", { userId: "u-1" }],
+  ]);
+  expect(h.published().map((p) => [p.name, p.payload])).toEqual([
+    ["payment.charged", { transactionId: "tx-u-1", amount: 42 }],
+  ]);
+  await h.stop();
+});
+
+it("answers with the business code when fraud blocks the user", async () => {
+  const h = await setup();
+  h.respond("fraud-svc", "Check", () => ({ blocked: true }));
+
+  const err = await h.invoke("Charge", { userId: "u-2", amount: 1 }).catch((e) => e);
+
+  expect(err).toBeInstanceOf(HandlerError);
+  expect((err as HandlerError).handlerCode).toBe("BLOCKED");
+  expect(h.published()).toHaveLength(0);
+  await h.stop();
+});
+```
+
+## Event handler
+
+```ts
+const h = createTestHarness();
+h.sb.event.handle("payment.*", async (payload, ctx) => {
+  await sendReceipt(payload, ctx.eventId); // must be idempotent — delivery is at-least-once
+}, { schema: { protoFile: SHOP, input: "PaymentCharged", output: "PaymentCharged" } });
+await h.start();
+
+const r = await h.deliver("payment.charged", { transactionId: "tx-1", amount: 1 });
+// { acked: true, reason: "", matchedPatterns: ["payment.*"] }
+```
+
+Retry behaviour is simulated by calling `deliver()` again (optionally with `{ attempt: 2 }`) and asserting each result.
 
 ## Scope — what this harness does not do
 
 | Not covered | Why |
 |---|---|
-| Protobuf encode/decode | The handler receives and returns typed objects directly, matching what its own business logic sees post-decode on the real path. |
-| Wire error mapping (`errorCode`/`errorMessage`) | `invoke()` rethrows the handler's own error so `rejects.toThrow(...)` checks the business message, not the transport envelope. |
-| Streaming RPC (`handleStream`) | Out of scope for now — `handle`/`invoke` are unary only. |
-| Workflow steps | The runner checkpoints step state against the runtime (persist/resume/replay); without a runtime a step can't be honestly committed or replayed. |
-| Event name validation, idempotency, partitioning | `TestEventDomain` is a recorder for outbound publishes, not a `Publisher` replacement. |
-| Live gRPC, SQLite outbox | The harness runs entirely in the test process's memory. |
+| Access policy, subscription filters | Runtime behaviour; cover it with e2e against a real runtime. |
+| Delivery retries, leases, DLQ | Also runtime; `deliver` returns the Ack/Nack the subscriber would send. |
+| Jobs and workflows | Scheduling, leases and step checkpoints live in the runtime. |
+| Network, mTLS, reconnect | The harness runs entirely in the test process's memory. |
 
-See [userDocs/testing.md](../../userDocs/testing.md) for the full guide and [src/testing/README.md](../../src/testing/README.md) for the module contract.
+The full guide is `node/userDocs/testing.md` and the module contract is `node/src/testing/README.md` in the [SDK repository](https://github.com/service-bridge/sdk).

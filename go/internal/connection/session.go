@@ -32,13 +32,13 @@ var (
 // session is opened for exactly one lease, and rotation is nothing but opening
 // a session for the next one.
 type Lease struct {
-	Identity    Identity
-	ServiceName string
-	CertDER     []byte
-	CAChainDER  []byte
-	PrivateKey  *ecdsa.PrivateKey
-	TLSCert     tls.Certificate
-	NotAfter    time.Time
+	Identity       Identity
+	ServiceName    string
+	CertDER        []byte
+	CAChainDER     []byte
+	PrivateKey     *ecdsa.PrivateKey
+	TLSCert        tls.Certificate
+	NotAfterUnixMs int64
 }
 
 // Credentials is the mTLS material derived from one lease. Everything that
@@ -182,13 +182,13 @@ func (p BootstrapProvisioner) Provision(ctx context.Context) (Lease, error) {
 		return Lease{}, err
 	}
 	return Lease{
-		Identity:    res.Identity,
-		ServiceName: res.ServiceName,
-		CertDER:     res.CertDER,
-		CAChainDER:  res.CAChainDER,
-		PrivateKey:  res.PrivateKey,
-		TLSCert:     res.TLSCert,
-		NotAfter:    res.NotAfter,
+		Identity:       res.Identity,
+		ServiceName:    res.ServiceName,
+		CertDER:        res.CertDER,
+		CAChainDER:     res.CAChainDER,
+		PrivateKey:     res.PrivateKey,
+		TLSCert:        res.TLSCert,
+		NotAfterUnixMs: res.NotAfterUnixMs,
 	}, nil
 }
 
@@ -207,7 +207,9 @@ type MTLSDialer struct{}
 func (MTLSDialer) Dial(_ context.Context, creds Credentials) (*grpc.ClientConn, error) {
 	const op = "dial runtime"
 
-	conn, err := grpc.NewClient(creds.Addr, grpc.WithTransportCredentials(gcreds.NewTLS(creds.TLS)))
+	conn, err := grpc.NewClient(creds.Addr,
+		grpc.WithTransportCredentials(gcreds.NewTLS(creds.TLS)),
+		grpc.WithKeepaliveParams(ClientKeepalive()))
 	if err != nil {
 		return nil, newError(KindSession, op, "build channel to "+creds.Addr, err)
 	}
@@ -290,6 +292,9 @@ type session struct {
 	endErr error
 
 	closing atomic.Bool
+	// drained is set once the runtime announced a drain on this session, so the
+	// end of the stream that follows is read as routine, not as a failure.
+	drained atomic.Bool
 }
 
 // newSession dials the runtime with creds and opens Control.Open. It returns as
@@ -307,7 +312,11 @@ func newSession(ctx context.Context, dialer Dialer, creds Credentials, log *slog
 	}
 
 	streamCtx, cancel := context.WithCancel(ctx)
-	stream, err := pb.NewControlClient(conn).Open(streamCtx, &pb.OpenRequest{})
+	stream, err := pb.NewControlClient(conn).Open(streamCtx, &pb.OpenRequest{
+		ProtocolVersion: ProtocolVersion,
+		SdkLanguage:     SDKLanguage,
+		SdkVersion:      SDKVersion,
+	})
 	if err != nil {
 		cancel()
 		if cerr := conn.Close(); cerr != nil {
@@ -354,6 +363,7 @@ func (s *session) run() {
 				s.log.Warn("connection: extra Welcome on a live control stream")
 			}
 		case *pb.ServerControl_Drain:
+			s.drained.Store(true)
 			s.onDrain(k.Drain.GetReason())
 		default:
 			s.log.Warn("connection: unknown control message")

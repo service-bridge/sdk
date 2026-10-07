@@ -106,7 +106,7 @@ func TestChiRouterRunsTheMiddleware(t *testing.T) {
 	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/users/7", nil))
 
 	start, _ := startEnd(t, rt)
-	if want := "http.handle:GET//users/7"; start.GetSubject() != want {
+	if want := "http.handle:GET//users/{id}"; start.GetSubject() != want {
 		t.Errorf("subject: got %q, want %q", start.GetSubject(), want)
 	}
 }

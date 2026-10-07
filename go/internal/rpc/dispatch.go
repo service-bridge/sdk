@@ -13,9 +13,9 @@ import (
 	"google.golang.org/grpc/codes"
 )
 
-// errorCodeInternal is the only error_code the dispatcher puts in a response
-// body. A handler failure is an answer, not a fault of the wire, and the caller
-// reads it under a gRPC OK status.
+// errorCodeInternal is the error_code of every handler failure that is not a
+// HandlerError. A handler failure is an answer, not a fault of the wire, and
+// the caller reads it under a gRPC OK status.
 const errorCodeInternal = "INTERNAL"
 
 // Dispatch failures. Each one picks a wire shape, so they are sentinels rather
@@ -228,13 +228,18 @@ func (d *Dispatcher) Stream(ctx context.Context, name string, payload []byte, se
 
 // failure maps a handler error onto the wire. A decode failure is the caller's
 // mistake and travels as a status; everything else is the callee's answer and
-// travels in the body.
+// travels in the body: a HandlerError under its own code, anything else —
+// panics included — as INTERNAL.
 func (d *Dispatcher) failure(name string, err error) Outcome {
 	if errors.Is(err, ErrDecode) {
 		return Outcome{
 			Status:        codes.InvalidArgument,
 			StatusMessage: fmt.Sprintf("rpc: %s: %s", name, err),
 		}
+	}
+	var he *HandlerError
+	if errors.As(err, &he) && he.Code != "" {
+		return Outcome{Status: codes.OK, ErrorCode: he.Code, ErrorMessage: he.Message}
 	}
 	return Outcome{
 		Status:       codes.OK,

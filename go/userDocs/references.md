@@ -11,15 +11,14 @@
 - [`../workflow/README.md`](../workflow/README.md) — словарь графа workflow
 - [`../sbhttp/README.md`](../sbhttp/README.md) — интеграция `net/http` и chi
 - [`../sbgin/README.md`](../sbgin/README.md) — интеграция gin (отдельный модуль)
-- [`../sbtest/README.md`](../sbtest/README.md) — in-memory двойник
+- [`../sbtest/README.md`](../sbtest/README.md) — тестовый харнесс вокруг настоящего клиента
 
 Внутренние пакеты — для тех, кто читает или правит сам SDK. Прикладной код на них не опирается:
 
 - [`../internal/connection/README.md`](../internal/connection/README.md) — жизненный цикл соединения, провижининг, ротация сертификатов
 - [`../internal/registry/README.md`](../internal/registry/README.md) — объявления и поток реестра
 - [`../internal/rpc/README.md`](../internal/rpc/README.md) — входящий сервер, клиент, транспорты, балансировка, размыкатель, ретраи
-- [`../internal/events/README.md`](../internal/events/README.md) — публикация, дренаж, подписка
-- [`../internal/outbox/README.md`](../internal/outbox/README.md) — локальное хранилище буфера
+- [`../internal/events/README.md`](../internal/events/README.md) — очередь публикаций, отправитель, подписка
 - [`../internal/job/README.md`](../internal/job/README.md) — каноническая форма задачи и подписчик исполнений
 - [`../internal/workflow/README.md`](../internal/workflow/README.md) — заморозка графа, валидация, раннер
 - [`../internal/telemetry/README.md`](../internal/telemetry/README.md) — операции, метрики, кольцевые буферы, мост `slog`
@@ -37,7 +36,7 @@
 
 | | Минимум |
 |---|---|
-| Go | 1.24 |
+| Go | 1.26.6 |
 | PostgreSQL | 18+ (нужен рантайму, не SDK) |
 | cgo | не требуется |
 

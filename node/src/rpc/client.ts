@@ -1,48 +1,53 @@
 import { randomUUID } from "node:crypto";
 import type { ServiceBridge } from "../connection/service-bridge";
+import {
+	ConfigurationError,
+	NoLiveInstanceError,
+	ServiceBridgeError,
+	ValidationError,
+} from "../errors";
 import { computeContractHash } from "../serde/contract-hash";
 import type { SchemaPair } from "../serde/serializer";
 import { runWithTrace, streamWithContext } from "../telemetry/context";
 import { Channel, type OpHandle, RpcCall, Status } from "../telemetry/ops";
 import type { CircuitBreakerRegistry } from "./circuit-breaker";
-import type { DirectTransport } from "./direct-transport";
+import type { DirectTransport, WireCall } from "./direct-transport";
 import type { InstanceCache } from "./instance-cache";
-import {
-	type Candidate,
-	cbKey,
-	type LoadBalancer,
-	NoLiveInstanceError,
-} from "./lb";
+import { type Candidate, cbKey, type LoadBalancer } from "./lb";
 import type { ProxyTransport } from "./proxy-transport";
-import {
-	backoffDelay,
-	GRPC_CODE_UNAVAILABLE,
-	isRetryable,
-	mergeRetryOpts,
-} from "./retry";
+import { backoffDelay, mergeRetryOpts } from "./retry";
+import { CallFailure } from "./wire";
 
-// CallOpts is the per-call configuration accepted by ServiceBridge.call().
-// Defaults are sourced from ServiceBridge.options.callDefaults, then overridden
-// by per-call values.
+/**
+ * Per-call options. `ServiceBridgeOptions.callDefaults` apply to every call
+ * path (sb.rpc.call, sb.stream, typed clients); a per-call value wins.
+ *
+ * @public — см. ./README.md
+ */
 export interface CallOpts {
-	/** Cancel local waiting and the underlying gRPC call. Remote effects may have happened. */
+	/** Cancels local waiting and the gRPC call. Remote effects may have happened. */
 	signal?: AbortSignal;
-	timeout?: string; // e.g. "10s", "500ms" — default "30s"
-	requestId?: string; // auto-generated UUID v4 if omitted
-	// transport selects how the call reaches the callee:
-	//   - "direct" : caller → callee mTLS, error if callee has no call_endpoint
-	//   - "proxy"  : caller → runtime Invoke → callee (even if direct possible)
-	//   - "auto"   : direct if endpoint is known, else proxy (DEFAULT)
+	/** Deadline for the whole logical call, e.g. "10s", "500ms". Default "30s". */
+	timeout?: string;
+	/** Correlation id carried to the callee. Default: random UUID. */
+	requestId?: string;
+	/**
+	 * "auto" (default): direct to the picked instance when it advertises an
+	 * endpoint, falling back to the runtime proxy after a pre-dispatch failure.
+	 * "direct": never via the runtime. "proxy": always via the runtime.
+	 */
 	transport?: "direct" | "proxy" | "auto";
-	// Correlation/cache key for proxy calls. A key never authorizes replay of
-	// an ambiguous dispatch; business dedup must be atomic with its effect.
-
+	/**
+	 * Handed to the callee (ctx.idempotencyKey) and to the runtime proxy's
+	 * dedup. It does not make a dispatched call retryable: the SDK retries only
+	 * failures proven to have happened before the handler ran.
+	 */
 	idempotencyKey?: string;
-	// Retry policy. Defaults: maxAttempts=3, baseDelayMs=200, factor=2,
-	// maxDelayMs=5000, jitter=0.3. Set maxAttempts=1 to disable retry.
+	/** Retry policy for pre-dispatch failures. maxAttempts=1 disables retry. */
 	retry?: Partial<RetryOpts>;
 }
 
+/** @public — см. ./README.md */
 export interface RetryOpts {
 	maxAttempts: number;
 	baseDelayMs: number;
@@ -51,132 +56,98 @@ export interface RetryOpts {
 	jitter: number; // fraction in [0, 1]
 }
 
+const DEFAULT_TIMEOUT_MS = 30_000;
+
 // CallerSchema bundles the SchemaPair with its precomputed contract hash so
 // the LB can filter instances whose hash differs (ADR 0005 — version routing).
 export interface CallerSchema {
 	pair: SchemaPair;
 	contractHash: string;
-	// contractHashBytes is the UTF-8 wire form the proxy transport puts on every
-	// InvokeRequest. The hash is fixed per method, so encoding the 64-char hex
-	// string per call was a constant re-encode on the hot path.
+	// UTF-8 wire form for InvokeRequest.contract_hash, encoded once per method.
 	contractHashBytes: Buffer;
 }
 
-// SchemaResolver is invoked by RpcClient when a method's CallerSchema is not yet
-// cached. Implementations look up the spec from registered handlers (handler
-// side knows the .proto path; caller side reuses the same spec or fetches
-// from local config).
 export type SchemaResolver = (
 	serviceName: string,
 	methodName: string,
 ) => CallerSchema | undefined;
 
+/** What the domain needs from an outbound client. @internal */
+export type RpcCaller = Pick<RpcClient, "call" | "stream">;
+
+/** @internal */
+export interface RpcClientDeps {
+	proxy: ProxyTransport;
+	direct: DirectTransport;
+	instances: InstanceCache;
+	resolveSchema: SchemaResolver;
+	cb: CircuitBreakerRegistry;
+	lb: LoadBalancer;
+	callDefaults: () => CallOpts;
+	// sb owns the telemetry surface used for the RPC.CALL op (ADR-0001).
+	sb: ServiceBridge;
+}
+
 // RpcClient is the entry point for outbound RPC calls.
 // @internal — см. ./README.md
 export class RpcClient {
-	constructor(
-		private readonly proxy: ProxyTransport,
-		private readonly directTransport: DirectTransport | null,
-		private readonly instances: InstanceCache,
-		private readonly resolveSchema: SchemaResolver,
-		// callerService is resolved per call, not captured at construction: the
-		// RpcClient is built from openSession before the first Welcome, so the
-		// session identity does not exist yet and the guard that keeps the client
-		// alive across reconnects would freeze the empty value forever.
-		private readonly callerService: () => string,
-		private readonly cb: CircuitBreakerRegistry,
-		private readonly lb: LoadBalancer,
-		// sb owns the instance identity and telemetry ring used for RPC.CALL emission.
-		// Per ADR-0001, the caller SDK emits RPC.CALL for every outbound call.
-		private readonly sb: ServiceBridge,
-	) {}
+	constructor(private readonly d: RpcClientDeps) {}
 
-	// stream invokes a server-side streaming method, returning an AsyncIterable
-	// of decoded chunks. Transport selection follows the same transport opt
-	// rules as call(). Retry is NOT applied — streams are single-pick by design
-	// (ADR 0001): mid-stream replay would re-deliver already-received chunks.
+	// stream invokes a server-side streaming method. A stream picks its instance
+	// once and is never retried: a repeat would re-deliver chunks already read.
 	async *stream<Req = unknown, Chunk = unknown>(
 		serviceName: string,
 		methodName: string,
 		payload: Req,
-		opts?: CallOpts,
+		callOpts?: CallOpts,
 	): AsyncIterable<Chunk> {
-		opts?.signal?.throwIfAborted();
-		const descriptor = this.instances.descriptorFor(serviceName, methodName);
-		if (!descriptor) {
-			throw new Error(
-				`rpc: no descriptor for ${serviceName}/${methodName} — not subscribed or target offline`,
-			);
-		}
-		if (!descriptor.streaming) {
-			throw new Error(
-				`rpc: ${serviceName}/${methodName} is not a streaming method — use sb.rpc.call()`,
-			);
-		}
-
-		const schema = this.resolveSchema(serviceName, methodName);
-		if (!schema) {
-			throw new Error(`rpc: no SchemaPair for ${serviceName}/${methodName}`);
-		}
-
+		const opts = { ...this.d.callDefaults(), ...(callOpts ?? {}) };
+		opts.signal?.throwIfAborted();
+		const schema = this.prepare(serviceName, methodName, true);
 		const reqBytes = schema.pair.input.encode(payload as object);
-		const requestId = opts?.requestId ?? randomUUID();
-		const idempotencyKey = opts?.idempotencyKey ?? "";
-		const timeoutMs = parseTimeout(opts?.timeout) ?? 30_000;
-		const transport = opts?.transport ?? "auto";
+		const requestId = opts.requestId ?? randomUUID();
+		const idempotencyKey = opts.idempotencyKey ?? "";
+		const deadline = new Date(Date.now() + timeoutMs(opts.timeout));
+		const transport = opts.transport ?? "auto";
 
 		const candidate = this.pickCandidate(
 			serviceName,
 			methodName,
 			schema.contractHash,
 		);
-		const useDirect = this.shouldUseDirect(candidate, transport);
+		const useDirect = useDirectFor(candidate, transport);
 
-		// One RPC.CALL op for the entire stream lifetime (ADR-0001).
-		const callOp = this.sb.telemetry.startOp({
+		const callOp = this.d.sb.telemetry.startOp({
 			channel: Channel.RPC,
 			kind: RpcCall,
 			subject: formatRpcCallSubject(serviceName, methodName),
 			peerServiceId: candidate.instance.serviceId,
+			peerInstanceId: useDirect ? candidate.instance.instanceId : "",
 			attempt: 0,
 			metaJson: rpcCallMeta(methodName, !useDirect, requestId, idempotencyKey),
 		});
-
-		// Streaming captures only the request payload (IN). The response is a
-		// chunk stream; concatenating chunks into one blob would break streaming
-		// memory bounds, so OUT is not captured for streams.
+		// Streaming captures only the request: concatenating chunks would break
+		// streaming memory bounds.
 		callOp.captureIn(reqBytes, schema.contractHash);
 
-		const release = this.lb.acquire(candidate.instance.instanceId);
+		const release = this.d.lb.acquire(candidate.instance.instanceId);
 		const childCtx = { traceId: callOp.traceId, parentOpId: callOp.opId };
-		const directTransport = this.directTransport;
-		const proxy = this.proxy;
-		const callerService = this.callerService();
+		const wire: WireCall = {
+			method: methodName,
+			payload: reqBytes,
+			requestId,
+			idempotencyKey,
+			deadline,
+			signal: opts.signal,
+		};
+		const { direct, proxy } = this.d;
 		const decoded = async function* (): AsyncIterable<Chunk> {
 			const source = useDirect
-				? directTransport!.callStream(
-						{
-							endpoint: candidate.instance.callEndpoint,
-							serviceId: candidate.instance.serviceId,
-							instanceId: candidate.instance.instanceId,
-						},
-						methodName,
-						reqBytes,
-						callerService,
-						requestId,
-						idempotencyKey,
-						timeoutMs,
-						opts?.signal,
-					)
+				? direct.callStream(directTarget(candidate), wire)
 				: proxy.callStream(
 						candidate.instance.serviceId,
-						methodName,
-						reqBytes,
-						requestId,
-						idempotencyKey,
-						timeoutMs,
 						schema.contractHashBytes,
-						opts?.signal,
+						wire,
 					);
 			for await (const bytes of source) {
 				yield schema.pair.output.decode(bytes) as Chunk;
@@ -186,16 +157,13 @@ export class RpcClient {
 		let endMsg: string | undefined;
 		try {
 			yield* streamWithContext(childCtx, decoded);
-			this.cb.recordSuccess(cbKey(candidate.instance));
+			if (useDirect) this.d.cb.recordSuccess(cbKey(candidate.instance));
 		} catch (err) {
+			const failure = asFailure(err, opts.signal);
 			endStatus = Status.ERROR;
-			endMsg = err instanceof Error ? err.message : String(err);
-			if (isApplicationRejection(err)) {
-				this.cb.recordSuccess(cbKey(candidate.instance));
-			} else {
-				this.cb.recordFailure(cbKey(candidate.instance));
-			}
-			throw err;
+			endMsg = failure.error.message;
+			if (useDirect) this.recordOutcome(candidate, failure);
+			throw failure.error;
 		} finally {
 			callOp.end(endStatus, endMsg);
 			release();
@@ -206,46 +174,44 @@ export class RpcClient {
 		serviceName: string,
 		methodName: string,
 		payload: Req,
-		opts?: CallOpts,
+		callOpts?: CallOpts,
 	): Promise<Res> {
-		opts?.signal?.throwIfAborted();
-		const descriptor = this.instances.descriptorFor(serviceName, methodName);
-		if (!descriptor) {
-			throw new Error(
-				`rpc: no descriptor for ${serviceName}/${methodName} — not subscribed or target offline`,
-			);
-		}
-		if (descriptor.streaming) {
-			throw new Error(
-				`rpc: ${serviceName}/${methodName} is a streaming method — use sb.stream() instead`,
-			);
-		}
-
-		const schema = this.resolveSchema(serviceName, methodName);
-		if (!schema) {
-			throw new Error(
-				`rpc: no SchemaPair for ${serviceName}/${methodName} — caller must register schema for this method`,
-			);
-		}
-
+		const opts = { ...this.d.callDefaults(), ...(callOpts ?? {}) };
+		opts.signal?.throwIfAborted();
+		const schema = this.prepare(serviceName, methodName, false);
 		const reqBytes = schema.pair.input.encode(payload as object);
-		const requestId = opts?.requestId ?? randomUUID();
-		// Idempotency is opt-in (ADR 0001). Empty string is the wire signal for
-		// "no key" — runtime then skips Claim/Save entirely.
-		const idempotencyKey = opts?.idempotencyKey ?? "";
-		const timeoutMs = parseTimeout(opts?.timeout) ?? 30_000;
-		const deadlineAt = Date.now() + timeoutMs;
-		const transport = opts?.transport ?? "auto";
-		const retry = mergeRetryOpts(opts?.retry);
-		const hasIdempotency = idempotencyKey.length > 0;
+		const requestId = opts.requestId ?? randomUUID();
+		const idempotencyKey = opts.idempotencyKey ?? "";
+		const deadlineAt = Date.now() + timeoutMs(opts.timeout);
+		const deadline = new Date(deadlineAt);
+		const transport = opts.transport ?? "auto";
+		const retry = mergeRetryOpts(opts.retry);
 
-		// One RPC.CALL op for the whole logical call (ADR-0001). Retries
-		// bump the attempt counter on the SAME row — no op per attempt. The op is
-		// started lazily on the first successful candidate pick so peer_service_id
-		// and via_proxy reflect the transport actually used.
+		// One RPC.CALL op for the whole logical call (ADR-0001); retries bump
+		// the attempt on the same row. Started on the first successful pick so
+		// peer_service_id and via_proxy reflect the transport actually used.
 		let callOp: OpHandle | null = null;
-		let lastErr: unknown = null;
+		// After a pre-dispatch failure of the direct path, "auto" moves to the
+		// runtime proxy: a dead pod may still sit in the local snapshot while
+		// the runtime already knows a live instance.
+		let viaProxy = transport === "proxy";
+		// Instances the direct path could not reach: the proxy tries them last.
+		const unreachable: string[] = [];
+		let lastError: ServiceBridgeError | null = null;
+
+		let fallback = false;
 		for (let attempt = 0; attempt < retry.maxAttempts; attempt++) {
+			// The switch to the proxy after a direct pre-dispatch failure is not a
+			// retry of the same path and waits for nothing.
+			if (attempt > 0 && !fallback) {
+				const pause = Math.min(
+					backoffDelay(retry, attempt - 1),
+					deadlineAt - Date.now(),
+				);
+				if (pause <= 0) break;
+				await sleep(pause, opts.signal);
+			}
+			fallback = false;
 			let candidate: Candidate;
 			try {
 				candidate = this.pickCandidate(
@@ -254,31 +220,24 @@ export class RpcClient {
 					schema.contractHash,
 				);
 			} catch (err) {
-				lastErr = err;
-				if (
-					attempt === retry.maxAttempts - 1 ||
-					!isRetryable(err, hasIdempotency)
-				) {
-					// Close the CALL row if it was already started on a prior attempt.
-					callOp?.setAttempt(attempt);
-					callOp?.end(
-						Status.ERROR,
-						err instanceof Error ? err.message : String(err),
-					);
-					throw err;
-				}
-				await sleep(backoffDelay(retry, attempt), opts?.signal);
+				lastError = err as ServiceBridgeError;
+				continue;
+			}
+			const useDirect = !viaProxy && useDirectFor(candidate, transport);
+			if (transport === "direct" && !useDirect) {
+				lastError = new NoLiveInstanceError(
+					`rpc: ${serviceName}/${methodName}: the picked instance advertises no endpoint and transport is "direct"`,
+				);
 				continue;
 			}
 
-			const useDirect = this.shouldUseDirect(candidate, transport);
-
 			if (callOp === null) {
-				callOp = this.sb.telemetry.startOp({
+				callOp = this.d.sb.telemetry.startOp({
 					channel: Channel.RPC,
 					kind: RpcCall,
 					subject: formatRpcCallSubject(serviceName, methodName),
 					peerServiceId: candidate.instance.serviceId,
+					peerInstanceId: useDirect ? candidate.instance.instanceId : "",
 					attempt,
 					metaJson: rpcCallMeta(
 						methodName,
@@ -287,193 +246,177 @@ export class RpcClient {
 						idempotencyKey,
 					),
 				});
-				// Caller owns the RPC.CALL payloads: request (IN) once per logical
-				// call, response (OUT) captured below before decode.
 				callOp.captureIn(reqBytes, schema.contractHash);
 			} else {
 				callOp.setAttempt(attempt);
+				// Via the proxy the runtime picks the instance and knows it.
+				callOp.setPeerInstance(useDirect ? candidate.instance.instanceId : "");
 			}
 
-			const release = this.lb.acquire(candidate.instance.instanceId);
+			const release = this.d.lb.acquire(candidate.instance.instanceId);
+			const op = callOp;
+			const wire: WireCall = {
+				method: methodName,
+				payload: reqBytes,
+				requestId,
+				idempotencyKey,
+				deadline,
+				signal: opts.signal,
+				excludeInstanceIds: unreachable,
+			};
 			try {
-				// Wrap invoke in child context so transport reads callOp.opId as
-				// parentOpId — the callee handler then runs under parent=CALL.op_id.
-				const childCtx = { traceId: callOp.traceId, parentOpId: callOp.opId };
-				const invoke = async () => {
-					const respBytes = useDirect
-						? await this.directTransport!.callUnary(
-								{
-									endpoint: candidate.instance.callEndpoint,
-									serviceId: candidate.instance.serviceId,
-									instanceId: candidate.instance.instanceId,
-								},
-								methodName,
-								reqBytes,
-								this.callerService(),
-								requestId,
-								idempotencyKey,
-								timeoutMs,
-								opts?.signal,
-							)
-						: await this.proxy.callUnary(
-								candidate.instance.serviceId,
-								methodName,
-								reqBytes,
-								requestId,
-								idempotencyKey,
-								timeoutMs,
-								schema.contractHashBytes,
-								opts?.signal,
-							);
-					callOp?.captureOut(respBytes, schema.contractHash);
-					return schema.pair.output.decode(respBytes) as Res;
-				};
-				const result = (await runWithTrace(childCtx, invoke)) as Res;
-				callOp.end(Status.SUCCESS);
-				this.cb.recordSuccess(cbKey(candidate.instance));
+				const respBytes = await runWithTrace(
+					{ traceId: op.traceId, parentOpId: op.opId },
+					() =>
+						useDirect
+							? this.d.direct.callUnary(directTarget(candidate), wire)
+							: this.d.proxy.callUnary(
+									candidate.instance.serviceId,
+									schema.contractHashBytes,
+									wire,
+								),
+				);
+				op.captureOut(respBytes, schema.contractHash);
+				const result = schema.pair.output.decode(respBytes) as Res;
+				op.end(Status.SUCCESS);
+				if (useDirect) this.d.cb.recordSuccess(cbKey(candidate.instance));
 				return result;
 			} catch (err) {
-				lastErr = err;
-				if (isApplicationRejection(err)) {
-					this.cb.recordSuccess(cbKey(candidate.instance));
-				} else {
-					this.cb.recordFailure(cbKey(candidate.instance));
+				const failure = asFailure(err, opts.signal);
+				if (useDirect) this.recordOutcome(candidate, failure);
+				if (!failure.preDispatch) {
+					op.end(Status.ERROR, failure.error.message);
+					throw failure.error;
 				}
-				// A dead pod can remain in the local registry snapshot until its
-				// Control.Open teardown reaches this caller. Redialling that same
-				// endpoint only repeats ECONNREFUSED; the runtime proxy resolves the
-				// currently connected instance from its authoritative registry.
-				if (
-					transport === "auto" &&
-					useDirect &&
-					isRetryable(err, false) &&
-					attempt + 1 < retry.maxAttempts
-				) {
-					const remainingMs = deadlineAt - Date.now();
-					if (remainingMs > 0) {
-						callOp.setAttempt(attempt + 1);
-						try {
-							const respBytes = await runWithTrace(
-								{ traceId: callOp.traceId, parentOpId: callOp.opId },
-								() =>
-									this.proxy.callUnary(
-										candidate.instance.serviceId,
-										methodName,
-										reqBytes,
-										requestId,
-										idempotencyKey,
-										remainingMs,
-										schema.contractHashBytes,
-										opts?.signal,
-									),
-							);
-							callOp.captureOut(respBytes, schema.contractHash);
-							const result = schema.pair.output.decode(respBytes) as Res;
-							callOp.end(Status.SUCCESS);
-							return result;
-						} catch (proxyErr) {
-							callOp.end(
-								Status.ERROR,
-								proxyErr instanceof Error ? proxyErr.message : String(proxyErr),
-							);
-							throw proxyErr;
-						}
-					}
+				lastError = failure.error;
+				if (useDirect && transport === "auto") {
+					viaProxy = true;
+					fallback = true;
+					unreachable.push(candidate.instance.instanceId);
 				}
-				if (
-					attempt === retry.maxAttempts - 1 ||
-					!isRetryable(err, hasIdempotency)
-				) {
-					callOp.end(
-						Status.ERROR,
-						err instanceof Error ? err.message : String(err),
-					);
-					throw err;
-				}
-				await sleep(backoffDelay(retry, attempt), opts?.signal);
 			} finally {
 				release();
 			}
 		}
-		// unreachable, but keep TS happy
-		throw lastErr as Error;
+		const error =
+			lastError ??
+			new NoLiveInstanceError(
+				`rpc: ${serviceName}/${methodName}: deadline exhausted before any attempt`,
+			);
+		callOp?.end(Status.ERROR, error.message);
+		throw error;
 	}
 
-	// pickCandidate reads the contract-matched candidate list from the instance
-	// cache, runs P2C through the LB, and surfaces the errors callers need to map
-	// onto retry decisions.
+	// prepare checks the call against the local contract view. A method the
+	// mesh does not describe yet is NO_LIVE_INSTANCE (retryable: the callee may
+	// be starting), a missing caller schema is a programming error.
+	private prepare(
+		serviceName: string,
+		methodName: string,
+		streaming: boolean,
+	): CallerSchema {
+		const schema = this.d.resolveSchema(serviceName, methodName);
+		if (!schema) {
+			throw new ConfigurationError(
+				`rpc: no schema for ${serviceName}/${methodName} — declare it with sb.client() or sb.useSchema() before start()`,
+			);
+		}
+		const descriptor = this.d.instances.descriptorFor(serviceName, methodName);
+		if (descriptor && descriptor.streaming !== streaming) {
+			throw new ValidationError(
+				streaming
+					? `rpc: ${serviceName}/${methodName} is not a streaming method — use sb.rpc.call()`
+					: `rpc: ${serviceName}/${methodName} is a streaming method — use sb.stream()`,
+			);
+		}
+		return schema;
+	}
+
+	// pickCandidate reads the contract-matched candidates and runs P2C.
 	private pickCandidate(
 		serviceName: string,
 		methodName: string,
 		callerHash: string,
 	): Candidate {
-		const all = this.instances.candidatesFor(
+		const all = this.d.instances.candidatesFor(
 			serviceName,
 			methodName,
 			callerHash,
 		);
 		if (all.length === 0) {
-			throw noLiveInstance(
-				`rpc: no instance of ${serviceName}/${methodName} matches caller contract ${callerHash}`,
+			throw new NoLiveInstanceError(
+				`rpc: no live instance of ${serviceName}/${methodName} matches caller contract ${callerHash}`,
 			);
 		}
-		let candidate: Candidate;
 		try {
-			candidate = this.lb.pick(all);
+			return this.d.lb.pick(all);
 		} catch (err) {
-			// The LB reports "everything is filtered out" without knowing which
-			// call it was serving; keep the type and add the coordinates.
-			if (err instanceof NoLiveInstanceError) {
-				// The LB drops endpoint-less instances during eligibility, so
-				// "nothing eligible" has two very different causes and opposite
-				// fixes: nobody advertised an inbound address (the callee runs
-				// caller-only, or advertise is misconfigured) versus the fleet is
-				// there but shedding. Reporting the wrong one sends the operator
-				// after the wrong thing.
-				const advertised = all.some((c) => c.instance.callEndpoint !== "");
-				throw noLiveInstance(
-					advertised
-						? `rpc: no live instance of ${serviceName}/${methodName} matching contract ${callerHash} — all candidates unhealthy or circuit-open`
-						: `rpc: no endpoint for ${serviceName}/${methodName} matching contract ${callerHash} — the callee advertises no inbound address`,
-				);
-			}
-			throw err;
+			if (!(err instanceof NoLiveInstanceError)) throw err;
+			// "Nothing eligible" has two causes with opposite fixes: nobody
+			// advertised an inbound address, or the fleet is circuit-open.
+			const advertised = all.some((c) => c.instance.callEndpoint !== "");
+			throw new NoLiveInstanceError(
+				advertised
+					? `rpc: no live instance of ${serviceName}/${methodName} — all candidates circuit-open`
+					: `rpc: no endpoint for ${serviceName}/${methodName} — the callee advertises no inbound address`,
+			);
 		}
-		return candidate;
 	}
 
-	private shouldUseDirect(
-		candidate: Candidate,
-		transport: "direct" | "proxy" | "auto",
-	): boolean {
-		return (
-			this.directTransport !== null &&
-			transport !== "proxy" &&
-			candidate.instance.callEndpoint !== ""
-		);
+	// recordOutcome feeds the breaker. An answer from the instance — including a
+	// handler error or a refusal — proves it can serve; only transport-side
+	// failures count against it.
+	private recordOutcome(candidate: Candidate, failure: CallFailure): void {
+		const key = cbKey(candidate.instance);
+		if (failure.transport) this.d.cb.recordFailure(key);
+		else this.d.cb.recordSuccess(key);
 	}
 }
 
-// formatRpcCallSubject mirrors Go's telemetry.FormatSubject(ChannelRPC, KindRPCCall, svc, method)
-// → "rpc.call:<svc>/<method>" (ADR-0007).
+function useDirectFor(
+	candidate: Candidate,
+	transport: "direct" | "proxy" | "auto",
+): boolean {
+	return transport !== "proxy" && candidate.instance.callEndpoint !== "";
+}
+
+function directTarget(candidate: Candidate) {
+	return {
+		endpoint: candidate.instance.callEndpoint,
+		serviceId: candidate.instance.serviceId,
+		instanceId: candidate.instance.instanceId,
+	};
+}
+
+// asFailure normalises whatever a transport threw. An abort by the caller's
+// signal is CANCELLED and never retried.
+function asFailure(err: unknown, signal?: AbortSignal): CallFailure {
+	if (signal?.aborted)
+		return new CallFailure(
+			new ServiceBridgeError("CANCELLED", "rpc: call cancelled by the caller", {
+				cause: err,
+			}),
+			false,
+		);
+	if (err instanceof CallFailure) return err;
+	if (err instanceof ServiceBridgeError) return new CallFailure(err, false);
+	return new CallFailure(
+		new ServiceBridgeError(
+			"INTERNAL",
+			err instanceof Error ? err.message : String(err),
+			{ cause: err },
+		),
+		false,
+	);
+}
+
+// formatRpcCallSubject mirrors Go telemetry.FormatSubject → "rpc.call:<svc>/<method>".
 function formatRpcCallSubject(serviceName: string, methodName: string): string {
 	return `rpc.call:${serviceName}/${methodName}`;
 }
 
-// noLiveInstance keeps the callee-fleet-is-empty condition on its own error
-// type while carrying gRPC UNAVAILABLE, so retry treats it as a connection that
-// never happened and callers can tell it apart from a callee that answered
-// UNAVAILABLE without matching on message text.
-function noLiveInstance(message: string): NoLiveInstanceError {
-	return Object.assign(new NoLiveInstanceError(message), {
-		code: GRPC_CODE_UNAVAILABLE,
-		preDispatch: true,
-	});
-}
-
-// rpcCallMeta builds the RPC.CALL meta JSON. Written out instead of
-// JSON.stringify over an object literal: it runs on every call, and the literal
-// plus the generic object walk were short-lived garbage on the hot path.
+// rpcCallMeta builds the RPC.CALL meta JSON without an intermediate object:
+// it runs on every call.
 function rpcCallMeta(
 	methodName: string,
 	viaProxy: boolean,
@@ -491,7 +434,12 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 	return new Promise((resolve, reject) => {
 		const abort = () => {
 			clearTimeout(timer);
-			reject(signal?.reason ?? new Error("rpc cancelled"));
+			reject(
+				new ServiceBridgeError(
+					"CANCELLED",
+					"rpc: call cancelled by the caller",
+				),
+			);
 		};
 		const timer = setTimeout(() => {
 			signal?.removeEventListener("abort", abort);
@@ -501,27 +449,17 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 	});
 }
 
-function parseTimeout(s: string | undefined): number | undefined {
-	if (!s) return undefined;
+// timeoutMs parses "10s" / "500ms" / "2m". Undefined → 30 s default.
+export function timeoutMs(s: string | undefined): number {
+	if (!s) return DEFAULT_TIMEOUT_MS;
 	const m = /^(\d+)(ms|s|m)$/.exec(s.trim());
-	if (!m) throw new Error(`rpc: invalid timeout ${s}`);
-	const n = Number.parseInt(m[1]!, 10);
-	switch (m[2]) {
-		case "ms":
-			return n;
-		case "s":
-			return n * 1000;
-		case "m":
-			return n * 60_000;
-		default:
-			return undefined;
-	}
+	if (!m) throw new ConfigurationError(`rpc: invalid timeout ${s}`);
+	const n = Number.parseInt(m[1] ?? "0", 10);
+	return m[2] === "ms" ? n : m[2] === "s" ? n * 1000 : n * 60_000;
 }
 
-// SchemaRegistry is the caller-side mapping from (serviceName, methodName)
-// to a SchemaPair. Populated by ServiceBridge when the user calls
-// sb.service(..., { schemas: ... }) or directly via a low-level setter that
-// registers the same .proto schemas used by callees.
+// SchemaRegistry is the caller-side mapping (serviceName, methodName) →
+// CallerSchema, filled by sb.client() / sb.useSchema().
 export class SchemaRegistry {
 	private map = new Map<string, CallerSchema>();
 
@@ -541,14 +479,4 @@ export class SchemaRegistry {
 	asResolver(): SchemaResolver {
 		return (service, method) => this.get(service, method);
 	}
-}
-
-// A rejected request still proves that the callee can answer RPCs. Counting
-// validation, authorization and missing-data responses as pod failures would
-// block unrelated methods on the same healthy instance.
-function isApplicationRejection(err: unknown): boolean {
-	const code = (err as { code?: unknown })?.code;
-	return (
-		typeof code === "number" && [1, 3, 5, 6, 7, 9, 11, 12, 16].includes(code)
-	);
 }

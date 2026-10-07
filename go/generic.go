@@ -2,13 +2,13 @@ package servicebridge
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"iter"
 	"log/slog"
 	"sync"
-	"time"
 
 	"google.golang.org/protobuf/proto"
 
@@ -45,7 +45,7 @@ func Handle[Req, Resp proto.Message](c *Client, name string, fn func(ctx context
 		}
 		resp, err := fn(ctx, req)
 		if err != nil {
-			return nil, err
+			return nil, handlerFailure(err)
 		}
 		return proto.Marshal(resp)
 	}); err != nil {
@@ -73,17 +73,45 @@ func HandleStream[Req, Chunk proto.Message](c *Client, name string, fn func(ctx 
 		if err := serde.Decode(payload, req); err != nil {
 			return fmt.Errorf("%w: %w", rpc.ErrDecode, err)
 		}
-		return fn(ctx, req, func(chunk Chunk) error {
+		return handlerFailure(fn(ctx, req, func(chunk Chunk) error {
 			raw, err := proto.Marshal(chunk)
 			if err != nil {
 				return err
 			}
 			return send(raw)
-		})
+		}))
 	}); err != nil {
 		return wrap(op, err)
 	}
 	return wrap(op, c.declareIncoming(name, reqZero, chunkZero, true))
+}
+
+// handlerFailure decides what error code a handler failure answers with: the
+// code of a HandlerError the handler returned itself, INTERNAL for anything
+// else. An SDK error that merely carries a downstream HandlerError — a failed
+// nested Call returned as is — is not this handler's business decision, so it
+// answers INTERNAL rather than impersonating the downstream code.
+func handlerFailure(err error) error {
+	if err == nil {
+		return nil
+	}
+	var sdk *Error
+	if errors.As(err, &sdk) {
+		return errors.New(err.Error())
+	}
+	return err
+}
+
+// CallInfo describes the inbound call a handler is serving: the request id,
+// the caller's idempotency key, the calling service and instance, and the
+// caller's deadline.
+type CallInfo = rpc.CallInfo
+
+// CallInfoFromContext returns the CallInfo of the inbound call ctx belongs to.
+// The handler's ctx is also cancelled when the caller cancels or its deadline
+// passes.
+func CallInfoFromContext(ctx context.Context) (CallInfo, bool) {
+	return rpc.CallInfoFromContext(ctx)
 }
 
 func (c *Client) declareIncoming(name string, req, resp proto.Message, streaming bool) error {
@@ -122,16 +150,17 @@ func Call[Req, Resp proto.Message](ctx context.Context, c *Client, service, meth
 	if err != nil {
 		return zero, newError(CodeValidation, op, "request does not encode", err)
 	}
-	ctx, cancel := withTimeout(ctx, o.timeout)
+	ctx, cancel := context.WithTimeout(ctx, o.timeout)
 	defer cancel()
 
-	raw, err := c.callers[o.transport].Unary(ctx, rpc.Request{
+	raw, err := c.caller.Unary(ctx, rpc.Request{
 		Service:        service,
 		Method:         method,
 		Payload:        payload,
 		ContractHash:   serde.ContractHash(req.ProtoReflect().Descriptor(), zero.ProtoReflect().Descriptor()),
 		IdempotencyKey: o.idempotencyKey,
 		BusinessKey:    o.businessKey,
+		Transport:      o.transport.internal(),
 	})
 	if err != nil {
 		return zero, wrap(op, err)
@@ -158,16 +187,17 @@ func Stream[Req, Chunk proto.Message](ctx context.Context, c *Client, service, m
 			yield(zero, newError(CodeValidation, op, "request does not encode", err))
 			return
 		}
-		ctx, cancel := withTimeout(ctx, o.timeout)
+		ctx, cancel := context.WithTimeout(ctx, o.timeout)
 		defer cancel()
 
-		st, err := c.callers[o.transport].Stream(ctx, rpc.Request{
+		st, err := c.caller.Stream(ctx, rpc.Request{
 			Service:        service,
 			Method:         method,
 			Payload:        payload,
 			ContractHash:   serde.ContractHash(req.ProtoReflect().Descriptor(), zero.ProtoReflect().Descriptor()),
 			IdempotencyKey: o.idempotencyKey,
 			BusinessKey:    o.businessKey,
+			Transport:      o.transport.internal(),
 		})
 		if err != nil {
 			yield(zero, wrap(op, err))
@@ -208,13 +238,6 @@ func drain[Chunk proto.Message](st chunkStream, zero Chunk, yield func(Chunk, er
 			return
 		}
 	}
-}
-
-func withTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
-	if d <= 0 {
-		return context.WithCancel(ctx)
-	}
-	return context.WithTimeout(ctx, d)
 }
 
 // NewClient names another service this one talks to. It declares nothing on its
@@ -276,6 +299,7 @@ func (m *Method[Req, Resp]) Stream(ctx context.Context, req Req, opts ...CallOpt
 }
 
 // DefineEvent declares an event this service publishes and freezes its schema.
+// It is the publisher's declaration only: a subscriber never needs it.
 func DefineEvent[T proto.Message](c *Client, name string) (*Event[T], error) {
 	const op = "servicebridge.DefineEvent"
 	if c.isStarted() {
@@ -301,14 +325,16 @@ type Event[T proto.Message] struct {
 // Name is the event name as declared.
 func (e *Event[T]) Name() string { return e.name }
 
-// Publish buffers one occurrence.
+// Publish publishes one occurrence; see PublishEvent.
 func (e *Event[T]) Publish(ctx context.Context, payload T, opts ...PublishOption) (string, error) {
 	return PublishEvent[T](ctx, e.c, e.name, payload, opts...)
 }
 
-// PublishEvent buffers one event locally and returns its identifier. It is a
-// local insert, not a network call: an unreachable runtime has no right to slow
-// a publication down or to fail it.
+// PublishEvent publishes one event and returns its identifier once the runtime
+// acknowledged it — the event is in the runtime's store. The event waits in
+// an in-memory queue while the runtime is unreachable; the queue is bounded
+// (CodeQueueFull) and so is the wait (CodeTimeout, which says whether the
+// event was ever sent).
 func PublishEvent[T proto.Message](ctx context.Context, c *Client, name string, payload T, opts ...PublishOption) (string, error) {
 	const op = "servicebridge.PublishEvent"
 	if !c.canPublish() {
@@ -321,33 +347,69 @@ func PublishEvent[T proto.Message](ctx context.Context, c *Client, name string, 
 	return id, nil
 }
 
-// SubscribeEvent registers a typed handler for one event name or pattern.
-// Routing is the runtime's (ADR-0002) and the delivery carries the concrete
-// name the publisher used, so a pattern is matched locally as well — otherwise
-// a wildcard subscription would receive deliveries no exact lookup can place.
-func SubscribeEvent[T proto.Message](c *Client, name string, fn func(ctx context.Context, event T) error) error {
+// SubscribeEvent registers the handler for one event name or pattern (`*` one
+// segment, `#` zero or more). The payload is decoded into T, the subscriber's
+// own schema: nothing has to be defined with DefineEvent. Routing is the
+// runtime's — a delivery runs the handlers of the patterns it matched — and
+// one pattern has one handler per process.
+func SubscribeEvent[T proto.Message](c *Client, pattern string, fn func(ctx context.Context, event T) error, opts ...SubscribeOption) error {
 	const op = "servicebridge.SubscribeEvent"
-	if c.isStarted() {
-		return newError(CodeState, op, "subscriptions must be declared before Start", nil)
+	if fn == nil {
+		return newError(CodeValidation, op, "handler must not be nil", nil)
 	}
-	if err := events.Subscribe(c.eventSub, name, events.Handler[T](fn)); err != nil {
-		return wrap(op, err)
-	}
-	return wrap(op, c.decls.SubscribeEvent(name))
+	return c.subscribe(op, pattern, opts, func(filter string) error {
+		return events.Subscribe(c.eventSub, pattern, filter, events.Handler[T](fn))
+	})
 }
 
 // SubscribeEventRaw registers a handler that receives the payload undecoded.
-// It is the way to serve a name whose payload type varies by publisher, which
-// no single type parameter can describe.
-func SubscribeEventRaw(c *Client, name string, fn func(ctx context.Context, payload []byte) error) error {
+// It is the way to serve a pattern whose payload type varies by event.
+func SubscribeEventRaw(c *Client, pattern string, fn func(ctx context.Context, payload []byte) error, opts ...SubscribeOption) error {
 	const op = "servicebridge.SubscribeEventRaw"
+	if fn == nil {
+		return newError(CodeValidation, op, "handler must not be nil", nil)
+	}
+	return c.subscribe(op, pattern, opts, func(filter string) error {
+		return events.Subscribe(c.eventSub, pattern, filter, events.Handler[[]byte](fn))
+	})
+}
+
+func (c *Client) subscribe(op, pattern string, opts []SubscribeOption, register func(filter string) error) error {
 	if c.isStarted() {
 		return newError(CodeState, op, "subscriptions must be declared before Start", nil)
 	}
-	if err := events.Subscribe(c.eventSub, name, events.Handler[[]byte](fn)); err != nil {
+	var o subscribeOpts
+	for _, opt := range opts {
+		opt(&o)
+	}
+	filter := ""
+	if len(o.filter) > 0 {
+		raw, err := json.Marshal(o.filter)
+		if err != nil {
+			return newError(CodeValidation, op, "filter does not encode as JSON", err)
+		}
+		filter = string(raw)
+	}
+	if err := register(filter); err != nil {
 		return wrap(op, err)
 	}
-	return wrap(op, c.decls.SubscribeEvent(name))
+	return wrap(op, c.decls.SubscribeEvent(pattern, filter))
+}
+
+// SubscribeOption tunes one subscription.
+type SubscribeOption func(*subscribeOpts)
+
+type subscribeOpts struct {
+	filter map[string]any
+}
+
+// WithFilter narrows a subscription on the runtime: only events whose JSON
+// payload has every given path equal to its literal are delivered, e.g.
+// {"$.status": "paid", "$.region": "eu"}. The runtime evaluates it on the
+// event's payload_json and refuses a malformed filter at registration, which
+// stops the client.
+func WithFilter(filter map[string]any) SubscribeOption {
+	return func(o *subscribeOpts) { o.filter = filter }
 }
 
 // PublishOption tunes one publication.
@@ -373,8 +435,10 @@ func WithPartitionKey(key string) PublishOption {
 	return func(o *publishOpts) { o.partitionKey = key }
 }
 
-// WithFireAndForget sends the event straight to the runtime, skipping the local
-// buffer and every retry with it.
+// WithFireAndForget returns the id as soon as the event is queued, without
+// waiting for the runtime's acknowledgement. It accepts loss: until the runtime
+// acknowledges it the event lives only in process memory and dies with the
+// process, and a delivery failure is only logged. A full queue still fails.
 func WithFireAndForget() PublishOption {
 	return func(o *publishOpts) { o.fireAndForget = true }
 }
@@ -587,20 +651,31 @@ func (e *executor) Call(ctx context.Context, spec wfi.CallSpec) (any, error) {
 	if err != nil {
 		return nil, wrap(op, err)
 	}
-	transport := TransportDirect
-	if spec.Transport == "proxy" {
-		transport = TransportProxy
+	// The client's call defaults apply to a workflow call step exactly as to
+	// Call; the step overrides only what it states.
+	o := c.cfg.callOptions(nil)
+	switch spec.Transport {
+	case "proxy":
+		o.transport = TransportProxy
+	case "direct":
+		o.transport = TransportDirect
+	case "auto":
+		o.transport = TransportAuto
 	}
-	ctx, cancel := withTimeout(ctx, spec.Timeout)
+	if spec.Timeout > 0 {
+		o.timeout = spec.Timeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, o.timeout)
 	defer cancel()
 
-	raw, err := c.callers[transport].Unary(ctx, rpc.Request{
+	raw, err := c.caller.Unary(ctx, rpc.Request{
 		Service:        spec.Service,
 		Method:         spec.Method,
 		Payload:        payload,
 		ContractHash:   schema.ContractHash,
 		IdempotencyKey: spec.IdempotencyKey,
 		BusinessKey:    spec.RequestID,
+		Transport:      o.transport.internal(),
 	})
 	if err != nil {
 		return nil, err
@@ -654,13 +729,7 @@ func (e *executor) Publish(ctx context.Context, spec wfi.PublishSpec) (any, erro
 // StartRun starts a nested run. The runner parks afterwards rather than waiting
 // in process, so this returns as soon as the child exists.
 func (e *executor) StartRun(ctx context.Context, spec wfi.StartSpec) (string, error) {
-	return (*Client)(e).wfCall.Start(ctx, wfi.StartArgs{
-		Workflow:       spec.Workflow,
-		Input:          spec.Input,
-		IdempotencyKey: spec.IdempotencyKey,
-		TimeoutSec:     spec.TimeoutSec,
-		ParentRunID:    spec.ParentRunID,
-	})
+	return (*Client)(e).wfCall.Start(ctx, wfi.StartArgs(spec))
 }
 
 // wrapStep opens one user sub-operation around every unit the runner executes,

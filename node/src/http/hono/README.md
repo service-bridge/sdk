@@ -2,34 +2,33 @@
 
 ## Зона ответственности
 
-Интеграция SDK с Hono. `attachHono` собирает зарегистрированные роуты из `app.routes`, кладёт их в `sb.routes` (как `source: "hono"`), публикует HTTP-endpoint (`host:port`) через `RouteCollector.publishHttp`, и оборачивает `app.fetch` для трейсинга: парсит входящий `X-SB-Trace`, прогоняет downstream-цепочку в `runWithTrace`, эмитит HTTP.HANDLE-операцию и захватывает тела запроса/ответа. ADR 0001.
+Интеграция SDK с Hono. `attachHono` собирает зарегистрированные роуты из `app.routes`, кладёт их в `sb.routes` (как `source: "hono"`), публикует HTTP-endpoint (`host:port`) через `RouteCollector.publishHttp`, и оборачивает `app.fetch` для трейсинга: прогоняет downstream-цепочку в `runWithTrace`, эмитит HTTP.HANDLE-операцию и захватывает тела запроса/ответа. ADR 0001.
 
 Не делает: не запускает сервер (Hono server-agnostic — пользователь поднимает `Bun.serve` / `@hono/node-server` / Deno вручную), не нормализует паттерны роутов (pattern идёт в registry as-is — косметика на UI Service Map).
 
 ## Публичный контракт
 
-Импорт: `import { attachHono, collectHonoRoutes, type HonoEndpoint } from "service-bridge/hono";`
+Импорт: `import { attachHono, type HonoEndpoint } from "service-bridge/hono";`
 
 | Имя | Тип | По умолчанию | Что делает |
 |-----|-----|--------------|------------|
 | `attachHono` | `(app: Hono, sb: ServiceBridge, endpoint: HonoEndpoint) => void` | — | Собирает роуты из `app.routes` в `sb.routes`, резолвит `host` через `resolveHttpAdvertiseHost(endpoint.host)`, публикует endpoint `host:port` через `sb.routes.publishHttp`, оборачивает `app.fetch` для трейсинга (idempotent — повторный вызов на том же `app` не дублирует обёртку). Если вызван до `sb.start()` — endpoint попадёт в первый `RegisterRequest` без restart; после `start()` — `publishHttp` рестартует Registry-watch стрим. |
-| `collectHonoRoutes` | `(app: Hono, sb: ServiceBridge) => void` | — | Только сбор роутов в `sb.routes`, без публикации endpoint и без обёртки `fetch`. Низкоуровневый слой для тестов. Метод приводится к верхнему регистру; `method === "ALL"` (от `app.all(...)`) пропускается. |
 | `HonoEndpoint` | `interface { host?: string; port: number }` | — | Адрес, на котором фактически слушает Hono-сервер. `port` обязателен (Hono агностичен к серверу, не открывает сокет сам — должен совпадать с тем, что передан в `Bun.serve`/`serve`). `host` опционален. |
 | `HonoEndpoint.host` | `string \| undefined` | `127.0.0.1` (с одноразовым warn) | Advertise-host для HTTP-плоскости (ADR 0001). Если опущен — `resolveHttpAdvertiseHost()` → `127.0.0.1`. |
-| `HonoEndpoint.resolveRemoteAddress` | `(request, env, executionContext) => string \| null \| undefined` | absent | Real server peer address; required for explicit rateLimit. Forwarded headers require trustProxyHops. |
 | `HonoEndpoint.port` | `number` | — (обязателен) | Порт HTTP-сервера. |
-| `HonoEndpoint.security` | `HttpSecurityOptions` | scanner block; limiter only with resolver | Early request guard before handler/telemetry. |
+| `HonoEndpoint.trustTraceHeader` | `boolean` | `false` | Принимать входящий `X-SB-Trace` и встраивать запрос в trace вызывающего. По умолчанию заголовок игнорируется (публичный edge не даёт клиентам встраиваться в чужие trace); включать для HTTP-сервера, к которому ходят только другие сервисы ServiceBridge. |
 
 ### Трейсинг и захват тел (поведение обёртки `app.fetch`)
 
 `attachHono` оборачивает `app.fetch` один раз (флаг `Symbol.for("servicebridge.hono.trace")` на инстансе `app`). На каждый запрос:
 
-- `X-SB-Trace` парсится в `TraceContext`; при отсутствии/невалидности минтится свежий root.
-- `businessKey` = заголовок `Idempotency-Key`, иначе `"<METHOD> <pathname>"`.
+- шаблон роута — последняя не-middleware запись, которую находит `app.router.match(method, pathname)` (`"*"`, если нет); subject `http.handle:<METHOD>/<route>`, meta `{method, route, status}`.
+- `X-SB-Trace` учитывается только при `trustTraceHeader`; иначе — свежий root.
+- `businessKey` = заголовок `Idempotency-Key`, иначе `"<METHOD> <route>"`.
 - downstream-цепочка выполняется внутри `runWithTrace(op.scope, …)`, чтобы handler и его `sb.rpc.call` / `event.publish` видели через ALS контекст, где `traceId` един с HTTP.HANDLE, а `parentOpId` = `opId` этого op'а (downstream вложен под HTTP.HANDLE, не отдельный корень).
 - эмитится HTTP.HANDLE-операция (`Channel.HTTP`, `kind: HttpHandle`) через общий `startHttpOp` (`../_common/http-op`).
 - Passive capture wraps body reads without clone/tee or read-ahead, retaining at most payloadMaxBytes per direction. Headers return immediately. Unread bodies are not captured.
-- статус операции: `statusForHttpCode` — HTTP `>= 400` (включая `>= 500`) → `Status.ERROR` (с текстом `HTTP <code>`), иначе `Status.SUCCESS`; исключение из цепочки → `Status.ERROR` с сообщением и ре-throw. На wire это единый словарь статусов (`success`/`error`).
+- статус операции: HTTP `>= 400` → `Status.ERROR` (`HTTP <code>`), иначе `Status.SUCCESS`; исключение из цепочки → `Status.ERROR` с сообщением и ре-throw. На wire это единый словарь статусов (`success`/`error`).
 
 ### Пример использования (Bun)
 
@@ -96,4 +95,4 @@ serve({ fetch: app.fetch, port: 8080 });
 - `sdk/node/src/http/hono/plugin.test.ts`.
 - Прикладной код через subpath `service-bridge/hono`.
 
-Passive capture wraps body reads without tee/clone, retaining at most payloadMaxBytes per direction. Response headers are returned immediately; unread body is not captured. Late capture respects the terminal HTTP status. HonoEndpoint.resolveRemoteAddress(request, env, executionContext) must read the actual server peer address; without it the default per-client limiter is disabled. Explicit rateLimit requires this resolver. Proxy headers remain opt-in through trustProxyHops.
+Passive capture wraps body reads without tee/clone, retaining at most payloadMaxBytes per direction. Response headers are returned immediately; unread body is not captured. Late capture respects the terminal HTTP status. 

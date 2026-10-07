@@ -1,123 +1,71 @@
-import type { ServiceBridge } from "../connection/service-bridge";
+import type { Logger } from "../logger";
 import type {
+	EventDelivery,
 	EventsClient,
 	SubscribeClientMessage,
+	SubscribeServerMessage,
 } from "../pb/servicebridge/v1/events";
-import {
-	Ack,
-	Nack,
-	SubscribeClientMessage as SubscribeClientMessageFns,
-	SubscribeInit,
-} from "../pb/servicebridge/v1/events";
-import type { EventHandlerFn } from "../registry/registry";
+import { Ack, Nack, SubscribeInit } from "../pb/servicebridge/v1/events";
+import type { SubscriptionEntry } from "../registry/registry";
 import { StreamSupervisor } from "../registry/stream-supervisor";
-import type { SchemaPair } from "../serde/serializer";
 import type { ReconnectDelayOptions } from "../utils/reconnect-ladder";
 import { Semaphore } from "../utils/semaphore";
-import type { Logger } from "./publisher";
 
-// EventStream is the bidi Subscribe call. Typed from the generated client so
-// the ack/nack writes stay on the same object the supervisor owns.
+// EventStream is the bidi Subscribe call.
 type EventStream = ReturnType<EventsClient["subscribe"]>;
 
-// InboundDelivery is the only server frame the subscriber acts on.
-interface InboundDelivery {
-	deliveryId: string;
-	envelope?: {
-		id: string;
-		name: string;
-		payload: Uint8Array;
-		partitionKey?: string;
-		xSbTrace?: string;
-	};
-	attempt: number;
-	leaseToken?: string;
-}
+/** Default concurrently handled deliveries; same in the Go SDK. */
+export const DEFAULT_EVENTS_MAX_IN_FLIGHT = 32;
 
 // @internal
-interface SubscriberIdentity {
-	serviceId: string;
-	instanceId: string;
-}
-
-// SchemaIndex for subscriber — maps event name to its schema pair.
-// @internal
-export interface SubscriberSchemaIndex {
-	get(name: string): { contractHash: string; pair: SchemaPair } | undefined;
-}
-
-const DEFAULT_MAX_IN_FLIGHT = 32;
-
-// @public — см. ./README.md
 export interface SubscriberDeps {
-	rpcClient: EventsClient;
-	schemaIndex: SubscriberSchemaIndex;
-	identity: () => SubscriberIdentity | null;
-	// handlers returns the in-process fan-out set for one exact event name.
-	// Lookup, not a scan: the registry keeps the bucket indexed by pattern, so a
-	// delivery costs a Map hit instead of rebuilding the whole handler list.
-	handlers: (pattern: string) => readonly EventHandlerFn[];
-	maxInFlight?: number;
-	logger?: Logger;
-	sb?: ServiceBridge;
-	// reconnectOpts pins the backoff ladder/jitter; tests inject a short
-	// deterministic ladder so reconnect behaviour is observable in milliseconds.
-	// @internal
-	reconnectOpts?: ReconnectDelayOptions;
-	// onSchedule observes each reconnect delay. See StreamSupervisorDeps.
-	onSchedule?: (delayMs: number) => void;
-	// runWithTrace runs the handler inside an AsyncLocalStorage trace context
-	// derived from envelope.xSbTrace so nested RPC/event calls inherit the trace.
-	// Mandatory: a missing hook would silently drop trace propagation into the
-	// delivered handler.
-	// @internal
+	// The events channel; null until the bridge has one.
+	client: () => EventsClient | null;
+	identity: () => { serviceId: string; instanceId: string } | null;
+	// This process's handler for one matched pattern.
+	subscription: (pattern: string) => SubscriptionEntry | undefined;
+	maxInFlight: number;
+	logger: Logger;
+	// Runs the handler inside the publisher's trace context so nested calls
+	// join the same trace.
 	runWithTrace: (xSbTrace: string, fn: () => Promise<void>) => Promise<void>;
+	// Test hooks: pin the reconnect ladder / observe scheduled delays.
+	reconnectOpts?: ReconnectDelayOptions;
+	onSchedule?: (delayMs: number) => void;
 }
 
-// Subscriber opens a long-lived bidi Subscribe stream and dispatches inbound
-// EventDelivery messages using the concrete event name and matching registered
-// patterns. Server routing determines delivery; handlers must be idempotent.
-// @public — см. ./README.md
+// Subscriber holds the Subscribe stream open and runs the handlers of every
+// pattern a delivery matched (EventDelivery.matched_patterns). Nothing is
+// matched locally: routing and filters are the runtime's (ADR-0002, decision
+// 7). Handlers must be idempotent: delivery is at-least-once.
+//
+// @internal — см. ./README.md
 export class Subscriber {
-	private readonly deps: SubscriberDeps;
-	private readonly logger: Logger;
-	private readonly maxInFlight: number;
-	private readonly runWithTrace: (
-		xSbTrace: string,
-		fn: () => Promise<void>,
-	) => Promise<void>;
-
 	private readonly supervisor: StreamSupervisor<
 		EventStream,
-		{ delivery?: InboundDelivery }
+		SubscribeServerMessage
 	>;
-
-	// Per-partition serial queues. Events that share a partition_key must reach
-	// their handlers in publication order — the server enforces «one in_flight
-	// per partition» but the gRPC stream "data" listener fires async, so two
-	// deliveries can arrive in quick succession and race on handler scheduling.
-	// We serialize by chaining a Promise per partition key. Empty partition_key
-	// stays parallel (no FIFO requirement). Keys with no pending work are
-	// dropped from the map after their chain drains.
+	// Per-partition serial queues: deliveries sharing a key reach handlers in
+	// order even though stream frames are dispatched asynchronously.
 	private partitionQueues = new Map<string, Promise<void>>();
 	private readonly slots: Semaphore;
-	private readonly stopping = new AbortController();
 	private streamController = new AbortController();
+	private draining = false;
+	private inflight = 0;
+	private idleWaiters: (() => void)[] = [];
 
-	constructor(deps: SubscriberDeps) {
-		this.deps = deps;
-		this.maxInFlight = deps.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT;
-		this.slots = new Semaphore(this.maxInFlight, 0);
-		this.logger = deps.logger ?? { warn: console.warn, error: console.error };
-		this.runWithTrace = deps.runWithTrace;
+	constructor(private readonly d: SubscriberDeps) {
+		this.slots = new Semaphore(d.maxInFlight, 0);
 		this.supervisor = new StreamSupervisor({
 			open: () => this.openStream(),
 			onData: (msg, stream) => this.handleFrame(msg, stream),
 			onDisconnect: () => this.streamController.abort(),
 			onError: (err) =>
-				this.logger.warn("events: subscriber: stream error", err.message),
-			reconnectOpts: deps.reconnectOpts,
-			onSchedule: deps.onSchedule,
+				d.logger.warn("events: subscribe stream failed", {
+					error: err.message,
+				}),
+			reconnectOpts: d.reconnectOpts,
+			onSchedule: d.onSchedule,
 		});
 	}
 
@@ -125,194 +73,202 @@ export class Subscriber {
 		this.supervisor.start();
 	}
 
-	async stop(): Promise<void> {
-		this.stopping.abort();
+	/** Reopens the stream at once (new session identity, recovered channel). */
+	restart(): void {
+		this.supervisor.restart();
+	}
+
+	/**
+	 * Stops taking new deliveries (left unanswered: the runtime redelivers them
+	 * once this instance disconnects) and waits for the handlers already running, up to
+	 * timeoutMs. The stream stays open meanwhile so their acks still reach the
+	 * runtime.
+	 */
+	async drain(timeoutMs: number): Promise<void> {
+		this.draining = true;
+		if (this.inflight === 0) return;
+		await new Promise<void>((resolve) => {
+			const timer = setTimeout(done, timeoutMs);
+			const self = this;
+			function done() {
+				clearTimeout(timer);
+				self.idleWaiters = self.idleWaiters.filter((w) => w !== done);
+				resolve();
+			}
+			this.idleWaiters.push(done);
+		});
+	}
+
+	stop(): void {
+		this.draining = true;
 		this.streamController.abort();
 		this.supervisor.stop();
 	}
 
-	// openStream opens the bidi Subscribe call and sends SubscribeInit as its
-	// first frame. Null while identity is missing — the supervisor retries on
-	// the ladder.
 	private openStream(): EventStream | null {
-		const id = this.deps.identity();
-		if (!id) return null;
-
+		const client = this.d.client();
+		const id = this.d.identity();
+		if (!client || !id) return null;
 		this.streamController = new AbortController();
-		const stream = this.deps.rpcClient.subscribe();
-		stream.write(
-			SubscribeClientMessageFns.create({
-				init: SubscribeInit.create({
-					subscriberServiceId: id.serviceId,
-					subscriberInstanceId: id.instanceId,
-					maxInFlight: this.maxInFlight,
-				}),
+		const stream = client.subscribe();
+		stream.write({
+			init: SubscribeInit.create({
+				subscriberServiceId: id.serviceId,
+				subscriberInstanceId: id.instanceId,
+				maxInFlight: this.d.maxInFlight,
 			}),
-		);
+		});
 		return stream;
 	}
 
-	private handleFrame(
-		msg: { delivery?: InboundDelivery },
-		stream: EventStream,
-	): void {
+	private handleFrame(msg: SubscribeServerMessage, stream: EventStream): void {
 		const delivery = msg.delivery;
-		if (!delivery || this.stopping.signal.aborted) return;
+		if (!delivery) return;
+		// A draining instance leaves new deliveries unanswered: they return to
+		// the runtime when it disconnects, without spending an attempt.
+		if (this.draining) return;
 		const signal = this.streamController.signal;
 		const key = delivery.envelope?.partitionKey ?? "";
-		const xSbTrace = delivery.envelope?.xSbTrace ?? "";
 		const admitted = this.slots.acquire(signal);
+		void admitted.catch(() => {});
+		this.inflight++;
 		const work = async () => {
 			try {
-				await admitted;
-			} catch {
-				this.sendNack(
-					stream,
-					delivery.deliveryId,
-					"local_overload",
-					delivery.envelope?.id,
-					delivery.leaseToken,
-				);
-				return;
-			}
-			try {
-				if (!signal.aborted)
-					await this.runWithTrace(xSbTrace, () =>
-						this.handleDelivery(stream, delivery, signal),
-					);
+				try {
+					await admitted;
+				} catch {
+					this.nack(stream, delivery, "local_overload");
+					return;
+				}
+				try {
+					if (!signal.aborted)
+						await this.d.runWithTrace(delivery.envelope?.xSbTrace ?? "", () =>
+							this.handleDelivery(stream, delivery, signal),
+						);
+				} finally {
+					this.slots.release();
+				}
 			} finally {
-				this.slots.release();
+				this.done();
 			}
 		};
-		void admitted.catch(() => {});
 		if (key === "") {
-			// No partition → parallel processing OK.
 			void work();
 			return;
 		}
-		// Chain onto the partition's queue so the next handler waits for the
-		// previous one's full handler→ack cycle to complete.
 		const prev = this.partitionQueues.get(key) ?? Promise.resolve();
 		const next = prev.then(work, work);
 		this.partitionQueues.set(key, next);
 		void next.finally(() => {
-			if (this.partitionQueues.get(key) === next) {
+			if (this.partitionQueues.get(key) === next)
 				this.partitionQueues.delete(key);
-			}
 		});
+	}
+
+	private done(): void {
+		this.inflight--;
+		if (this.inflight > 0) return;
+		const waiters = this.idleWaiters;
+		this.idleWaiters = [];
+		for (const w of waiters) w();
 	}
 
 	private async handleDelivery(
 		stream: EventStream,
-		delivery: InboundDelivery,
+		delivery: EventDelivery,
 		signal: AbortSignal,
 	): Promise<void> {
-		const { deliveryId, envelope, leaseToken } = delivery;
+		const envelope = delivery.envelope;
 		if (!envelope) {
-			this.sendNack(
+			this.nack(stream, delivery, "missing envelope");
+			return;
+		}
+		// During a rolling deploy another instance of this service may subscribe
+		// to a pattern this one does not have: run what this instance has; with
+		// nothing to run, nack so the runtime redelivers — likely elsewhere.
+		const entries = delivery.matchedPatterns
+			.map((p) => this.d.subscription(p))
+			.filter((e): e is SubscriptionEntry => e !== undefined);
+		if (entries.length === 0) {
+			this.nack(
 				stream,
-				deliveryId,
-				"missing envelope",
-				undefined,
-				leaseToken,
+				delivery,
+				`no handler for matched patterns [${delivery.matchedPatterns.join(", ")}]`,
 			);
 			return;
 		}
-
-		const { id: eventId, name, payload } = envelope;
-		const schemaEntry = this.deps.schemaIndex.get(name);
-		if (!schemaEntry) {
-			this.sendNack(stream, deliveryId, "no_schema", eventId, leaseToken);
-			return;
-		}
-
-		// Resolve registered patterns matching the delivered concrete name.
-		// Server routing determines delivery; handlers must be idempotent.
-		const handlers = this.deps.handlers(name);
-		if (handlers.length === 0) {
-			this.sendNack(
-				stream,
-				deliveryId,
-				"no_registered_handler",
-				eventId,
-				leaseToken,
-			);
-			return;
-		}
-
-		// Decode payload once.
-		let decoded: unknown;
-		try {
-			decoded = schemaEntry.pair.input.decode(payload);
-		} catch (decodeErr) {
-			this.sendNack(
-				stream,
-				deliveryId,
-				`decode_error: ${String(decodeErr)}`,
-				eventId,
-				leaseToken,
-			);
-			return;
-		}
-
-		for (const handler of handlers) {
+		const ctx = {
+			eventId: envelope.id,
+			eventName: envelope.name,
+			attempt: delivery.attempt,
+			deliveryId: delivery.deliveryId,
+			leaseToken: delivery.leaseToken,
+			partitionKey: envelope.partitionKey,
+			headers: envelope.headers,
+			occurredAtMs: Number(envelope.occurredAtUnixMs),
+			signal,
+		};
+		for (const entry of entries) {
 			if (signal.aborted) return;
+			let payload: unknown = envelope.payload;
+			if (entry.schemaPair) {
+				try {
+					payload = entry.schemaPair.input.decode(envelope.payload);
+				} catch (err) {
+					this.nack(
+						stream,
+						delivery,
+						`decode for pattern ${entry.pattern}: ${(err as Error).message}`,
+					);
+					return;
+				}
+			}
 			try {
-				await handler(decoded, {
-					attempt: delivery.attempt,
-					deliveryId,
-					eventId,
-					leaseToken: leaseToken ?? "",
-					signal,
-				});
+				await entry.fn(payload, ctx);
 			} catch (err) {
-				this.sendNack(stream, deliveryId, String(err), eventId, leaseToken);
+				this.nack(
+					stream,
+					delivery,
+					err instanceof Error ? err.message : String(err),
+				);
 				return;
 			}
 		}
-
-		if (!signal.aborted) this.sendAck(stream, deliveryId, eventId, leaseToken);
+		if (!signal.aborted) this.ack(stream, delivery);
 	}
 
-	private sendAck(
-		stream: EventStream,
-		deliveryId: string,
-		eventId?: string,
-		leaseToken?: string,
-	): void {
-		try {
-			const msg: SubscribeClientMessage = {
-				ack: Ack.create({
-					deliveryId,
-					leaseToken: leaseToken ?? "",
-					eventId: eventId ? Buffer.from(eventId) : Buffer.alloc(0),
-				}),
-			};
-			stream.write(msg);
-		} catch (err) {
-			this.logger.warn("events: subscriber: ack write failed", String(err));
-		}
+	private ack(stream: EventStream, delivery: EventDelivery): void {
+		this.write(stream, {
+			ack: Ack.create({
+				deliveryId: delivery.deliveryId,
+				leaseToken: delivery.leaseToken,
+				eventId: Buffer.from(delivery.envelope?.id ?? ""),
+			}),
+		});
 	}
 
-	private sendNack(
+	private nack(
 		stream: EventStream,
-		deliveryId: string,
-		errorMessage: string,
-		eventId?: string,
-		leaseToken?: string,
+		delivery: EventDelivery,
+		reason: string,
 	): void {
+		this.write(stream, {
+			nack: Nack.create({
+				deliveryId: delivery.deliveryId,
+				leaseToken: delivery.leaseToken,
+				errorMessage: reason,
+				eventId: Buffer.from(delivery.envelope?.id ?? ""),
+			}),
+		});
+	}
+
+	private write(stream: EventStream, msg: SubscribeClientMessage): void {
 		try {
-			const msg: SubscribeClientMessage = {
-				nack: Nack.create({
-					deliveryId,
-					leaseToken: leaseToken ?? "",
-					errorMessage,
-					eventId: eventId ? Buffer.from(eventId) : Buffer.alloc(0),
-				}),
-			};
 			stream.write(msg);
 		} catch (err) {
-			this.logger.warn("events: subscriber: nack write failed", String(err));
+			this.d.logger.warn("events: ack/nack write failed", {
+				error: (err as Error).message,
+			});
 		}
 	}
 }

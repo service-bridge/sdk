@@ -3,163 +3,167 @@ package sbtest
 import (
 	"context"
 	"fmt"
-	"sync"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"google.golang.org/protobuf/proto"
+
+	pb "github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1"
+	"github.com/service-bridge/sdk/go/internal/serde"
 )
 
-// Subscriber is one registered event handler, with the payload already decoded.
-type Subscriber[T any] func(ctx context.Context, event T) error
-
-// PublishRecord is one published event, in the order it happened. Payload is the
-// value as the publisher passed it, not a decoded copy.
-type PublishRecord struct {
-	Name    string
-	Payload any
+// PublishedEvent is one event the code under test published, as the runtime
+// received it.
+type PublishedEvent struct {
+	ID             string
+	Name           string
+	Payload        []byte
+	PayloadJSON    []byte
+	PartitionKey   string
+	IdempotencyKey string
+	Headers        map[string]string
+	OccurredAtMs   int64
 }
 
-// Delivery is what one Publish did: which subscribers saw the event and how each
-// answered. Acked is false when the handler returned an error — the runtime
-// nacks such a delivery and redelivers it later.
-type Delivery struct {
-	Name  string
+// DecodePublished reads a published payload back as T.
+func DecodePublished[T proto.Message](e PublishedEvent) (T, error) {
+	var zero T
+	out := serde.New(zero)
+	if err := serde.Decode(e.Payload, out); err != nil {
+		return zero, fmt.Errorf("sbtest: decode published %s: %w", e.Name, err)
+	}
+	return out, nil
+}
+
+// Published returns the events the runtime acknowledged, in order. Every one
+// went through the client's real publish queue; the in-memory runtime accepts
+// each envelope.
+func (h *Harness) Published() []PublishedEvent {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]PublishedEvent(nil), h.published...)
+}
+
+func (h *Harness) publish(_ context.Context, req *pb.PublishRequest) (*pb.PublishResponse, error) {
+	resp := &pb.PublishResponse{}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, env := range req.GetEvents() {
+		h.published = append(h.published, PublishedEvent{
+			ID:             env.GetId(),
+			Name:           env.GetName(),
+			Payload:        env.GetPayload(),
+			PayloadJSON:    env.GetPayloadJson(),
+			PartitionKey:   env.GetPartitionKey(),
+			IdempotencyKey: env.GetIdempotencyKey(),
+			Headers:        env.GetHeaders(),
+			OccurredAtMs:   env.GetOccurredAtUnixMs(),
+		})
+		resp.Results = append(resp.Results, &pb.PublishStatusEntry{
+			EventId: env.GetId(),
+			Status:  pb.PublishStatus_PUBLISH_STATUS_ACCEPTED,
+		})
+	}
+	return resp, nil
+}
+
+// DeliveryResult is what the subscriber answered.
+type DeliveryResult struct {
 	Acked bool
-	Err   error
+	// Reason is the nack reason; empty when acked.
+	Reason string
+	// MatchedPatterns are the patterns the delivery carried.
+	MatchedPatterns []string
 }
 
-// Event doubles both directions of durable events: what this service publishes
-// and what it subscribes to.
-type Event struct {
-	mu       sync.Mutex
-	handlers map[string][]erasedFunc
-	// defined records the names declared with Define. Publishing an undeclared
-	// name is refused, because the runtime rejects a publish whose event was
-	// never registered and a test that skips the declaration would pass against
-	// a shape production never accepts.
-	defined    map[string]struct{}
-	published  []PublishRecord
-	deliveries []Delivery
+// DeliverOption tunes one simulated delivery.
+type DeliverOption func(*pb.EventDelivery)
+
+// WithMatchedPatterns sets the patterns the delivery names instead of
+// computing them. Use it to reproduce what a filter on the runtime decided.
+func WithMatchedPatterns(patterns ...string) DeliverOption {
+	return func(d *pb.EventDelivery) { d.MatchedPatterns = patterns }
 }
 
-// NewEvent builds an empty event double.
-func NewEvent() *Event {
-	return &Event{
-		handlers: make(map[string][]erasedFunc),
-		defined:  make(map[string]struct{}),
-	}
+// WithAttempt sets the delivery attempt (1 by default).
+func WithAttempt(n int32) DeliverOption {
+	return func(d *pb.EventDelivery) { d.Attempt = n }
 }
 
-// Define declares an event this service publishes.
-func Define[T any](e *Event, name string) error {
-	if e == nil {
-		return fmt.Errorf("sbtest: define %q: nil event double: %w", name, ErrInvalidArg)
-	}
-	if name == "" {
-		return fmt.Errorf("sbtest: define: empty event name: %w", ErrInvalidArg)
-	}
-
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if _, taken := e.defined[name]; taken {
-		return fmt.Errorf("sbtest: define %q: %w", name, ErrDuplicate)
-	}
-	e.defined[name] = struct{}{}
-	return nil
+// WithDeliveryPartitionKey sets the envelope's partition key.
+func WithDeliveryPartitionKey(key string) DeliverOption {
+	return func(d *pb.EventDelivery) { d.Envelope.PartitionKey = key }
 }
 
-// Subscribe registers a handler for an exact event name.
-//
-// Several handlers may share one name — the runtime fans a delivery out to all
-// of them, and Publish reproduces that.
-func Subscribe[T any](e *Event, name string, fn Subscriber[T]) error {
-	if e == nil {
-		return fmt.Errorf("sbtest: subscribe %q: nil event double: %w", name, ErrInvalidArg)
-	}
-	if name == "" {
-		return fmt.Errorf("sbtest: subscribe: empty event name: %w", ErrInvalidArg)
-	}
-	if fn == nil {
-		return fmt.Errorf("sbtest: subscribe %q: nil handler: %w", name, ErrInvalidArg)
-	}
-
-	wrapped := erase(func(ctx context.Context, event T) (any, error) {
-		return nil, fn(ctx, event)
-	})
-
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.handlers[name] = append(e.handlers[name], wrapped)
-	return nil
+// WithDeliveryHeaders sets the envelope's headers.
+func WithDeliveryHeaders(headers map[string]string) DeliverOption {
+	return func(d *pb.EventDelivery) { d.Envelope.Headers = headers }
 }
 
-// Publish records the event and delivers it to every subscriber of that exact
-// name.
-//
-// Matching is by exact name only. Wildcard routing belongs to the runtime, so a
-// double that matched patterns locally would answer a question production never
-// asks of the SDK.
-func Publish[T any](ctx context.Context, e *Event, name string, payload T) (Delivery, error) {
-	if e == nil {
-		return Delivery{}, fmt.Errorf("sbtest: publish %q: nil event double: %w", name, ErrInvalidArg)
+// Deliver hands one event to the client's subscriber the way the runtime
+// does. The delivery names the subscription patterns the event name matches —
+// computed here with the runtime's rules (`*` one segment, `#` zero or more),
+// filters are not evaluated — and the subscriber runs the handlers of exactly
+// those patterns. The payload goes through the real encoding; the handler gets
+// it decoded into its own type, and DeliveryFromContext works.
+func (h *Harness) Deliver(ctx context.Context, name string, payload proto.Message, opts ...DeliverOption) (DeliveryResult, error) {
+	enc, err := serde.Encode(payload)
+	if err != nil {
+		return DeliveryResult{}, fmt.Errorf("sbtest: deliver %s: encode: %w", name, err)
 	}
-	if name == "" {
-		return Delivery{}, fmt.Errorf("sbtest: publish: empty event name: %w", ErrInvalidArg)
+	id, err := uuid.NewV7()
+	if err != nil {
+		return DeliveryResult{}, fmt.Errorf("sbtest: deliver %s: mint id: %w", name, err)
 	}
-
-	e.mu.Lock()
-	if _, declared := e.defined[name]; !declared {
-		e.mu.Unlock()
-		return Delivery{}, fmt.Errorf("sbtest: publish %q: %w — declare it with Define first", name, ErrNoHandler)
+	d := &pb.EventDelivery{
+		DeliveryId: uuid.NewString(),
+		LeaseToken: uuid.NewString(),
+		Attempt:    1,
+		Envelope: &pb.EventEnvelope{
+			Id:               id.String(),
+			Name:             name,
+			Payload:          enc.Proto,
+			PayloadJson:      enc.JSON,
+			ContractHash:     enc.ContractHash,
+			OccurredAtUnixMs: time.Now().UnixMilli(),
+		},
 	}
-	e.published = append(e.published, PublishRecord{Name: name, Payload: payload})
-	handlers := make([]erasedFunc, len(e.handlers[name]))
-	copy(handlers, e.handlers[name])
-	e.mu.Unlock()
-
-	// No subscriber for the name is an ack, not a failure: routing is the
-	// runtime's, so a delivery reaching a service that handles nothing under
-	// that name is spent, and nacking it would have the runtime redeliver
-	// forever.
-	result := Delivery{Name: name, Acked: true}
-	for _, h := range handlers {
-		// The first failing handler decides the delivery: the runtime nacks the
-		// whole delivery, so the remaining handlers of a nacked event never run
-		// in production either.
-		if _, err := h(ctx, any(payload)); err != nil {
-			result.Acked = false
-			result.Err = err
-			break
+	for _, sub := range h.mem.Subscriptions() {
+		if MatchPattern(sub.Pattern, name) {
+			d.MatchedPatterns = append(d.MatchedPatterns, sub.Pattern)
 		}
 	}
-
-	e.mu.Lock()
-	e.deliveries = append(e.deliveries, result)
-	e.mu.Unlock()
-	return result, nil
+	for _, opt := range opts {
+		opt(d)
+	}
+	acked, reason := h.mem.Deliver(ctx, d)
+	return DeliveryResult{Acked: acked, Reason: reason, MatchedPatterns: d.MatchedPatterns}, nil
 }
 
-// Published returns every event published so far, oldest first.
-func (e *Event) Published() []PublishRecord {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	out := make([]PublishRecord, len(e.published))
-	copy(out, e.published)
-	return out
+// MatchPattern reports whether the runtime routes an event name to a
+// subscription pattern: segments separated by dots, `*` exactly one segment,
+// `#` zero or more. It stands in for the runtime here; the client itself never
+// matches patterns.
+func MatchPattern(pattern, name string) bool {
+	return matchSegments(strings.Split(pattern, "."), strings.Split(name, "."))
 }
 
-// Deliveries returns the outcome of every publish so far, oldest first.
-func (e *Event) Deliveries() []Delivery {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	out := make([]Delivery, len(e.deliveries))
-	copy(out, e.deliveries)
-	return out
-}
-
-// Reset clears every declaration, subscription and recording.
-func (e *Event) Reset() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.handlers = make(map[string][]erasedFunc)
-	e.defined = make(map[string]struct{})
-	e.published = nil
-	e.deliveries = nil
+func matchSegments(pat, seg []string) bool {
+	if len(pat) == 0 {
+		return len(seg) == 0
+	}
+	switch pat[0] {
+	case "#":
+		for i := 0; i <= len(seg); i++ {
+			if matchSegments(pat[1:], seg[i:]) {
+				return true
+			}
+		}
+		return false
+	case "*":
+		return len(seg) > 0 && matchSegments(pat[1:], seg[1:])
+	default:
+		return len(seg) > 0 && pat[0] == seg[0] && matchSegments(pat[1:], seg[1:])
+	}
 }

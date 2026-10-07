@@ -1,6 +1,5 @@
-// Package events owns durable event publication and subscription: the local
-// outbox write, the drain that hands batches to the runtime, and the inbound
-// delivery stream.
+// Package events owns event publication and subscription: the in-memory
+// publish queue and its sender, and the inbound delivery stream.
 package events
 
 import (
@@ -9,18 +8,37 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
-	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/service-bridge/sdk/go/internal/outbox"
 	pb "github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1"
 	"github.com/service-bridge/sdk/go/internal/telemetry"
 )
 
-// DefaultMaxOutboxRows caps the local buffer. Past it a publish fails loudly
-// instead of growing the file without bound.
-const DefaultMaxOutboxRows = 10_000
+// Publisher defaults. See ./README.md.
+const (
+	// DefaultMaxPending caps the publish queue. Past it a publish fails at once
+	// with ErrQueueFull instead of growing memory without bound.
+	DefaultMaxPending = 10_000
+	// DefaultPublishTimeout bounds one publication, from enqueue to the
+	// runtime's acknowledgement.
+	DefaultPublishTimeout = 30 * time.Second
+	// DefaultBatchSize caps one Publish request.
+	DefaultBatchSize = 100
+	// requestTimeout bounds one Publish RPC. A batch the runtime does not
+	// answer within it is retried with the same ids.
+	requestTimeout = 10 * time.Second
+)
+
+// defaultRetryLadder spaces the retries of a batch the runtime did not settle.
+// The last rung repeats; a settled batch resets the ladder.
+func defaultRetryLadder() []time.Duration {
+	return []time.Duration{
+		100 * time.Millisecond, 250 * time.Millisecond, 500 * time.Millisecond,
+		time.Second, 2 * time.Second, 5 * time.Second,
+	}
+}
 
 // eventNameRE accepts dot-separated segments of lowercase alphanumerics,
 // underscores and hyphens. It mirrors runtime/internal/events/event_name.go: a
@@ -30,76 +48,41 @@ var eventNameRE = regexp.MustCompile(`^[a-z0-9_-]+(\.[a-z0-9_-]+)*$`)
 
 // Sentinels for errors.Is.
 var (
-	// ErrInvalidName marks a name the runtime would reject.
+	// ErrInvalidName marks a name the runtime rejects.
 	ErrInvalidName = errors.New("events: invalid event name")
-	// ErrOutboxFull marks a publish refused because the local buffer is at its
-	// cap. It is outbox.ErrFull so callers match either spelling.
-	ErrOutboxFull = outbox.ErrFull
 	// ErrInvalidConfig marks a missing required dependency.
 	ErrInvalidConfig = errors.New("events: invalid config")
 	// ErrAlreadyStarted marks a second Start on a single-use component.
 	ErrAlreadyStarted = errors.New("events: already started")
+	// ErrQueueFull marks a publish refused because the queue is at its cap.
+	ErrQueueFull = errors.New("events: publish queue is full")
+	// ErrNotSent marks a publish that timed out before it was ever sent: the
+	// event is not in the runtime.
+	ErrNotSent = errors.New("events: publish timed out, event not sent")
+	// ErrOutcomeUnknown marks a publish that timed out after it was sent: the
+	// runtime may or may not hold the event.
+	ErrOutcomeUnknown = errors.New("events: publish timed out, outcome unknown")
+	// ErrConflict marks an id the runtime already holds with other content.
+	ErrConflict = errors.New("events: event id already accepted with different content")
+	// ErrForbidden marks a publish the access policy denies.
+	ErrForbidden = errors.New("events: publish denied by policy")
+	// ErrStopped marks a publish still queued when the client stopped.
+	ErrStopped = errors.New("events: client stopped")
 )
 
 // ValidEventName reports whether the runtime would accept name.
 func ValidEventName(name string) bool { return eventNameRE.MatchString(name) }
 
 // eventPatternRE accepts a subscription pattern: the same segments as a name,
-// plus `*` for exactly one segment and `#` for one or more. The runtime routes
-// on these (registry.proto, EventSubscription.pattern), so a subscription may
-// carry them where a publish may not.
+// plus `*` for exactly one segment and `#` for zero or more. The runtime routes
+// on these, so a subscription may carry them where a publish may not.
 var eventPatternRE = regexp.MustCompile(`^([a-z0-9_-]+|\*|#)(\.([a-z0-9_-]+|\*|#))*$`)
 
 // ValidEventPattern reports whether the runtime would accept pattern as a
 // subscription.
 func ValidEventPattern(pattern string) bool { return eventPatternRE.MatchString(pattern) }
 
-// MatchEventPattern reports whether a delivered event name is covered by a
-// subscription pattern.
-//
-// The runtime already routed the delivery, so this decides only which local
-// handlers see it. Matching locally is what makes a wildcard subscription
-// actually work end to end: a pattern registered server-side delivers events
-// whose concrete names no exact-match lookup would ever find, and the delivery
-// would be acked with nothing run.
-func MatchEventPattern(pattern, name string) bool {
-	if pattern == name {
-		return true
-	}
-	return matchSegments(strings.Split(pattern, "."), strings.Split(name, "."))
-}
-
-func matchSegments(pat, seg []string) bool {
-	if len(pat) == 0 {
-		return len(seg) == 0
-	}
-	switch pat[0] {
-	case "#":
-		// `#` covers zero or more segments, which is the AMQP semantics the
-		// runtime matches on. Requiring at least one would leave a delivery the
-		// runtime routed here with no local handler to run — it would be acked
-		// having done nothing.
-		for i := 0; i <= len(seg); i++ {
-			if matchSegments(pat[1:], seg[i:]) {
-				return true
-			}
-		}
-		return false
-	case "*":
-		if len(seg) == 0 {
-			return false
-		}
-		return matchSegments(pat[1:], seg[1:])
-	default:
-		if len(seg) == 0 || pat[0] != seg[0] {
-			return false
-		}
-		return matchSegments(pat[1:], seg[1:])
-	}
-}
-
-// Identity is the live session identity stamped on outgoing frames. Read per
-// use: instance_id changes on every certificate rotation.
+// Identity is the live session identity stamped on outgoing frames.
 type Identity struct {
 	ServiceID  string
 	InstanceID string
@@ -109,9 +92,8 @@ type Identity struct {
 type Encoded struct {
 	// Proto is the canonical payload; the runtime treats it as opaque bytes.
 	Proto []byte
-	// JSON mirrors Proto so the runtime can evaluate JSON-path wait_event
-	// filters without decoding protobuf. Empty when the payload has no JSON
-	// form.
+	// JSON mirrors Proto so the runtime can evaluate JSON-path filters without
+	// decoding protobuf.
 	JSON         []byte
 	ContractHash string
 }
@@ -131,8 +113,10 @@ type PublishFunc func(ctx context.Context, req *pb.PublishRequest) (*pb.PublishR
 type PublishOptions struct {
 	IdempotencyKey string
 	PartitionKey   string
-	// FireAndForget sends straight to the runtime instead of buffering. The
-	// call fails with the transport error; nothing is retried.
+	// FireAndForget returns the id right after enqueue instead of waiting for
+	// the runtime's acknowledgement. The event lives only in process memory
+	// until it is acknowledged: it is lost if the process dies first, and a
+	// delivery failure is only logged.
 	FireAndForget bool
 	Headers       map[string]string
 	// OccurredAtMs is unix-ms; zero means now.
@@ -147,14 +131,12 @@ func WithIdempotencyKey(key string) PublishOption {
 	return func(o *PublishOptions) { o.IdempotencyKey = key }
 }
 
-// WithPartitionKey pins the event to a FIFO lane: consumers process events
-// sharing a key strictly in order.
+// WithPartitionKey pins the event to a FIFO lane.
 func WithPartitionKey(key string) PublishOption {
 	return func(o *PublishOptions) { o.PartitionKey = key }
 }
 
-// WithFireAndForget skips the outbox. The event is lost if the runtime is
-// unreachable — durability is exactly what the outbox provides.
+// WithFireAndForget returns without waiting for the acknowledgement.
 func WithFireAndForget() PublishOption {
 	return func(o *PublishOptions) { o.FireAndForget = true }
 }
@@ -169,48 +151,88 @@ func WithOccurredAt(unixMs int64) PublishOption {
 	return func(o *PublishOptions) { o.OccurredAtMs = unixMs }
 }
 
+// PolicyViolation reports an event the runtime refused on policy grounds.
+type PolicyViolation struct {
+	EventID   string
+	EventName string
+	Reason    string
+}
+
 // PublisherConfig wires the publish path. See ./README.md.
 type PublisherConfig struct {
-	Storage  *outbox.Storage
-	Codec    Codec
-	Publish  PublishFunc
-	Identity func() Identity
-	// Kick wakes the drain after an enqueue. Optional.
-	Kick func()
-	// MaxOutboxRows caps the local buffer; zero explicitly disables the row limit.
-	MaxOutboxRows int
+	Codec   Codec
+	Publish PublishFunc
+	// MaxPending defaults to DefaultMaxPending.
+	MaxPending int
+	// Timeout defaults to DefaultPublishTimeout.
+	Timeout time.Duration
+	// BatchSize defaults to DefaultBatchSize.
+	BatchSize int
+	// RetryLadder defaults to 100, 250, 500, 1000, 2000, 5000 ms.
+	RetryLadder []time.Duration
+	// OnPolicyViolation surfaces a publish the policy denied.
+	OnPolicyViolation func(PolicyViolation)
 	// Now returns unix-ms; defaults to the wall clock.
 	Now func() int64
-	// NewID mints the event identifier; defaults to UUIDv7.
+	// NewID mints the event identifier; defaults to UUIDv7, monotonic.
 	NewID  func() (string, error)
 	Logger *slog.Logger
 }
 
-// Publisher writes events into the local outbox, or sends them straight to the
-// runtime on the no-wait path.
+// entry is one queued publication. Every field after env is guarded by the
+// publisher's mutex.
+type entry struct {
+	env           *pb.EventEnvelope
+	fireAndForget bool
+	done          chan struct{}
+
+	inflight  bool
+	sent      bool
+	abandoned bool
+	resolved  bool
+	id        string
+	err       error
+}
+
+// Publisher queues events in memory and sends them to the runtime, one batch
+// at a time, until each is acknowledged.
 type Publisher struct {
 	cfg PublisherConfig
+
+	mu      sync.Mutex
+	queue   []*entry
+	closed  bool
+	started bool
+	idle    chan struct{} // closed and replaced whenever the queue empties
+
+	wake   chan struct{} // a new event: an idle sender goes
+	kick   chan struct{} // a reconnect: a sender in backoff retries now
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 // NewPublisher validates the config and fills its defaults.
 func NewPublisher(cfg PublisherConfig) (*Publisher, error) {
-	if cfg.Storage == nil {
-		return nil, fmt.Errorf("events: new publisher: missing Storage: %w", ErrInvalidConfig)
-	}
 	if cfg.Codec == nil {
 		return nil, fmt.Errorf("events: new publisher: missing Codec: %w", ErrInvalidConfig)
 	}
 	if cfg.Publish == nil {
 		return nil, fmt.Errorf("events: new publisher: missing Publish: %w", ErrInvalidConfig)
 	}
-	if cfg.Identity == nil {
-		return nil, fmt.Errorf("events: new publisher: missing Identity: %w", ErrInvalidConfig)
+	if cfg.MaxPending < 0 || cfg.BatchSize < 0 || cfg.Timeout < 0 {
+		return nil, fmt.Errorf("events: new publisher: negative bound: %w", ErrInvalidConfig)
 	}
-	if cfg.MaxOutboxRows < 0 {
-		return nil, fmt.Errorf("events: new publisher: negative MaxOutboxRows: %w", ErrInvalidConfig)
+	if cfg.MaxPending == 0 {
+		cfg.MaxPending = DefaultMaxPending
 	}
-	if cfg.Kick == nil {
-		cfg.Kick = func() {}
+	if cfg.Timeout == 0 {
+		cfg.Timeout = DefaultPublishTimeout
+	}
+	if cfg.BatchSize == 0 {
+		cfg.BatchSize = DefaultBatchSize
+	}
+	if len(cfg.RetryLadder) == 0 {
+		cfg.RetryLadder = defaultRetryLadder()
 	}
 	if cfg.Now == nil {
 		cfg.Now = func() int64 { return time.Now().UnixMilli() }
@@ -221,12 +243,43 @@ func NewPublisher(cfg PublisherConfig) (*Publisher, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	return &Publisher{cfg: cfg}, nil
+	return &Publisher{
+		cfg:  cfg,
+		idle: make(chan struct{}),
+		wake: make(chan struct{}, 1),
+		kick: make(chan struct{}, 1),
+	}, nil
 }
 
-// Publish buffers one event and returns its identifier. It is a local insert,
-// not a network call: the runtime being down must not slow a publish down or
-// fail it.
+// Start runs the sender until Close.
+func (p *Publisher) Start(ctx context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.started {
+		return fmt.Errorf("events: publisher: start: %w", ErrAlreadyStarted)
+	}
+	p.started = true
+	runCtx, cancel := context.WithCancel(ctx)
+	p.cancel = cancel
+	p.wg.Add(1)
+	go p.run(runCtx)
+	return nil
+}
+
+// Kick makes a sender waiting out a retry rung try again now. The client calls
+// it on every reconnect: the failure the rung was waiting out is gone.
+func (p *Publisher) Kick() { signal(p.kick) }
+
+// Pending reports how many events wait for an acknowledgement.
+func (p *Publisher) Pending() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.queue)
+}
+
+// Publish enqueues one event and waits for the runtime's acknowledgement,
+// returning the event id the runtime holds. A full queue fails at once; a
+// timeout says whether the event was ever sent.
 func (p *Publisher) Publish(ctx context.Context, name string, payload any, opts ...PublishOption) (string, error) {
 	if !ValidEventName(name) {
 		return "", fmt.Errorf("events: publish %q: %w", name, ErrInvalidName)
@@ -235,96 +288,298 @@ func (p *Publisher) Publish(ctx context.Context, name string, payload any, opts 
 	for _, opt := range opts {
 		opt(&o)
 	}
-
 	enc, err := p.cfg.Codec.Encode(name, payload)
 	if err != nil {
 		return "", fmt.Errorf("events: publish %q: encode: %w", name, err)
-	}
-	id, err := p.cfg.NewID()
-	if err != nil {
-		return "", fmt.Errorf("events: publish %q: mint id: %w", name, err)
 	}
 	occurredAt := o.OccurredAtMs
 	if occurredAt == 0 {
 		occurredAt = p.cfg.Now()
 	}
-	trace := traceHeader(ctx)
+	e := &entry{
+		env: &pb.EventEnvelope{
+			Name:             name,
+			Payload:          enc.Proto,
+			PayloadJson:      enc.JSON,
+			ContractHash:     enc.ContractHash,
+			PartitionKey:     o.PartitionKey,
+			IdempotencyKey:   o.IdempotencyKey,
+			Headers:          o.Headers,
+			OccurredAtUnixMs: occurredAt,
+			XSbTrace:         traceHeader(ctx),
+		},
+		fireAndForget: o.FireAndForget,
+		done:          make(chan struct{}),
+	}
 
-	if o.FireAndForget {
-		if err := p.sendNow(ctx, id, name, enc, o, occurredAt, trace); err != nil {
-			return "", err
-		}
+	p.mu.Lock()
+	switch {
+	case p.closed:
+		p.mu.Unlock()
+		return "", fmt.Errorf("events: publish %q: %w", name, ErrStopped)
+	case len(p.queue) >= p.cfg.MaxPending:
+		p.mu.Unlock()
+		return "", fmt.Errorf("events: publish %q: %d events pending: %w", name, p.cfg.MaxPending, ErrQueueFull)
+	}
+	// Minted under the queue lock, so ids rise in queue order.
+	id, err := p.cfg.NewID()
+	if err != nil {
+		p.mu.Unlock()
+		return "", fmt.Errorf("events: publish %q: mint id: %w", name, err)
+	}
+	e.env.Id = id
+	p.queue = append(p.queue, e)
+	p.mu.Unlock()
+	signal(p.wake)
+
+	if e.fireAndForget {
 		return id, nil
 	}
 
-	rec := outbox.Record{
-		ID:             id,
-		Name:           name,
-		Payload:        enc.Proto,
-		PayloadJSON:    enc.JSON,
-		ContractHash:   enc.ContractHash,
-		PartitionKey:   o.PartitionKey,
-		IdempotencyKey: o.IdempotencyKey,
-		Headers:        o.Headers,
-		OccurredAtMs:   occurredAt,
-		EnqueuedAtMs:   p.cfg.Now(),
-		Trace:          trace,
+	timer := time.NewTimer(p.cfg.Timeout)
+	defer timer.Stop()
+	select {
+	case <-e.done:
+	case <-timer.C:
+		if sent, settled := p.abandon(e); !settled {
+			if sent {
+				return "", fmt.Errorf("events: publish %q (%s): %w", name, id, ErrOutcomeUnknown)
+			}
+			return "", fmt.Errorf("events: publish %q (%s): %w", name, id, ErrNotSent)
+		}
+	case <-ctx.Done():
+		if _, settled := p.abandon(e); !settled {
+			return "", fmt.Errorf("events: publish %q (%s): %w", name, id, ctx.Err())
+		}
 	}
-	if err := p.cfg.Storage.Enqueue(ctx, rec, p.cfg.MaxOutboxRows); err != nil {
-		return "", fmt.Errorf("events: publish %q: %w", name, err)
-	}
-	p.cfg.Kick()
-	return id, nil
+	return e.id, e.err
 }
 
-// sendNow is the no-wait path: one envelope straight to the runtime, no buffer,
-// no retry.
-func (p *Publisher) sendNow(ctx context.Context, id, name string, enc Encoded, o PublishOptions, occurredAt int64, trace string) error {
-	env := &pb.EventEnvelope{
-		Id:               id,
-		Name:             name,
-		Payload:          enc.Proto,
-		PayloadJson:      enc.JSON,
-		ContractHash:     enc.ContractHash,
-		PartitionKey:     o.PartitionKey,
-		IdempotencyKey:   o.IdempotencyKey,
-		FireAndForget:    true,
-		Headers:          o.Headers,
-		OccurredAtUnixMs: occurredAt,
-		XSbTrace:         trace,
+// abandon takes an entry the caller stopped waiting for out of the queue. It
+// reports whether the entry was ever sent and whether it settled first, in
+// which case its result stands.
+func (p *Publisher) abandon(e *entry) (sent, settled bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e.resolved {
+		return e.sent, true
 	}
-	resp, err := p.cfg.Publish(ctx, &pb.PublishRequest{
-		Events: []*pb.EventEnvelope{env},
-	})
-	if err != nil {
-		return fmt.Errorf("events: publish %q: send: %w", name, err)
+	e.abandoned = true
+	if !e.inflight {
+		p.removeLocked(e)
 	}
-	for _, r := range resp.GetResults() {
-		if r.GetEventId() != id {
+	return e.sent, false
+}
+
+// Close stops accepting events, keeps sending until the queue is empty or ctx
+// ends, and fails whatever is left with ErrStopped.
+func (p *Publisher) Close(ctx context.Context) {
+	p.mu.Lock()
+	p.closed = true
+	empty := len(p.queue) == 0
+	idle := p.idle
+	p.mu.Unlock()
+
+	if !empty {
+		p.Kick()
+		select {
+		case <-idle:
+		case <-ctx.Done():
+		}
+	}
+	if p.cancel != nil {
+		p.cancel()
+	}
+	p.wg.Wait()
+
+	p.mu.Lock()
+	left := p.queue
+	p.queue = nil
+	for _, e := range left {
+		p.resolveLocked(e, "", fmt.Errorf("events: publish %q (%s): %w", e.env.GetName(), e.env.GetId(), ErrStopped))
+	}
+	p.mu.Unlock()
+}
+
+func (p *Publisher) run(ctx context.Context) {
+	defer p.wg.Done()
+	rung := 0
+	for {
+		batch := p.take()
+		if len(batch) == 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-p.wake:
+			case <-p.kick:
+			}
 			continue
 		}
-		switch r.GetStatus() {
-		case pb.PublishStatus_PUBLISH_STATUS_ACCEPTED, pb.PublishStatus_PUBLISH_STATUS_REJECTED_DUPLICATE:
-			return nil
-		default:
-			return fmt.Errorf("events: publish %q: rejected %s: %s: %w", name, r.GetStatus(), r.GetMessage(), ErrRejected)
+
+		envs := make([]*pb.EventEnvelope, len(batch))
+		for i, e := range batch {
+			envs[i] = e.env
 		}
+		reqCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+		resp, err := p.cfg.Publish(reqCtx, &pb.PublishRequest{Events: envs})
+		cancel()
+		if ctx.Err() != nil {
+			p.release(batch)
+			return
+		}
+
+		if !p.settle(batch, resp, err) {
+			rung = 0
+			continue
+		}
+		delay := p.cfg.RetryLadder[min(rung, len(p.cfg.RetryLadder)-1)]
+		rung++
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-p.kick:
+			rung = 0
+		case <-timer.C:
+		}
+		timer.Stop()
 	}
-	return fmt.Errorf("events: publish %q: missing acceptance result for %s: %w", name, id, ErrRejected)
 }
 
-// ErrRejected marks an envelope the runtime refused for a reason no retry
-// fixes: a name it will never accept, or a policy that denies the publish.
-var ErrRejected = errors.New("events: rejected by runtime")
+// take marks the next batch in flight: queue order, at most BatchSize events,
+// at most one event per non-empty partition key. A later event of a key that
+// is already in the batch waits for the next one, which is what keeps every
+// key in publish order across retries.
+func (p *Publisher) take() []*entry {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var batch []*entry
+	keys := make(map[string]struct{})
+	for _, e := range p.queue {
+		if len(batch) >= p.cfg.BatchSize {
+			break
+		}
+		if key := e.env.GetPartitionKey(); key != "" {
+			if _, busy := keys[key]; busy {
+				continue
+			}
+			keys[key] = struct{}{}
+		}
+		e.inflight = true
+		e.sent = true
+		batch = append(batch, e)
+	}
+	return batch
+}
 
-// terminalStatus reports whether a per-envelope status is worth no retry.
-func terminalStatus(s pb.PublishStatus) bool {
-	switch s {
-	case pb.PublishStatus_PUBLISH_STATUS_REJECTED_INVALID_NAME,
-		pb.PublishStatus_PUBLISH_STATUS_REJECTED_FORBIDDEN:
-		return true
+// release puts a batch back without a verdict.
+func (p *Publisher) release(batch []*entry) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, e := range batch {
+		p.unflightLocked(e)
+	}
+}
+
+// settle applies the runtime's verdicts and reports whether anything is left
+// to retry. A transport failure or a missing or UNSPECIFIED verdict keeps the
+// event queued under the same id, so the retry is deduplicated by the runtime.
+func (p *Publisher) settle(batch []*entry, resp *pb.PublishResponse, err error) bool {
+	if err != nil {
+		p.cfg.Logger.Warn("events: publish batch failed, retrying", "events", len(batch), "error", err)
+	}
+	results := resp.GetResults()
+	// Verdicts are matched by position — a duplicate's verdict names the
+	// original id, not the one sent. A response of another length cannot be
+	// matched at all, so the whole batch counts as unsettled.
+	unmatched := err != nil || len(results) != len(batch)
+	var violations []PolicyViolation
+	retry := false
+
+	p.mu.Lock()
+	for i, e := range batch {
+		if unmatched {
+			retry = true
+			p.unflightLocked(e)
+			continue
+		}
+		r := results[i]
+		name, id := e.env.GetName(), e.env.GetId()
+		switch r.GetStatus() {
+		case pb.PublishStatus_PUBLISH_STATUS_ACCEPTED:
+			p.resolveLocked(e, id, nil)
+		case pb.PublishStatus_PUBLISH_STATUS_REJECTED_DUPLICATE:
+			// The runtime already holds this publication; its id is the answer.
+			original := r.GetEventId()
+			if original == "" {
+				original = id
+			}
+			p.resolveLocked(e, original, nil)
+		case pb.PublishStatus_PUBLISH_STATUS_REJECTED_CONFLICT:
+			p.resolveLocked(e, "", fmt.Errorf("events: publish %q (%s): %s: %w", name, id, r.GetMessage(), ErrConflict))
+		case pb.PublishStatus_PUBLISH_STATUS_REJECTED_INVALID_NAME:
+			p.resolveLocked(e, "", fmt.Errorf("events: publish %q (%s): %s: %w", name, id, r.GetMessage(), ErrInvalidName))
+		case pb.PublishStatus_PUBLISH_STATUS_REJECTED_FORBIDDEN:
+			p.resolveLocked(e, "", fmt.Errorf("events: publish %q (%s): %s: %w", name, id, r.GetMessage(), ErrForbidden))
+			violations = append(violations, PolicyViolation{EventID: id, EventName: name, Reason: r.GetMessage()})
+		default:
+			retry = true
+			p.cfg.Logger.Warn("events: publish not settled, retrying",
+				"event", name, "event_id", id, "message", r.GetMessage())
+			p.unflightLocked(e)
+		}
+	}
+	p.mu.Unlock()
+
+	if p.cfg.OnPolicyViolation != nil {
+		for _, v := range violations {
+			p.cfg.OnPolicyViolation(v)
+		}
+	}
+	return retry
+}
+
+// unflightLocked returns an entry to the queue for the next batch, or drops it
+// if its caller has already given up on it.
+func (p *Publisher) unflightLocked(e *entry) {
+	e.inflight = false
+	if e.abandoned {
+		p.removeLocked(e)
+	}
+}
+
+func (p *Publisher) resolveLocked(e *entry, id string, err error) {
+	if e.resolved {
+		return
+	}
+	e.resolved, e.inflight = true, false
+	e.id, e.err = id, err
+	p.removeLocked(e)
+	close(e.done)
+	if err != nil && e.fireAndForget {
+		p.cfg.Logger.Warn("events: fire-and-forget publish failed",
+			"event", e.env.GetName(), "event_id", e.env.GetId(), "error", err)
+	}
+}
+
+func (p *Publisher) removeLocked(e *entry) {
+	for i, q := range p.queue {
+		if q == e {
+			p.queue = append(p.queue[:i], p.queue[i+1:]...)
+			break
+		}
+	}
+	if len(p.queue) == 0 {
+		close(p.idle)
+		p.idle = make(chan struct{})
+	}
+}
+
+func signal(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
 	default:
-		return false
 	}
 }
 

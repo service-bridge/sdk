@@ -488,3 +488,29 @@ func TestRecorderCapturingAnswersBeforeStart(t *testing.T) {
 		t.Fatal("Recorder does not expose its ring and policy")
 	}
 }
+
+func TestPeerInstanceTravelsOnStartAndFollowsTheCallToEnd(t *testing.T) {
+	rec, ring := recorderWith(ModeNone, DefaultPayloadMaxBytes)
+	_, op, err := rec.Start(context.Background(), OpSpec{
+		Channel:        pb.Channel_RPC,
+		Kind:           OpKindRPCCall,
+		Subject:        "rpc.call:svc/m",
+		PeerInstanceID: "first0instance",
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// A retry moved the call to another instance.
+	op.SetPeerInstance("second0instnc")
+	op.End(pb.Status_SUCCESS, "")
+	frames := drainOps(t, ring)
+	if len(frames) != 2 {
+		t.Fatalf("frames = %d, want START and END", len(frames))
+	}
+	if got := frames[0].GetPeerInstanceId(); got != "first0instance" {
+		t.Fatalf("START peer instance = %q", got)
+	}
+	if got := frames[1].GetPeerInstanceId(); got != "second0instnc" {
+		t.Fatalf("END peer instance = %q, want the instance that served the call", got)
+	}
+}

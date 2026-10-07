@@ -118,15 +118,7 @@ class SpyProxy {
 	capturedXSbTrace: string | undefined;
 	capturedStreamCtx: TraceContext | undefined;
 
-	async callUnary(
-		_service: string,
-		_method: string,
-		_payload: Uint8Array,
-		_reqId: string,
-		_idem: string,
-		_timeout: number,
-		_hash: string,
-	): Promise<Uint8Array> {
+	async callUnary(): Promise<Uint8Array> {
 		const { formatXSbTrace } = await import("../telemetry/wire-trace");
 		const ctx = currentTraceContext();
 		if (ctx) {
@@ -137,15 +129,7 @@ class SpyProxy {
 		return new Uint8Array(0);
 	}
 
-	async *callStream(
-		_service: string,
-		_method: string,
-		_payload: Uint8Array,
-		_reqId: string,
-		_idem: string,
-		_timeout: number,
-		_hash: string,
-	): AsyncIterable<Uint8Array> {
+	async *callStream(): AsyncIterable<Uint8Array> {
 		this.capturedStreamCtx = currentTraceContext();
 		yield new Uint8Array(0);
 	}
@@ -170,16 +154,16 @@ describe("RpcClient trace-context propagation", () => {
 		schemas.set("payment-svc", "charge", pair);
 		const ring = new TelemetryRing();
 
-		const client = new RpcClient(
-			proxy as unknown as ProxyTransport,
-			null as unknown as DirectTransport,
-			instances,
-			schemas.asResolver(),
-			() => "caller-svc-id",
-			cb,
-			lb,
-			makeStubSb({ ring }),
-		);
+		const client = new RpcClient({
+			proxy: proxy as unknown as ProxyTransport,
+			direct: null as unknown as DirectTransport,
+			instances: instances,
+			resolveSchema: schemas.asResolver(),
+			cb: cb,
+			lb: lb,
+			callDefaults: () => ({}),
+			sb: makeStubSb({ ring }),
+		});
 
 		pair.output.decode = (() => ({ ok: true })) as typeof pair.output.decode;
 
@@ -239,16 +223,16 @@ describe("RpcClient trace-context propagation", () => {
 		schemas.set("payment-svc", "charge", pair);
 		const ring = new TelemetryRing();
 
-		const client = new RpcClient(
-			proxy as unknown as ProxyTransport,
-			null as unknown as DirectTransport,
-			instances,
-			schemas.asResolver(),
-			() => "caller-svc-id",
-			cb,
-			lb,
-			makeStubSb({ ring }),
-		);
+		const client = new RpcClient({
+			proxy: proxy as unknown as ProxyTransport,
+			direct: null as unknown as DirectTransport,
+			instances: instances,
+			resolveSchema: schemas.asResolver(),
+			cb: cb,
+			lb: lb,
+			callDefaults: () => ({}),
+			sb: makeStubSb({ ring }),
+		});
 
 		pair.output.decode = (() => ({ ok: true })) as typeof pair.output.decode;
 
@@ -295,16 +279,16 @@ describe("RpcClient trace-context propagation", () => {
 		schemas.set("payment-svc", "charge", pair);
 		const ring = new TelemetryRing();
 
-		const client = new RpcClient(
-			proxy as unknown as ProxyTransport,
-			null as unknown as DirectTransport,
-			instances,
-			schemas.asResolver(),
-			() => "caller-svc-id",
-			cb,
-			lb,
-			makeStubSb({ ring }),
-		);
+		const client = new RpcClient({
+			proxy: proxy as unknown as ProxyTransport,
+			direct: null as unknown as DirectTransport,
+			instances: instances,
+			resolveSchema: schemas.asResolver(),
+			cb: cb,
+			lb: lb,
+			callDefaults: () => ({}),
+			sb: makeStubSb({ ring }),
+		});
 
 		pair.output.decode = (() => ({ ok: true })) as typeof pair.output.decode;
 
@@ -359,16 +343,16 @@ describe("RpcClient trace-context propagation", () => {
 		schemas.set("payment-svc", "charge", pair);
 		const ring = new TelemetryRing();
 
-		const client = new RpcClient(
-			proxy as unknown as ProxyTransport,
-			null as unknown as DirectTransport,
-			instances,
-			schemas.asResolver(),
-			() => "caller-svc-id",
-			cb,
-			lb,
-			makeStubSb({ ring }),
-		);
+		const client = new RpcClient({
+			proxy: proxy as unknown as ProxyTransport,
+			direct: null as unknown as DirectTransport,
+			instances: instances,
+			resolveSchema: schemas.asResolver(),
+			cb: cb,
+			lb: lb,
+			callDefaults: () => ({}),
+			sb: makeStubSb({ ring }),
+		});
 
 		pair.output.decode = (() => ({ ok: true })) as typeof pair.output.decode;
 

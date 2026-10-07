@@ -11,6 +11,9 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { ServiceBridge } from "../../src/connection/service-bridge";
+import { ConnectionError } from "../../src/connection/service-bridge-error";
+import { ConfigurationError } from "../../src/errors";
+import { BootstrapKeyPayload } from "../../src/pb/servicebridge/v1/bootstrap";
 import { Channel } from "../../src/pb/servicebridge/v1/telemetry";
 import { withDb } from "./_helpers/policy-db";
 
@@ -51,13 +54,18 @@ async function waitFor(
 
 // Flip a byte in the secret region (offset 8..40) so auth fails without changing
 // the key shape.
+// corruptSecret keeps the key well-formed but flips one secret byte, so the
+// runtime rejects it (UNAUTHENTICATED) instead of the SDK refusing to parse it.
 function corruptSecret(raw: string): string {
 	if (!raw.startsWith("sb.")) throw new Error("invalid key format");
-	const payload = Buffer.from(raw.slice(3), "base64url");
-	const b = payload[10];
-	if (b === undefined) throw new Error("payload too short");
-	payload[10] = b ^ 0xff;
-	return `sb.${payload.toString("base64url")}`;
+	const payload = BootstrapKeyPayload.decode(
+		Buffer.from(raw.slice(3), "base64url"),
+	);
+	const secret = Buffer.from(payload.secret);
+	secret[0] = (secret[0] ?? 0) ^ 0xff;
+	return `sb.${Buffer.from(
+		BootstrapKeyPayload.encode({ ...payload, secret }).finish(),
+	).toString("base64url")}`;
 }
 
 describe("misc-lifecycle: connect FSM", () => {
@@ -110,13 +118,10 @@ describe("misc-lifecycle: connect FSM", () => {
 		expect(events.length).toBe(before);
 	}, 20_000);
 
-	test("connect: corrupted secret drives reconnect FSM to disconnected{exhausted}", async () => {
+	test("connect: a rejected key stops at once: start() rejects, one disconnected, no reconnect", async () => {
 		const { url, key } = env();
-		const badKey = corruptSecret(key);
-
-		sb = new ServiceBridge(url, badKey, {
+		sb = new ServiceBridge(url, corruptSecret(key), {
 			reconnectIntervalMs: 200,
-			reconnectAttempts: 2,
 			certRefreshLeadMs: 60_000,
 			certRefreshJitterMs: 0,
 		});
@@ -129,21 +134,20 @@ describe("misc-lifecycle: connect FSM", () => {
 			events.push({ type: "disconnected", payload: e }),
 		);
 
-		await sb.start();
-		await waitFor(
-			() => events.some((e) => e.type === "disconnected"),
-			10_000,
-			"disconnected event",
-		);
-
-		expect(events.some((e) => e.type === "reconnecting")).toBe(true);
-		const exhausted = events.find(
-			(e) =>
-				e.type === "disconnected" &&
-				(e.payload as { reason: string }).reason === "exhausted",
-		);
-		expect(exhausted).toBeDefined();
+		const err = await sb.start().catch((e) => e);
+		expect(err).toBeInstanceOf(ConnectionError);
+		expect((err as ConnectionError).grpcCode).toBe(16); // UNAUTHENTICATED
+		await sleep(500);
+		expect(events.filter((e) => e.type === "reconnecting")).toHaveLength(0);
+		expect(events.filter((e) => e.type === "disconnected")).toHaveLength(1);
 	}, 20_000);
+
+	test("connect: a malformed key is a ConfigurationError at construction", () => {
+		const { url } = env();
+		expect(() => new ServiceBridge(url, "sb.not-a-key")).toThrow(
+			ConfigurationError,
+		);
+	});
 });
 
 const CAPTURE_KEYS = [

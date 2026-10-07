@@ -13,6 +13,9 @@
 
 import { describe, expect, it } from "bun:test";
 import { EventEmitter } from "node:events";
+import { silentLogger } from "../logger";
+import type { EventsClient } from "../pb/servicebridge/v1/events";
+import type { SchemaPair } from "../serde/serializer";
 import { currentTraceContext, runWithTrace } from "../telemetry/context";
 import { formatXSbTrace, parseXSbTrace } from "../telemetry/wire-trace";
 import type { SubscriberDeps } from "./subscriber";
@@ -74,10 +77,17 @@ function makeDelivery(
 				id: `ev-${deliveryId}`,
 				name,
 				payload: new Uint8Array([1, 2, 3]),
+				payloadJson: new Uint8Array(),
+				contractHash: "",
 				partitionKey,
+				idempotencyKey: "",
+				headers: {},
+				occurredAtUnixMs: 0,
 				xSbTrace,
 			},
 			attempt: 1,
+			leaseToken: "",
+			matchedPatterns: [name],
 		},
 	};
 }
@@ -88,18 +98,19 @@ function makeDeps(handlerFn: (p: unknown) => Promise<void>): {
 } {
 	const fake = makeFakeStream();
 	const deps: SubscriberDeps = {
-		// biome-ignore lint/suspicious/noExplicitAny: minimal grpc stub
-		rpcClient: { subscribe: () => fake.stream } as any,
-		schemaIndex: {
-			get: (name: string) =>
-				name === "order.created"
-					? { contractHash: "h", pair: makeSchema() }
-					: undefined,
-		},
+		client: () => ({ subscribe: () => fake.stream }) as unknown as EventsClient,
 		identity: () => ({ serviceId: "svc-1", instanceId: "inst-1" }),
-		handlers: (pattern) => (pattern === "order.created" ? [handlerFn] : []),
+		subscription: (pattern) =>
+			pattern === "order.created"
+				? {
+						pattern,
+						filter: "",
+						fn: handlerFn,
+						schemaPair: makeSchema() as unknown as SchemaPair,
+					}
+				: undefined,
 		maxInFlight: 32,
-		logger: { warn: () => {}, error: () => {} },
+		logger: silentLogger,
 		runWithTrace: runHandlerWithTrace,
 	};
 	return { deps, fake };

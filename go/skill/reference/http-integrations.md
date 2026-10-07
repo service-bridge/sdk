@@ -7,9 +7,14 @@ ServiceBridge does **not** proxy business HTTP. You run your own server; the int
 ```go signature
 func New(rt Runtime, opts ...Option) (*Integration, error)
 func WithLogger(log *slog.Logger) Option
+func WithTrustTraceHeader() Option
+func WithRouteResolver(fn func(*http.Request) string) Option
+
+const UnmatchedRoute = "*"
+func RouteOf(r *http.Request) string
 
 func (i *Integration) Middleware(next http.Handler) http.Handler
-func (i *Integration) Begin(r *http.Request) (*http.Request, *Operation, error)
+func (i *Integration) Begin(r *http.Request, route string) (*http.Request, *Operation, error)
 func (i *Integration) Publish(routes []Route, ep Endpoint) error
 func (i *Integration) PublishMux(m *Mux, ep Endpoint) error
 func (i *Integration) PublishChi(r chi.Routes, ep Endpoint) error
@@ -20,7 +25,14 @@ func (m *Mux) Handle(pattern string, handler http.Handler)
 func (m *Mux) HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request))
 func (m *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request)
 func (m *Mux) Routes() []Route
+func (m *Mux) Route(r *http.Request) string
 ```
+
+| Option | Default | Effect |
+|---|---|---|
+| `sbhttp.WithLogger(log)` | `slog.Default()` | Logger for the loopback-host warning and for spans that could not start. |
+| `sbhttp.WithTrustTraceHeader()` | off | Adopt an incoming `X-SB-Trace` header as the span's parent. Off by default: on a public edge a client must not graft its requests into arbitrary traces. Turn it on only behind a gateway that sets the header itself. |
+| `sbhttp.WithRouteResolver(fn)` | none | Names the route template of a request for routers the middleware cannot read. Returns the template with its leading slash, or `""` when nothing matched. |
 
 Package `sbhttp` covers `net/http` and chi (both use `func(http.Handler) http.Handler`). gin lives in the separate module `sbgin`:
 
@@ -32,6 +44,14 @@ func Publish(integration *sbhttp.Integration, engine *gin.Engine, endpoint sbhtt
 ```sh
 go get github.com/service-bridge/sdk/go/sbgin
 ```
+
+`sbgin` is its own Go module with its own `go.mod`, so gin never lands in the dependency graph of SDK users who do not use it. It names the span from gin's `c.FullPath()`.
+
+## Span naming
+
+Each request becomes one span named by its **route template**, never the raw path: `http.handle:<METHOD>/<template>`, e.g. `http.handle:GET//orders/{id}`. A request that matched no route is `*` (`sbhttp.UnmatchedRoute`). The span carries `meta {method, route, status}`.
+
+`Middleware` finds the template before the handler runs, in this order: `WithRouteResolver`; the wrapped `*sbhttp.Mux` or `*http.ServeMux`; chi's routing context; `r.Pattern` when the middleware wraps a single route inside a `ServeMux`. Otherwise `*`.
 
 ## Endpoint
 
@@ -216,9 +236,10 @@ import (
 	"github.com/service-bridge/sdk/go/sbhttp"
 )
 
-func Wrap(i *sbhttp.Integration, next http.Handler) http.Handler {
+// route is the template the framework matched ("/orders/{id}"); "" records "*".
+func Wrap(i *sbhttp.Integration, route string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		req, op, err := i.Begin(r)
+		req, op, err := i.Begin(r, route)
 		if err != nil {
 			i.Logger().Error("span not started", "error", err)
 			next.ServeHTTP(w, r)
@@ -240,7 +261,7 @@ func Wrap(i *sbhttp.Integration, next http.Handler) http.Handler {
 }
 ```
 
-Ask `op.Capturing()` and `op.PayloadLimit()` **before** touching a body: with capture off the bytes are discarded and the read alone costs more than the span. `op.CaptureResponse(body)` records the response.
+Ask `op.Capturing()` and `op.PayloadLimit()` **before** touching a body: with capture off the bytes are discarded and the read alone costs more than the span. `op.CaptureResponse(body)` records the response. The request body is never read ahead: only what the handler itself reads is captured, up to the limit.
 
 Route lists can be handed over directly:
 
@@ -275,11 +296,12 @@ func Publish(i *sbhttp.Integration) error {
 - Publishing before `Start` rides the first registration; after `Start` it reopens the registry stream so the routes arrive now.
 - Repeat calls are idempotent — a route already declared is not declared twice (two rows with one name roll the whole registration back).
 - A pattern registered without a method gets method `*`. It gets a Service Map card but no stitched statistics.
-- The business key comes from the `Idempotency-Key` header, falling back to `"<METHOD> <path>"`.
+- The business key comes from the `Idempotency-Key` header, falling back to `"<METHOD> <route template>"` — never with a query string.
 
 ## Gotchas
 
 - Register the gin middleware **before** the routes; call `PublishChi` / `sbgin.Publish` **after** them.
 - Do not drop the request returned by `Begin`.
 - `sbhttp.New(nil)` → `sbhttp.ErrNoRuntime`; a nil router → `sbhttp.ErrNoRouter`.
-- Body capture is off unless the runtime enables it; a local setting can only narrow it, never widen it.
+- The runtime pushes the body-capture mode; its default is `errors`. Bodies are captured as-is — the SDK does not mask them, the runtime masks payloads on ingest. There is no perimeter protection (no scanner block, no rate limit) in the integration.
+- An incoming `X-SB-Trace` is ignored unless the integration is built with `sbhttp.WithTrustTraceHeader()`.

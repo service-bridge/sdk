@@ -9,6 +9,7 @@
 // those directly where a domain needs them.
 
 import { join } from "node:path";
+import type { ServiceBridge } from "../../../src/connection/service-bridge";
 
 export { uniqueId, uniqueName } from "./namespace";
 export { connect, dedicated, type Role, shared } from "./pool";
@@ -26,6 +27,31 @@ export const ORDER_EVENT_PROTO = join(
 	"testdata",
 	"order-event.proto",
 );
+
+// PAYMENT_PROTO — protobuf fixture with ChargeRequest/ChargeResponse, for
+// RPC handlers a test only needs to exist in the registry.
+export const PAYMENT_PROTO = join(
+	import.meta.dir,
+	"..",
+	"..",
+	"..",
+	"src",
+	"serde",
+	"testdata",
+	"payment.proto",
+);
+
+// declareRpc registers a real unary handler that answers an empty response —
+// enough for registry/service-map tests that never call it.
+export function declareRpc(sb: ServiceBridge, method: string): void {
+	sb.rpc.handle(method, () => ({}), {
+		schema: {
+			protoFile: PAYMENT_PROTO,
+			input: "ChargeRequest",
+			output: "ChargeResponse",
+		},
+	});
+}
 
 export function sleep(ms: number): Promise<void> {
 	return new Promise((r) => setTimeout(r, ms));

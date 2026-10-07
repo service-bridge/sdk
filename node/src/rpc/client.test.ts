@@ -1,9 +1,15 @@
-// client.test.ts — unit tests for RpcClient caller-side RPC.CALL emission (ADR-0001).
-// These tests verify that RpcClient.call() and RpcClient.stream() emit the
-// correct telemetry frames to the ring on each invocation.
+// client.test.ts — RpcClient: one RPC.CALL op per logical call (ADR-0001),
+// retries only for proven pre-dispatch failures, auto → proxy fallback,
+// error model, circuit-breaker input, callDefaults.
 
 import { beforeEach, describe, expect, it } from "bun:test";
-import type { ServiceBridge, TelemetryAPI } from "../connection/service-bridge";
+import {
+	ConfigurationError,
+	HandlerError,
+	NoLiveInstanceError,
+	ServiceBridgeError,
+	ValidationError,
+} from "../errors";
 import type {
 	MethodDescriptor,
 	ServiceInstanceInfo,
@@ -15,28 +21,27 @@ import type {
 } from "../pb/servicebridge/v1/telemetry";
 import { Status } from "../pb/servicebridge/v1/telemetry";
 import { runWithTrace } from "../telemetry/context";
-import { Channel, OpHandle, RpcCall } from "../telemetry/ops";
+import { Channel, RpcCall } from "../telemetry/ops";
 import { TelemetryRing } from "../telemetry/ring";
 import { CircuitBreakerRegistry } from "./circuit-breaker";
-import { RpcClient } from "./client";
-import type { DirectTransport } from "./direct-transport";
-import { InstanceCache } from "./instance-cache";
-import { type Candidate, cbKey, type LoadBalancer } from "./lb";
+import { type CallerSchema, type CallOpts, RpcClient } from "./client";
+import type { DirectTransport, WireCall } from "./direct-transport";
+import type { InstanceCache } from "./instance-cache";
+import { type Candidate, cbKey, LoadBalancer } from "./lb";
 import type { ProxyTransport } from "./proxy-transport";
+import { makeStubSb } from "./test-helpers";
+import { CallFailure, handlerFailure } from "./wire";
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+const SVC = "target-svc";
+const METHOD = "Charge";
 
-function makeDesc(
-	serviceName: string,
-	methodName: string,
-	streaming = false,
-): MethodDescriptor {
+function desc(streaming = false): MethodDescriptor {
 	return {
 		instanceId: "inst-1",
-		serviceId: "svc-id",
-		serviceName,
+		serviceId: "target-svc-id",
+		serviceName: SVC,
 		type: MethodType.METHOD_TYPE_RPC,
-		name: methodName,
+		name: METHOD,
 		published: false,
 		contractHash: "hash-1",
 		inputSchema: Buffer.alloc(0),
@@ -45,14 +50,11 @@ function makeDesc(
 	};
 }
 
-function makeInst(
-	id = "inst-1",
-	endpoint = "localhost:9000",
-): ServiceInstanceInfo {
+function inst(endpoint = "localhost:9000"): ServiceInstanceInfo {
 	return {
-		instanceId: id,
+		instanceId: "inst-1",
 		serviceId: "target-svc-id",
-		serviceName: "target-svc",
+		serviceName: SVC,
 		callEndpoint: endpoint,
 		status: "connected",
 		httpEndpoint: "",
@@ -60,776 +62,377 @@ function makeInst(
 	};
 }
 
-function makeCandidate(
-	serviceName = "target-svc",
-	methodName = "Charge",
+function cache(
+	candidates: Candidate[],
 	streaming = false,
-): Candidate {
-	return {
-		descriptor: makeDesc(serviceName, methodName, streaming),
-		instance: makeInst(),
-		isUnhealthyAt: null,
-	};
-}
-
-// makeInstanceCache creates an InstanceCache-shaped stub for testing.
-function makeInstanceCache(
-	serviceName: string,
-	methodName: string,
-	streaming = false,
+	known = true,
 ): InstanceCache {
-	const cache = new InstanceCache();
-	// Override candidatesFor / descriptorFor without real WatchStream
-	(
-		cache as unknown as {
-			candidatesFor: (s: string, m: string, h: string) => Candidate[];
-		}
-	).candidatesFor = (s: string, m: string, h: string) => {
-		if (s === serviceName && m === methodName && h === "hash-1")
-			return [makeCandidate(serviceName, methodName, streaming)];
-		return [];
-	};
-	(
-		cache as unknown as {
-			descriptorFor: (s: string, m: string) => MethodDescriptor | null;
-		}
-	).descriptorFor = (s: string, m: string) => {
-		if (s === serviceName && m === methodName)
-			return makeDesc(serviceName, methodName, streaming);
-		return null;
-	};
-	return cache;
-}
-
-// makeSchemaPair creates a minimal encode/decode pair that passes bytes through.
-function makeSchemaPair() {
-	// Use unknown cast to avoid fully implementing Serializer in test stubs.
 	return {
-		pair: {
-			input: {
-				encode: (_obj: object) => Buffer.from("{}"),
-			},
-			output: {
-				decode: (b: Uint8Array) => JSON.parse(Buffer.from(b).toString()),
-			},
-			contractHash: "hash-1",
-		},
-		contractHash: "hash-1",
-	} as unknown as import("./client").CallerSchema;
+		candidatesFor: (s: string, m: string, h: string) =>
+			s === SVC && m === METHOD && h === "hash-1" ? candidates : [],
+		descriptorFor: (s: string, m: string) =>
+			known && s === SVC && m === METHOD ? desc(streaming) : null,
+	} as unknown as InstanceCache;
 }
 
-// makeLB returns a LoadBalancer-shaped stub that picks the single candidate.
-function makeLB(candidate: Candidate): LoadBalancer {
-	return {
-		pick: (_candidates: Candidate[]) => candidate,
-		acquire: (_instanceId: string) => () => {},
-		recordHealthHint: (_instanceId: string, _at: Date | null) => {},
-	} as unknown as LoadBalancer;
+const schema = {
+	pair: {
+		input: { encode: () => Buffer.from("{}") },
+		output: {
+			decode: (b: Uint8Array) => JSON.parse(Buffer.from(b).toString()),
+		},
+	},
+	contractHash: "hash-1",
+	contractHashBytes: Buffer.from("hash-1"),
+} as unknown as CallerSchema;
+
+type UnaryFn = (call: WireCall) => Promise<Uint8Array>;
+
+interface Recorder {
+	direct: WireCall[];
+	proxy: WireCall[];
 }
 
-// makeRing returns a fresh TelemetryRing for inspection.
-function makeRing() {
-	return new TelemetryRing();
-}
-
-// makeStubSb returns a minimal ServiceBridge stub with telemetry ring.
-// captureMode models the runtime-pushed effective capture mode (default none).
-function makeStubSb(
-	ring: TelemetryRing,
-	captureMode: "all" | "errors" | "none" = "none",
-): ServiceBridge {
-	const telemetry: TelemetryAPI = {
-		enabled: () => true,
-		startOp(params) {
-			return OpHandle.start(ring, {
-				...params,
-				effectiveCaptureMode: captureMode,
-			});
+function transports(
+	directFn: UnaryFn,
+	proxyFn: UnaryFn,
+	streamFn?: () => AsyncIterable<Uint8Array>,
+): { direct: DirectTransport; proxy: ProxyTransport; rec: Recorder } {
+	const rec: Recorder = { direct: [], proxy: [] };
+	const direct = {
+		callUnary: (_t: unknown, call: WireCall) => {
+			rec.direct.push(call);
+			return directFn(call);
 		},
-		captureModeForChannel: () => captureMode,
-		log: {
-			debug: () => {},
-			info: () => {},
-			warn: () => {},
-			error: () => {},
+		callStream: (_t: unknown, _c: WireCall) =>
+			streamFn ? streamFn() : (async function* () {})(),
+		retain: () => {},
+		close: () => {},
+	} as unknown as DirectTransport;
+	const proxy = {
+		callUnary: (_s: string, _h: Buffer, call: WireCall) => {
+			rec.proxy.push(call);
+			return proxyFn(call);
 		},
-		counter: () => ({ inc: () => {} }) as ReturnType<TelemetryAPI["counter"]>,
-		gauge: () => ({}) as ReturnType<TelemetryAPI["gauge"]>,
-		histogram: () => ({}) as ReturnType<TelemetryAPI["histogram"]>,
-	};
-	return {
-		telemetry,
-		instanceIdString: () => "caller-inst-id",
-		identity: () => ({
-			sessionId: "test-session",
-			serviceId: "caller-svc-id",
-			serviceName: "caller-svc",
-			instanceId: "caller-inst-id",
-		}),
-	} as unknown as ServiceBridge;
-}
-
-// makeProxyTransport returns a proxy stub that resolves with empty payload.
-function makeProxyTransport(
-	onCall?: (targetServiceId: string, method: string) => void,
-): ProxyTransport {
-	return {
-		callUnary: async (targetServiceId: string, method: string) => {
-			onCall?.(targetServiceId, method);
-			return Buffer.from("{}");
-		},
-		callStream: async function* () {
-			// empty stream
-		},
+		callStream: (_s: string, _h: Buffer, _c: WireCall) =>
+			streamFn ? streamFn() : (async function* () {})(),
 		close: () => {},
 	} as unknown as ProxyTransport;
+	return { direct, proxy, rec };
 }
 
-// makeFailingProxyTransport returns a proxy that fails the first N attempts.
-function makeFailingProxyTransport(failCount: number): ProxyTransport {
-	let calls = 0;
-	return {
-		callUnary: async () => {
-			calls++;
-			if (calls <= failCount) {
-				const err = Object.assign(new Error("UNAVAILABLE before dispatch"), {
-					code: 14,
-					preDispatch: true,
-				});
-				throw err;
-			}
-			return Buffer.from("{}");
-		},
-		callStream: async function* () {
-			// empty stream
-		},
-		close: () => {},
-	} as unknown as ProxyTransport;
+const ok: UnaryFn = async () => Buffer.from('{"ok":true}');
+const preDispatch = () =>
+	new CallFailure(
+		new ServiceBridgeError("CONNECTION", "connect refused"),
+		true,
+	);
+const dispatched = () =>
+	new CallFailure(new ServiceBridgeError("CONNECTION", "stream reset"), false);
+
+function makeClient(opts: {
+	candidates?: Candidate[];
+	direct?: UnaryFn;
+	proxy?: UnaryFn;
+	stream?: () => AsyncIterable<Uint8Array>;
+	streaming?: boolean;
+	known?: boolean;
+	ring?: TelemetryRing;
+	capture?: "all" | "none";
+	callDefaults?: CallOpts;
+	noSchema?: boolean;
+	cb?: CircuitBreakerRegistry;
+}) {
+	const ring = opts.ring ?? new TelemetryRing();
+	const cb = opts.cb ?? new CircuitBreakerRegistry();
+	const t = transports(opts.direct ?? ok, opts.proxy ?? ok, opts.stream);
+	const candidates = opts.candidates ?? [
+		{ descriptor: desc(opts.streaming), instance: inst(), isUnhealthyAt: null },
+	];
+	const client = new RpcClient({
+		proxy: t.proxy,
+		direct: t.direct,
+		instances: cache(candidates, opts.streaming, opts.known ?? true),
+		resolveSchema: () => (opts.noSchema ? undefined : schema),
+		cb,
+		lb: new LoadBalancer(cb),
+		callDefaults: () => opts.callDefaults ?? {},
+		sb: makeStubSb({ ring, captureMode: opts.capture ?? "none" }),
+	});
+	return { client, ring, rec: t.rec, cb, candidates };
 }
 
-// drainOpReports peeks the ring and returns all typed OpReport frames.
-function drainOpReports(ring: TelemetryRing): OpReport[] {
+function ops(ring: TelemetryRing): OpReport[] {
 	return ring
-		.peek(200)
-		.filter((item) => item.kind === "ops")
-		.map((item) => item.message as OpReport);
+		.peek(500)
+		.filter((i) => i.kind === "ops")
+		.map((i) => i.message as OpReport)
+		.filter((r) => r.channel === Channel.RPC && r.kind === RpcCall);
 }
 
-// ─── Tests: T5 — caller emits RPC.CALL on call ────────────────────────────────
+const fast = { retry: { baseDelayMs: 1, maxDelayMs: 2 } } satisfies CallOpts;
 
-describe("RpcClient caller-side CALL emission", () => {
+describe("RpcClient.call telemetry", () => {
 	let ring: TelemetryRing;
-	let sb: ServiceBridge;
-	let cb: CircuitBreakerRegistry;
-
 	beforeEach(() => {
-		ring = makeRing();
-		sb = makeStubSb(ring);
-		cb = new CircuitBreakerRegistry();
+		ring = new TelemetryRing();
 	});
 
-	it("caller emits RPC.CALL on call — START+END frames with correct fields", async () => {
-		const candidate = makeCandidate("target-svc", "Charge");
-		const proxy = makeProxyTransport();
-		const cache = makeInstanceCache("target-svc", "Charge");
-		const lb = makeLB(candidate);
-
-		const client = new RpcClient(
-			proxy,
-			null, // no direct transport — forces proxy path
-			cache,
-			(_s, _m) => makeSchemaPair(),
-			() => "caller-svc",
-			cb,
-			lb,
-			sb,
-		);
-
+	it("emits one RPC.CALL op with START and END in the caller's trace", async () => {
+		const { client } = makeClient({ ring });
 		const traceId = "01900000-0000-7000-8000-000000000001";
 		const parentOpId = "01900000-0000-7000-8000-000000000002";
-
-		await runWithTrace({ traceId, parentOpId }, async () => {
-			await client.call("target-svc", "Charge", {});
-		});
-
-		const reports = drainOpReports(ring);
-		const startFrames = reports.filter(
-			(r) =>
-				r.channel === Channel.RPC &&
-				r.kind === RpcCall &&
-				r.finishedAtMs === undefined,
+		await runWithTrace({ traceId, parentOpId }, () =>
+			client.call(SVC, METHOD, {}),
 		);
-		const endFrames = reports.filter(
-			(r) =>
-				r.channel === Channel.RPC &&
-				r.kind === RpcCall &&
-				r.finishedAtMs !== undefined,
-		);
-
-		expect(startFrames).toHaveLength(1);
-		expect(endFrames).toHaveLength(1);
-
-		const start = startFrames[0]!;
+		const frames = ops(ring);
+		expect(frames).toHaveLength(2);
+		const [start, end] = frames as [OpReport, OpReport];
 		expect(start.traceId).toBe(traceId);
 		expect(start.parentOpId).toBe(parentOpId);
 		expect(start.subject).toBe("rpc.call:target-svc/Charge");
-		expect(start.attempt).toBe(0);
 		expect(start.status).toBe(Status.PENDING);
-
-		const end = endFrames[0]!;
-		expect(end.traceId).toBe(traceId);
 		expect(end.status).toBe(Status.SUCCESS);
+		// The direct path knows which instance served the call (health key).
+		expect(start.peerInstanceId).toBe("inst-1");
+		expect(end.peerInstanceId).toBe("inst-1");
 	});
 
-	it("caller emits RPC.CALL payloads (IN+OUT) when runtime pushes capture=all", async () => {
-		// The capture mode is the runtime-pushed effective mode, not SDK env.
-		const captureRing = new TelemetryRing();
-		const captureSb = makeStubSb(captureRing, "all");
-		const candidate = makeCandidate("target-svc", "Charge");
-		const proxy = makeProxyTransport();
-		const cache = makeInstanceCache("target-svc", "Charge");
-		const lb = makeLB(candidate);
-		const client = new RpcClient(
-			proxy,
-			null,
-			cache,
-			(_s, _m) => makeSchemaPair(),
-			() => "caller-svc",
-			cb,
-			lb,
-			captureSb,
-		);
-
-		await client.call("target-svc", "Charge", {});
-
-		const payloads = captureRing
-			.peek(200)
+	it("captures request and response when the runtime pushes capture=all", async () => {
+		const { client } = makeClient({ ring, capture: "all" });
+		await client.call(SVC, METHOD, {});
+		const directions = ring
+			.peek(500)
 			.filter((i) => i.kind === "payloads")
-			.map((i) => i.message as PayloadAttachment);
-		const directions = payloads.map((p) => p.direction).sort();
+			.map((i) => (i.message as PayloadAttachment).direction)
+			.sort();
 		expect(directions).toEqual([1, 2]);
-		expect(payloads.every((p) => p.contractHash === "hash-1")).toBe(true);
-	});
-
-	// ─── T6: retry reuses ONE CALL op, attempt counter on the same row ──────────
-
-	it("retry produces ONE CALL op across attempts — single op_id, attempt counter, ends OK (ADR-0001)", async () => {
-		const candidate = makeCandidate("target-svc", "Charge");
-		const proxy = makeFailingProxyTransport(2); // first 2 fail, 3rd succeeds
-		const cache = makeInstanceCache("target-svc", "Charge");
-		const lb = makeLB(candidate);
-
-		const client = new RpcClient(
-			proxy,
-			null,
-			cache,
-			(_s, _m) => makeSchemaPair(),
-			() => "caller-svc",
-			cb,
-			lb,
-			sb,
-		);
-
-		const traceId = "01900000-0000-7000-8000-000000000010";
-		const parentOpId = "01900000-0000-7000-8000-000000000011";
-
-		await runWithTrace({ traceId, parentOpId }, async () => {
-			await client.call(
-				"target-svc",
-				"Charge",
-				{},
-				{
-					retry: {
-						maxAttempts: 3,
-						baseDelayMs: 0,
-						factor: 1,
-						maxDelayMs: 0,
-						jitter: 0,
-					},
-				},
-			);
-		});
-
-		const reports = drainOpReports(ring);
-		const startFrames = reports.filter(
-			(r) =>
-				r.channel === Channel.RPC &&
-				r.kind === RpcCall &&
-				r.finishedAtMs === undefined,
-		);
-		const endFrames = reports.filter(
-			(r) =>
-				r.channel === Channel.RPC &&
-				r.kind === RpcCall &&
-				r.finishedAtMs !== undefined,
-		);
-
-		// Exactly one CALL row for the whole logical call (1 START + 1 END).
-		expect(startFrames).toHaveLength(1);
-		expect(endFrames).toHaveLength(1);
-
-		const start = startFrames[0]!;
-		const end = endFrames[0]!;
-
-		// Same op_id and trace across the lifecycle; parent is the ambient parent.
-		expect(start.traceId).toBe(traceId);
-		expect(start.parentOpId).toBe(parentOpId);
-		expect(end.opId).toBe(start.opId);
-
-		// START minted at attempt 0; END carries the final attempt count (2 = took
-		// 3 tries) — the counter lives on the same row, no op per attempt.
-		expect(start.attempt).toBe(0);
-		expect(end.attempt).toBe(2);
-
-		// The single row ends OK (the 3rd try succeeded).
-		expect(end.status).toBe(Status.SUCCESS);
-	});
-
-	it("exhausted retries close the single CALL row with ERROR and final attempt", async () => {
-		const candidate = makeCandidate("target-svc", "Charge");
-		const proxy = makeFailingProxyTransport(5); // always fails within maxAttempts
-		const cache = makeInstanceCache("target-svc", "Charge");
-		const lb = makeLB(candidate);
-
-		const client = new RpcClient(
-			proxy,
-			null,
-			cache,
-			(_s, _m) => makeSchemaPair(),
-			() => "caller-svc",
-			cb,
-			lb,
-			sb,
-		);
-
-		await expect(
-			client.call(
-				"target-svc",
-				"Charge",
-				{},
-				{
-					retry: {
-						maxAttempts: 3,
-						baseDelayMs: 0,
-						factor: 1,
-						maxDelayMs: 0,
-						jitter: 0,
-					},
-				},
-			),
-		).rejects.toThrow();
-
-		const reports = drainOpReports(ring);
-		const callFrames = reports.filter(
-			(r) => r.channel === Channel.RPC && r.kind === RpcCall,
-		);
-		const starts = callFrames.filter((r) => r.finishedAtMs === undefined);
-		const ends = callFrames.filter((r) => r.finishedAtMs !== undefined);
-		expect(starts).toHaveLength(1);
-		expect(ends).toHaveLength(1);
-		expect(ends[0]!.opId).toBe(starts[0]!.opId);
-		expect(ends[0]!.attempt).toBe(2);
-		expect(ends[0]!.status).toBe(Status.ERROR);
-	});
-
-	it("falls back to runtime proxy once when a stale direct endpoint refuses connection", async () => {
-		const candidate = makeCandidate("target-svc", "Charge");
-		candidate.instance.callEndpoint = "10.0.1.221:50051";
-		const cache = makeInstanceCache("target-svc", "Charge");
-		const lb = makeLB(candidate);
-		const directCalls: string[] = [];
-		let directRequestId = "";
-		const direct = {
-			callUnary: async (
-				target: { endpoint: string },
-				_method: string,
-				_payload: Uint8Array,
-				_callerService: string,
-				requestId: string,
-			) => {
-				directCalls.push(target.endpoint);
-				directRequestId = requestId;
-				throw Object.assign(new Error("connect ECONNREFUSED 10.0.1.221"), {
-					code: 14,
-					preDispatch: true,
-				});
-			},
-		} as unknown as DirectTransport;
-		const proxyCalls: Array<{
-			serviceId: string;
-			requestId: string;
-			timeoutMs: number;
-		}> = [];
-		const proxy = {
-			callUnary: async (
-				serviceId: string,
-				_method: string,
-				_payload: Uint8Array,
-				requestId: string,
-				_idempotencyKey: string,
-				timeoutMs: number,
-			) => {
-				proxyCalls.push({ serviceId, requestId, timeoutMs });
-				return Buffer.from('{"instance":"10.0.1.226"}');
-			},
-		} as unknown as ProxyTransport;
-		const client = new RpcClient(
-			proxy,
-			direct,
-			cache,
-			() => makeSchemaPair(),
-			() => "caller-svc",
-			cb,
-			lb,
-			sb,
-		);
-
-		const result = await client.call<object, { instance: string }>(
-			"target-svc",
-			"Charge",
-			{},
-			{
-				requestId: "same-logical-call",
-				timeout: "1s",
-				retry: { maxAttempts: 3 },
-			},
-		);
-		expect(result.instance).toBe("10.0.1.226");
-		expect(directCalls).toEqual(["10.0.1.221:50051"]);
-		expect(proxyCalls).toHaveLength(1);
-		expect(proxyCalls[0]!.serviceId).toBe(candidate.instance.serviceId);
-		expect(directRequestId).toBe("same-logical-call");
-		expect(proxyCalls[0]!.requestId).toBe(directRequestId);
-		expect(proxyCalls[0]!.timeoutMs).toBeGreaterThan(0);
-		expect(proxyCalls[0]!.timeoutMs).toBeLessThanOrEqual(1000);
-		const ends = drainOpReports(ring).filter(
-			(r) => r.kind === RpcCall && r.finishedAtMs !== undefined,
-		);
-		expect(ends).toHaveLength(1);
-		expect(ends[0]!.status).toBe(Status.SUCCESS);
-		expect(ends[0]!.attempt).toBe(1);
-	});
-
-	it("does not replay an ambiguous direct UNAVAILABLE without idempotency", async () => {
-		const candidate = makeCandidate("target-svc", "Charge");
-		let directCalls = 0;
-		let proxyCalls = 0;
-		const direct = {
-			callUnary: async () => {
-				directCalls++;
-				throw Object.assign(new Error("callee disconnected after dispatch"), {
-					code: 14,
-				});
-			},
-		} as unknown as DirectTransport;
-		const proxy = makeProxyTransport(() => proxyCalls++);
-		const client = new RpcClient(
-			proxy,
-			direct,
-			makeInstanceCache("target-svc", "Charge"),
-			() => makeSchemaPair(),
-			() => "caller-svc",
-			cb,
-			makeLB(candidate),
-			sb,
-		);
-
-		await expect(
-			client.call("target-svc", "Charge", {}, { retry: { maxAttempts: 3 } }),
-		).rejects.toThrow("callee disconnected after dispatch");
-		expect(directCalls).toBe(1);
-		expect(proxyCalls).toBe(0);
-	});
-
-	// ─── T7: stream produces single CALL op ─────────────────────────────────────
-
-	it("stream produces single CALL op for entire stream lifetime — not per-chunk", async () => {
-		const candidate = makeCandidate("target-svc", "Stream", true);
-		// Proxy transport that yields 3 chunks then closes.
-		const proxy: ProxyTransport = {
-			callStream: async function* () {
-				yield Buffer.from("{}");
-				yield Buffer.from("{}");
-				yield Buffer.from("{}");
-			},
-			callUnary: async () => Buffer.from("{}"),
-			close: () => {},
-		} as unknown as ProxyTransport;
-
-		const cache = makeInstanceCache("target-svc", "Stream", true);
-		const lb = makeLB(candidate);
-
-		const client = new RpcClient(
-			proxy,
-			null,
-			cache,
-			(_s, _m) => makeSchemaPair(),
-			() => "caller-svc",
-			cb,
-			lb,
-			sb,
-		);
-
-		const traceId = "01900000-0000-7000-8000-000000000020";
-		const parentOpId = "01900000-0000-7000-8000-000000000021";
-
-		await runWithTrace({ traceId, parentOpId }, async () => {
-			const chunks = [];
-			for await (const chunk of client.stream("target-svc", "Stream", {})) {
-				chunks.push(chunk);
-			}
-			expect(chunks).toHaveLength(3);
-		});
-
-		const reports = drainOpReports(ring);
-		const startFrames = reports.filter(
-			(r) =>
-				r.channel === Channel.RPC &&
-				r.kind === RpcCall &&
-				r.finishedAtMs === undefined,
-		);
-		const endFrames = reports.filter(
-			(r) =>
-				r.channel === Channel.RPC &&
-				r.kind === RpcCall &&
-				r.finishedAtMs !== undefined,
-		);
-
-		// Exactly 1 CALL op — not 3 (not per-chunk).
-		expect(startFrames).toHaveLength(1);
-		expect(endFrames).toHaveLength(1);
-
-		const start = startFrames[0]!;
-		expect(start.traceId).toBe(traceId);
-		expect(start.parentOpId).toBe(parentOpId);
-		expect(start.subject).toBe("rpc.call:target-svc/Stream");
-		expect(start.attempt).toBe(0);
-
-		const end = endFrames[0]!;
-		expect(end.status).toBe(Status.SUCCESS);
-	});
-
-	// ─── peerServiceId and metaJson.via_proxy field ──────────────────────────────
-
-	it("CALL op carries peerServiceId = target.serviceId and metaJson.via_proxy flag", async () => {
-		const candidate = makeCandidate("target-svc", "Charge");
-		const proxy = makeProxyTransport();
-		const cache = makeInstanceCache("target-svc", "Charge");
-		const lb = makeLB(candidate);
-
-		const client = new RpcClient(
-			proxy,
-			null,
-			cache,
-			(_s, _m) => makeSchemaPair(),
-			() => "caller-svc",
-			cb,
-			lb,
-			sb,
-		);
-
-		await runWithTrace(
-			{
-				traceId: "01900000-0000-7000-8000-000000000030",
-				parentOpId: "01900000-0000-7000-8000-000000000031",
-			},
-			async () => {
-				await client.call("target-svc", "Charge", {});
-			},
-		);
-
-		const reports = drainOpReports(ring);
-		const start = reports.find(
-			(r) =>
-				r.channel === Channel.RPC &&
-				r.kind === RpcCall &&
-				r.finishedAtMs === undefined,
-		)!;
-		expect(start).toBeDefined();
-
-		// peerServiceId must be the target instance's serviceId (actor/peer contract).
-		expect(start.peerServiceId).toBe(candidate.instance.serviceId);
-
-		// metaJson must carry via_proxy (true here: null directTransport → proxy path).
-		const meta = JSON.parse(Buffer.from(start.metaJson!).toString()) as Record<
-			string,
-			unknown
-		>;
-		expect(meta.via_proxy).toBe(true);
-		expect(meta.method).toBe("Charge");
-	});
-
-	// ─── stream error path → CALL ends with ERROR ────────────────────────────────
-
-	it("stream CALL op ends with ERROR when generator throws", async () => {
-		const candidate = makeCandidate("target-svc", "Stream", true);
-		const errMsg = "upstream broke";
-		const erroringProxy: ProxyTransport = {
-			callStream: async function* () {
-				yield Buffer.from("{}");
-				throw new Error(errMsg);
-			},
-			callUnary: async () => Buffer.from("{}"),
-			close: () => {},
-		} as unknown as ProxyTransport;
-
-		const cache = makeInstanceCache("target-svc", "Stream", true);
-		const lb = makeLB(candidate);
-
-		const client = new RpcClient(
-			erroringProxy,
-			null,
-			cache,
-			(_s, _m) => makeSchemaPair(),
-			() => "caller-svc",
-			cb,
-			lb,
-			sb,
-		);
-
-		await runWithTrace(
-			{
-				traceId: "01900000-0000-7000-8000-000000000040",
-				parentOpId: "01900000-0000-7000-8000-000000000041",
-			},
-			async () => {
-				try {
-					for await (const _ of client.stream("target-svc", "Stream", {})) {
-						// consume first chunk
-					}
-				} catch {
-					// expected
-				}
-			},
-		);
-
-		const reports = drainOpReports(ring);
-		const endFrames = reports.filter(
-			(r) =>
-				r.channel === Channel.RPC &&
-				r.kind === RpcCall &&
-				r.finishedAtMs !== undefined,
-		);
-
-		expect(endFrames).toHaveLength(1);
-		const end = endFrames[0]!;
-		expect(end.status).toBe(Status.ERROR);
-		expect(end.statusMessage).toBe(errMsg);
-	});
-
-	// ─── call() error path → CALL ends with ERROR (non-retryable) ───────────────
-
-	it("call CALL op ends with ERROR when transport throws non-retryable error", async () => {
-		const candidate = makeCandidate("target-svc", "Charge");
-		const errMsg = "permission denied";
-		// gRPC status code 7 = PermissionDenied — non-retryable.
-		const failProxy: ProxyTransport = {
-			callUnary: async () => {
-				const err = Object.assign(new Error(errMsg), { code: 7 });
-				throw err;
-			},
-			callStream: async function* () {},
-			close: () => {},
-		} as unknown as ProxyTransport;
-
-		const cache = makeInstanceCache("target-svc", "Charge");
-		const lb = makeLB(candidate);
-
-		const client = new RpcClient(
-			failProxy,
-			null,
-			cache,
-			(_s, _m) => makeSchemaPair(),
-			() => "caller-svc",
-			cb,
-			lb,
-			sb,
-		);
-
-		await runWithTrace(
-			{
-				traceId: "01900000-0000-7000-8000-000000000050",
-				parentOpId: "01900000-0000-7000-8000-000000000051",
-			},
-			async () => {
-				try {
-					await client.call(
-						"target-svc",
-						"Charge",
-						{},
-						{ retry: { maxAttempts: 1 } },
-					);
-				} catch {
-					// expected
-				}
-			},
-		);
-
-		const reports = drainOpReports(ring);
-		const endFrames = reports.filter(
-			(r) =>
-				r.channel === Channel.RPC &&
-				r.kind === RpcCall &&
-				r.finishedAtMs !== undefined,
-		);
-
-		expect(endFrames).toHaveLength(1);
-		const end = endFrames[0]!;
-		expect(end.status).toBe(Status.ERROR);
-		expect(end.statusMessage).toBe(errMsg);
 	});
 });
 
-describe("RPC circuit breaker error classification", () => {
-	for (const streaming of [false, true]) {
-		for (const code of [3, 5, 7, 9, 16, 13, 14]) {
-			it(`${streaming ? "stream" : "unary"} code ${code} only opens the breaker for service failures`, async () => {
-				const candidate = makeCandidate("target-svc", "Charge", streaming);
-				const cb = new CircuitBreakerRegistry();
-				const error = Object.assign(new Error("Rejected"), { code });
-				const proxy = {
-					callUnary: async () => {
-						throw error;
-					},
-					callStream: async function* () {
-						yield Buffer.from("{}");
-						throw error;
-					},
-				} as unknown as ProxyTransport;
-				const client = new RpcClient(
-					proxy,
-					null,
-					makeInstanceCache("target-svc", "Charge", streaming),
-					() => makeSchemaPair(),
-					() => "caller-svc",
-					cb,
-					makeLB(candidate),
-					makeStubSb(makeRing()),
-				);
-				for (let i = 0; i < 10; i++) {
-					const invoke = async () => {
-						if (streaming) {
-							for await (const _chunk of client.stream(
-								"target-svc",
-								"Charge",
-								{},
-							)) {
-							}
-						} else {
-							await client.call(
-								"target-svc",
-								"Charge",
-								{},
-								{ retry: { maxAttempts: 1 } },
-							);
-						}
-					};
-					await expect(invoke()).rejects.toMatchObject({ code });
-				}
-				expect(cb.state(cbKey(candidate.instance))).toBe(
-					[13, 14].includes(code) ? "OPEN" : "CLOSED",
-				);
+describe("RpcClient.call retries", () => {
+	it("retries a pre-dispatch failure on the same op and succeeds", async () => {
+		let n = 0;
+		const ring = new TelemetryRing();
+		const { client, rec } = makeClient({
+			ring,
+			direct: async () => {
+				if (++n < 3) throw preDispatch();
+				return Buffer.from("{}");
+			},
+			callDefaults: { transport: "direct" },
+		});
+		await client.call(SVC, METHOD, {}, fast);
+		expect(rec.direct).toHaveLength(3);
+		const frames = ops(ring);
+		expect(new Set(frames.map((f) => f.opId)).size).toBe(1);
+		expect(frames.at(-1)?.status).toBe(Status.SUCCESS);
+		expect(frames.at(-1)?.attempt).toBe(2);
+	});
+
+	it("auto falls back to the runtime proxy after a pre-dispatch direct failure", async () => {
+		const { client, rec } = makeClient({
+			direct: async () => {
+				throw preDispatch();
+			},
+		});
+		await expect(client.call(SVC, METHOD, {}, fast)).resolves.toEqual({
+			ok: true,
+		});
+		expect(rec.direct).toHaveLength(1);
+		expect(rec.proxy).toHaveLength(1);
+		// The runtime is told which instance the direct path could not reach.
+		expect(rec.proxy[0]?.excludeInstanceIds).toEqual(["inst-1"]);
+	});
+
+	it("never replays a dispatched failure", async () => {
+		const { client, rec } = makeClient({
+			direct: async () => {
+				throw dispatched();
+			},
+		});
+		const err = await client.call(SVC, METHOD, {}, fast).catch((e) => e);
+		expect(err).toBeInstanceOf(ServiceBridgeError);
+		expect((err as ServiceBridgeError).code).toBe("CONNECTION");
+		expect(rec.direct).toHaveLength(1);
+		expect(rec.proxy).toHaveLength(0);
+	});
+
+	it("exhausted pre-dispatch attempts close the op with ERROR and throw the last error", async () => {
+		const ring = new TelemetryRing();
+		const { client } = makeClient({
+			ring,
+			proxy: async () => {
+				throw preDispatch();
+			},
+			callDefaults: { transport: "proxy" },
+		});
+		const err = await client.call(SVC, METHOD, {}, fast).catch((e) => e);
+		expect((err as ServiceBridgeError).code).toBe("CONNECTION");
+		expect(ops(ring).at(-1)?.status).toBe(Status.ERROR);
+	});
+
+	it("no candidate is NO_LIVE_INSTANCE after the attempts", async () => {
+		const { client } = makeClient({ candidates: [] });
+		const err = await client.call(SVC, METHOD, {}, fast).catch((e) => e);
+		expect(err).toBeInstanceOf(NoLiveInstanceError);
+		expect((err as NoLiveInstanceError).retryable).toBe(true);
+	});
+
+	it("transport direct with no advertised endpoint never goes via proxy", async () => {
+		const { client, rec } = makeClient({
+			candidates: [
+				{ descriptor: desc(), instance: inst(""), isUnhealthyAt: null },
+			],
+			callDefaults: { transport: "direct" },
+		});
+		const err = await client.call(SVC, METHOD, {}, fast).catch((e) => e);
+		expect(err).toBeInstanceOf(NoLiveInstanceError);
+		expect(rec.proxy).toHaveLength(0);
+	});
+
+	it("a cancelled call is CANCELLED and not retried", async () => {
+		const ctl = new AbortController();
+		const { client, rec } = makeClient({
+			direct: async () => {
+				ctl.abort();
+				throw preDispatch();
+			},
+		});
+		const err = await client
+			.call(SVC, METHOD, {}, { ...fast, signal: ctl.signal })
+			.catch((e) => e);
+		expect((err as ServiceBridgeError).code).toBe("CANCELLED");
+		expect(rec.direct).toHaveLength(1);
+	});
+});
+
+describe("RpcClient.call errors and options", () => {
+	it("a handler error reaches the caller as HandlerError with the business code", async () => {
+		const { client } = makeClient({
+			direct: async () => {
+				throw handlerFailure("OUT_OF_STOCK", "nothing left");
+			},
+		});
+		const err = await client.call(SVC, METHOD, {}).catch((e) => e);
+		expect(err).toBeInstanceOf(HandlerError);
+		expect((err as HandlerError).handlerCode).toBe("OUT_OF_STOCK");
+		expect((err as HandlerError).message).toBe("nothing left");
+	});
+
+	it("a missing caller schema is a configuration error", async () => {
+		const { client } = makeClient({ noSchema: true });
+		await expect(client.call(SVC, METHOD, {})).rejects.toBeInstanceOf(
+			ConfigurationError,
+		);
+	});
+
+	it("calling a streaming method as unary is a validation error", async () => {
+		const { client } = makeClient({ streaming: true });
+		await expect(client.call(SVC, METHOD, {})).rejects.toBeInstanceOf(
+			ValidationError,
+		);
+	});
+
+	it("callDefaults apply and per-call options win", async () => {
+		const { client, rec } = makeClient({
+			callDefaults: {
+				transport: "proxy",
+				idempotencyKey: "default-key",
+				timeout: "5s",
+			},
+		});
+		const before = Date.now();
+		await client.call(SVC, METHOD, {}, { idempotencyKey: "own-key" });
+		expect(rec.proxy).toHaveLength(1);
+		const call = rec.proxy[0] as WireCall;
+		expect(call.idempotencyKey).toBe("own-key");
+		expect(call.deadline.getTime() - before).toBeLessThanOrEqual(5_100);
+		expect(call.deadline.getTime() - before).toBeGreaterThan(4_000);
+	});
+
+	it("an invalid timeout string is a configuration error", async () => {
+		const { client } = makeClient({});
+		await expect(
+			client.call(SVC, METHOD, {}, { timeout: "soon" }),
+		).rejects.toBeInstanceOf(ConfigurationError);
+	});
+});
+
+describe("RpcClient circuit breaker input", () => {
+	const cases: [string, () => CallFailure, "OPEN" | "CLOSED"][] = [
+		["handler error", () => handlerFailure("BAD", "bad"), "CLOSED"],
+		[
+			"access denied",
+			() =>
+				new CallFailure(new ServiceBridgeError("ACCESS_DENIED", "no"), false),
+			"CLOSED",
+		],
+		[
+			"validation",
+			() => new CallFailure(new ServiceBridgeError("VALIDATION", "no"), false),
+			"CLOSED",
+		],
+		["connection", dispatched, "OPEN"],
+		[
+			"timeout",
+			() => new CallFailure(new ServiceBridgeError("TIMEOUT", "late"), false),
+			"OPEN",
+		],
+		[
+			"internal status",
+			() => new CallFailure(new ServiceBridgeError("INTERNAL", "boom"), false),
+			"OPEN",
+		],
+	];
+	for (const [name, failure, state] of cases) {
+		it(`${name} leaves the breaker ${state}`, async () => {
+			const cb = new CircuitBreakerRegistry();
+			const { client, candidates } = makeClient({
+				cb,
+				direct: async () => {
+					throw failure();
+				},
 			});
-		}
+			for (let i = 0; i < 12; i++)
+				await client
+					.call(SVC, METHOD, {}, { retry: { maxAttempts: 1 } })
+					.catch(() => {});
+			expect(cb.state(cbKey((candidates[0] as Candidate).instance))).toBe(
+				state,
+			);
+		});
 	}
+});
+
+describe("RpcClient.stream", () => {
+	it("one op for the whole stream, ERROR when the stream fails", async () => {
+		const ring = new TelemetryRing();
+		const { client } = makeClient({
+			ring,
+			streaming: true,
+			stream: async function* () {
+				yield Buffer.from('{"n":1}');
+				throw dispatched();
+			},
+		});
+		const got: unknown[] = [];
+		const err = await (async () => {
+			for await (const chunk of client.stream(SVC, METHOD, {})) got.push(chunk);
+		})().catch((e) => e);
+		expect(got).toEqual([{ n: 1 }]);
+		expect((err as ServiceBridgeError).code).toBe("CONNECTION");
+		const frames = ops(ring);
+		expect(frames).toHaveLength(2);
+		expect(frames[1]?.status).toBe(Status.ERROR);
+	});
+
+	it("streaming a unary method is a validation error", async () => {
+		const { client } = makeClient({ streaming: false });
+		const err = await (async () => {
+			for await (const _ of client.stream(SVC, METHOD, {})) {
+			}
+		})().catch((e) => e);
+		expect(err).toBeInstanceOf(ValidationError);
+	});
 });

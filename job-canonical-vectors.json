@@ -1,0 +1,218 @@
+{
+  "description": "Canonical job spec vectors: input is the Node JobOpts shape; canonical is JSON.stringify of the canonical spec, byte for byte; sha256 is its contract hash. Both SDKs must reproduce every vector.",
+  "vectors": [
+    {
+      "name": "cron without timezone",
+      "input": {
+        "version": "v1",
+        "trigger": {
+          "cron": "0 3 * * *"
+        }
+      },
+      "canonical": "{\"version\":\"v1\",\"trigger\":{\"cron\":{\"expr\":\"0 3 * * *\"}}}",
+      "sha256": "b6cf6d7d1962006b3b09cd526d733c27bba95c5028e68fbcb26914244f936c33"
+    },
+    {
+      "name": "cron with timezone",
+      "input": {
+        "version": "v1",
+        "trigger": {
+          "cron": "*/5 * * * *",
+          "tz": "Europe/Berlin"
+        }
+      },
+      "canonical": "{\"version\":\"v1\",\"trigger\":{\"cron\":{\"expr\":\"*/5 * * * *\",\"tz\":\"Europe/Berlin\"}}}",
+      "sha256": "13bd9b12b92519b9d0caa93ee189012568f96d39e4f42ebe3bac8c94fcc0ccd2"
+    },
+    {
+      "name": "interval",
+      "input": {
+        "version": "v2",
+        "trigger": {
+          "interval": 30000
+        }
+      },
+      "canonical": "{\"version\":\"v2\",\"trigger\":{\"interval\":{\"everyMs\":30000}}}",
+      "sha256": "3d2e808f2904867173460f5edafc92a4341699afcd39b940cb9670cfd3d18ea0"
+    },
+    {
+      "name": "delayed",
+      "input": {
+        "version": "v1",
+        "trigger": {
+          "delayed": {
+            "at": 1767225600000
+          }
+        }
+      },
+      "canonical": "{\"version\":\"v1\",\"trigger\":{\"delayed\":{\"runAtUnixMs\":1767225600000}}}",
+      "sha256": "13462962a5fbe38433116f284057e216108246a41d395e4edfba3ab49838218a"
+    },
+    {
+      "name": "every field",
+      "input": {
+        "version": "v3",
+        "trigger": {
+          "cron": "0 0 1 * *",
+          "tz": "UTC"
+        },
+        "catchup": "fire_all",
+        "overlap": "buffer_one",
+        "deps": [
+          {
+            "rpc": "billing.Charge"
+          },
+          {
+            "event": "order.placed"
+          },
+          {
+            "workflow": "checkout"
+          }
+        ],
+        "maxAttempts": 7,
+        "leaseTtlMs": 30000,
+        "maxConcurrent": 4,
+        "retry": {
+          "initialMs": 250,
+          "maxMs": 5000,
+          "multiplier": 1.5,
+          "jitter": 0.1
+        }
+      },
+      "canonical": "{\"version\":\"v3\",\"trigger\":{\"cron\":{\"expr\":\"0 0 1 * *\",\"tz\":\"UTC\"}},\"catchup\":\"fire_all\",\"overlap\":\"buffer_one\",\"deps\":[{\"kind\":\"rpc\",\"target\":\"billing.Charge\"},{\"kind\":\"event\",\"target\":\"order.placed\"},{\"kind\":\"workflow\",\"target\":\"checkout\"}],\"maxAttempts\":7,\"leaseTtlMs\":30000,\"maxConcurrent\":4,\"retry\":{\"initial_ms\":250,\"max_ms\":5000,\"multiplier\":1.5,\"jitter\":0.1}}",
+      "sha256": "bf78d14d51c486ce8583088302beaed15b2f2a70aca6c8384e672d5a0fff8107"
+    },
+    {
+      "name": "zero limits are written",
+      "input": {
+        "version": "v1",
+        "trigger": {
+          "interval": 1000
+        },
+        "maxAttempts": 0,
+        "leaseTtlMs": 0,
+        "maxConcurrent": 0
+      },
+      "canonical": "{\"version\":\"v1\",\"trigger\":{\"interval\":{\"everyMs\":1000}},\"maxAttempts\":0,\"leaseTtlMs\":0,\"maxConcurrent\":0}",
+      "sha256": "6ac3670135d34e33f6afd704fcec86f0c3f2ca3aea811073082dba859743eb84"
+    },
+    {
+      "name": "empty deps are left out",
+      "input": {
+        "version": "v1",
+        "trigger": {
+          "interval": 1000
+        },
+        "deps": []
+      },
+      "canonical": "{\"version\":\"v1\",\"trigger\":{\"interval\":{\"everyMs\":1000}}}",
+      "sha256": "1be70dfb3805071572dd48e43245ec178865dc98d254ac6840ff39a8f496b8c2"
+    },
+    {
+      "name": "policies only",
+      "input": {
+        "version": "v1",
+        "trigger": {
+          "cron": "15 4 * * 1"
+        },
+        "catchup": "skip",
+        "overlap": "allow"
+      },
+      "canonical": "{\"version\":\"v1\",\"trigger\":{\"cron\":{\"expr\":\"15 4 * * 1\"}},\"catchup\":\"skip\",\"overlap\":\"allow\"}",
+      "sha256": "c24e8b577c3469497bf1656d67c816866895d520db6dc1cb30a77caefd11376d"
+    },
+    {
+      "name": "line separators stay raw",
+      "input": {
+        "version": "v1 x y",
+        "trigger": {
+          "interval": 60000
+        }
+      },
+      "canonical": "{\"version\":\"v1 x y\",\"trigger\":{\"interval\":{\"everyMs\":60000}}}",
+      "sha256": "44a522899edecdf4e62cefaaebb6a0542a5daffc6db416e6a050ee7c61fc6fec"
+    },
+    {
+      "name": "html characters stay raw",
+      "input": {
+        "version": "<b>&amp;</b>",
+        "trigger": {
+          "interval": 60000
+        },
+        "deps": [
+          {
+            "event": "a&b<c>d"
+          }
+        ]
+      },
+      "canonical": "{\"version\":\"<b>&amp;</b>\",\"trigger\":{\"interval\":{\"everyMs\":60000}},\"deps\":[{\"kind\":\"event\",\"target\":\"a&b<c>d\"}]}",
+      "sha256": "c678419a1fec033d032f1bbdebe22baf30d26e6a00082979add7108aa022c0ea"
+    },
+    {
+      "name": "quotes, backslash and control characters",
+      "input": {
+        "version": "say \"hi\"\\now",
+        "trigger": {
+          "interval": 60000
+        },
+        "deps": [
+          {
+            "rpc": "tab\there\nnew\rret\bback\fform\u0001\u001f"
+          }
+        ]
+      },
+      "canonical": "{\"version\":\"say \\\"hi\\\"\\\\now\",\"trigger\":{\"interval\":{\"everyMs\":60000}},\"deps\":[{\"kind\":\"rpc\",\"target\":\"tab\\there\\nnew\\rret\\bback\\fform\\u0001\\u001f\"}]}",
+      "sha256": "dc4fd5acb33743247372b7058139efb5b653a267e46f807b26003589dce01c0e"
+    },
+    {
+      "name": "non-ascii text",
+      "input": {
+        "version": "версия-1 😀",
+        "trigger": {
+          "interval": 60000
+        },
+        "deps": [
+          {
+            "workflow": "заказ.创建"
+          }
+        ]
+      },
+      "canonical": "{\"version\":\"версия-1 😀\",\"trigger\":{\"interval\":{\"everyMs\":60000}},\"deps\":[{\"kind\":\"workflow\",\"target\":\"заказ.创建\"}]}",
+      "sha256": "0ebfd22b0d6aca227ee76a4fe6337d4fefae686fdf250ee194870e3f380967d3"
+    },
+    {
+      "name": "integer retry factors",
+      "input": {
+        "version": "v1",
+        "trigger": {
+          "interval": 60000
+        },
+        "retry": {
+          "initialMs": 100,
+          "maxMs": 100,
+          "multiplier": 2,
+          "jitter": 0
+        }
+      },
+      "canonical": "{\"version\":\"v1\",\"trigger\":{\"interval\":{\"everyMs\":60000}},\"retry\":{\"initial_ms\":100,\"max_ms\":100,\"multiplier\":2,\"jitter\":0}}",
+      "sha256": "01a4c075086aad33771b167c894e0ac310d488bc5bf530229548cbef29ac6d85"
+    },
+    {
+      "name": "small fractional jitter",
+      "input": {
+        "version": "v1",
+        "trigger": {
+          "interval": 60000
+        },
+        "retry": {
+          "initialMs": 1,
+          "maxMs": 1000000,
+          "multiplier": 1.25,
+          "jitter": 1e-7
+        }
+      },
+      "canonical": "{\"version\":\"v1\",\"trigger\":{\"interval\":{\"everyMs\":60000}},\"retry\":{\"initial_ms\":1,\"max_ms\":1000000,\"multiplier\":1.25,\"jitter\":1e-7}}",
+      "sha256": "44c2e7f934f6793fed2152726155a8a0721f18216888df20a9a7edeab621158c"
+    }
+  ]
+}

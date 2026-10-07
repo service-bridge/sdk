@@ -23,9 +23,9 @@
 
 | Имя | Тип | По умолчанию | Что делает |
 |-----|-----|--------------|------------|
-| `Spec` | struct | все поля нулевые | `Trigger`, `Catchup`, `Overlap`, `Deps`, `MaxAttempts`, `LeaseTTLMs`, `MaxConcurrent`, `Retry`. Нулевое поле не попадает в JSON — значение проставит рантайм. |
+| `Spec` | struct | все поля не заданы | `Version`, `Trigger`, `Catchup`, `Overlap`, `Deps`, `MaxAttempts *int`, `LeaseTTLMs *int64`, `MaxConcurrent *int`, `Retry *RetryPolicy`. Незаданное поле (`nil`, пустая строка, пустой список) не попадает в JSON; заданный лимит пишется, даже если он `0`. |
 | `Spec.Validate()` | `error` | — | Отвергает формы, на которые рантайм отвечает `InvalidArgument`, и ту одну, которую он молча переписывает (retry без начальной задержки). |
-| `Spec.CanonicalJSON()` | `([]byte, error)` | — | Каноническая форма для `input_schema_json`. Валидирует перед сериализацией. |
+| `Spec.CanonicalJSON()` | `([]byte, error)` | — | Каноническая форма для `input_schema_json` — байт в байт `JSON.stringify` Node SDK (векторы в `sdk/job-canonical-vectors.json`). Валидирует перед сериализацией. |
 | `ContractHash(canonicalJSON []byte)` | `string` | — | SHA-256 в hex от ровно тех байт, что уедут на провод. |
 | `CatchupPolicy` | `string` | пусто | `CatchupSkip`, `CatchupFireOnce`, `CatchupFireAll`. |
 | `OverlapPolicy` | `string` | пусто | `OverlapSkip`, `OverlapAllow`, `OverlapBufferOne`. |
@@ -38,7 +38,7 @@
 |-----|-----|--------------|------------|
 | `Handler` | `func(ctx context.Context, exec Execution) error` | — | Обработчик одного исполнения. У задач нет входа и выхода. |
 | `Execution` | struct | — | `Name`, `ID`, `ScheduledAtUnixMs`, `LocalScheduledAtUnixMs`, `Attempt`, `IdempotencyKey`. |
-| `ErrPermanent` | `error` | — | Обёрнутая в неё ошибка отправляется как `retryable=false`. |
+| `ErrPermanent` | `error` | — | Обёрнутая в неё ошибка отправляется как `JobFailure.retryable=false`; рантайм сразу отправляет исполнение в DLQ. Публично оборачивается через `servicebridge.NonRetryable(err)`. |
 | `Declaration` | struct | — | `Name`, `Spec`, `SpecJSON`, `ContractHash`, `Handler` — всё, что нужно и реестру, и подписчику. |
 | `NewDeclarations()` | `*Declarations` | — | Набор объявленных задач. Потокобезопасен. |
 | `Declarations.Add(name, spec, handler)` | `(Declaration, error)` | — | Валидирует спецификацию, замораживает канонические байты и хеш, привязывает обработчик. Дубль имени — ошибка. |
@@ -55,12 +55,14 @@
 | `NewSubscriber(cfg SubscriberConfig)` | `(*Subscriber, error)` | — | Проверяет конфиг, подставляет дефолты, строит супервизор стрима. |
 | `Subscriber.Start(ctx)` | `error` | — | Открывает `Jobs.Subscribe` и запускает хартбит. Повторный вызов — `stream.ErrAlreadyStarted`. |
 | `Subscriber.Stop()` | — | — | Отменяет контексты выполняющихся обработчиков, закрывает стрим, дожидается всех своих горутин. Терминально. |
+| `Subscriber.Drain()` | — | — | Перестаёт брать новые исполнения; рантайм вернёт их после закрытия стрима. |
+| `Subscriber.Wait(ctx)` | `error` | — | Ждёт, пока не останется выполняющихся исполнений, или конца `ctx`. |
 | `ClientSource` | interface | — | `JobsClient(ctx) (pb.JobsClient, error)` — стаб спрашивается на каждое открытие. |
 | `Identity` | struct | — | `ServiceID`, `InstanceID` живой сессии. |
 | `cfg.Clients` | `ClientSource` | — (обязательный) | Источник стаба. |
 | `cfg.Identity` | `func() Identity` | — (обязательный) | Идентичность по требованию: читается на каждый subscribe, хартбит и результат. |
 | `cfg.Jobs` | `*Declarations` | — (обязательный) | Резолв исполнения в обработчик и лимит одновременности. |
-| `cfg.HeartbeatInterval` | `time.Duration` | `5s` | Максимальный период хартбита. Первый запрос немедленный, runtime может сократить период ответом Heartbeat (timeout/3). |
+| `cfg.HeartbeatInterval` | `time.Duration` | `5s` | Период хартбита до первого ответа. Первый запрос немедленный; дальше период — `heartbeat_interval_ms` ответа рантайма в обе стороны (не реже 100 мс). |
 | `cfg.HeartbeatThreshold` | `int` | `3` | Сколько подряд неудачных хартбитов пересоздают стрим. |
 | `cfg.ResultTimeout` | `time.Duration` | `10s` | Потолок одного вызова `JobResult`. |
 | `cfg.Backoff` | `stream.Backoff` | `stream.NewBackoff()` | Лестница переподключения. |
@@ -78,7 +80,8 @@
 | `cronParser` | `cron.Parser` | 5 полей | Ровно та же конфигурация, что в `runtime/internal/jobs/register.go`. |
 | `triggerKind` | `uint8` | `triggerNone` | Дискриминант триггера. |
 | `canonicalSpec` / `canonicalTrigger` / `canonicalCron` / `canonicalDelayed` / `canonicalInterval` / `canonicalDep` | struct | — | Зеркало `runtime/internal/jobs/canonical.go`. Порядок полей = порядок ключей в JSON. |
-| `Trigger.canonical()` | метод | — | Триггер в канонической форме. `panic` на отсутствующем виде: `Validate` не пускает такую спецификацию дальше. |
+| `Trigger.write(w)` | метод | — | Триггер в канонической форме. `panic` на отсутствующем виде: `Validate` не пускает такую спецификацию дальше. |
+| `canonicalWriter` · `writeJSString` | тип, функция | — | Объект JSON по правилам `JSON.stringify`: строки экранируют только `"`, `\` и управляющие символы; `<`, `>`, `&`, U+2028/U+2029 — как есть; числа — через `encoding/json` (формат ECMAScript). |
 | `Subscriber.open` / `onData` / `dispatch` / `acquire` / `run` / `withTrace` / `sendResult` | методы | — | Хуки супервизора и путь одного исполнения. |
 | `Subscriber.heartbeat` / `beat` / `onHeartbeatFailure` | методы | — | Горутина хартбита и учёт подряд идущих отказов. |
 | `Subscriber.slots` | `map[string]chan struct{}` | — | Токены одновременности на задачу. |
@@ -89,11 +92,15 @@
 
 **`retry` — snake_case внутри camelCase документа.** Рантайм декодирует этот блок в `jobs.RetryPolicy`, чьи теги пришли из колонки `job_definitions.retry_policy`. Обе половины воспроизводятся как есть. Node SDK шлёт здесь camelCase — блок молча разбирается в нули, и рантайм заменяет всю политику своим дефолтом.
 
+**Каноническая форма — общая с Node.** Ключи в порядке `CanonicalJobSpec` рантайма, присутствие поля — как у Node (`!== undefined`): заданный ноль пишется. Строки кодируются как в `JSON.stringify`; `encoding/json` отличался бы `\u003c`/`\u003e`/`\u0026` и `\u2028`/`\u2029`, и такая спецификация получала бы в Go другой хеш. Общие векторы `sdk/job-canonical-vectors.json` прогоняют оба SDK.
+
 **Дефолтов у SDK нет.** Незаданная опция не попадает в документ; максимум попыток, TTL лиза, лимит одновременности и политика ретраев приходят из настроек рантайма. Копия дефолтов в SDK разошлась бы с первой же правкой настроек. Единственное исключение — `retry` с нулевой начальной задержкой: рантайм молча выбрасывает такую политику целиком, поэтому она отвергается здесь.
 
 **Cron валидируется при объявлении.** Пять полей, тот же парсер `robfig/cron/v3` и та же конфигурация, что у рантайма, плюс проверка зоны. Иначе выражение с ошибкой регистрируется как обычная строка, и задача просто не срабатывает — молча.
 
-**Идентичность читается по требованию.** `instance_id` меняется на каждой ротации сертификата. Скопированный при создании идентификатор — это хартбит за инстанс, которого уже нет: лиз истекает, исполнение переназначается, шаги выполняются дважды. Ровно этим сгорел workflow-подписчик в Node. Здесь идентичность спрашивается на каждый subscribe, на каждый хартбит и на каждую отправку результата.
+**Хартбит продлевает лизы.** Пока подписчик работает, хартбит идёт постоянно с периодом, который назначает рантайм; каждый удар продлевает лиз всех исполнений этого инстанса. Отдельного продления на исполнение нет.
+
+**Идентичность читается по требованию.** `instance_id` меняется при переподготовке истёкшего сертификата. Скопированный при создании идентификатор — это хартбит за инстанс, которого уже нет: лиз истекает, исполнение переназначается, шаги выполняются дважды. Ровно этим сгорел workflow-подписчик в Node. Здесь идентичность спрашивается на каждый subscribe, на каждый хартбит и на каждую отправку результата.
 
 **Отказ хартбита логируется всегда.** В Node он глушился пустым `catch`: инстанс молча реклеймился по таймауту, его исполнения уходили другому, и в логах не было ни строки. Здесь каждый отказ идёт в `Warn` со счётчиком и в `OnError`, а несколько подряд пересоздают стрим.
 

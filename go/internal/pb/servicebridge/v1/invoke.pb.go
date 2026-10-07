@@ -35,9 +35,14 @@ type InvokeRequest struct {
 	// method (ADR-0001). Empty for non-RPC paths or when the caller has no
 	// schema registered — matched only against instances that advertise an
 	// empty hash for the method.
-	ContractHash  []byte `protobuf:"bytes,7,opt,name=contract_hash,json=contractHash,proto3" json:"contract_hash,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	ContractHash []byte `protobuf:"bytes,7,opt,name=contract_hash,json=contractHash,proto3" json:"contract_hash,omitempty"`
+	// Instances the caller already failed to reach directly (e.g. the direct
+	// transport's pick before falling back to proxy). The runtime prefers any
+	// other compatible instance and uses an excluded one only when nothing
+	// else is left.
+	ExcludeInstanceIds []string `protobuf:"bytes,8,rep,name=exclude_instance_ids,json=excludeInstanceIds,proto3" json:"exclude_instance_ids,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *InvokeRequest) Reset() {
@@ -115,6 +120,13 @@ func (x *InvokeRequest) GetXSbTrace() string {
 func (x *InvokeRequest) GetContractHash() []byte {
 	if x != nil {
 		return x.ContractHash
+	}
+	return nil
+}
+
+func (x *InvokeRequest) GetExcludeInstanceIds() []string {
+	if x != nil {
+		return x.ExcludeInstanceIds
 	}
 	return nil
 }
@@ -244,7 +256,7 @@ var File_servicebridge_v1_invoke_proto protoreflect.FileDescriptor
 
 const file_servicebridge_v1_invoke_proto_rawDesc = "" +
 	"\n" +
-	"\x1dservicebridge/v1/invoke.proto\x12\x10servicebridge.v1\"\xf8\x01\n" +
+	"\x1dservicebridge/v1/invoke.proto\x12\x10servicebridge.v1\"\xaa\x02\n" +
 	"\rInvokeRequest\x12*\n" +
 	"\x11target_service_id\x18\x01 \x01(\tR\x0ftargetServiceId\x12\x16\n" +
 	"\x06method\x18\x02 \x01(\tR\x06method\x12\x18\n" +
@@ -254,7 +266,8 @@ const file_servicebridge_v1_invoke_proto_rawDesc = "" +
 	"\x0fidempotency_key\x18\x05 \x01(\tR\x0eidempotencyKey\x12\x1c\n" +
 	"\n" +
 	"x_sb_trace\x18\x06 \x01(\tR\bxSbTrace\x12#\n" +
-	"\rcontract_hash\x18\a \x01(\fR\fcontractHash\"n\n" +
+	"\rcontract_hash\x18\a \x01(\fR\fcontractHash\x120\n" +
+	"\x14exclude_instance_ids\x18\b \x03(\tR\x12excludeInstanceIds\"n\n" +
 	"\x0eInvokeResponse\x12\x18\n" +
 	"\apayload\x18\x01 \x01(\fR\apayload\x12\x1d\n" +
 	"\n" +

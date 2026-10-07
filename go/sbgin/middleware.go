@@ -24,7 +24,9 @@ import (
 // a handler registered earlier finishes the request first.
 func Middleware(integration *sbhttp.Integration) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		req, op, err := integration.Begin(c.Request)
+		// gin has routed the request by the time middleware runs; FullPath is
+		// the matched template ("/users/:id"), empty when nothing matched.
+		req, op, err := integration.Begin(c.Request, c.FullPath())
 		if err != nil {
 			integration.Logger().Error("sbgin: http span not started",
 				"error", err, "method", c.Request.Method, "path", c.Request.URL.Path)

@@ -42,7 +42,7 @@ func newIntegration(t *testing.T, httpMode telemetry.Mode) (*sbhttp.Integration,
 	return newIntegrationWithLimit(t, httpMode, telemetry.DefaultPayloadMaxBytes)
 }
 
-func newIntegrationWithLimit(t *testing.T, httpMode telemetry.Mode, payloadMaxBytes int32) (*sbhttp.Integration, *testRuntime) {
+func newIntegrationWithLimit(t *testing.T, httpMode telemetry.Mode, payloadMaxBytes int32, opts ...sbhttp.Option) (*sbhttp.Integration, *testRuntime) {
 	t.Helper()
 	policy := telemetry.NewPolicy()
 	modes := telemetry.DefaultModes()
@@ -54,7 +54,7 @@ func newIntegrationWithLimit(t *testing.T, httpMode telemetry.Mode, payloadMaxBy
 		rec:   telemetry.NewRecorder(telemetry.NewRing(telemetry.DefaultBudgets()), policy),
 		decls: registry.NewDeclarations(),
 	}
-	integ, err := sbhttp.New(rt, sbhttp.WithLogger(slog.New(slog.DiscardHandler)))
+	integ, err := sbhttp.New(rt, append([]sbhttp.Option{sbhttp.WithLogger(slog.New(slog.DiscardHandler))}, opts...)...)
 	if err != nil {
 		t.Fatalf("new integration: %v", err)
 	}
@@ -114,11 +114,30 @@ func TestRequestEmitsExactlyOneHandleOperation(t *testing.T) {
 	if start.GetKind() != uint32(telemetry.OpKindHTTPHandle) {
 		t.Errorf("kind: got %d, want %d (handle)", start.GetKind(), telemetry.OpKindHTTPHandle)
 	}
-	if want := "http.handle:GET//users/42"; start.GetSubject() != want {
+	// gin's matched template, the same string Publish declares.
+	if want := "http.handle:GET//users/:id"; start.GetSubject() != want {
 		t.Errorf("subject: got %q, want %q", start.GetSubject(), want)
 	}
 	if end.GetStatus() != pb.Status_SUCCESS {
 		t.Errorf("END status: got %v, want SUCCESS", end.GetStatus())
+	}
+	if want := `{"status":200}`; string(end.GetMetaJson()) != want {
+		t.Errorf("END meta: got %s, want %s", end.GetMetaJson(), want)
+	}
+}
+
+func TestUnmatchedRouteIsRecordedAsWildcard(t *testing.T) {
+	integ, rt := newIntegration(t, telemetry.ModeNone)
+	engine := engineWith(integ, http.MethodGet, "/users/:id", noop)
+
+	engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/nope?q=1", nil))
+
+	start, _ := startEnd(t, rt)
+	if want := "http.handle:GET/*"; start.GetSubject() != want {
+		t.Errorf("subject: got %q, want %q", start.GetSubject(), want)
+	}
+	if want := "GET *"; start.GetBusinessKey() != want {
+		t.Errorf("business key: got %q, want %q", start.GetBusinessKey(), want)
 	}
 }
 
@@ -215,8 +234,8 @@ func TestBusinessKey(t *testing.T) {
 }
 
 func TestTraceHeader(t *testing.T) {
-	t.Run("adopted", func(t *testing.T) {
-		integ, rt := newIntegration(t, telemetry.ModeNone)
+	t.Run("adopted when trusted", func(t *testing.T) {
+		integ, rt := newIntegrationWithLimit(t, telemetry.ModeNone, telemetry.DefaultPayloadMaxBytes, sbhttp.WithTrustTraceHeader())
 		engine := engineWith(integ, http.MethodGet, "/x", noop)
 
 		incoming := telemetry.TraceContext{TraceID: uuid.New(), ParentOpID: uuid.New()}

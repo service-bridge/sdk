@@ -1,0 +1,33 @@
+# What a handler's failure looks like to the caller.
+scenarios:
+  - name: a business code and message travel to the caller
+    callee:
+      rpc:
+        - method: decline
+          behaviour: {fail: {code: CARD_DECLINED, message: card declined}}
+    steps:
+      - call: {method: decline, payload: {}}
+        expect:
+          error: {code: HANDLER, handlerCode: CARD_DECLINED, handlerMessage: card declined, retryable: false}
+
+  - name: any other handler failure reaches the caller as INTERNAL
+    callee:
+      rpc:
+        - method: crash
+          behaviour: {throw: database is down}
+    steps:
+      - call: {method: crash, payload: {}}
+        expect:
+          error: {code: HANDLER, handlerCode: INTERNAL, retryable: false}
+
+  - name: a handler error is never retried
+    callee:
+      rpc:
+        - method: decline
+          behaviour: {fail: {code: OUT_OF_STOCK, message: none left}}
+    steps:
+      - call: {method: decline, payload: {}}
+        expect:
+          error: {code: HANDLER, handlerCode: OUT_OF_STOCK}
+          # The handler ran exactly once.
+          served: 1

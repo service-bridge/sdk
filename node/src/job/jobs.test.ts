@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { Registry } from "../registry/registry";
+import { cronError } from "./cron";
 import { JobDomain } from "./domain";
 import type { JobOpts, Trigger } from "./types";
 
@@ -389,4 +391,58 @@ test("job concurrency rejects unbounded and invalid limits before registration",
 		{ version: "v1", trigger: { interval: 1000 }, maxConcurrent: 0 },
 		noop,
 	);
+});
+
+// sdk/job-canonical-vectors.json is shared with the Go SDK (go/job): both must
+// produce the same canonical bytes and contract hash for every input.
+describe("canonical job spec — cross-SDK vectors", () => {
+	const { vectors } = JSON.parse(
+		readFileSync(
+			new URL("../../../job-canonical-vectors.json", import.meta.url),
+			"utf8",
+		),
+	) as {
+		vectors: {
+			name: string;
+			input: JobOpts;
+			canonical: string;
+			sha256: string;
+		}[];
+	};
+	for (const v of vectors) {
+		test(v.name, () => {
+			const { domain, registry } = newDomain();
+			domain.handle("vector", v.input, noop);
+			const entry = registry._handle.incomingMethods()[0]!;
+			expect(Buffer.from(entry.inputSchemaJson).toString()).toBe(v.canonical);
+			expect(entry.contractHash).toBe(v.sha256);
+		});
+	}
+});
+
+// sdk/cron-vectors.json is shared with the Go SDK, which validates with the
+// runtime's own parser: both must accept and reject the same expressions.
+describe("cron grammar — cross-SDK vectors", () => {
+	const { vectors } = JSON.parse(
+		readFileSync(
+			new URL("../../../cron-vectors.json", import.meta.url),
+			"utf8",
+		),
+	) as { vectors: { expr: string; valid: boolean }[] };
+	for (const v of vectors) {
+		test(`${JSON.stringify(v.expr)} is ${v.valid ? "valid" : "invalid"}`, () => {
+			expect(cronError(v.expr) === null).toBe(v.valid);
+		});
+	}
+});
+
+test("an unknown cron time zone is rejected at declaration", () => {
+	const { domain } = newDomain();
+	expect(() =>
+		domain.handle(
+			"tz",
+			{ version: "v1", trigger: { cron: "0 3 * * *", tz: "Mars/Olympus" } },
+			noop,
+		),
+	).toThrow(/time zone/);
 });

@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"errors"
 	"sync"
 	"time"
 
@@ -133,22 +134,27 @@ func NewBreaker(cfg BreakerConfig) *Breaker {
 
 // BreakerFailure reports whether err is the breaker's business.
 //
-// Only transport and server failures count. A callee rejecting bad input is
-// working correctly; counting InvalidArgument would let one caller's validation
-// bug take a healthy instance out of the fleet. An error carrying no wire code
-// never reached the instance and says nothing about it either.
+// A failure is what the SDK error model calls CONNECTION, TIMEOUT, OVERLOADED or
+// an INTERNAL-class status: the instance did not answer, or answered as a
+// broken server. Everything else — a handler's business code, a denial, a
+// validation refusal — is the instance working correctly and counts as a
+// success; counting it would let one caller's bug take a healthy instance out
+// of the fleet. An error carrying no wire code never reached the instance and
+// says nothing about it, except a channel that never became ready.
 func BreakerFailure(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, ErrPeerUnreachable) {
+		return true
 	}
 	code, ok := callCode(err)
 	if !ok {
 		return false
 	}
 	switch code {
-	case codes.Unavailable, codes.DeadlineExceeded, codes.Internal, codes.Unknown, codes.DataLoss:
-		// Unavailable also carries connection resets and mTLS handshake
-		// failures — gRPC surfaces both as transport errors.
+	case codes.Unavailable, codes.DeadlineExceeded, codes.ResourceExhausted,
+		codes.Internal, codes.Unknown, codes.DataLoss, codes.Aborted:
 		return true
 	default:
 		return false

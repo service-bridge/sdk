@@ -2,16 +2,16 @@
 
 ← [Jobs](./jobs.md) · Дальше: [Integrations](./integrations.md) →
 
-Юнит-тестирование зарегистрированных RPC- и event-хендлеров без живого рантайма: `service-bridge/testing`. Читается линейно.
+Юнит-тестирование RPC- и event-хендлеров без живого рантайма и без сети: `service-bridge/testing`. Читается линейно.
 
 ## Содержание
 
 - [Краткая модель](#краткая-модель)
-- [1. RPC-хендлер: регистрация и вызов](#1-rpc-хендлер-регистрация-и-вызов)
-- [2. Исходящие RPC-вызовы: моки и записи](#2-исходящие-rpc-вызовы-моки-и-записи)
-- [3. Event-хендлер: доставка и ack/nack](#3-event-хендлер-доставка-и-acknack)
-- [4. Исходящая публикация событий](#4-исходящая-публикация-событий)
-- [5. Паттерн: тестируемая фабрика хендлера](#5-паттерн-тестируемая-фабрика-хендлера)
+- [1. Настройка харнесса](#1-настройка-харнесса)
+- [2. Входящий RPC: invoke и invokeStream](#2-входящий-rpc-invoke-и-invokestream)
+- [3. Исходящие RPC-вызовы: respond и calls](#3-исходящие-rpc-вызовы-respond-и-calls)
+- [4. Входящее событие: deliver](#4-входящее-событие-deliver)
+- [5. Исходящая публикация: published](#5-исходящая-публикация-published)
 - [6. Чего харнесс не делает](#6-чего-харнесс-не-делает)
 - [7. Шпаргалка](#7-шпаргалка)
 
@@ -19,170 +19,213 @@
 
 ## Краткая модель
 
-`service-bridge/testing` даёт `createTestHarness()` — in-memory двойник `sb.rpc` + `sb.event`:
+`createTestHarness()` создаёт настоящий `ServiceBridge` и запускает его на in-memory runtime. Подменена только сеть, остальное — продакшен-путь:
 
-- `harness.rpc` (`TestRpcDomain`) — `handle()`/`invoke()` для входящих RPC, `call()`/`mockResponse()` для исходящих.
-- `harness.event` (`TestEventDomain`) — `handle()`/`deliver()` для входящих событий, `publish()` для исходящих.
+- хендлеры и зависимости регистрируются обычным API: `sb.rpc.handle`, `sb.rpc.handleStream`, `sb.event.handle`, `sb.event.define`, `sb.client`, `sb.useSchema`;
+- запросы и ответы кодируются схемами, как на проводе — ошибка схемы падает в тесте, а не в e2e;
+- ошибки хендлера проходят тот же маппинг, что видит вызывающий (`HandlerError` с `handlerCode`);
+- публикации идут через настоящий Publisher, доставки — через настоящий Subscriber.
 
-Никакой сети, SQLite или живого рантайма. Хендлер вызывается напрямую с типизированным объектом — Protobuf encode/decode остаётся за рамками теста (это забота serde/CallServer, не бизнес-логики хендлера).
-
-```sh
-bun add service-bridge
-```
+Тот же код регистрации работает и в продакшене, и в тесте: в тест передаётся `h.sb`.
 
 ```ts
 import { createTestHarness } from "service-bridge/testing";
 ```
 
----
-
-## 1. RPC-хендлер: регистрация и вызов
-
-```ts
-harness.rpc.handle<Req, Res>(name: string, fn: (req: Req) => Promise<Res> | Res): void
-harness.rpc.invoke<Req, Res>(name: string, req: Req): Promise<Res>
-```
-
-`fn` — тот же `RpcHandlerFn`, что принимает `sb.rpc.handle(name, fn, opts)` в продакшене (`opts.schema` здесь не нужен — харнесс не кодирует payload). `invoke()` зовёт `fn(req)` напрямую и возвращает результат; если хендлер бросает — ошибка пробрасывается как есть.
-
-```ts
-const harness = createTestHarness();
-
-harness.rpc.handle("Charge", async (req: { userId: string; amount: number }) => {
-  if (req.amount <= 0) throw new Error("amount must be positive");
-  return { transactionId: `tx-${req.userId}`, ok: true };
-});
-
-const res = await harness.rpc.invoke("Charge", { userId: "u-1", amount: 42 });
-// { transactionId: "tx-u-1", ok: true }
-
-await expect(harness.rpc.invoke("Charge", { userId: "u-2", amount: -1 }))
-  .rejects.toThrow("amount must be positive");
-```
-
-`invoke()` бросает `no RPC handler registered for "..."`, если под этим именем ничего не зарегистрировано.
+Сценарии совпадают с Go-харнессом `sbtest`.
 
 ---
 
-## 2. Исходящие RPC-вызовы: моки и записи
-
-Хендлер, который сам зовёт `rpc.call(...)`, тестируется через тот же харнесс:
+## 1. Настройка харнесса
 
 ```ts
-harness.rpc.mockResponse(serviceName: string, methodName: string, responder: Res | ((payload, opts?) => Res | Promise<Res>)): void
-harness.rpc.calls(): readonly { serviceName; methodName; payload; opts? }[]
+createTestHarness(opts?: { callDefaults?: CallOpts; publishTimeoutMs?: number }): TestHarness
 ```
 
+| Член | Что делает |
+|---|---|
+| `h.sb` | Бридж под тестом. Хендлеры и зависимости регистрируются на нём до `h.start()`. |
+| `h.start()` | Грузит схемы и запускает бридж на in-memory runtime. Сеть не открывается. |
+| `h.invoke` / `h.invokeStream` | Входящий вызов хендлера (§2). |
+| `h.respond` / `h.respondStream` | Ответ на исходящий вызов кода под тестом (§3). |
+| `h.calls()` | Исходящие вызовы по порядку (§3). |
+| `h.deliver` | Доставка события подписке (§4). |
+| `h.published()` | Опубликованные события (§5). |
+| `h.reset()` | Забывает записанные вызовы и публикации; регистрации и ответчики остаются. |
+| `h.stop()` | Останавливает бридж. |
+
+Пример ниже — из `src/testing/example.test.ts`: хендлер `Charge` зовёт `fraud-svc`, публикует `payment.charged` и возвращает ответ.
+
 ```ts
-harness.rpc.mockResponse("fraud-svc", "Check", { blocked: false });
-// или ответ, вычисленный из payload:
-harness.rpc.mockResponse("fraud-svc", "Check", (req: { userId: string }) => ({
-  blocked: req.userId === "banned-user",
-}));
+import { join } from "node:path";
+import { HandlerError } from "service-bridge";
+import { createTestHarness } from "service-bridge/testing";
 
-// ... хендлер внутри зовёт rpc.call("fraud-svc", "Check", { userId })
+const SHOP = join(import.meta.dir, "testdata", "shop.proto");
 
-expect(harness.rpc.calls()).toEqual([
-  { serviceName: "fraud-svc", methodName: "Check", payload: { userId: "u-1" } },
+async function setup() {
+  const h = createTestHarness();
+  const { sb } = h;
+  // Та же регистрация, что в продакшене.
+  await sb.client("fraud-svc", SHOP, { methods: ["Check"] });
+  sb.event.define("payment.charged", { protoFile: SHOP, input: "PaymentCharged", output: "PaymentCharged" });
+  sb.rpc.handle(
+    "Charge",
+    async (req: { userId: string; amount: number }) => {
+      const verdict = await sb.rpc.call<{ userId: string }, { blocked: boolean }>(
+        "fraud-svc", "Check", { userId: req.userId },
+      );
+      if (verdict.blocked) throw new HandlerError("BLOCKED", `user ${req.userId} is blocked`);
+      const transactionId = `tx-${req.userId}`;
+      await sb.event.publish("payment.charged", { transactionId, amount: req.amount });
+      return { transactionId, ok: true };
+    },
+    { schema: { protoFile: SHOP, method: "Charge" } },
+  );
+  await h.start();
+  return h;
+}
+```
+
+---
+
+## 2. Входящий RPC: invoke и invokeStream
+
+```ts
+h.invoke<Req, Res>(method: string, req: Req, opts?: InvokeOpts): Promise<Res>
+h.invokeStream<Req, Chunk>(method: string, req: Req, opts?: InvokeOpts): Promise<Chunk[]>
+
+interface InvokeOpts {
+  caller?: { serviceId: string; instanceId: string };
+  requestId?: string;        // по умолчанию UUID
+  idempotencyKey?: string;
+  signal?: AbortSignal;
+  deadline?: number;         // абсолютный дедлайн, unix-ms
+}
+```
+
+`req` кодируется схемой хендлера, проходит реальный dispatch, ответ декодируется. `InvokeOpts` попадают в `ctx` хендлера. `invokeStream` собирает все чанки в массив.
+
+Ошибки приходят в той форме, которую увидел бы вызывающий:
+
+- `HandlerError` с `handlerCode` из `HandlerError` хендлера, иначе `"INTERNAL"`;
+- отказ до хендлера — `ServiceBridgeError` с кодом статуса: неизвестный метод — `NOT_FOUND`, недекодируемый запрос или не тот вид метода — `VALIDATION`.
+
+```ts
+const h = await setup();
+h.respond("fraud-svc", "Check", () => ({ blocked: true }));
+
+const err = await h.invoke("Charge", { userId: "u-2", amount: 1 }).catch((e) => e);
+
+expect(err).toBeInstanceOf(HandlerError);
+expect((err as HandlerError).handlerCode).toBe("BLOCKED");
+await h.stop();
+```
+
+---
+
+## 3. Исходящие RPC-вызовы: respond и calls
+
+```ts
+h.respond<Req, Res>(service: string, method: string, fn: (req: Req, call: CallRecord) => Res | Promise<Res>): void
+h.respondStream<Req, Chunk>(service: string, method: string, fn: (req: Req, call: CallRecord) => AsyncIterable<Chunk> | Iterable<Chunk>): void
+h.calls(): readonly CallRecord[]
+
+interface CallRecord {
+  service: string;
+  method: string;
+  payload: unknown;   // запрос после кодирования и декодирования схемой
+  opts: CallOpts;
+}
+```
+
+`respond` отвечает на `sb.rpc.call` и typed-клиент, `respondStream` — на `sb.stream`. Запрос и ответ проходят схему вызывающего в обе стороны, поэтому нужна объявленная схема (`sb.client` или `sb.useSchema`) — без неё `ConfigurationError`, как в продакшене. Ответчик, бросивший `HandlerError`, даёт вызывающему тот же бизнес-код; любая другая ошибка — `"INTERNAL"`.
+
+Вызов без ответчика записывается в `calls()` и падает `NO_LIVE_INSTANCE`: забытый `respond` — ошибка теста, а не тихий `undefined`.
+
+```ts
+const h = await setup();
+h.respond("fraud-svc", "Check", () => ({ blocked: false }));
+
+const res = await h.invoke("Charge", { userId: "u-1", amount: 42 });
+
+expect(res).toEqual({ transactionId: "tx-u-1", ok: true });
+expect(h.calls().map((c) => [c.service, c.method, c.payload])).toEqual([
+  ["fraud-svc", "Check", { userId: "u-1" }],
 ]);
-```
-
-Без `mockResponse(...)` для пары `(serviceName, methodName)` вызов `call()` бросает — забытый мок падает тестом сразу, а не превращается в `undefined` где-то дальше по цепочке.
-
----
-
-## 3. Event-хендлер: доставка и ack/nack
-
-```ts
-harness.event.handle(pattern: string, fn: (payload: unknown) => Promise<void> | void): void
-harness.event.deliver(name: string, payload: unknown): Promise<{ outcome: "ack" } | { outcome: "nack"; reason: string }>
-```
-
-`deliver()` воспроизводит контракт `Subscriber.handleDelivery` из продакшена: нет хендлера под точным именем → `ack` (routing — на сервере); хендлер бросает → `nack` с `String(error)`; все хендлеры отработали успешно → `ack`. Несколько хендлеров на одно имя вызываются по порядку регистрации, первый throw останавливает доставку.
-
-```ts
-harness.event.handle("payment.charged", async (payload) => {
-  const { transactionId } = payload as { transactionId: string };
-  await sendReceipt(transactionId); // должен быть идемпотентен — delivery at-least-once
-});
-
-const result = await harness.event.deliver("payment.charged", { transactionId: "tx-1" });
-// { outcome: "ack" }
-```
-
-Attempt/retry-ветка проверяется повтором `deliver()` с тем же payload: реальный `EventHandlerFn` не получает номер попытки (его нет в контракте `sb.event.handle`), поэтому тест моделирует «вторую попытку» вторым вызовом `deliver()` и проверяет `ack`/`nack` каждого:
-
-```ts
-let dbDown = true;
-harness.event.handle("payment.charged", async () => {
-  if (dbDown) throw new Error("db unavailable");
-});
-
-const first = await harness.event.deliver("payment.charged", {});
-// { outcome: "nack", reason: "Error: db unavailable" }
-
-dbDown = false;
-const retried = await harness.event.deliver("payment.charged", {});
-// { outcome: "ack" }
+await h.stop();
 ```
 
 ---
 
-## 4. Исходящая публикация событий
+## 4. Входящее событие: deliver
 
 ```ts
-harness.event.publish<T>(name: string, payload: T, opts?: PublishOpts): Promise<{ eventId: string }>
-harness.event.published(): readonly { name; payload; opts? }[]
-```
+h.deliver(name: string, payload: unknown, opts?: DeliverOpts): Promise<DeliveryResult>
 
-```ts
-// внутри хендлера: await event.publish("payment.charged", { transactionId, amount });
-
-expect(harness.event.published()).toEqual([
-  { name: "payment.charged", payload: { transactionId: "tx-u-1", amount: 42 } },
-]);
-```
-
-`publish()` только записывает вызов и возвращает свежий `eventId` — имя события не валидируется, payload не кодируется. Это точка наблюдения «что хендлер опубликовал», не замена реального `Publisher` (outbox, schema, gRPC).
-
----
-
-## 5. Паттерн: тестируемая фабрика хендлера
-
-Хендлеры, которым нужен исходящий канал, пишутся как фабрика от узкой зависимости — не как замыкание над глобальным `sb`:
-
-```ts
-import type { EventDomain } from "service-bridge";
-import type { RpcDomain } from "service-bridge";
-
-function makeChargeHandler(deps: {
-  rpc: Pick<RpcDomain, "call">;
-  event: Pick<EventDomain, "publish">;
-}) {
-  return async (req: { userId: string; amount: number }) => {
-    const fraud = await deps.rpc.call<{ userId: string }, { blocked: boolean }>(
-      "fraud-svc", "Check", { userId: req.userId },
-    );
-    if (fraud.blocked) throw new Error(`user ${req.userId} blocked`);
-
-    const transactionId = `tx-${req.userId}`;
-    await deps.event.publish("payment.charged", { transactionId, amount: req.amount });
-    return { transactionId, ok: true };
-  };
+interface DeliverOpts {
+  matchedPatterns?: string[];        // вместо вычисленных правилами runtime
+  attempt?: number;                  // ctx.attempt, по умолчанию 1
+  partitionKey?: string;
+  headers?: Record<string, string>;
 }
 
-// продакшен:
-const sb = new ServiceBridge(URL, KEY);
-sb.rpc.handle("Charge", makeChargeHandler(sb), { schema: { protoFile: "./payment.proto", input: "ChargeRequest", output: "ChargeReply" } });
-
-// тест:
-const harness = createTestHarness();
-harness.rpc.mockResponse("fraud-svc", "Check", { blocked: false });
-harness.rpc.handle("Charge", makeChargeHandler(harness));
-const res = await harness.rpc.invoke("Charge", { userId: "u-1", amount: 42 });
+interface DeliveryResult {
+  acked: boolean;
+  reason: string;                    // текст Nack
+  matchedPatterns: string[];
+}
 ```
 
-`Pick<RpcDomain, "call">` и `Pick<EventDomain, "publish">` — структурные типы: `harness.rpc`/`harness.event` подходят под них без каста, потому что у `TestRpcDomain.call`/`TestEventDomain.publish` та же сигнатура, что у продакшен-методов.
+Доставка идёт через настоящий Subscriber. Совпавшие шаблоны вычисляются правилами runtime (`*` — один сегмент, `#` — ноль и более) по подпискам сервиса; фильтры подписок не вычисляются. Payload кодируется схемой первой совпавшей подписки; без схемы передайте `Uint8Array`. Нужна хотя бы одна подписка, иначе `ConfigurationError`.
+
+Результат — то, что подписчик ответил бы runtime: `acked: true`, если все хендлеры совпавших шаблонов успешны; первый throw — `acked: false` с текстом ошибки в `reason`; ни одного своего шаблона — `acked: false`, «no handler for matched patterns».
+
+```ts
+const h = createTestHarness();
+let dbDown = true;
+h.sb.event.handle("payment.*", async () => {
+  if (dbDown) throw new Error("db unavailable");
+}, { schema: { protoFile: SHOP, input: "PaymentCharged", output: "PaymentCharged" } });
+await h.start();
+
+const first = await h.deliver("payment.charged", { transactionId: "tx-1", amount: 1 });
+// { acked: false, reason: "db unavailable", matchedPatterns: ["payment.*"] }
+
+dbDown = false;
+const retried = await h.deliver("payment.charged", { transactionId: "tx-1", amount: 1 }, { attempt: 2 });
+// { acked: true, reason: "", matchedPatterns: ["payment.*"] }
+await h.stop();
+```
+
+`matchPattern(pattern, name)` из того же модуля применяет те же правила маршрутизации — для проверки шаблонов без доставки.
+
+---
+
+## 5. Исходящая публикация: published
+
+```ts
+h.published(): readonly PublishedRecord[]
+
+interface PublishedRecord {
+  id: string;
+  name: string;
+  payload: unknown;          // декодирован схемой из sb.event.define
+  payloadJson: unknown;      // JSON-вид, по которому runtime считает фильтры
+  partitionKey: string;
+  idempotencyKey: string;
+  headers: Record<string, string>;
+  occurredAtMs: number;
+}
+```
+
+Публикация проходит настоящий Publisher: проверку имени, наличие `define`, кодирование схемой. In-memory runtime подтверждает каждое событие (`ACCEPTED`), поэтому `publish` резолвится, как после ACK.
+
+```ts
+expect(h.published().map((p) => [p.name, p.payload])).toEqual([
+  ["payment.charged", { transactionId: "tx-u-1", amount: 42 }],
+]);
+```
 
 ---
 
@@ -190,12 +233,10 @@ const res = await harness.rpc.invoke("Charge", { userId: "u-1", amount: 42 });
 
 | Не делает | Почему |
 |---|---|
-| Protobuf encode/decode payload-а | Хендлер получает и возвращает типизированные объекты напрямую — так же, как их видит его собственная бизнес-логика после декодирования на реальном пути. |
-| Wire-маппинг ошибок (`errorCode`/`errorMessage`) | `invoke()` пробрасывает ошибку хендлера как есть, чтобы `rejects.toThrow(...)` проверял бизнес-сообщение. |
-| Streaming RPC (`handleStream`) | Не входит в текущий охват; `handle`/`invoke` — только unary. |
-| Workflow-шаги | Раннер требует чекпоинтинга состояния в рантайме (persist/resume/replay) — без рантайма шаг нельзя ни закоммитить, ни реплеить честно. |
-| Валидация имени события, идемпотентность, партиционирование | `TestEventDomain` — recorder исходящих публикаций, не замена `Publisher`. |
-| Живой gRPC, SQLite outbox | Харнесс работает целиком в памяти процесса теста. |
+| Политика доступа, фильтры подписок | Это поведение runtime; проверяется e2e против настоящего runtime. |
+| Ретраи, лизы и DLQ доставки | Тоже runtime: `deliver` возвращает Ack/Nack, повтор моделируется повторным `deliver`. |
+| Jobs и workflow | Расписание, лизы и чекпоинты шагов живут в runtime. |
+| Сеть, mTLS, reconnect | Харнесс работает целиком в памяти процесса теста. |
 
 ---
 
@@ -204,25 +245,24 @@ const res = await harness.rpc.invoke("Charge", { userId: "u-1", amount: 42 });
 ```ts
 import { createTestHarness } from "service-bridge/testing";
 
-const harness = createTestHarness();
+const h = createTestHarness();
+// регистрация на h.sb — как в продакшене
+await h.start();
 
-// RPC
-harness.rpc.handle("Charge", async (req) => ({ ok: true }));
-const res = await harness.rpc.invoke("Charge", { amount: 1 });
+// входящий RPC
+await h.invoke("Charge", { userId: "u-1", amount: 1 });
+await h.invokeStream("Countdown", { n: 3 });
 
-harness.rpc.mockResponse("other-svc", "Method", { ok: true });
-// ... вызов хендлера, который сам зовёт rpc.call(...)
-harness.rpc.calls(); // readonly RpcCallRecord[]
+// исходящий RPC
+h.respond("fraud-svc", "Check", () => ({ blocked: false }));
+h.calls();          // readonly CallRecord[]
 
-// Events
-harness.event.handle("payment.charged", async (payload) => { /* ... */ });
-await harness.event.deliver("payment.charged", { transactionId: "tx-1" });
-// { outcome: "ack" } | { outcome: "nack"; reason: string }
+// события
+await h.deliver("payment.charged", { transactionId: "tx-1", amount: 1 });   // { acked, reason, matchedPatterns }
+h.published();      // readonly PublishedRecord[]
 
-// ... вызов хендлера, который сам зовёт event.publish(...)
-harness.event.published(); // readonly PublishedEventRecord[]
-
-harness.reset(); // очищает rpc + event
+h.reset();          // очистить calls и published
+await h.stop();
 ```
 
 → Дальше: [Integrations](./integrations.md)

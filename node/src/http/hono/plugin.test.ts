@@ -140,7 +140,7 @@ describe("attachHono payload capture gating", () => {
 		expect(clones()).toBe(0);
 		expect(stub.captures).toHaveLength(0);
 		expect(stub.endCalls).toEqual([
-			{ status: Status.SUCCESS, message: undefined },
+			{ status: Status.SUCCESS, message: undefined, meta: { status: 200 } },
 		]);
 	});
 
@@ -159,22 +159,24 @@ describe("attachHono payload capture gating", () => {
 		await app.fetch(new Request("http://localhost/missing"));
 		await app.fetch(new Request("http://localhost/boom"));
 		expect(stub.endCalls).toEqual([
-			{ status: Status.ERROR, message: "HTTP 404" },
-			{ status: Status.ERROR, message: "HTTP 503" },
+			{ status: Status.ERROR, message: "HTTP 404", meta: { status: 404 } },
+			{ status: Status.ERROR, message: "HTTP 503", meta: { status: 503 } },
 		]);
 	});
 
-	it("rejects scanner probes before creating HTTP telemetry", async () => {
+	it('names the op after the route template, "*" when nothing matched', async () => {
 		const stub = makeSbStub();
 		const app = new Hono();
-		app.get("*", (c) => c.json({ leaked: true }));
+		app.use("*", async (_c, next) => next());
+		app.get("/users/:id", (c) => c.json({}));
 		attachHono(app, stub.sb, { port: 1 });
-		const response = await app.fetch(
-			new Request("http://localhost/wp/wp-json/batch/v1"),
-		);
-		expect(response.status).toBe(404);
-		expect(await response.json()).toEqual({ error: "Not Found" });
-		expect(stub.started).toHaveLength(0);
+		await app.fetch(new Request("http://localhost/users/42?token=secret"));
+		await app.fetch(new Request("http://localhost/nope"));
+		expect(stub.started.map((s) => s.subject)).toEqual([
+			"http.handle:GET//users/:id",
+			"http.handle:GET/*",
+		]);
+		expect(stub.started[0]?.businessKey).toBe("GET /users/:id");
 	});
 });
 
@@ -201,26 +203,4 @@ it("returns streaming response headers without waiting for EOF", async () => {
 		"data: one\n\n",
 	);
 	await reader.cancel();
-});
-it("uses the explicit server address resolver for independent client limits", async () => {
-	const stub = makeSbStub();
-	const app = new Hono();
-	app.get("/", (c) => c.text("ok"));
-	attachHono(app, stub.sb, {
-		port: 1,
-		resolveRemoteAddress: (_r, env) => (env as { ip: string }).ip,
-		security: { rateLimit: { limit: 1 } },
-	});
-	expect(
-		(await app.fetch(new Request("http://localhost/"), { ip: "1.1.1.1" }))
-			.status,
-	).toBe(200);
-	expect(
-		(await app.fetch(new Request("http://localhost/"), { ip: "2.2.2.2" }))
-			.status,
-	).toBe(200);
-	expect(
-		(await app.fetch(new Request("http://localhost/"), { ip: "1.1.1.1" }))
-			.status,
-	).toBe(429);
 });

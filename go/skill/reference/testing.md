@@ -1,90 +1,107 @@
 # Testing — Go SDK reference
 
-`sbtest` runs your handlers with no network, no runtime and no local storage.
+`sbtest` runs your handlers inside a **real** `*sb.Client` whose network edges are in memory: no runtime, no listener, no TLS. Requests and responses go through the same proto encoding, handler wrapping, error mapping, publish queue and event routing as in production; only what the runtime and the peers would answer is doubled.
 
 **Read the limits first.** A green `sbtest` run does not mean working production.
 
-## What the double does NOT reproduce
+## What the harness does NOT reproduce
 
-- runtime routing, including event pattern matching
 - access policy
-- leases, epochs and fencing
-- retries, backoff and circuit breakers
-- streaming
-- workflows
-- idempotency and deduplication
-- partition-key ordering
+- subscription filters (reproduce the runtime's decision with `WithMatchedPatterns`)
+- leases, delivery retries, DLQ
+- call retries, load balancing and circuit breakers
+- workflows and jobs
 
-A double pretending to be a runtime is worse than no double: the test goes green where production fails. All of the above is only verified end-to-end against a live runtime. Use `sbtest` for the domain logic inside a handler.
+All of the above is only verified end-to-end against a live runtime. Use `sbtest` for the domain logic inside a handler and for what the handler calls and publishes.
 
 ## Signatures
 
 ```go signature
-func New() *Harness
+func New(t TB, opts ...sb.Option) *Harness // the client is stopped in t.Cleanup
+func (h *Harness) Start(ctx context.Context) error
 func (h *Harness) Reset()
-func NewRPC() *RPC
-func NewEvent() *Event
 
-func Handle[Req, Res any](r *RPC, method string, fn Handler[Req, Res]) error
-func Invoke[Req, Res any](ctx context.Context, r *RPC, method string, req Req) (Res, error)
-func Respond[Req, Res any](r *RPC, service, method string, fn Responder[Req, Res]) error
-func RespondWith[Res any](r *RPC, service, method string, res Res) error
-func Call[Req, Res any](ctx context.Context, r *RPC, service, method string, req Req) (Res, error)
-func (r *RPC) Calls() []CallRecord
-func (r *RPC) Reset()
+// Inbound: call a registered handler the way a peer would.
+func Invoke[Req, Resp proto.Message](ctx context.Context, h *Harness, method string, req Req, opts ...InvokeOption) (Resp, error)
+func InvokeStream[Req, Chunk proto.Message](ctx context.Context, h *Harness, method string, req Req, opts ...InvokeOption) ([]Chunk, error)
+func WithCaller(serviceID, instanceID string) InvokeOption
+func WithRequestID(id string) InvokeOption   // a fresh UUID otherwise
+func WithIdempotencyKey(key string) InvokeOption
 
-func Define[T any](e *Event, name string) error
-func Subscribe[T any](e *Event, name string, fn Subscriber[T]) error
-func Publish[T any](ctx context.Context, e *Event, name string, payload T) (Delivery, error)
-func (e *Event) Published() []PublishRecord
-func (e *Event) Deliveries() []Delivery
-func (e *Event) Reset()
+// Outbound: arrange answers, read back what was called.
+func Respond[Req, Resp proto.Message](h *Harness, service, method string, fn func(ctx context.Context, req Req) (Resp, error)) error
+func RespondStream[Req, Chunk proto.Message](h *Harness, service, method string, fn func(ctx context.Context, req Req) ([]Chunk, error)) error
+func (h *Harness) Calls() []CallRecord
+func DecodeCall[T proto.Message](rec CallRecord) (T, error)
+
+// Events.
+func (h *Harness) Published() []PublishedEvent
+func DecodePublished[T proto.Message](e PublishedEvent) (T, error)
+func (h *Harness) Deliver(ctx context.Context, name string, payload proto.Message, opts ...DeliverOption) (DeliveryResult, error)
+func WithMatchedPatterns(patterns ...string) DeliverOption
+func WithAttempt(n int32) DeliverOption // 1 by default
+func WithDeliveryPartitionKey(key string) DeliverOption
+func WithDeliveryHeaders(headers map[string]string) DeliverOption
+func MatchPattern(pattern, name string) bool
 ```
 
 ```go signature
-type CallRecord struct {
-	Service string
-	Method  string
-	Input   any
+type Harness struct {
+	Client *sb.Client // declare on it exactly as in production, then Start
 }
 
-type Delivery struct {
-	Name  string
-	Acked bool
-	Err   error
+type CallRecord struct {
+	Service, Method string
+	Payload         []byte
+	IdempotencyKey  string
+	BusinessKey     string
+	Transport       sb.Transport
+}
+
+type PublishedEvent struct {
+	ID, Name       string
+	Payload        []byte
+	PayloadJSON    []byte
+	PartitionKey   string
+	IdempotencyKey string
+	Headers        map[string]string
+	OccurredAtMs   int64
+}
+
+type DeliveryResult struct {
+	Acked           bool
+	Reason          string   // nack reason; empty when acked
+	MatchedPatterns []string // the patterns the delivery carried
 }
 ```
 
-`h.RPC` and `h.Event` are the two doubles. Build one harness per test — registrations and recordings live on the instance, so parallel tests never see each other's.
+Sentinels: `sbtest.ErrNoResponse` (no answer arranged), `sbtest.ErrInvalidArg` (nil harness, empty name, nil function).
 
-## Behaviour that differs from a naive mock
+## Rules
 
 | Rule | Why |
 |---|---|
-| `Handle` **refuses** a taken name (`ErrDuplicate`) | The runtime refuses a duplicate declaration too; a test that silently loses its first registration passes for the wrong reason. |
-| `Respond` **replaces** a previous answer | Arranging a different answer per case is what a test does. |
-| `Call` with no configured answer returns `ErrNoResponse` | A forgotten `Respond` is a bug in the test; a silent zero hides it until an assertion far below fails for an unrelated-looking reason. |
-| A wrong-typed value is named (`ErrTypeMismatch`), never coerced | Coercion would run the handler against something the real decoder would never produce. |
-| `Publish` of an undeclared name is refused | The runtime rejects a publish whose event was never registered. |
-| A delivery nobody handled is **acked** | Routing belongs to the runtime; nacking would make it redeliver forever. |
-| The first failing handler decides the whole delivery | The runtime nacks the delivery, so later handlers do not run in production either. |
-| The handler's own error comes back **unwrapped** | The test asserts the business failure it wrote, not a transport classification. |
+| Declare on `h.Client` with the ordinary API, then `h.Start(ctx)` | It is the production client; declaring after `Start` is `CodeState` here too. |
+| `Invoke` errors come in the **caller's** form | A `*sb.HandlerError` the handler returned arrives as `*sb.Error{Code: CodeHandler}` with that `HandlerError` inside (`errors.As`). Any other error or a panic → `HandlerError.Code == "INTERNAL"`. An SDK error from a nested call returned as is → `INTERNAL`, not the downstream code. Unknown method → `CodeNotFound`; undecodable request → `CodeValidation`. |
+| `Respond` answers `sb.Call`, a declared method's `Call` and a workflow `wf.Call` step | Request decoded into `Req`, answer encoded from `Resp` — a type mismatch fails as on the wire. A `*sb.HandlerError` from `fn` answers with that code; any other error answers `INTERNAL`. Arranging again replaces the answer. |
+| An outbound call with nothing arranged fails with `ErrNoResponse` | A forgotten `Respond` is a bug in the test; a silent zero hides it. The call is still recorded in `Calls()`. |
+| Publishing goes through the real publish queue | `Published()` holds what the in-memory runtime accepted, with `PayloadJSON` filled. An invalid name is `CodeInvalidEventName`. |
+| `Deliver` computes the matched patterns with the runtime's rules | `*` one segment, `#` zero or more. The subscriber runs the handlers of exactly those patterns; acked only if all return `nil`; no match → nack `no handler for matched patterns`. `sb.DeliveryFromContext` works. |
+| Filters are not evaluated | Pass `WithMatchedPatterns(...)` to reproduce what a filter decided. |
 
 ## Write the handler as a plain function
 
-Keep the handler separate from its registration: production registers it on the client, the test registers it on the double, and the code under test is the code that ships.
+Keep the handler separate from its registration: production and the test register the same function, and the code under test is the code that ships.
 
 ```go
 package orders
 
 import (
 	"context"
-	"errors"
 
 	"example.com/orders/paymentpb"
+	sb "github.com/service-bridge/sdk/go"
 )
-
-var ErrNonPositiveAmount = errors.New("amount must be positive")
 
 type Ledger interface {
 	Debit(ctx context.Context, user string, amount int64) error
@@ -93,7 +110,7 @@ type Ledger interface {
 func NewChargeHandler(ledger Ledger) func(context.Context, *paymentpb.ChargeRequest) (*paymentpb.ChargeReply, error) {
 	return func(ctx context.Context, req *paymentpb.ChargeRequest) (*paymentpb.ChargeReply, error) {
 		if req.GetAmount() <= 0 {
-			return nil, ErrNonPositiveAmount
+			return nil, &sb.HandlerError{Code: "INVALID_AMOUNT", Message: "amount must be positive"}
 		}
 		if err := ledger.Debit(ctx, req.GetUserId(), req.GetAmount()); err != nil {
 			return nil, err
@@ -101,9 +118,11 @@ func NewChargeHandler(ledger Ledger) func(context.Context, *paymentpb.ChargeRequ
 		return &paymentpb.ChargeReply{Ok: true, TransactionId: "tx-" + req.GetUserId()}, nil
 	}
 }
-```
 
-Production wiring: `sb.Handle(c, "Charge", orders.NewChargeHandler(ledger))`.
+func Wire(c *sb.Client, ledger Ledger) error {
+	return sb.Handle(c, "Charge", NewChargeHandler(ledger))
+}
+```
 
 ## Complete test file
 
@@ -115,147 +134,149 @@ import (
 	"errors"
 	"testing"
 
+	"example.com/orders"
 	"example.com/orders/orderpb"
 	"example.com/orders/paymentpb"
+	sb "github.com/service-bridge/sdk/go"
 	"github.com/service-bridge/sdk/go/sbtest"
 )
 
-var errNonPositiveAmount = errors.New("amount must be positive")
+type okLedger struct{}
 
-func chargeHandler(ctx context.Context, req *paymentpb.ChargeRequest) (*paymentpb.ChargeReply, error) {
-	if req.GetAmount() <= 0 {
-		return nil, errNonPositiveAmount
+func (okLedger) Debit(context.Context, string, int64) error { return nil }
+
+func started(t *testing.T, h *sbtest.Harness) {
+	t.Helper()
+	if err := h.Start(context.Background()); err != nil {
+		t.Fatal(err)
 	}
-	return &paymentpb.ChargeReply{Ok: true, TransactionId: "tx-" + req.GetUserId()}, nil
 }
 
 func TestChargeAccepts(t *testing.T) {
-	h := sbtest.New()
-	if err := sbtest.Handle(h.RPC, "Charge", chargeHandler); err != nil {
+	h := sbtest.New(t)
+	if err := orders.Wire(h.Client, okLedger{}); err != nil {
 		t.Fatal(err)
 	}
+	started(t, h)
 
 	res, err := sbtest.Invoke[*paymentpb.ChargeRequest, *paymentpb.ChargeReply](
-		context.Background(), h.RPC, "Charge",
-		&paymentpb.ChargeRequest{UserId: "u-1", Amount: 100})
+		context.Background(), h, "Charge",
+		&paymentpb.ChargeRequest{UserId: "u-1", Amount: 100},
+		sbtest.WithCaller("orders-svc-id", "inst-1"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !res.GetOk() || res.GetTransactionId() != "tx-u-1" {
-		t.Fatalf("unexpected reply: %+v", res)
+		t.Fatalf("unexpected reply: %v", res)
 	}
 }
 
 func TestChargeRejectsZero(t *testing.T) {
-	h := sbtest.New()
-	if err := sbtest.Handle(h.RPC, "Charge", chargeHandler); err != nil {
+	h := sbtest.New(t)
+	if err := orders.Wire(h.Client, okLedger{}); err != nil {
 		t.Fatal(err)
 	}
+	started(t, h)
 
-	// The handler's error arrives unwrapped.
 	_, err := sbtest.Invoke[*paymentpb.ChargeRequest, *paymentpb.ChargeReply](
-		context.Background(), h.RPC, "Charge", &paymentpb.ChargeRequest{Amount: 0})
-	if !errors.Is(err, errNonPositiveAmount) {
-		t.Fatalf("want errNonPositiveAmount, got %v", err)
+		context.Background(), h, "Charge", &paymentpb.ChargeRequest{Amount: 0})
+	var he *sb.HandlerError
+	if !errors.Is(err, sb.ErrHandler) || !errors.As(err, &he) || he.Code != "INVALID_AMOUNT" {
+		t.Fatalf("want INVALID_AMOUNT, got %v", err)
 	}
 }
 
-func TestPlaceOrderCalls(t *testing.T) {
-	h := sbtest.New()
-
-	// Fixed answer.
-	if err := sbtest.RespondWith(h.RPC, "payment-svc", "Charge",
-		&paymentpb.ChargeReply{Ok: true, TransactionId: "tx-1"}); err != nil {
+func TestPlaceCallsPaymentAndPublishes(t *testing.T) {
+	h := sbtest.New(t)
+	payment := sb.NewClient(h.Client, "payment-svc")
+	charge, err := sb.NewMethod[*paymentpb.ChargeRequest, *paymentpb.ChargeReply](payment, "Charge")
+	if err != nil {
 		t.Fatal(err)
 	}
-	// Or an answer computed from the request.
-	if err := sbtest.Respond(h.RPC, "inventory-svc", "Reserve",
-		func(ctx context.Context, req *orderpb.ShipRequest) (*orderpb.ShipReply, error) {
-			return &orderpb.ShipReply{Ok: req.GetOrderId() != ""}, nil
+	if err := sb.Handle(h.Client, "Place",
+		func(ctx context.Context, req *orderpb.PlaceRequest) (*orderpb.PlaceReply, error) {
+			if _, err := charge.Call(ctx, &paymentpb.ChargeRequest{UserId: req.GetUserId(), Amount: req.GetTotal()},
+				sb.WithIdempotencyKey("charge:"+req.GetOrderId())); err != nil {
+				return nil, err
+			}
+			id, err := sb.PublishEvent(ctx, h.Client, "order.placed",
+				&orderpb.OrderPlaced{OrderId: req.GetOrderId(), Total: req.GetTotal(), UserId: req.GetUserId()},
+				sb.WithPartitionKey(req.GetOrderId()))
+			if err != nil {
+				return nil, err
+			}
+			return &orderpb.PlaceReply{EventId: id}, nil
 		}); err != nil {
 		t.Fatal(err)
 	}
+	if err := sbtest.Respond(h, "payment-svc", "Charge",
+		func(ctx context.Context, req *paymentpb.ChargeRequest) (*paymentpb.ChargeReply, error) {
+			return &paymentpb.ChargeReply{Ok: true, TransactionId: "tx-1"}, nil
+		}); err != nil {
+		t.Fatal(err)
+	}
+	started(t, h)
 
-	if _, err := sbtest.Call[*paymentpb.ChargeRequest, *paymentpb.ChargeReply](
-		context.Background(), h.RPC, "payment-svc", "Charge",
-		&paymentpb.ChargeRequest{UserId: "u-1", Amount: 100}); err != nil {
+	if _, err := sbtest.Invoke[*orderpb.PlaceRequest, *orderpb.PlaceReply](
+		context.Background(), h, "Place",
+		&orderpb.PlaceRequest{OrderId: "o-1", UserId: "u-1", Total: 4200}); err != nil {
 		t.Fatal(err)
 	}
 
-	calls := h.RPC.Calls()
-	if len(calls) != 1 || calls[0].Service != "payment-svc" || calls[0].Method != "Charge" {
-		t.Fatalf("unexpected calls: %+v", calls)
+	calls := h.Calls()
+	if len(calls) != 1 || calls[0].Service != "payment-svc" || calls[0].IdempotencyKey != "charge:o-1" {
+		t.Fatalf("calls %+v", calls)
 	}
-
-	// An unconfigured call is a refusal, not a zero value.
-	if _, err := sbtest.Call[*paymentpb.ChargeRequest, *paymentpb.ChargeReply](
-		context.Background(), h.RPC, "payment-svc", "Refund",
-		&paymentpb.ChargeRequest{}); !errors.Is(err, sbtest.ErrNoResponse) {
-		t.Fatalf("want ErrNoResponse, got %v", err)
+	published := h.Published()
+	if len(published) != 1 || published[0].Name != "order.placed" || published[0].PartitionKey != "o-1" {
+		t.Fatalf("published %+v", published)
+	}
+	e, err := sbtest.DecodePublished[*orderpb.OrderPlaced](published[0])
+	if err != nil || e.GetTotal() != 4200 {
+		t.Fatalf("decoded %v, %v", e, err)
 	}
 }
 
-func TestOrderPlacedFansOut(t *testing.T) {
-	h := sbtest.New()
-
-	// Define is mandatory before Publish.
-	if err := sbtest.Define[*orderpb.OrderPlaced](h.Event, "order.placed"); err != nil {
-		t.Fatal(err)
-	}
-
+func TestReceiptOnOrderPlaced(t *testing.T) {
+	h := sbtest.New(t)
 	var seen string
-	if err := sbtest.Subscribe(h.Event, "order.placed",
+	if err := sb.SubscribeEvent(h.Client, "order.*",
 		func(ctx context.Context, e *orderpb.OrderPlaced) error {
 			seen = e.GetOrderId()
 			return nil
 		}); err != nil {
 		t.Fatal(err)
 	}
+	started(t, h)
 
-	delivery, err := sbtest.Publish(context.Background(), h.Event, "order.placed",
-		&orderpb.OrderPlaced{OrderId: "o-1", Total: 4200})
+	res, err := h.Deliver(context.Background(), "order.placed", &orderpb.OrderPlaced{OrderId: "o-1"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !delivery.Acked {
-		t.Fatalf("delivery nacked: %v", delivery.Err)
-	}
-	if seen != "o-1" {
-		t.Fatalf("handler saw %q", seen)
-	}
-	if got := h.Event.Published(); len(got) != 1 || got[0].Name != "order.placed" {
-		t.Fatalf("unexpected publications: %+v", got)
-	}
-}
-
-func TestNackedDelivery(t *testing.T) {
-	h := sbtest.New()
-	if err := sbtest.Define[*orderpb.OrderPlaced](h.Event, "order.placed"); err != nil {
-		t.Fatal(err)
-	}
-	boom := errors.New("boom")
-	if err := sbtest.Subscribe(h.Event, "order.placed",
-		func(ctx context.Context, e *orderpb.OrderPlaced) error { return boom }); err != nil {
-		t.Fatal(err)
+	if !res.Acked || seen != "o-1" {
+		t.Fatalf("result %+v, handler saw %q", res, seen)
 	}
 
-	delivery, err := sbtest.Publish(context.Background(), h.Event, "order.placed",
-		&orderpb.OrderPlaced{OrderId: "o-2"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if delivery.Acked || !errors.Is(delivery.Err, boom) {
-		t.Fatalf("expected a nack carrying boom, got %+v", delivery)
+	res, _ = h.Deliver(context.Background(), "billing.invoice", &orderpb.OrderPlaced{})
+	if res.Acked || res.Reason != "no handler for matched patterns" {
+		t.Fatalf("unmatched delivery: %+v", res)
 	}
 }
 ```
 
-## Sentinels
+## Quick reference
 
-`sbtest.ErrNoHandler`, `ErrNoResponse`, `ErrTypeMismatch`, `ErrDuplicate`, `ErrInvalidArg` — matched with `errors.Is`.
-
-## Gotchas
-
-- `sbtest` has no client, no `Start` and no lifecycle. Do not try to point it at a runtime.
-- `Subscribe` on the double matches the **exact** name only — patterns are not reproduced.
-- Nothing in `sbtest` exercises streaming, workflows or jobs; cover those end-to-end.
+| Task | Code |
+|---|---|
+| New harness | `h := sbtest.New(t)` |
+| Declare a handler, subscription, dependency | ordinary API on `h.Client` |
+| Start | `h.Start(ctx)` |
+| Invoke a handler | `sbtest.Invoke[Req, Resp](ctx, h, "Method", req, opts...)` |
+| Invoke a streaming handler | `sbtest.InvokeStream[Req, Chunk](ctx, h, "Method", req)` |
+| Arrange an outbound answer | `sbtest.Respond(h, "svc", "Method", fn)` |
+| Arrange an outbound stream | `sbtest.RespondStream(h, "svc", "Method", fn)` |
+| Inspect outbound calls | `h.Calls()` · `sbtest.DecodeCall[T](rec)` |
+| Inspect publications | `h.Published()` · `sbtest.DecodePublished[T](e)` |
+| Deliver an event | `h.Deliver(ctx, "name", payload, opts...)` |
+| Check a pattern | `sbtest.MatchPattern(pattern, name)` |
+| Forget answers and records | `h.Reset()` |

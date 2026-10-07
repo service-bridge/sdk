@@ -1,18 +1,14 @@
 // @public — см. ./README.md
+import { AccessDeniedError, StateError } from "../errors";
 import type {
 	Registry,
 	RpcHandlerFn,
 	RpcHandlerOpts,
 	RpcStreamHandlerFn,
 } from "../registry/registry";
-import type { CallOpts, RpcClient } from "./client";
-import { RpcAccessDeniedError } from "./errors";
+import type { CallOpts, RpcCaller } from "./client";
 
-// gRPC PERMISSION_DENIED numeric code (matches @grpc/grpc-js).
-const GRPC_PERMISSION_DENIED = 7;
-
-// Sink for call-time policy denials; the owner wires it to emit
-// `policy_violation`. Structural type avoids importing from connection.
+// Sink for call-time policy denials; the owner wires it to `policy_violation`.
 type PolicyViolationSink = (v: {
 	declaration: string;
 	value: string;
@@ -23,10 +19,11 @@ type PolicyViolationSink = (v: {
 export class RpcDomain {
 	constructor(
 		private readonly registry: Registry,
-		private readonly getClient: () => RpcClient | null,
+		private readonly getClient: () => RpcCaller | null,
 		private readonly onPolicyViolation?: PolicyViolationSink,
 	) {}
 
+	/** Registers a unary handler: `(req, ctx) => res`. Throw HandlerError for a business code. */
 	handle<Req = unknown, Res = unknown>(
 		name: string,
 		fn: RpcHandlerFn<Req, Res>,
@@ -35,6 +32,7 @@ export class RpcDomain {
 		this.registry._handle.rpc(name, fn, opts);
 	}
 
+	/** Registers a server-streaming handler: `async function* (req, ctx)`. */
 	handleStream<Req = unknown, Chunk = unknown>(
 		name: string,
 		fn: RpcStreamHandlerFn<Req, Chunk>,
@@ -43,15 +41,12 @@ export class RpcDomain {
 		this.registry._handle.stream(name, fn, opts);
 	}
 
-	// _declareForTests registers an RPC entry without a schema. E2E tests use this
-	// to assemble fixtures that exercise registration paths without loading real
-	// .proto files. Production code MUST use handle() with an explicit schema.
-	//
-	// @internal — см. ./README.md
-	_declareForTests(name: string, streaming = false): void {
-		this.registry._handle._declareForTests(name, streaming);
-	}
-
+	/**
+	 * Calls a method of another service. Every failure is a
+	 * ServiceBridgeError: HandlerError (the callee's answer), AccessDeniedError
+	 * (policy; also emitted as `policy_violation`), NoLiveInstanceError,
+	 * TimeoutError, or CONNECTION/OVERLOADED/CANCELLED/INTERNAL codes.
+	 */
 	async call<Req = unknown, Res = unknown>(
 		serviceName: string,
 		methodName: string,
@@ -59,11 +54,8 @@ export class RpcDomain {
 		opts?: CallOpts,
 	): Promise<Res> {
 		const client = this.getClient();
-		if (!client) {
-			throw new Error(
-				"ServiceBridge: rpc client not ready — call start() and wait for 'connected' event before calling sb.rpc.call()",
-			);
-		}
+		if (!client)
+			throw new StateError("rpc: call before start() — call sb.start() first");
 		try {
 			return await client.call<Req, Res>(
 				serviceName,
@@ -72,21 +64,13 @@ export class RpcDomain {
 				opts,
 			);
 		} catch (err) {
-			// Gate #3 denial (ADR-0004): surface as a typed, catchable error and
-			// emit a policy_violation so call-time denials are observable on the
-			// same channel as registration warnings.
-			if ((err as { code?: number }).code === GRPC_PERMISSION_DENIED) {
-				const reason =
-					(err as { details?: string }).details ||
-					(err instanceof Error ? err.message : String(err));
+			if (err instanceof AccessDeniedError)
 				this.onPolicyViolation?.({
 					declaration: "rpc.call",
 					value: `${serviceName}/${methodName}`,
 					denySide: "self_egress",
-					reason,
+					reason: err.message,
 				});
-				throw new RpcAccessDeniedError(serviceName, methodName, reason);
-			}
 			throw err;
 		}
 	}

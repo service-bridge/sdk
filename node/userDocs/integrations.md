@@ -40,6 +40,10 @@ Runtime НЕ проксирует HTTP. Пользователь сам:
 
 Паттерны роутов уходят в registry **как есть**: SDK их не нормализует. Косметика паттерна (`:id{[0-9]+}`, регекс-ограничения) — задача UI Service Map, а не SDK.
 
+Интеграции не защищают периметр: rate limit, фильтр сканеров, WAF — задача вашего ingress или middleware. Интеграция только наблюдает за запросом.
+
+Общая опция всех трёх интеграций — `trustTraceHeader?: boolean` (по умолчанию `false`, см. [Трейсинг](#трейсинг-и-payload-capture)).
+
 ## Express
 
 ```sh
@@ -64,7 +68,7 @@ await sb.start();
 app.listen(3000);
 ```
 
-`port` обязателен (Express может биндиться на `0`, и в момент сбора роутов реальный порт неизвестен). `host` опционален — это явная опция; если её не передать, берётся `127.0.0.1` с одноразовым warn (см. [Шпаргалку](#шпаргалка)).
+`ExpressEndpoint`: `port` обязателен (Express может биндиться на `0`, и в момент сбора роутов реальный порт неизвестен). `host` опционален — если его не передать, берётся `127.0.0.1` с одноразовым warn (см. [Шпаргалку](#шпаргалка)). `trustTraceHeader` опционален.
 
 `attachExpress` безопасен и до `sb.start()`: endpoint осядет в Registry и попадёт в первый register-запрос. Идемпотентен — повторный вызов не дублирует роуты.
 
@@ -75,11 +79,12 @@ app.listen(3000);
 ## Fastify
 
 ```sh
-bun add fastify
-# fastify-plugin уже в dependencies SDK — ставить не нужно
+npm i fastify
 ```
 
-Плагин регистрируется через `sbFastify` с опцией `{ sb }`. Роуты собираются хуком `onRoute`, endpoint публикуется в `onListen` (после bind — реальный порт уже известен, в т. ч. при `{ port: 0 }`).
+Плагин регистрируется через `sbFastify` с опцией `{ sb }`. Он работает в родительском scope приложения, поэтому видит все роуты. Роуты собираются хуком `onRoute`, endpoint публикуется в `onListen` (после bind — реальный порт уже известен, в т. ч. при `{ port: 0 }`).
+
+Интеграция Fastify работает только на Node.js 22 / 24 / 26: Bun 1.3.13 не сообщает об обрыве соединения клиентом, и интеграция не может закрыть операцию запроса.
 
 ```ts
 import Fastify from "fastify";
@@ -97,7 +102,7 @@ await sb.start();
 await app.listen({ port: 3000 });          // onListen хук опубликует endpoint
 ```
 
-`SbFastifyOptions`: `sb` обязателен, `host` опционален (явная опция; иначе `127.0.0.1` с одноразовым warn). HEAD-метод, который Fastify авто-генерирует к каждому GET, отсекается — не дублирует методы в Service Map. Совместимость: Fastify 4.x и 5.x.
+`SbFastifyOptions`: `sb` обязателен; `host` опционален (иначе адрес, на котором слушает сокет, а если он пустой — `127.0.0.1` с одноразовым warn); `trustTraceHeader` опционален. HEAD-метод, который Fastify авто-генерирует к каждому GET, отсекается — не дублирует методы в Service Map. Совместимость: Fastify 4.x и 5.x.
 
 См. [src/http/fastify/README.md](../src/http/fastify/README.md).
 
@@ -124,7 +129,7 @@ await sb.start();
 Bun.serve({ fetch: app.fetch, port: 3000 });
 ```
 
-`HonoEndpoint`: `port` обязателен, `host` опционален (явная опция; иначе `127.0.0.1` с одноразовым warn). Роуты, объявленные через `app.all(...)`, в Service Map не попадают — метод `ALL` не раскладывается в конкретные.
+`HonoEndpoint`: `port` обязателен, `host` и `trustTraceHeader` опциональны (без `host` — `127.0.0.1` с одноразовым warn). Роуты, объявленные через `app.all(...)`, в Service Map не попадают — метод `ALL` не раскладывается в конкретные.
 
 См. [src/http/hono/README.md](../src/http/hono/README.md).
 
@@ -176,10 +181,18 @@ const res = await fetch(`http://${inst.httpEndpoint}/api/orders/42`);
 
 Каждая интеграция автоматически (без отдельного API) на входящий request:
 
-- читает заголовок `X-SB-Trace` и восстанавливает `TraceContext`, оборачивая downstream chain так, что handler и любой ваш `sb.rpc.call` / `sb.event.publish` внутри видят контекст через ALS — на miss/невалидный заголовок берётся новый root-контекст;
-- эмитит op `Channel.HTTP` / `HttpHandle` с `businessKey` = заголовок `Idempotency-Key` (иначе `"<METHOD> <path>"`);
+- открывает trace-контекст запроса и оборачивает downstream chain так, что handler и любой ваш `sb.rpc.call` / `sb.event.publish` внутри видят контекст через ALS;
+- эмитит op `Channel.HTTP` / `HttpHandle` с subject `http.handle:<METHOD>/<шаблон роута>` (например `http.handle:GET//api/orders/:id`; запрос, не попавший ни в один роут, — шаблон `*`), meta `{ method, route, status }` и `businessKey` = заголовок `Idempotency-Key` (иначе `"<METHOD> <шаблон роута>"`). Сырой путь и query в subject и businessKey не попадают;
 - завершает op статусом из единого словаря: `Status.SUCCESS` (код < 400), `Status.ERROR` (код ≥ 400), `Status.TIMEOUT` (клиент оборвал соединение);
-- захватывает тело запроса (IN) и ответа (OUT) как raw-JSON; пустые тела (например, у GET) не пишутся. Запись гейтится runtime-режимом HTTP-канала (`none` / `all` / `errors`), который runtime пушит в SDK.
+- захватывает тело запроса (IN) и ответа (OUT) как raw-JSON; пустые тела (например, у GET) не пишутся. Запись гейтится режимом HTTP-канала (`none` / `errors` / `all`), который пушит runtime; по умолчанию `errors`. Тела уходят как есть — секреты маскирует runtime при приёме.
+
+**Входящий `X-SB-Trace` по умолчанию игнорируется**: каждый запрос начинает свой trace. Иначе любой внешний клиент мог бы вписать свой запрос в чужое дерево трейсов. Если HTTP-сервер вызывают только другие сервисы ServiceBridge и запрос должен продолжить trace вызывающего, включите `trustTraceHeader: true`:
+
+```ts
+attachExpress(app, sb, { port: 3000, trustTraceHeader: true });
+await app.register(sbFastify, { sb, trustTraceHeader: true });
+attachHono(app, sb, { port: 3000, trustTraceHeader: true });
+```
 
 Тело ответа только читается для capture — интеграция его не меняет. Для Express тело IN читается из `req.body`, так что нужен `express.json()` (или другой body-parser) до роутов.
 

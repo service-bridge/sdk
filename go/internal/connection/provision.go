@@ -9,7 +9,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"net"
-	"time"
 
 	pb "github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1"
 	"google.golang.org/grpc"
@@ -20,13 +19,13 @@ const csrCommonName = "servicebridge-instance"
 
 // ProvisionResult is the mTLS identity handed back by the runtime.
 type ProvisionResult struct {
-	Identity    Identity
-	ServiceName string
-	CertDER     []byte
-	CAChainDER  []byte
-	PrivateKey  *ecdsa.PrivateKey
-	NotAfter    time.Time
-	TLSCert     tls.Certificate
+	Identity       Identity
+	ServiceName    string
+	CertDER        []byte
+	CAChainDER     []byte
+	PrivateKey     *ecdsa.PrivateKey
+	NotAfterUnixMs int64
+	TLSCert        tls.Certificate
 }
 
 // Provision obtains a leaf certificate from the runtime's Bootstrap service.
@@ -72,12 +71,12 @@ func Provision(ctx context.Context, addr string, key BootstrapKey) (*ProvisionRe
 			ServiceID:  resp.GetServiceId(),
 			InstanceID: resp.GetInstanceId(),
 		},
-		ServiceName: resp.GetServiceName(),
-		CertDER:     resp.GetCertDer(),
-		CAChainDER:  resp.GetCaChainDer(),
-		PrivateKey:  priv,
-		NotAfter:    time.UnixMilli(resp.GetNotAfterUnixMs()).UTC(),
-		TLSCert:     tlsCert,
+		ServiceName:    resp.GetServiceName(),
+		CertDER:        resp.GetCertDer(),
+		CAChainDER:     resp.GetCaChainDer(),
+		PrivateKey:     priv,
+		NotAfterUnixMs: resp.GetNotAfterUnixMs(),
+		TLSCert:        tlsCert,
 	}, nil
 }
 

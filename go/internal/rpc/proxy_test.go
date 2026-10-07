@@ -28,6 +28,9 @@ type stubInvoke struct {
 
 	// errUntil fails the first N calls with err, then answers with resp.
 	errUntil int
+	// trailer is handed back with every failure, the way a callee or the
+	// runtime attaches the not-dispatched proof.
+	trailer metadata.MD
 }
 
 func (s *stubInvoke) record(ctx context.Context, in *pb.InvokeRequest) int {
@@ -41,9 +44,14 @@ func (s *stubInvoke) record(ctx context.Context, in *pb.InvokeRequest) int {
 	return s.calls
 }
 
-func (s *stubInvoke) Unary(ctx context.Context, in *pb.InvokeRequest, _ ...grpc.CallOption) (*pb.InvokeResponse, error) {
+func (s *stubInvoke) Unary(ctx context.Context, in *pb.InvokeRequest, opts ...grpc.CallOption) (*pb.InvokeResponse, error) {
 	n := s.record(ctx, in)
 	if s.err != nil && (s.errUntil == 0 || n <= s.errUntil) {
+		for _, opt := range opts {
+			if t, ok := opt.(grpc.TrailerCallOption); ok && s.trailer != nil {
+				*t.TrailerAddr = s.trailer
+			}
+		}
 		return nil, s.err
 	}
 	if s.resp != nil {
@@ -79,9 +87,12 @@ func (s *stubChunkStream) Recv() (*pb.InvokeChunk, error) {
 
 // stubInvokeSource hands out the same stub on every call.
 type stubInvokeSource struct {
-	client pb.InvokeClient
-	err    error
+	client   pb.InvokeClient
+	err      error
+	notReady error
 }
+
+func (s stubInvokeSource) WaitReady(context.Context) error { return s.notReady }
 
 func (s stubInvokeSource) InvokeClient(context.Context) (pb.InvokeClient, error) {
 	if s.err != nil {
@@ -162,7 +173,7 @@ func TestProxyUnaryMapsABodyErrorToAHandlerError(t *testing.T) {
 	if he.Code != "NOT_FOUND" || he.Message != "no such account" {
 		t.Fatalf("handler error = %#v, want the code and message from the body", he)
 	}
-	if Retryable(err, true) {
+	if PreDispatch(err) {
 		t.Fatal("a body error must not be retryable even with an idempotency key")
 	}
 }
@@ -175,8 +186,11 @@ func TestProxyUnaryPreservesTheTransportStatus(t *testing.T) {
 	if err == nil {
 		t.Fatal("a transport failure must surface")
 	}
-	if got := Classify(err); got != RetryNever {
-		t.Fatalf("wrapping must preserve the status: Classify = %v, want %v", got, RetryNever)
+	if PreDispatch(err) {
+		t.Fatal("a bare status is no pre-dispatch proof")
+	}
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("wrapping must preserve the status, got %v", status.Code(err))
 	}
 	if !strings.Contains(err.Error(), "Ping") {
 		t.Fatalf("the error must name the method, got %q", err.Error())
@@ -250,5 +264,22 @@ func TestProxyReportsAMissingStub(t *testing.T) {
 	}
 	if _, err := p.Stream(context.Background(), &pb.InvokeRequest{Method: "Ping"}); err == nil {
 		t.Fatal("a missing stub must fail the stream")
+	}
+}
+
+// A runtime channel that never became ready sent nothing: the failure is
+// pre-dispatch proof, but not a direct-path one.
+func TestProxyChannelNotReadyIsPreDispatch(t *testing.T) {
+	stub := &stubInvoke{}
+	p, err := NewProxy(stubInvokeSource{client: stub, notReady: errors.New("connection refused")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = p.Unary(context.Background(), &pb.InvokeRequest{Method: "Ping"})
+	if !PreDispatch(err) || directPreDispatch(err) || !errors.Is(err, ErrPeerUnreachable) {
+		t.Fatalf("got %v", err)
+	}
+	if stub.calls != 0 {
+		t.Fatal("nothing may be sent over a channel that is not ready")
 	}
 }

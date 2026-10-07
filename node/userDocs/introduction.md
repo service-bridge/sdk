@@ -8,7 +8,7 @@ ServiceBridge — единый self-hosted рантайм для микросе�
 
 Сервисы декларируют входящие хендлеры (RPC, события, workflow, HTTP) и исходящие зависимости **до старта**. Runtime сразу строит граф сервисов и берёт на себя транспорт, доставку, политики и observability — без sidecar-прокси и отдельной инфраструктуры.
 
-Node.js SDK — backend-SDK (Bun + TypeScript), подключается к рантайму по gRPC (порт `14445`).
+Node.js SDK — backend-SDK на TypeScript для Node.js 22 / 24 / 26 и Bun ≥ 1.3.13, подключается к рантайму по gRPC (порт `14445`).
 
 ## Чем НЕ является
 
@@ -57,26 +57,32 @@ Node.js SDK — backend-SDK (Bun + TypeScript), подключается к ра
 ## Что умеет SDK
 
 ### Connectivity
-- Bootstrap + provisioning mTLS-сертификата
-- Reconnect с overlap-rotation сертификатов
+- Bootstrap + provisioning mTLS-сертификата; продление без обрыва стримов
+- Reconnect без лимита попыток по умолчанию; `start()` ждёт Welcome и первый snapshot реестра, `ready()` — живую сессию
+- Упорядоченный `stop()`: снять анонс, дождаться in-flight работы, дослать публикации и телеметрию
 - Live `serviceMap()` через `RegisterAndWatch`
 
 ### Communication
 - **Unary RPC** (`sb.rpc.call`) и **server-side streaming** (`sb.stream`) — см. [RPC](./rpc.md)
 - **Direct mode** (caller → callee mTLS) + **Proxy mode** (через runtime `Invoke`) + `transport: "auto"`
 - **Typed client** `sb.client(svc, .proto)` — авторегистрация deps + schemas
-- **Events** (durable pub/sub): `sb.event.define` / `sb.event.handle` / `sb.event.publish` — см. [Events](./events.md)
+- **Events** (durable pub/sub): `sb.event.define` / `sb.event.handle` (шаблоны, фильтры) / `sb.event.publish` (резолвится после записи события runtime) — см. [Events](./events.md)
 - **Workflows** (durable steps) + **Jobs** (cron) — см. [Workflows](./workflows.md)
 - **HTTP integrations** (Express / Fastify / Hono) — авто-публикация роутов в Service Map; HTTP-сервер у пользователя — см. [Integrations](./integrations.md)
 
 ### Reliability
-- Load Balancer (power-of-two-choices по in-flight), Circuit Breaker (per-instance), Retry (exp+jitter)
+- Load Balancer (power-of-two-choices по in-flight), Circuit Breaker (per-instance), Retry (exp+jitter) только для отказов до запуска хендлера
 - Idempotency cache в proxy mode
 - Contract-version routing (blue-green: v1 caller → v1 callee, v2 → v2)
+- Единая модель ошибок: каждая ошибка — `ServiceBridgeError` с `code` и `retryable`; бизнес-коды — `HandlerError`
 
 ### Observability
 - `sb.telemetry` — ops/traces, structured logs (`sb.logger`), `counter` / `gauge` / `histogram`
-- Авто-flush в runtime (off-switch — опция `telemetry: false`); trace-контекст наследуется вложенными вызовами
+- Авто-flush в runtime; включение, режим захвата payload и cap задаёт runtime (Settings → Telemetry); trace-контекст наследуется вложенными вызовами
+- Своя диагностика SDK — в `options.logger`
+
+### Testing
+- `service-bridge/testing` — харнесс с настоящим `ServiceBridge` на in-memory runtime: юнит-тесты хендлеров без сети — см. [Тестирование](./testing.md)
 
 ### Schemas
 - Источники: `.proto` (с/без service block) и `.schema.json` с явными `fieldNumber`

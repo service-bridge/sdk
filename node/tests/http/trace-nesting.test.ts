@@ -28,6 +28,7 @@ function makeSb(): { sb: ServiceBridge; started: StartedOp[] } {
 	const started: StartedOp[] = [];
 	const sb = {
 		routes: new RouteCollector({ setEndpoint() {}, triggerRestart() {} }),
+		diagnostics: { debug() {}, info() {}, warn() {}, error() {} },
 		telemetry: {
 			startOp(p: { traceId?: string }) {
 				const op = { traceId: p.traceId ?? "", opId: uuidv7() };

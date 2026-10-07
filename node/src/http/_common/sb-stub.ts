@@ -13,11 +13,13 @@ export interface StartedOp {
 	parentOpId: string;
 	subject: string;
 	businessKey: string;
+	meta: Record<string, unknown>;
 }
 
 export interface EndCall {
 	status: Status;
 	message?: string;
+	meta?: Record<string, unknown>;
 }
 
 export interface CaptureCall {
@@ -58,6 +60,7 @@ export function makeSbStub(captureMode: CaptureMode = "none"): SbStub {
 			parentOpId?: string;
 			subject: string;
 			businessKey?: string;
+			metaJson?: Buffer;
 		}) {
 			opCounter++;
 			const op: StartedOp = {
@@ -66,6 +69,7 @@ export function makeSbStub(captureMode: CaptureMode = "none"): SbStub {
 				parentOpId: p.parentOpId ?? "",
 				subject: p.subject,
 				businessKey: p.businessKey ?? "",
+				meta: p.metaJson ? JSON.parse(p.metaJson.toString()) : {},
 			};
 			state.started.push(op);
 			return {
@@ -81,13 +85,21 @@ export function makeSbStub(captureMode: CaptureMode = "none"): SbStub {
 				captureOut(bytes: Uint8Array) {
 					state.captures.push({ direction: "out", bytes });
 				},
-				end(status: Status, message?: string) {
-					state.endCalls.push({ status, message });
+				end(status: Status, message?: string, metaJson?: Buffer) {
+					state.endCalls.push({
+						status,
+						message,
+						meta: metaJson ? JSON.parse(metaJson.toString()) : undefined,
+					});
 				},
 			};
 		},
 	};
-	const sb = { routes, telemetry } as unknown as ServiceBridge;
+	const sb = {
+		routes,
+		telemetry,
+		diagnostics: { debug() {}, info() {}, warn() {}, error() {} },
+	} as unknown as ServiceBridge;
 	return {
 		sb,
 		routes,

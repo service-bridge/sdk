@@ -9,26 +9,19 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/service-bridge/sdk/go/internal/connection"
 	pb "github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	gcreds "google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/metadata"
 )
 
-// Channel cache tuning.
-const (
-	// DefaultTTLLeadMs retires a channel this long before the leaf certificate
-	// behind it expires, so no call starts on a certificate about to die.
-	DefaultTTLLeadMs int64 = 5 * 60 * 1000
-	// DefaultTTLFloorMs keeps a channel usable for at least this long even when
-	// the certificate is already inside the lead window; the rotation that
-	// replaces it evicts the whole cache anyway.
-	DefaultTTLFloorMs int64 = 60_000
-	// DefaultIdleTTLMs closes a channel nothing has used for this long.
-	DefaultIdleTTLMs int64 = 5 * 60 * 1000
-)
+// DefaultIdleTTLMs closes a peer channel nothing has used for this long.
+const DefaultIdleTTLMs int64 = 5 * 60 * 1000
 
 // ErrPeerIdentity is the SPIFFE pinning failure. It is the only authentication
 // on the direct path: every leaf in the mesh is signed by the same CA, so chain
@@ -54,10 +47,13 @@ type PeerDialer interface {
 // the pinned CA plus the SPIFFE URI SAN check in cfg.VerifyConnection.
 type GRPCPeerDialer struct{}
 
-// DialPeer builds the channel. grpc.NewClient connects lazily, so a peer that
-// cannot come up surfaces on the first RPC, where the retry ladder handles it.
+// DialPeer builds the channel. grpc.NewClient connects lazily; every call waits
+// for the channel to become ready before writing, so a peer that cannot come
+// up is a proven pre-dispatch failure rather than an ambiguous one.
 func (GRPCPeerDialer) DialPeer(_ context.Context, endpoint string, cfg *tls.Config) (*grpc.ClientConn, error) {
-	conn, err := grpc.NewClient(endpoint, grpc.WithTransportCredentials(gcreds.NewTLS(cfg)))
+	conn, err := grpc.NewClient(endpoint,
+		grpc.WithTransportCredentials(gcreds.NewTLS(cfg)),
+		grpc.WithKeepaliveParams(connection.ClientKeepalive()))
 	if err != nil {
 		return nil, fmt.Errorf("rpc: dial peer %s: %w", endpoint, err)
 	}
@@ -66,23 +62,15 @@ func (GRPCPeerDialer) DialPeer(_ context.Context, endpoint string, cfg *tls.Conf
 
 // DirectConfig tunes the direct transport.
 type DirectConfig struct {
-	Dialer     PeerDialer
-	TTLLeadMs  int64
-	TTLFloorMs int64
-	IdleTTLMs  int64
-	Now        func() int64
-	Logger     *slog.Logger
+	Dialer    PeerDialer
+	IdleTTLMs int64
+	Now       func() int64
+	Logger    *slog.Logger
 }
 
 func (c DirectConfig) normalized() DirectConfig {
 	if c.Dialer == nil {
 		c.Dialer = GRPCPeerDialer{}
-	}
-	if c.TTLLeadMs <= 0 {
-		c.TTLLeadMs = DefaultTTLLeadMs
-	}
-	if c.TTLFloorMs <= 0 {
-		c.TTLFloorMs = DefaultTTLFloorMs
 	}
 	if c.IdleTTLMs <= 0 {
 		c.IdleTTLMs = DefaultIdleTTLMs
@@ -109,11 +97,14 @@ type connKey struct {
 }
 
 type pooledPeer struct {
-	conn        *grpc.ClientConn
-	expiresAtMs int64
-	lastUsedMs  int64
-	refs        int
-	evicted     bool
+	conn       *grpc.ClientConn
+	lastUsedMs int64
+	refs       int
+	evicted    bool
+	// handshakeErr is the last TLS verification failure on this channel. gRPC
+	// reports a failed connect only as TRANSIENT_FAILURE; this is what names the
+	// reason — a pinned identity mismatch reads very differently from a refusal.
+	handshakeErr atomic.Pointer[error]
 }
 
 // Direct takes its certificate from the credential registry like every other
@@ -142,8 +133,12 @@ func NewDirect(cfg DirectConfig) *Direct {
 	}
 }
 
-// UseCredentials adopts a new lease and drops every cached channel: each one
-// carries the previous leaf certificate as its client identity.
+// UseCredentials adopts the TLS configuration of the lease. A renewal of the
+// same instance keeps every cached channel: the configuration reads the current
+// leaf on every handshake, so the renewed leaf reaches the next connection
+// without cutting a live one. A lease for another instance — a re-provision
+// after the old leaf expired — drops them, because their established
+// connections still authenticate as the instance that is gone.
 func (d *Direct) UseCredentials(_ context.Context, creds connection.Credentials) error {
 	if creds.TLS == nil {
 		return fmt.Errorf("rpc: adopt credentials: %w", ErrNoLease)
@@ -154,9 +149,11 @@ func (d *Direct) UseCredentials(_ context.Context, creds connection.Credentials)
 	if d.closed {
 		return ErrDirectClosed
 	}
+	if d.haveCreds && d.creds.Lease.Identity.InstanceID != creds.Lease.Identity.InstanceID {
+		d.dropAllLocked()
+	}
 	d.creds = creds
 	d.haveCreds = true
-	d.dropAllLocked()
 	return nil
 }
 
@@ -182,6 +179,22 @@ func (d *Direct) RetainInstances(live map[string]struct{}) {
 	}
 }
 
+// DropRevoked closes the channels of revoked services and instances at once,
+// without waiting for their certificates to expire.
+func (d *Direct) DropRevoked(services, instances map[string]struct{}) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	for k, p := range d.conns {
+		_, svc := services[k.serviceID]
+		_, inst := instances[k.instanceID]
+		if svc || inst {
+			delete(d.conns, k)
+			d.retire(p)
+		}
+	}
+}
+
 // Cached reports how many channels the pool holds.
 func (d *Direct) Cached() int {
 	d.mu.Lock()
@@ -196,11 +209,15 @@ func (d *Direct) Unary(ctx context.Context, target Candidate, req *pb.CallReques
 		return nil, err
 	}
 	defer l.release()
+	if err := d.ready(ctx, l); err != nil {
+		return nil, fmt.Errorf("rpc: direct unary %s to %s: %w", req.GetMethod(), target.Endpoint, err)
+	}
 
-	resp, err := pb.NewCallClient(l.conn).Unary(ctx, req)
+	var trailer metadata.MD
+	resp, err := pb.NewCallClient(l.conn).Unary(ctx, req, grpc.Trailer(&trailer))
 	if err != nil {
 		d.evictOnTransportError(l.key, err)
-		return nil, fmt.Errorf("rpc: direct unary %s to %s: %w", req.GetMethod(), target.Endpoint, err)
+		return nil, fmt.Errorf("rpc: direct unary %s to %s: %w", req.GetMethod(), target.Endpoint, markNotDispatched(err, trailer, true))
 	}
 	if resp.GetErrorCode() != "" {
 		return nil, handlerError(resp.GetErrorCode(), resp.GetErrorMessage())
@@ -215,6 +232,10 @@ func (d *Direct) Stream(ctx context.Context, target Candidate, req *pb.CallReque
 	if err != nil {
 		return nil, err
 	}
+	if err := d.ready(ctx, l); err != nil {
+		l.release()
+		return nil, fmt.Errorf("rpc: direct stream %s to %s: %w", req.GetMethod(), target.Endpoint, err)
+	}
 
 	streamCtx, cancel := context.WithCancel(ctx)
 	cs, err := pb.NewCallClient(l.conn).Stream(streamCtx, req)
@@ -226,12 +247,12 @@ func (d *Direct) Stream(ctx context.Context, target Candidate, req *pb.CallReque
 	}
 
 	key := l.key
-	return newStream(
+	return NewStream(
 		func() ([]byte, error) {
 			chunk, rerr := cs.Recv()
 			if rerr != nil {
 				d.evictOnTransportError(key, rerr)
-				return nil, rerr
+				return nil, markNotDispatched(rerr, cs.Trailer(), true)
 			}
 			if chunk.GetErrorCode() != "" {
 				return nil, handlerError(chunk.GetErrorCode(), chunk.GetErrorMessage())
@@ -260,6 +281,31 @@ func (l *peerLease) release() {
 	l.once.Do(func() { l.direct.release(l.peer) })
 }
 
+// ready waits for the leased channel to be able to carry the request. A channel
+// that fails to connect, or does not connect within the call's deadline, never
+// wrote a byte of it — that is the pre-dispatch proof the retry ladder and the
+// fall back to the proxy rely on.
+func (d *Direct) ready(ctx context.Context, l *peerLease) error {
+	conn := l.conn
+	conn.Connect()
+	for {
+		state := conn.GetState()
+		switch state {
+		case connectivity.Ready:
+			return nil
+		case connectivity.TransientFailure, connectivity.Shutdown:
+			d.evict(l.key)
+			if cause := l.peer.handshakeErr.Load(); cause != nil {
+				return &NotDispatchedError{Err: fmt.Errorf("%w: %s: %w", ErrPeerUnreachable, state, *cause), Direct: true}
+			}
+			return &NotDispatchedError{Err: fmt.Errorf("%w: %s", ErrPeerUnreachable, state), Direct: true}
+		}
+		if !conn.WaitForStateChange(ctx, state) {
+			return &NotDispatchedError{Err: fmt.Errorf("%w: %w", ErrPeerUnreachable, ctx.Err()), Direct: true}
+		}
+	}
+}
+
 func (d *Direct) lease(_ context.Context, target Candidate) (*peerLease, error) {
 	if target.Endpoint == "" {
 		return nil, fmt.Errorf("rpc: dial %s/%s: %w", target.ServiceName, target.InstanceID, ErrNoEndpoint)
@@ -280,21 +326,25 @@ func (d *Direct) lease(_ context.Context, target Candidate) (*peerLease, error) 
 
 	key := connKey{endpoint: target.Endpoint, serviceID: target.ServiceID, instanceID: target.InstanceID}
 	p := d.conns[key]
-	if p != nil && now >= p.expiresAtMs {
-		delete(d.conns, key)
-		d.retire(p)
-		p = nil
-	}
 	if p == nil {
 		cfg, err := peerTLSConfig(d.creds.TLS, connection.Identity{ServiceID: target.ServiceID, InstanceID: target.InstanceID})
 		if err != nil {
 			return nil, err
 		}
+		p = &pooledPeer{}
+		verify := cfg.VerifyConnection
+		cfg.VerifyConnection = func(cs tls.ConnectionState) error {
+			err := verify(cs)
+			if err != nil {
+				p.handshakeErr.Store(&err)
+			}
+			return err
+		}
 		conn, err := d.cfg.Dialer.DialPeer(context.Background(), target.Endpoint, cfg)
 		if err != nil {
 			return nil, err
 		}
-		p = &pooledPeer{conn: conn, expiresAtMs: now + d.channelTTLMs(now)}
+		p.conn = conn
 		d.conns[key] = p
 	}
 	p.lastUsedMs = now
@@ -361,21 +411,6 @@ func (d *Direct) sweepLocked(now int64) {
 			d.retire(p)
 		}
 	}
-}
-
-// channelTTLMs derives the channel lifetime from the local leaf certificate:
-// once it expires the peer stops accepting our client identity, so the channel
-// dies with it.
-func (d *Direct) channelTTLMs(now int64) int64 {
-	notAfter := d.creds.Lease.NotAfter
-	if notAfter.IsZero() {
-		return d.cfg.TTLFloorMs
-	}
-	ttl := notAfter.UnixMilli() - now - d.cfg.TTLLeadMs
-	if ttl < d.cfg.TTLFloorMs {
-		return d.cfg.TTLFloorMs
-	}
-	return ttl
 }
 
 func (d *Direct) closeConn(conn *grpc.ClientConn) {

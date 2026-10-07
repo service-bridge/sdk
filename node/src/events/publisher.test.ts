@@ -1,320 +1,364 @@
-/// <reference types="bun-types" />
-
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
-import type { ServiceError } from "@grpc/grpc-js";
-import { Storage } from "../sqlite/storage";
-import { InvalidEventNameError, OutboxFullError } from "./errors";
+import { describe, expect, it } from "bun:test";
+import {
+	AccessDeniedError,
+	type ServiceBridgeError,
+	StateError,
+	TimeoutError,
+	ValidationError,
+} from "../errors";
+import type { Logger } from "../logger";
+import { silentLogger } from "../logger";
 import type {
-	DrainerHandle,
-	Logger,
-	PublisherDeps,
-	SchemaIndex,
-} from "./publisher";
-import { Publisher } from "./publisher";
+	EventEnvelope,
+	EventsClient,
+	PublishRequest,
+	PublishResponse,
+} from "../pb/servicebridge/v1/events";
+import { PublishStatus } from "../pb/servicebridge/v1/events";
+import type { SchemaPair } from "../serde/serializer";
+import { InvalidEventNameError } from "./errors";
+import { Publisher, type PublisherDeps } from "./publisher";
 
-// Minimal Serializer stub that encodes payload as JSON bytes.
-function makeSerializer() {
-	return {
-		encode: (v: unknown) => Buffer.from(JSON.stringify(v)),
-		decode: (b: Uint8Array) => JSON.parse(Buffer.from(b).toString()),
-		contractHash: () => "stub-hash",
-		toJsonSchema: () => ({}) as Record<string, unknown>,
-	};
-}
+type Answer = (req: PublishRequest) => PublishResponse | Error | "hang";
 
-function makeSchemaIndex(
-	entries: Record<string, { contractHash: string }>,
-): SchemaIndex {
+const pair = {
+	input: { encode: (v: unknown) => Buffer.from(JSON.stringify(v)) },
+} as unknown as SchemaPair;
+
+function client(answer: Answer, requests: PublishRequest[]): EventsClient {
 	return {
-		get(name) {
-			const e = entries[name];
-			if (!e) return undefined;
-			const s = makeSerializer();
-			return { contractHash: e.contractHash, pair: { input: s, output: s } };
+		publish: (
+			req: PublishRequest,
+			_md: unknown,
+			_opts: unknown,
+			cb: (err: Error | null, res?: PublishResponse) => void,
+		) => {
+			requests.push(req);
+			const out = answer(req);
+			if (out === "hang") return;
+			setTimeout(() => (out instanceof Error ? cb(out) : cb(null, out)), 0);
 		},
-	};
+	} as unknown as EventsClient;
 }
 
-function makeKicker(): DrainerHandle & { count: number } {
-	let count = 0;
-	return {
-		kick() {
-			count++;
+const accept: Answer = (req) => ({
+	results: req.events.map((e) => ({
+		eventId: e.id,
+		status: PublishStatus.PUBLISH_STATUS_ACCEPTED,
+		message: "",
+	})),
+});
+
+function statusFor(
+	status: PublishStatus,
+	message = "",
+	eventId?: string,
+): Answer {
+	return (req) => ({
+		results: req.events.map((e) => ({
+			eventId: eventId ?? e.id,
+			status,
+			message,
+		})),
+	});
+}
+
+function make(
+	answer: Answer | null,
+	over: Partial<PublisherDeps> = {},
+): {
+	pub: Publisher;
+	requests: PublishRequest[];
+	violations: unknown[];
+	warns: string[];
+} {
+	const requests: PublishRequest[] = [];
+	const violations: unknown[] = [];
+	const warns: string[] = [];
+	const logger: Logger = { ...silentLogger, warn: (m) => warns.push(m) };
+	const c = answer ? client(answer, requests) : null;
+	const pub = new Publisher({
+		client: () => c,
+		schemaIndex: {
+			get: (n) =>
+				n.startsWith("order.") ? { contractHash: "h1", pair } : undefined,
 		},
-		get count() {
-			return count;
-		},
-	};
+		logger,
+		timeoutMs: 2_000,
+		maxPending: 100,
+		xSbTraceFn: () => "trace-header",
+		onPolicyViolation: (v) => violations.push(v),
+		...over,
+	});
+	return { pub, requests, violations, warns };
 }
 
-function makeLogger(): Logger {
-	return { warn() {}, error() {} };
-}
+const envelopes = (requests: PublishRequest[]): EventEnvelope[] =>
+	requests.flatMap((r) => r.events);
 
-// Fake EventsClient.publish that calls callback with null error and response.
-function makeRpcClient(
-	handler: (
-		req: unknown,
-		cb: (
-			err: ServiceError | null,
-			res?: { results: Array<{ eventId: string; status: number }> },
-		) => void,
-	) => void,
-) {
-	return {
-		publish: handler,
-	} as unknown as import("../pb/servicebridge/v1/events").EventsClient;
-}
-
-describe("Publisher", () => {
-	let tmpDir: string;
-	let storage: Storage;
-
-	beforeEach(() => {
-		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sb-pub-test-"));
-		storage = Storage.open({ dataDir: tmpDir });
+describe("Publisher acknowledgement", () => {
+	it("resolves after ACCEPTED with the event id and a complete envelope", async () => {
+		const { pub, requests } = make(accept);
+		const { eventId } = await pub.publish(
+			"order.created",
+			{ id: 1 },
+			{
+				partitionKey: "o-1",
+				headers: { a: "b" },
+				idempotencyKey: "k",
+				occurredAtMs: 5,
+			},
+		);
+		const env = envelopes(requests)[0] as EventEnvelope;
+		expect(eventId).toBe(env.id);
+		expect(env.id).toMatch(/^[0-9a-f-]{36}$/);
+		expect(env).toMatchObject({
+			name: "order.created",
+			contractHash: "h1",
+			partitionKey: "o-1",
+			idempotencyKey: "k",
+			headers: { a: "b" },
+			occurredAtUnixMs: 5,
+			xSbTrace: "trace-header",
+		});
+		expect(Buffer.from(env.payloadJson).toString()).toBe('{"id":1}');
 	});
 
-	afterEach(() => {
-		storage.close();
-		fs.rmSync(tmpDir, { recursive: true, force: true });
+	it("REJECTED_DUPLICATE is a success carrying the original event id", async () => {
+		const { pub } = make(
+			statusFor(
+				PublishStatus.PUBLISH_STATUS_REJECTED_DUPLICATE,
+				"",
+				"original-id",
+			),
+		);
+		await expect(pub.publish("order.created", {})).resolves.toEqual({
+			eventId: "original-id",
+		});
 	});
 
-	function makeDeps(overrides: Partial<PublisherDeps> = {}): PublisherDeps {
-		return {
-			storage,
-			rpcClient: makeRpcClient((_req, cb) => cb(null, { results: [] })),
-			schemaIndex: makeSchemaIndex({
-				"payment.charged": { contractHash: "hash1" },
-			}),
-			drainer: makeKicker(),
-			identity: () => ({
-				sessionId: "s",
-				serviceId: "svc",
-				serviceName: "svc",
-				instanceId: "i",
-			}),
-			maxOutboxRows: 100_000,
-			logger: makeLogger(),
-			xSbTraceFn: () => "",
-			...overrides,
-		};
-	}
-
-	it("throws InvalidEventNameError for invalid name formats", async () => {
-		const p = new Publisher(makeDeps());
-		const invalid = [
-			"Payment.Charged",
-			"payment..charged",
-			".payment.charged",
-			"payment.charged.",
-			"payment charged",
-			"",
-			"UPPER",
-			"a.b.C",
-		];
-		for (const name of invalid) {
-			await expect(p.publish(name, {})).rejects.toBeInstanceOf(
-				InvalidEventNameError,
-			);
-		}
+	it("REJECTED_CONFLICT is a CONFLICT error", async () => {
+		const { pub } = make(
+			statusFor(
+				PublishStatus.PUBLISH_STATUS_REJECTED_CONFLICT,
+				"different payload",
+			),
+		);
+		const err = await pub.publish("order.created", {}).catch((e) => e);
+		expect((err as ServiceBridgeError).code).toBe("CONFLICT");
+		expect((err as Error).message).toContain("different payload");
 	});
 
-	it("throws error if no schema registered for the event name", async () => {
-		const p = new Publisher(makeDeps());
-		await expect(p.publish("unknown.event", {})).rejects.toThrow(
-			/no schema registered for event/,
+	it("REJECTED_INVALID_NAME is an InvalidEventNameError", async () => {
+		const { pub } = make(
+			statusFor(PublishStatus.PUBLISH_STATUS_REJECTED_INVALID_NAME),
+		);
+		await expect(pub.publish("order.created", {})).rejects.toBeInstanceOf(
+			InvalidEventNameError,
 		);
 	});
 
-	it("happy path: inserts outbox row and kicks drainer", async () => {
-		const kicker = makeKicker();
-		const p = new Publisher(makeDeps({ drainer: kicker }));
-
-		const { eventId } = await p.publish("payment.charged", { amount: 100 });
-		expect(eventId).toMatch(/^[0-9a-f-]{36}$/);
-		expect(kicker.count).toBe(1);
-
-		const row = storage
-			.prepare("SELECT * FROM event_outbox WHERE id=?")
-			.get(eventId) as {
-			name: string;
-			status: string;
-			contract_hash: string;
-		};
-		expect(row).not.toBeNull();
-		expect(row.name).toBe("payment.charged");
-		expect(row.status).toBe("pending");
-		expect(row.contract_hash).toBe("hash1");
+	it("REJECTED_FORBIDDEN is an AccessDeniedError and a policy violation", async () => {
+		const { pub, violations } = make(
+			statusFor(PublishStatus.PUBLISH_STATUS_REJECTED_FORBIDDEN, "no rule"),
+		);
+		await expect(pub.publish("order.created", {})).rejects.toBeInstanceOf(
+			AccessDeniedError,
+		);
+		expect(violations).toEqual([
+			{
+				declaration: "event.publish",
+				value: "order.created",
+				denySide: "self_egress",
+				reason: "no rule",
+			},
+		]);
 	});
 
-	it("fireAndForget bypasses outbox and calls rpcClient directly", async () => {
-		let publishCalled = false;
-		const rpcClient = makeRpcClient((req, cb) => {
-			publishCalled = true;
-			cb(null, {
-				results: (req as { events: { id: string }[] }).events.map((e) => ({
-					eventId: e.id,
-					status: 1,
-				})),
-			});
+	it("retries the SAME envelope after a transport error and after UNSPECIFIED", async () => {
+		let n = 0;
+		const { pub, requests } = make((req) => {
+			n++;
+			if (n === 1) return new Error("unavailable");
+			if (n === 2)
+				return statusFor(
+					PublishStatus.PUBLISH_STATUS_UNSPECIFIED,
+					"rate limit",
+				)(req);
+			return accept(req);
 		});
-		const kicker = makeKicker();
-		const p = new Publisher(makeDeps({ rpcClient, drainer: kicker }));
+		const { eventId } = await pub.publish("order.created", {});
+		const ids = envelopes(requests).map((e) => e.id);
+		expect(ids).toEqual([eventId, eventId, eventId]);
+	});
 
-		const { eventId } = await p.publish(
-			"payment.charged",
+	it("waits for a channel and sends on kick()", async () => {
+		let ready = false;
+		const requests: PublishRequest[] = [];
+		const c = client(accept, requests);
+		const { pub } = make(null, { client: () => (ready ? c : null) });
+		const pending = pub.publish("order.created", {});
+		await new Promise((r) => setTimeout(r, 20));
+		expect(requests).toHaveLength(0);
+		ready = true;
+		pub.kick();
+		await pending;
+		expect(requests).toHaveLength(1);
+	});
+});
+
+describe("Publisher bounds", () => {
+	it("an event the runtime never received times out as 'not sent'", async () => {
+		const { pub } = make(null, { timeoutMs: 30 });
+		const err = await pub.publish("order.created", {}).catch((e) => e);
+		expect(err).toBeInstanceOf(TimeoutError);
+		expect((err as Error).message).toContain("not sent");
+	});
+
+	it("an event sent but never acknowledged times out as 'outcome unknown'", async () => {
+		const { pub } = make(() => new Error("reset"), { timeoutMs: 60 });
+		const err = await pub.publish("order.created", {}).catch((e) => e);
+		expect(err).toBeInstanceOf(TimeoutError);
+		expect((err as Error).message).toContain("outcome unknown");
+	});
+
+	it("a full queue fails publish with QUEUE_FULL", async () => {
+		const { pub } = make(() => "hang", { maxPending: 2 });
+		void pub.publish("order.created", {}).catch(() => {});
+		void pub.publish("order.created", {}).catch(() => {});
+		const err = await pub.publish("order.created", {}).catch((e) => e);
+		expect((err as ServiceBridgeError).code).toBe("QUEUE_FULL");
+		expect((err as ServiceBridgeError).retryable).toBe(true);
+	});
+
+	it("rejects an invalid name and an undeclared event locally", async () => {
+		const { pub, requests } = make(accept);
+		await expect(pub.publish("Bad Name", {})).rejects.toBeInstanceOf(
+			InvalidEventNameError,
+		);
+		await expect(pub.publish("invoice.created", {})).rejects.toBeInstanceOf(
+			StateError,
+		);
+		expect(requests).toHaveLength(0);
+	});
+});
+
+describe("Publisher ordering", () => {
+	it("puts at most one event per partition key in a request, keeping key order", async () => {
+		const { pub, requests } = make(accept);
+		const all = Promise.all([
+			pub.publish("order.created", { n: 1 }, { partitionKey: "a" }),
+			pub.publish("order.created", { n: 2 }, { partitionKey: "a" }),
+			pub.publish("order.created", { n: 3 }, { partitionKey: "b" }),
+			pub.publish("order.created", { n: 4 }),
+			pub.publish("order.created", { n: 5 }),
+		]);
+		await all;
+		const batches = requests.map((r) =>
+			r.events.map((e) => JSON.parse(Buffer.from(e.payloadJson).toString()).n),
+		);
+		expect(batches[0]).toEqual([1, 3, 4, 5]);
+		expect(batches[1]).toEqual([2]);
+	});
+
+	it("a transient failure of one key never lets a later event of that key overtake it", async () => {
+		let first = true;
+		const { pub, requests } = make((req) => {
+			if (first) {
+				first = false;
+				return {
+					results: req.events.map((e) => ({
+						eventId: e.id,
+						status: PublishStatus.PUBLISH_STATUS_UNSPECIFIED,
+						message: "",
+					})),
+				};
+			}
+			return accept(req);
+		});
+		await Promise.all([
+			pub.publish("order.created", { n: 1 }, { partitionKey: "a" }),
+			pub.publish("order.created", { n: 2 }, { partitionKey: "a" }),
+		]);
+		const order = requests.flatMap((r) =>
+			r.events.map((e) => JSON.parse(Buffer.from(e.payloadJson).toString()).n),
+		);
+		expect(order).toEqual([1, 1, 2]);
+	});
+});
+
+describe("Publisher fire-and-forget and close", () => {
+	it("fireAndForget resolves at once and only logs a terminal failure", async () => {
+		const { pub, warns } = make(
+			statusFor(PublishStatus.PUBLISH_STATUS_REJECTED_CONFLICT),
+		);
+		const { eventId } = await pub.publish(
+			"order.created",
 			{},
 			{ fireAndForget: true },
 		);
-		expect(publishCalled).toBe(true);
-		expect(kicker.count).toBe(0);
-
-		const count = storage
-			.prepare("SELECT COUNT(*) AS c FROM event_outbox")
-			.get() as { c: number };
-		expect(count.c).toBe(0);
-		expect(eventId).toBeDefined();
-	});
-
-	it("throws when rpcClient errors in fireAndForget", async () => {
-		const rpcClient = makeRpcClient((_req, cb) => {
-			const err = Object.assign(new Error("grpc error"), {
-				code: 14,
-			}) as ServiceError;
-			cb(err);
-		});
-		const p = new Publisher(makeDeps({ rpcClient }));
-		await expect(
-			p.publish("payment.charged", {}, { fireAndForget: true }),
-		).rejects.toThrow("grpc error");
-	});
-
-	it("throws OutboxFullError when cap is reached", async () => {
-		const p = new Publisher(makeDeps({ maxOutboxRows: 2 }));
-		await p.publish("payment.charged", { n: 1 });
-		await p.publish("payment.charged", { n: 2 });
-		await expect(p.publish("payment.charged", { n: 3 })).rejects.toBeInstanceOf(
-			OutboxFullError,
+		expect(eventId).toMatch(/^[0-9a-f-]{36}$/);
+		await new Promise((r) => setTimeout(r, 20));
+		expect(warns.some((w) => w.includes("fire-and-forget publish lost"))).toBe(
+			true,
 		);
 	});
 
-	it("tracks the outbox row count without scanning the table", async () => {
-		const p = new Publisher(makeDeps({ maxOutboxRows: 3 }));
-		await p.publish("payment.charged", { n: 1 });
-		await p.publish("payment.charged", { n: 2 });
-		expect(storage.outboxRowCount()).toBe(2);
-
-		await p.publish("payment.charged", { n: 3 });
-		await expect(p.publish("payment.charged", { n: 4 })).rejects.toBeInstanceOf(
-			OutboxFullError,
-		);
-		// The rejected publish rolled back — the count must not drift.
-		expect(storage.outboxRowCount()).toBe(3);
-		expect(
-			storage.prepare("SELECT COUNT(*) AS c FROM event_outbox").get(),
-		).toMatchObject({ c: 3 });
-	});
-
-	it("sends payload_json on the fireAndForget path too", async () => {
-		let captured: Uint8Array | undefined;
-		const rpcClient = makeRpcClient((req, cb) => {
-			const events = (req as { events: { payloadJson: Uint8Array }[] }).events;
-			captured = events[0]?.payloadJson;
-			cb(null, {
-				results: (req as { events: { id: string }[] }).events.map((e) => ({
-					eventId: e.id,
-					status: 1,
-				})),
-			});
-		});
-		const p = new Publisher(makeDeps({ rpcClient }));
-
-		await p.publish("payment.charged", { amount: 7 }, { fireAndForget: true });
-
-		// The runtime feeds payload_json to workflow wait_event filters for every
-		// ingested event, fire-and-forget included.
-		expect(captured).toBeDefined();
-		expect(Buffer.from(captured as Uint8Array).toString()).toBe(
-			JSON.stringify({ amount: 7 }),
+	it("close() sends what it can, then rejects the rest with CONNECTION", async () => {
+		const { pub } = make(() => "hang");
+		const pending = pub.publish("order.created", {}).catch((e) => e);
+		await pub.close(30);
+		const err = await pending;
+		expect((err as ServiceBridgeError).code).toBe("CONNECTION");
+		await expect(pub.publish("order.created", {})).rejects.toBeInstanceOf(
+			StateError,
 		);
 	});
 
-	it("propagates idempotencyKey and partitionKey to outbox row", async () => {
-		const p = new Publisher(makeDeps());
-		const { eventId } = await p.publish(
-			"payment.charged",
-			{},
-			{
-				idempotencyKey: "idem-42",
-				partitionKey: "user-7",
+	it("close() resolves early once the queue drained", async () => {
+		const { pub } = make(accept);
+		const sent = pub.publish("order.created", {});
+		const started = Date.now();
+		await pub.close(5_000);
+		await sent;
+		expect(Date.now() - started).toBeLessThan(1_000);
+	});
+});
+
+describe("Publisher schema validation", () => {
+	it("a payload the schema rejects is a ValidationError rejection, nothing is sent", async () => {
+		const { pub, requests } = make(accept);
+		const strict = new Publisher({
+			client: () => null,
+			schemaIndex: {
+				get: () => ({
+					contractHash: "h",
+					pair: {
+						input: {
+							encode: () => {
+								throw new Error("orderId: string expected");
+							},
+						},
+					} as unknown as SchemaPair,
+				}),
 			},
-		);
-		const row = storage
-			.prepare("SELECT * FROM event_outbox WHERE id=?")
-			.get(eventId) as {
-			idempotency_key: string;
-			partition_key: string;
-		};
-		expect(row.idempotency_key).toBe("idem-42");
-		expect(row.partition_key).toBe("user-7");
+			logger: silentLogger,
+			timeoutMs: 1000,
+			maxPending: 10,
+			xSbTraceFn: () => "",
+			onPolicyViolation: () => {},
+		});
+		const pending = strict.publish("order.created", { orderId: 1 });
+		await expect(pending).rejects.toBeInstanceOf(ValidationError);
+		void pub;
+		expect(requests).toHaveLength(0);
 	});
+});
 
-	it("propagates headers to outbox row as JSON", async () => {
-		const p = new Publisher(makeDeps());
-		const { eventId } = await p.publish(
-			"payment.charged",
-			{},
-			{
-				headers: { "x-trace-id": "abc" },
-			},
-		);
-		const row = storage
-			.prepare("SELECT headers FROM event_outbox WHERE id=?")
-			.get(eventId) as { headers: string };
-		const headers = JSON.parse(row.headers) as Record<string, string>;
-		expect(headers["x-trace-id"]).toBe("abc");
-	});
-
-	it("uses occurredAtMs override in outbox row", async () => {
-		const customTs = 1_700_000_000_000;
-		const p = new Publisher(makeDeps());
-		const { eventId } = await p.publish(
-			"payment.charged",
-			{},
-			{ occurredAtMs: customTs },
-		);
-		const row = storage
-			.prepare("SELECT occurred_at_ms FROM event_outbox WHERE id=?")
-			.get(eventId) as { occurred_at_ms: number };
-		expect(row.occurred_at_ms).toBe(customTs);
-	});
-
-	it("durable path persists x_sb_trace header from xSbTraceFn in outbox row", async () => {
-		const xSbTrace =
-			"01890d1e-1234-7890-abcd-ef1234567890-01890d1f-aaaa-7777-bbbb-cccccccccccc";
-		const p = new Publisher(makeDeps({ xSbTraceFn: () => xSbTrace }));
-
-		const { eventId } = await p.publish("payment.charged", {});
-
-		const row = storage
-			.prepare("SELECT x_sb_trace FROM event_outbox WHERE id=?")
-			.get(eventId) as { x_sb_trace: string };
-		expect(row).not.toBeNull();
-		expect(row.x_sb_trace).toBe(xSbTrace);
-	});
-
-	it("durable path stores empty x_sb_trace when no context is active", async () => {
-		const p = new Publisher(makeDeps());
-		const { eventId } = await p.publish("payment.charged", {});
-
-		const row = storage
-			.prepare("SELECT x_sb_trace FROM event_outbox WHERE id=?")
-			.get(eventId) as { x_sb_trace: string };
-		expect(row).not.toBeNull();
-		expect(row.x_sb_trace).toBe("");
+describe("Publisher sequencing", () => {
+	it("a publish issued right after the previous one resolved is sent too", async () => {
+		const { pub, requests } = make(accept);
+		for (let i = 0; i < 5; i++) await pub.publish("order.created", { n: i });
+		expect(requests).toHaveLength(5);
 	});
 });

@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package testing.shop;
+
+message ChargeRequest {
+  string user_id = 1;
+  double amount = 2;
+}
+
+message ChargeResponse {
+  string transaction_id = 1;
+  bool ok = 2;
+}
+
+message CheckRequest {
+  string user_id = 1;
+}
+
+message CheckResponse {
+  bool blocked = 1;
+}
+
+message Tick {
+  int32 n = 1;
+}
+
+message PaymentCharged {
+  string transaction_id = 1;
+  double amount = 2;
+}
+
+service Payments {
+  rpc Charge (ChargeRequest) returns (ChargeResponse);
+  rpc Countdown (Tick) returns (stream Tick);
+}
+
+service Fraud {
+  rpc Check (CheckRequest) returns (CheckResponse);
+}

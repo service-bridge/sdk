@@ -163,7 +163,7 @@ describe("attachExpress payload capture gating", () => {
 		expect(serializations()).toBe(1);
 		expect(stub.captures).toHaveLength(0);
 		expect(stub.endCalls).toEqual([
-			{ status: Status.SUCCESS, message: undefined },
+			{ status: Status.SUCCESS, message: undefined, meta: { status: 200 } },
 		]);
 	});
 
@@ -173,18 +173,47 @@ describe("attachExpress payload capture gating", () => {
 		expect(stub.captures.map((c) => c.direction)).toEqual(["in", "out"]);
 	});
 
-	it("rejects scanner probes before creating HTTP telemetry", async () => {
+	it("names the op after the route template, never the raw path or query", async () => {
 		const stub = makeSbStub();
 		const app = express();
+		app.get("/users/:id", (_req, res) => {
+			res.json({});
+		});
+		const sub = express.Router();
+		sub.post("/orders/:oid/items", (_req, res) => {
+			res.status(201).json({});
+		});
+		app.use("/api", sub);
 		const port = await new Promise<number>((resolve) => {
 			server = app.listen(0, "127.0.0.1", () => {
 				resolve((server!.address() as { port: number }).port);
 			});
 		});
 		attachExpress(app, stub.sb, { port });
-		const response = await fetch(`http://127.0.0.1:${port}/.git/config`);
-		expect(response.status).toBe(404);
-		expect(await response.json()).toEqual({ error: "Not Found" });
-		expect(stub.started).toHaveLength(0);
+		await (
+			await fetch(`http://127.0.0.1:${port}/users/42?token=secret`)
+		).text();
+		await (
+			await fetch(`http://127.0.0.1:${port}/api/orders/7/items`, {
+				method: "POST",
+			})
+		).text();
+		await (await fetch(`http://127.0.0.1:${port}/nope`)).text();
+		await new Promise((r) => setTimeout(r, 30));
+		expect(stub.started.map((s) => s.subject)).toEqual([
+			"http.handle:GET//users/:id",
+			"http.handle:POST//api/orders/:oid/items",
+			"http.handle:GET/*",
+		]);
+		expect(stub.started[0]?.businessKey).toBe("GET /users/:id");
+		expect(stub.started[0]?.meta).toEqual({
+			method: "GET",
+			route: "/users/:id",
+		});
+		expect(stub.endCalls.map((e) => e.meta)).toEqual([
+			{ status: 200 },
+			{ status: 201 },
+			{ status: 404 },
+		]);
 	});
 });

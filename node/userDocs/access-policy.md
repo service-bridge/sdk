@@ -31,7 +31,7 @@ ServiceBridge поддерживает гранулярную политику �
 
 Runtime в первом снапшоте после `RegisterAndWatch` посылает SDK `PolicyEvaluation` со списком нарушений в декларациях. SDK:
 
-- логирует `console.warn` на каждое нарушение,
+- пишет warn в `logger` (опция конструктора) на каждое нарушение,
 - эмитит `policy_violation` event:
 
 ```ts
@@ -47,19 +47,24 @@ sb.on('policy_violation', ({ declaration, value, denySide, reason }) => {
 Для строгого режима (prod):
 
 ```ts
+import { AccessDeniedError } from 'service-bridge';
+
 const sb = new ServiceBridge(url, key, {
   failOnPolicyViolation: true,
 });
-// При любом warning в первом снапшоте SDK не бросает исключение из start(),
-// а эмитит `disconnected` и сам останавливается (вызывает stop()).
-// reason начинается с "policy:", в error лежит ConnectionError.
-sb.on('disconnected', ({ reason, error }) => {
-  if (reason.startsWith('policy:')) {
-    console.error('policy violations on start:', error);
+// Snapshot политики с warning'ами останавливает бридж: start() бросает
+// AccessDeniedError («policy violations on start: ...»), и эмитится
+// `disconnected` с той же ошибкой. Если warning придёт в snapshot уже после
+// start(), бридж остановится так же — через `disconnected`.
+try {
+  await sb.start();
+} catch (err) {
+  if (err instanceof AccessDeniedError) {
+    console.error(err.message);
     process.exit(1);
   }
-});
-await sb.start();
+  throw err;
+}
 ```
 
 Также доступен геттер — последний снапшот политики, который runtime прислал
@@ -94,29 +99,23 @@ interface ServiceMapEntry {
 
 ## CLI: редактирование политики
 
-Все команды требуют `--dsn` (Postgres DSN рантайма).
+Политику правят в консоли рантайма или CLI `sb` (поставляется в образе рантайма):
 
 ```sh
-# Посмотреть текущую политику
-sb-policy show --dsn=... --service=analytics
+# Посмотреть capabilities и allow-листы сервиса
+sb service policy show <service-id>
 
-# Отключить capability (только *.handle: rpc.handle / event.handle / workflow.handle / job.handle)
-sb-policy capability set --dsn=... --service=payments --cap=event.handle --value=false
-
-# Добавить egress правило
-sb-policy action add --dsn=... --service=analytics --kind=rpc.call --target=payments/charge
-
-# Удалить egress
-sb-policy action remove --dsn=... --service=analytics --kind=rpc.call --target=payments/charge
-
-# Добавить acceptance (кому можно меня вызывать)
-sb-policy acceptance add --dsn=... --service=payments --kind=rpc.handle --caller=analytics --method=charge
-
-# Удалить
-sb-policy acceptance remove --dsn=... --service=payments --kind=rpc.handle --caller=analytics --method=charge
+# Задать политику. Неуказанные измерения сохраняют текущее значение;
+# --cap полностью заменяет набор capabilities. Флаги повторяемые.
+sb service policy set <service-id> \
+  --cap rpc.handle --cap event.handle \
+  --allow-call payments \
+  --allow-caller analytics \
+  --allow-publish 'orders.#' \
+  --allow-subscribe 'payments.*' \
+  --allow-run-wf checkout \
+  --allow-wf-caller storefront
 ```
-
-Изменения вступают в силу <1s — Postgres NOTIFY автоматически обновляет in-memory snapshot в runtime.
 
 ## Wildcards
 
@@ -137,9 +136,10 @@ sb-policy acceptance remove --dsn=... --service=payments --kind=rpc.handle --cal
 |---|---|
 | **Регистрация handler'а с отключённой capability** | Handler **не регистрируется** (runtime тихо пропускает его), но `start()` не падает — сервис остаётся жив. Пропуск приходит как warning (`policy_violation`). |
 | **Объявление outgoing dep / subscription не покрытое правилами** | Регистрация проходит. SDK получает warning (`policy_violation`). Реальная попытка вызова денится в рантайме. |
-| **`sb.rpc.call(...)`** | Промис реджектится `RpcAccessDeniedError` (маппинг с gRPC `PERMISSION_DENIED`). |
+| **`sb.rpc.call(...)`** | Промис реджектится `AccessDeniedError` (`code: "ACCESS_DENIED"`, маппинг с gRPC `PERMISSION_DENIED`); SDK эмитит `policy_violation` с `declaration: 'rpc.call'`. |
+| **Входящий вызов от запрещённого или отозванного сервиса** | Callee отвечает `PERMISSION_DENIED` до хендлера; вызывающий получает `AccessDeniedError`. |
 | **`sb.workflow.start(...)`** | Промис реджектится `WorkflowAccessDeniedError`. |
-| **`sb.event.publish(...)`** | Publish — fire-and-forget в локальный outbox, поэтому отказ **не** бросается в caller. Envelope получает `PUBLISH_STATUS_REJECTED_FORBIDDEN`, строка в outbox помечается `failed` (терминально, без ретраев), а SDK эмитит `policy_violation` с `denySide: 'self_egress'`. |
+| **`sb.event.publish(...)`** | Runtime отвечает `PUBLISH_STATUS_REJECTED_FORBIDDEN`; промис реджектится `AccessDeniedError`, а SDK эмитит `policy_violation` с `declaration: 'event.publish'`, `denySide: 'self_egress'`. С `fireAndForget: true` отказ только логируется. |
 
 ## Глобальный граф для UI
 
@@ -149,4 +149,4 @@ sb-policy acceptance remove --dsn=... --service=payments --kind=rpc.handle --cal
 
 - ADR-0004 (`runtime/docs/adr/0004-access-security-tls.md`) — детальное обоснование
 - `runtime/internal/access/README.md` — internals реализации
-- `runtime/cmd/sb-policy/README.md` — полная спецификация CLI
+- `runtime/internal/sbcli/README.md` — CLI `sb`

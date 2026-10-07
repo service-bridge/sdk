@@ -27,7 +27,7 @@ func newIntegration(t *testing.T, httpMode telemetry.Mode) (*sbhttp.Integration,
 	return newIntegrationWithLimit(t, httpMode, int32(telemetry.DefaultPayloadMaxBytes))
 }
 
-func newIntegrationWithLimit(t *testing.T, httpMode telemetry.Mode, payloadMaxBytes int32) (*sbhttp.Integration, *testRuntime) {
+func newIntegrationWithLimit(t *testing.T, httpMode telemetry.Mode, payloadMaxBytes int32, opts ...sbhttp.Option) (*sbhttp.Integration, *testRuntime) {
 	t.Helper()
 	policy := telemetry.NewPolicy()
 	modes := telemetry.DefaultModes()
@@ -39,7 +39,7 @@ func newIntegrationWithLimit(t *testing.T, httpMode telemetry.Mode, payloadMaxBy
 		rec:   telemetry.NewRecorder(telemetry.NewRing(telemetry.DefaultBudgets()), policy),
 		decls: registry.NewDeclarations(),
 	}
-	integ, err := sbhttp.New(rt, sbhttp.WithLogger(slog.New(slog.DiscardHandler)))
+	integ, err := sbhttp.New(rt, append([]sbhttp.Option{sbhttp.WithLogger(slog.New(slog.DiscardHandler))}, opts...)...)
 	if err != nil {
 		t.Fatalf("new integration: %v", err)
 	}

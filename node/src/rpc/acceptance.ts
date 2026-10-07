@@ -1,5 +1,4 @@
-import "reflect-metadata";
-import * as x509 from "@peculiar/x509";
+import { X509Certificate } from "node:crypto";
 import { RUNTIME_SPIFFE_URI, SPIFFE_TRUST_DOMAIN } from "../connection/spiffe";
 import type { PolicyEvaluation } from "../pb/servicebridge/v1/registry";
 
@@ -14,7 +13,7 @@ export interface SpiffeIdentity {
 //   runtime — the runtime proxying a call on behalf of an originating service
 //   unknown — identity could not be established; the caller must reject
 export type PeerIdentity =
-	| { kind: "service"; serviceId: string }
+	| { kind: "service"; serviceId: string; instanceId: string }
 	| { kind: "runtime" }
 	| { kind: "unknown"; reason: string };
 
@@ -58,15 +57,12 @@ function uriSansFromAltName(altName: string): string[] {
 // Returns null when the DER cannot be parsed at all.
 function certFactsFromDer(raw: Buffer | Uint8Array): CertFacts | null {
 	try {
-		const parsed = new x509.X509Certificate(raw);
-		const uriSans: string[] = [];
-		const sanExt = parsed.getExtension(x509.SubjectAlternativeNameExtension);
-		if (sanExt) {
-			for (const name of sanExt.names.items) {
-				if (name.type === "url") uriSans.push(name.value);
-			}
-		}
-		return { uriSans };
+		const parsed = new X509Certificate(raw);
+		return {
+			uriSans: parsed.subjectAltName
+				? uriSansFromAltName(parsed.subjectAltName)
+				: [],
+		};
 	} catch {
 		return null;
 	}
@@ -105,7 +101,12 @@ export function classifyPeer(cert: PeerCertLike): PeerIdentity {
 	const uri = facts.uriSans[0]!;
 	if (uri === RUNTIME_SPIFFE_URI) return { kind: "runtime" };
 	const id = parsePeerSpiffeUri(uri);
-	if (id) return { kind: "service", serviceId: id.serviceId };
+	if (id)
+		return {
+			kind: "service",
+			serviceId: id.serviceId,
+			instanceId: id.instanceId,
+		};
 	return {
 		kind: "unknown",
 		reason:
@@ -139,39 +140,36 @@ export function checkAcceptance(
 	return false;
 }
 
-// evaluatePeerAcceptance is the pure decision function used by CallServer for
-// every incoming direct call. Returns a denial reason string when the call
-// should be rejected, or null when it should proceed.
+// peerOfCall classifies the TLS peer of an inbound call. A call whose
+// certificate cannot be read is `unknown`.
+export function peerOfCall(call: object): PeerIdentity {
+	const cert = getPeerCertFromCall(call);
+	if (!cert)
+		return {
+			kind: "unknown",
+			reason: "could not extract peer certificate from the call",
+		};
+	return classifyPeer(cert);
+}
+
+// evaluatePeerAcceptance is the decision CallServer makes for every inbound
+// direct call. Returns a denial reason, or null when the call may proceed.
 //
-// Default-allow when policy is null or has no rpc.handle rules. Once rules
-// exist the check is fail-closed: any peer whose identity cannot be established
-// is rejected.
+// Default-allow when the policy has no rpc.handle rules. Once rules exist the
+// check is fail-closed: a peer whose identity cannot be established is
+// rejected. The runtime (proxy path) already enforced the caller-side gate.
 export function evaluatePeerAcceptance(
-	policy: PolicyEvaluation | null,
-	call: object,
+	policy: PolicyEvaluation,
+	peer: PeerIdentity,
 	methodName: string,
 ): string | null {
-	if (!policy) return null;
-	const rpcHandleRules = policy.acceptance.filter(
-		(r) => r.action === "rpc.handle",
-	);
-	if (rpcHandleRules.length === 0) return null;
-	const cert = getPeerCertFromCall(call);
-	if (!cert) {
-		return "rpc: could not extract peer certificate from direct call";
-	}
-	const peer = classifyPeer(cert);
-	if (peer.kind === "unknown") {
+	const hasRules = policy.acceptance.some((r) => r.action === "rpc.handle");
+	if (!hasRules) return null;
+	if (peer.kind === "unknown")
 		return `rpc: peer identity not established — ${peer.reason}`;
-	}
-	if (peer.kind === "runtime") {
-		// The runtime already enforced caller-side gate #3 against the originating
-		// service. Local acceptance rules only describe direct SDK→SDK peers.
-		return null;
-	}
-	if (!checkAcceptance(peer.serviceId, methodName, policy)) {
+	if (peer.kind === "runtime") return null;
+	if (!checkAcceptance(peer.serviceId, methodName, policy))
 		return `rpc: acceptance denied for caller ${peer.serviceId} method ${methodName}`;
-	}
 	return null;
 }
 

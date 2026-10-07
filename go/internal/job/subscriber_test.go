@@ -407,7 +407,7 @@ func TestConcurrencyIsCappedPerJob(t *testing.T) {
 	var live, peak atomic.Int64
 	var done atomic.Int64
 	capped := cronSpec(t)
-	capped.MaxConcurrent = 2
+	capped.MaxConcurrent = ptr(2)
 	capped.Overlap = job.OverlapAllow
 	declare(t, decls, "capped", capped, func(ctx context.Context, _ job.Execution) error {
 		cur := live.Add(1)
@@ -962,7 +962,7 @@ func TestQueuedExecutionsAreDroppedOnStop(t *testing.T) {
 	srv, client := startJobs(t)
 	decls := job.NewDeclarations()
 	spec := cronSpec(t)
-	spec.MaxConcurrent = 1
+	spec.MaxConcurrent = ptr(1)
 
 	running := make(chan struct{}, 1)
 	var started atomic.Int64
@@ -1052,7 +1052,7 @@ func TestSkipRedeliveryWaitsForHandlerAcrossIdentityReconnect(t *testing.T) {
 			decls := job.NewDeclarations()
 			spec := cronSpec(t)
 			spec.Overlap = overlap
-			spec.MaxConcurrent = 8
+			spec.MaxConcurrent = ptr(8)
 			release := make(chan struct{})
 			var releaseOnce sync.Once
 			var running, peak, calls atomic.Int64
@@ -1142,5 +1142,34 @@ func TestHeartbeatNegotiatesBeforeDefaultPeriod(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("changed cadence not consumed")
 		}
+	}
+}
+
+// The runtime is the authority in both directions: a cadence longer than the
+// local default is adopted too, not clamped to it.
+func TestHeartbeatAdoptsALongerRuntimeCadence(t *testing.T) {
+	t.Parallel()
+	srv, client := startJobs(t)
+	srv.heartbeatInterval.Store(1000)
+	sub, err := job.NewSubscriber(job.SubscriberConfig{
+		Clients: &staticClients{client: client}, Identity: func() job.Identity { return job.Identity{ServiceID: "s", InstanceID: "i"} },
+		Jobs: job.NewDeclarations(), Logger: slog.New(&logSink{}), HeartbeatInterval: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = sub.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Stop()
+	<-srv.heartbeats
+	start := time.Now()
+	select {
+	case <-srv.heartbeats:
+		if gap := time.Since(start); gap < 800*time.Millisecond {
+			t.Fatalf("next beat after %v, want the runtime's 1s", gap)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no second beat")
 	}
 }

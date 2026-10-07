@@ -1,5 +1,6 @@
 import * as grpc from "@grpc/grpc-js";
-import { derToPem } from "../connection/pem";
+import type { CertificateStore } from "../connection/tls-material";
+import type { Logger } from "../logger";
 import {
 	type CallRequest,
 	type CallResponse,
@@ -10,17 +11,14 @@ import type { PolicyEvaluation } from "../pb/servicebridge/v1/registry";
 import { runWithTrace } from "../telemetry/context";
 import { mintRootContext, type TraceContext } from "../telemetry/trace-context";
 import { parseXSbTrace } from "../telemetry/wire-trace";
-import { Semaphore, SemaphoreExhaustedError } from "../utils/semaphore";
-import { evaluatePeerAcceptance } from "./acceptance";
-import type { DispatchPort } from "./dispatch-port";
-
-// Credentials for the inbound call server: leaf cert + key (DER), CA chain (DER).
-// Reuses the same certs the SDK obtained from runtime Bootstrap.
-export interface CallServerCredentials {
-	caChainDer: Buffer;
-	leafCertDer: Buffer;
-	privateKeyDer: Buffer;
-}
+import { Semaphore } from "../utils/semaphore";
+import {
+	evaluatePeerAcceptance,
+	type PeerIdentity,
+	peerOfCall,
+} from "./acceptance";
+import type { DispatchPort, RpcHandlerContext } from "./dispatch-port";
+import { notDispatchedTrailer } from "./wire";
 
 // AdvertiseConfig is the operator-supplied advertise address. host is mandatory
 // (no auto-detect — k8s/docker need explicit POD_IP via downward API), port=0
@@ -30,125 +28,86 @@ export interface AdvertiseConfig {
 	port: number;
 }
 
-// DEFAULT_MAX_CONCURRENT_CALLS bounds handlers running at once. Each in-flight
-// call holds a decoded request plus whatever the handler allocates, so an
-// unbounded server turns a caller-side burst into callee-side OOM.
+// Inbound bounds. Same defaults in the Go SDK (WithInboundLimits).
 export const DEFAULT_MAX_CONCURRENT_CALLS = 256;
 
-// CallServerLimits bounds inbound load. Both values matter: the concurrency
-// limit alone would just move an overload into an unbounded queue, so the
-// queue depth is what actually sheds load with RESOURCE_EXHAUSTED.
+// CallServerLimits bounds inbound load. The concurrency limit alone would just
+// move an overload into an unbounded queue; the queue depth is what sheds load
+// with RESOURCE_EXHAUSTED.
 export interface CallServerLimits {
 	maxConcurrentCalls?: number;
-	// maxQueuedCalls defaults to maxConcurrentCalls. 0 rejects any call that
-	// cannot start immediately.
+	// Defaults to maxConcurrentCalls. 0 rejects any call that cannot start at once.
 	maxQueuedCalls?: number;
 }
 
-/**
- * Parse the inbound trace context from a CallRequest. Falls back to a fresh
- * root context when xSbTrace is missing or malformed — that keeps the local
- * trace consistent even when the caller side has not yet been wired for
- * propagation.
- * @internal
- */
-function inboundTraceContext(req: CallRequest): TraceContext {
-	const parsed = parseXSbTrace(req.xSbTrace);
-	return parsed ?? mintRootContext();
+/** @internal */
+export interface CallServerDeps {
+	dispatch: DispatchPort;
+	store: CertificateStore;
+	// The policy the runtime last pushed; null until the first snapshot. Calls
+	// are refused (UNAVAILABLE) until it exists: without it acceptance rules are
+	// unknown and default-allow would admit anyone (GSDK-07).
+	policy: () => PolicyEvaluation | null;
+	// Revoked peers are refused at once (decision 12).
+	isRevoked: (serviceId: string, instanceId: string) => boolean;
+	limits?: CallServerLimits;
+	logger: Logger;
 }
 
-// CallServer hosts the inbound Call.Unary gRPC service on the SDK instance.
-// All incoming requests are dispatched to the DispatchPort which owns handler
-// registration and schema (de)serialization. Errors thrown by handlers are
-// converted to CallResponse.error_code/error_message — gRPC status stays OK.
+// How long a rebind (certificate rotation) or a stop waits for in-flight calls
+// on the old listener before cancelling them.
+const DEFAULT_DRAIN_MS = 30_000;
+
+// The call shapes the server handles; both expose cancellation and deadline.
+interface SurfaceCall {
+	cancelled: boolean;
+	once(event: "cancelled", listener: () => void): unknown;
+	off(event: "cancelled", listener: () => void): unknown;
+	getDeadline(): grpc.Deadline;
+}
+
+type Refusal = { code: grpc.status; message: string; transient: boolean };
+
+// CallServer hosts the inbound Call service of this instance.
 //
-// Acceptance check (Layer 2, ADR-0004): for each incoming direct call, the
-// server resolves the peer's identity from its TLS cert and checks it against
-// the callee's rpc.handle acceptance rules. A peer whose identity cannot be
-// established is rejected with PermissionDenied.
+// Wire form (identical in the Go SDK):
+//   - refusals before the handler runs are gRPC statuses; the transient ones
+//     (not ready, draining, overload) carry the x-sb-not-dispatched trailer so
+//     the caller may retry elsewhere;
+//   - a handler failure is gRPC OK with error_code/error_message.
 //
-// Overload (availability): calls are admitted through a semaphore. Past the
-// concurrency limit they queue; past the queue depth they are rejected with
-// RESOURCE_EXHAUSTED so the caller can retry or fail fast, instead of the
-// callee accumulating work it cannot finish.
-//
-// Tracing (ADR-0001): the server emits NO op. It runs the handler inside
-// the inbound call's trace context (parent = caller CALL.op_id) so the handler's
-// nested ops (rpc.call / event.publish) parent to the single caller-owned
-// RPC.CALL row. Callee errors flow back in the CallResponse and the caller
-// records them on the CALL row.
+// Tracing (ADR-0001): no op is emitted here. The handler runs in the call's
+// trace context (parent = the caller's RPC.CALL op).
 //
 // @internal — см. ./README.md
 export class CallServer {
 	private server: grpc.Server | null = null;
+	private bindAddress: string | null = null;
 	private advertised: string | null = null;
+	private draining = false;
+	private inflight = 0;
+	private idleWaiters: (() => void)[] = [];
 	private readonly admission: Semaphore;
 	private readonly maxConcurrentStreams: number;
 
-	constructor(
-		private readonly dispatch: DispatchPort,
-		private readonly creds: CallServerCredentials,
-		// Returns the current PolicyEvaluation for this service. May return null
-		// when policy is not yet loaded (default-allow in that case).
-		private readonly getPolicy: () => PolicyEvaluation | null = () => null,
-		limits: CallServerLimits = {},
-	) {
+	constructor(private readonly d: CallServerDeps) {
 		const maxConcurrent =
-			limits.maxConcurrentCalls ?? DEFAULT_MAX_CONCURRENT_CALLS;
-		const maxQueued = limits.maxQueuedCalls ?? maxConcurrent;
+			d.limits?.maxConcurrentCalls ?? DEFAULT_MAX_CONCURRENT_CALLS;
+		const maxQueued = d.limits?.maxQueuedCalls ?? maxConcurrent;
 		this.admission = new Semaphore(maxConcurrent, maxQueued);
 		this.maxConcurrentStreams = maxConcurrent + maxQueued;
 	}
 
+	/** Binds the listener and returns the advertised host:port. */
 	async start(cfg: AdvertiseConfig): Promise<string> {
-		if (this.server) {
-			throw new Error("rpc: call server already started");
-		}
-		if (!cfg.host) {
-			throw new Error("rpc: advertise.host is required");
-		}
-
-		// HTTP/2-level backpressure: peers stop opening streams past this bound
-		// instead of the SDK decoding requests it has no capacity to run. The
-		// semaphore below still sheds load across multiple connections.
-		const server = new grpc.Server({
-			"grpc.max_concurrent_streams": this.maxConcurrentStreams,
-		});
-		server.addService(CallService, {
-			unary: (
-				call: grpc.ServerUnaryCall<CallRequest, CallResponse>,
-				callback: grpc.sendUnaryData<CallResponse>,
-			) => {
-				this.handleUnary(call, callback);
-			},
-			stream: (call: grpc.ServerWritableStream<CallRequest, StreamChunk>) => {
-				void this.handleStream(call);
-			},
-		});
-
-		// grpc-js ServerCredentials.createSsl requires PEM-encoded buffers.
-		const caChainPem = derToPem(this.creds.caChainDer, "CERTIFICATE");
-		const certPem = derToPem(this.creds.leafCertDer, "CERTIFICATE");
-		const keyPem = derToPem(this.creds.privateKeyDer, "PRIVATE KEY");
-
-		const bound = await new Promise<number>((resolve, reject) => {
-			const sc = grpc.ServerCredentials.createSsl(
-				caChainPem,
-				[{ private_key: keyPem, cert_chain: certPem }],
-				true, // checkClientCertificate
-			);
-			// Bind on the advertise host directly so SO_REUSEADDR / IPv4 vs IPv6
-			// matches the address that will be published in the registry. grpc-js
-			// requires a non-empty hostname (it does not accept 0.0.0.0:0 with the
-			// current TLS credentials path).
-			server.bindAsync(`${cfg.host}:${cfg.port}`, sc, (err, port) => {
-				if (err) reject(err);
-				else resolve(port);
-			});
-		});
-
+		if (this.server) throw new Error("rpc: call server already started");
+		if (!cfg.host) throw new Error("rpc: advertise.host is required");
+		const { server, port } = await this.bind(`${cfg.host}:${cfg.port}`);
 		this.server = server;
-		this.advertised = `${cfg.host}:${bound}`;
+		// The port the OS handed out is kept: a rebind on rotation must not move
+		// the endpoint callers already resolved.
+		this.bindAddress = `${cfg.host}:${port}`;
+		this.advertised = this.bindAddress;
 		return this.advertised;
 	}
 
@@ -157,12 +116,101 @@ export class CallServer {
 		return this.advertised;
 	}
 
+	/**
+	 * Presents the rotated certificate to new connections. The listener is
+	 * rebound on the same port with fresh credentials; the old server stops
+	 * accepting connections at once and keeps serving its in-flight calls until
+	 * they finish (bounded by DEFAULT_DRAIN_MS). In-place secure-context updates
+	 * are not honoured by every runtime the SDK supports, a rebind is.
+	 */
+	async rotate(): Promise<void> {
+		const old = this.server;
+		const address = this.bindAddress;
+		if (!old || !address) return;
+		const retired = this.retire(old, DEFAULT_DRAIN_MS);
+		for (let attempt = 0; ; attempt++) {
+			try {
+				const { server } = await this.bind(address);
+				this.server = server;
+				break;
+			} catch (err) {
+				if (attempt >= 50) {
+					this.d.logger.error("rpc: call server rebind failed after rotation", {
+						address,
+						error: (err as Error).message,
+					});
+					this.server = null;
+					break;
+				}
+				await new Promise((r) => setTimeout(r, 100));
+			}
+		}
+		void retired;
+	}
+
+	/**
+	 * Stops admitting calls: every new call is refused with UNAVAILABLE and the
+	 * not-dispatched trailer, so the caller retries on another instance.
+	 */
+	beginDrain(): void {
+		this.draining = true;
+	}
+
+	/** Resolves when no call is in flight, or when timeoutMs elapses. */
+	waitIdle(timeoutMs: number): Promise<void> {
+		if (this.inflight === 0) return Promise.resolve();
+		return new Promise((resolve) => {
+			const timer = setTimeout(done, timeoutMs);
+			const self = this;
+			function done() {
+				clearTimeout(timer);
+				self.idleWaiters = self.idleWaiters.filter((w) => w !== done);
+				resolve();
+			}
+			this.idleWaiters.push(done);
+		});
+	}
+
 	async stop(timeoutMs = 1000): Promise<void> {
-		if (!this.server) return;
 		const server = this.server;
 		this.server = null;
 		this.advertised = null;
-		await new Promise<void>((resolve) => {
+		this.bindAddress = null;
+		if (server) await this.retire(server, timeoutMs);
+	}
+
+	private async bind(
+		address: string,
+	): Promise<{ server: grpc.Server; port: number }> {
+		// HTTP/2-level backpressure: peers stop opening streams past this bound
+		// instead of the SDK decoding requests it has no capacity to run.
+		// grpc-js has no server keepalive enforcement policy; client pings are
+		// accepted at any rate.
+		const server = new grpc.Server({
+			"grpc.max_concurrent_streams": this.maxConcurrentStreams,
+		});
+		server.addService(CallService, {
+			unary: (
+				call: grpc.ServerUnaryCall<CallRequest, CallResponse>,
+				callback: grpc.sendUnaryData<CallResponse>,
+			) => {
+				void this.handleUnary(call, callback);
+			},
+			stream: (call: grpc.ServerWritableStream<CallRequest, StreamChunk>) => {
+				void this.handleStream(call);
+			},
+		});
+		const port = await new Promise<number>((resolve, reject) => {
+			server.bindAsync(address, this.d.store.serverCredentials(), (err, p) => {
+				if (err) reject(err);
+				else resolve(p);
+			});
+		});
+		return { server, port };
+	}
+
+	private retire(server: grpc.Server, timeoutMs: number): Promise<void> {
+		return new Promise<void>((resolve) => {
 			const timer = setTimeout(() => {
 				server.forceShutdown();
 				resolve();
@@ -175,10 +223,81 @@ export class CallServer {
 		});
 	}
 
-	// admit takes an execution slot, or throws SemaphoreExhaustedError when the
-	// server is past both its concurrency and queue bounds.
-	private async admit(signal?: AbortSignal): Promise<() => void> {
-		await this.admission.acquire(signal);
+	// refusal decides whether a call may reach admission at all.
+	private refusal(
+		call: object,
+		method: string,
+		peer: PeerIdentity,
+	): Refusal | null {
+		void call;
+		if (this.draining)
+			return {
+				code: grpc.status.UNAVAILABLE,
+				message: "rpc: instance is draining",
+				transient: true,
+			};
+		const policy = this.d.policy();
+		if (!policy)
+			return {
+				code: grpc.status.UNAVAILABLE,
+				message: "rpc: instance not ready — no access policy received yet",
+				transient: true,
+			};
+		if (
+			peer.kind === "service" &&
+			this.d.isRevoked(peer.serviceId, peer.instanceId)
+		)
+			return {
+				code: grpc.status.PERMISSION_DENIED,
+				message: `rpc: caller ${peer.serviceId}/${peer.instanceId} is revoked`,
+				transient: false,
+			};
+		const denial = evaluatePeerAcceptance(policy, peer, method);
+		if (denial)
+			return {
+				code: grpc.status.PERMISSION_DENIED,
+				message: denial,
+				transient: false,
+			};
+		return null;
+	}
+
+	private refuse(r: Refusal): grpc.ServiceError {
+		const err = Object.assign(new Error(r.message), {
+			code: r.code,
+			details: r.message,
+			metadata: r.transient ? notDispatchedTrailer() : new grpc.Metadata(),
+		});
+		return err as grpc.ServiceError;
+	}
+
+	private track(): () => void {
+		this.inflight++;
+		let done = false;
+		return () => {
+			if (done) return;
+			done = true;
+			this.inflight--;
+			if (this.inflight === 0) {
+				const waiters = this.idleWaiters;
+				this.idleWaiters = [];
+				for (const w of waiters) w();
+			}
+		};
+	}
+
+	// admit takes an execution slot. Throws when the server is past both its
+	// concurrency and queue bounds, or the caller went away while queued.
+	private async admit(call: SurfaceCall): Promise<() => void> {
+		const controller = new AbortController();
+		if (call.cancelled) controller.abort();
+		const cancel = () => controller.abort();
+		call.once("cancelled", cancel);
+		try {
+			await this.admission.acquire(controller.signal);
+		} finally {
+			call.off("cancelled", cancel);
+		}
 		let released = false;
 		return () => {
 			if (released) return;
@@ -191,219 +310,245 @@ export class CallServer {
 		call: grpc.ServerUnaryCall<CallRequest, CallResponse>,
 		callback: grpc.sendUnaryData<CallResponse>,
 	): Promise<void> {
-		// Acceptance runs before admission: an unauthorized caller must not be able
-		// to occupy a slot that authorized callers are queueing for.
-		const denial = this.checkPeerAcceptance(call, call.request.method);
-		if (denial) {
-			callback({ code: grpc.status.PERMISSION_DENIED, message: denial });
-			return;
-		}
-
-		let release: () => void;
+		const untrack = this.track();
 		try {
-			const controller = new AbortController();
-			if (call.cancelled) controller.abort();
-			const cancel = () => controller.abort();
-			call.once("cancelled", cancel);
-			try {
-				release = await this.admit(controller.signal);
-			} finally {
-				call.off("cancelled", cancel);
+			const req = call.request;
+			const peer = peerOfCall(call);
+			const refused = this.refusal(call, req.method, peer);
+			if (refused) {
+				callback(this.refuse(refused));
+				return;
 			}
-		} catch (err) {
-			callback({
-				code: call.cancelled
-					? grpc.status.CANCELLED
-					: grpc.status.RESOURCE_EXHAUSTED,
-				message: call.cancelled ? "rpc: call cancelled" : overloadMessage(err),
-			});
-			return;
-		}
-
-		if (call.cancelled) {
-			release();
-			return;
-		}
-		const req = call.request;
-		const traceCtx = inboundTraceContext(req);
-		// The handler runs in the call's trace context (parent = caller CALL.op_id)
-		// so its nested ops parent to CALL. No RPC.HANDLE op is emitted — the single
-		// RPC.CALL row owned by the caller SDK is the whole call (ADR-0001).
-		try {
-			await runWithTrace(traceCtx, async () => {
-				try {
-					const result = await this.dispatch.dispatchUnary(
-						req.method,
-						req.payload,
+			let release: () => void;
+			try {
+				release = await this.admit(call);
+			} catch {
+				callback(
+					call.cancelled
+						? this.refuse({
+								code: grpc.status.CANCELLED,
+								message: "rpc: call cancelled",
+								transient: false,
+							})
+						: this.refuse({
+								code: grpc.status.RESOURCE_EXHAUSTED,
+								message: "rpc: server overloaded",
+								transient: true,
+							}),
+				);
+				return;
+			}
+			const { ctx, dispose } = handlerContext(call, req, peer);
+			try {
+				const result = await runWithTrace(inboundTraceContext(req), () =>
+					this.d.dispatch.dispatchUnary(req.method, req.payload, ctx),
+				);
+				if (result.status !== undefined) {
+					callback(
+						this.refuse({
+							code: result.status,
+							message: result.errorMessage ?? "",
+							transient: false,
+						}),
 					);
-					callback(null, {
-						payload: Buffer.from(result.payload),
-						errorCode: result.errorCode ?? "",
-						errorMessage: result.errorMessage ?? "",
-					});
-				} catch (err) {
-					// Handler failure is an application outcome, not a transport one:
-					// gRPC status stays OK and the caller decides on retry from
-					// errorCode. Collapsing the two would break that decision.
-					const msg = (err as Error).message;
-					callback(null, {
-						payload: Buffer.alloc(0),
-						errorCode: "INTERNAL",
-						errorMessage: msg,
-					});
+					return;
 				}
-			});
+				callback(null, {
+					payload: Buffer.from(result.payload ?? new Uint8Array()),
+					errorCode: result.errorCode ?? "",
+					errorMessage: result.errorMessage ?? "",
+				});
+			} finally {
+				dispose();
+				release();
+			}
 		} finally {
-			release();
+			untrack();
 		}
-	}
-
-	// checkPeerAcceptance returns a denial reason string when the caller is not
-	// permitted, or null when the call should proceed.
-	private checkPeerAcceptance(call: object, methodName: string): string | null {
-		return evaluatePeerAcceptance(this.getPolicy(), call, methodName);
 	}
 
 	private async handleStream(
 		call: grpc.ServerWritableStream<CallRequest, StreamChunk>,
 	): Promise<void> {
-		const denial = this.checkPeerAcceptance(call, call.request.method);
-		if (denial) {
-			call.write({
-				payload: Buffer.alloc(0),
-				errorCode: "PERMISSION_DENIED",
-				errorMessage: denial,
-			});
-			call.end();
-			return;
-		}
-
-		let release: () => void;
+		const untrack = this.track();
 		try {
-			const controller = new AbortController();
-			if (call.cancelled) controller.abort();
-			const cancel = () => controller.abort();
-			call.once("cancelled", cancel);
-			try {
-				release = await this.admit(controller.signal);
-			} finally {
-				call.off("cancelled", cancel);
+			const req = call.request;
+			const peer = peerOfCall(call);
+			const refused = this.refusal(call, req.method, peer);
+			if (refused) {
+				call.emit("error", this.refuse(refused));
+				return;
 			}
-		} catch (err) {
-			// Overload is a transport-level outcome, so it travels as a gRPC status
-			// rather than a StreamChunk error: grpc-js turns an 'error' event on the
-			// writable side into the call's final status.
-			call.emit("error", {
-				code: call.cancelled
-					? grpc.status.CANCELLED
-					: grpc.status.RESOURCE_EXHAUSTED,
-				details: call.cancelled ? "rpc: call cancelled" : overloadMessage(err),
-			});
-			return;
-		}
-
-		let cancelled = false;
-		const onCancelled = () => {
-			cancelled = true;
-		};
-		// grpc-js emits 'cancelled' on the stream when the caller goes away. Without
-		// this the handler's generator keeps producing into a dead call.
-		call.on("cancelled", onCancelled);
-
-		if (call.cancelled) {
-			release();
-			return;
-		}
-		const req = call.request;
-		const traceCtx = inboundTraceContext(req);
-		// Handler runs in the call's trace context; no RPC.HANDLE op (ADR-0001).
-		try {
-			await runWithTrace(traceCtx, async () => {
-				const iterator = this.dispatch
-					.dispatchStream(req.method, req.payload)
-					[Symbol.asyncIterator]();
-				let drained = false;
-				try {
-					while (!cancelled) {
-						const next = await iterator.next();
-						if (next.done) {
-							drained = true;
-							break;
-						}
-						const item = next.value;
-						if (item.errorCode) {
-							this.writeChunk(call, {
-								payload: Buffer.alloc(0),
-								errorCode: item.errorCode,
-								errorMessage: item.errorMessage ?? "",
-							});
-							return;
-						}
-						const wrote = this.writeChunk(call, {
-							payload: Buffer.from(item.payload ?? new Uint8Array()),
-							errorCode: "",
-							errorMessage: "",
-						});
-						// write() returning false means grpc-js is buffering for a slow
-						// consumer. Waiting for 'drain' is what stops an unbounded
-						// producer from filling memory ahead of the reader.
-						if (!wrote) await this.waitForDrain(call, () => cancelled);
-					}
-				} catch (err) {
-					const msg = (err as Error).message;
-					this.writeChunk(call, {
-						payload: Buffer.alloc(0),
-						errorCode: "INTERNAL",
-						errorMessage: msg,
-					});
-				} finally {
-					// Any exit other than natural exhaustion leaves the handler's
-					// generator suspended mid-body; return() runs its finally blocks and
-					// stops it producing values nobody will read.
-					if (!drained) await iterator.return?.(undefined).catch(() => {});
-					if (!cancelled) call.end();
-				}
-			});
+			let release: () => void;
+			try {
+				release = await this.admit(call);
+			} catch {
+				call.emit(
+					"error",
+					call.cancelled
+						? this.refuse({
+								code: grpc.status.CANCELLED,
+								message: "rpc: call cancelled",
+								transient: false,
+							})
+						: this.refuse({
+								code: grpc.status.RESOURCE_EXHAUSTED,
+								message: "rpc: server overloaded",
+								transient: true,
+							}),
+				);
+				return;
+			}
+			const { ctx, dispose } = handlerContext(call, req, peer);
+			try {
+				await runWithTrace(inboundTraceContext(req), () =>
+					this.pumpStream(call, req, ctx),
+				);
+			} finally {
+				dispose();
+				release();
+			}
 		} finally {
-			call.off("cancelled", onCancelled);
-			release();
+			untrack();
 		}
 	}
 
-	// writeChunk pushes a chunk unless the call is already gone. Returns false
-	// when grpc-js wants the producer to pause.
-	private writeChunk(
+	private async pumpStream(
 		call: grpc.ServerWritableStream<CallRequest, StreamChunk>,
-		chunk: StreamChunk,
-	): boolean {
-		if (call.writableEnded || call.destroyed) return true;
-		return call.write(chunk);
-	}
-
-	private waitForDrain(
-		call: grpc.ServerWritableStream<CallRequest, StreamChunk>,
-		isCancelled: () => boolean,
+		req: CallRequest,
+		ctx: RpcHandlerContext,
 	): Promise<void> {
-		if (isCancelled()) return Promise.resolve();
-		return new Promise<void>((resolve) => {
-			const done = () => {
-				call.off("drain", done);
-				call.off("cancelled", done);
-				call.off("close", done);
-				call.off("error", done);
-				resolve();
-			};
-			call.once("drain", done);
-			call.once("cancelled", done);
-			call.once("close", done);
-			call.once("error", done);
-		});
+		const iterator = this.d.dispatch
+			.dispatchStream(req.method, req.payload, ctx)
+			[Symbol.asyncIterator]();
+		let drained = false;
+		try {
+			while (!ctx.signal.aborted) {
+				const next = await iterator.next();
+				if (next.done) {
+					drained = true;
+					break;
+				}
+				const item = next.value;
+				if (item.status !== undefined) {
+					call.emit(
+						"error",
+						this.refuse({
+							code: item.status,
+							message: item.errorMessage ?? "",
+							transient: false,
+						}),
+					);
+					return;
+				}
+				if (item.errorCode) {
+					writeChunk(call, {
+						payload: Buffer.alloc(0),
+						errorCode: item.errorCode,
+						errorMessage: item.errorMessage ?? "",
+					});
+					break;
+				}
+				const wrote = writeChunk(call, {
+					payload: Buffer.from(item.payload ?? new Uint8Array()),
+					errorCode: "",
+					errorMessage: "",
+				});
+				// write() returning false means grpc-js is buffering for a slow
+				// consumer; waiting for 'drain' stops the producer running ahead.
+				if (!wrote) await waitForDrain(call, ctx.signal);
+			}
+		} finally {
+			// Any exit other than natural exhaustion leaves the handler's
+			// generator suspended; return() runs its finally blocks.
+			if (!drained) await iterator.return?.(undefined).catch(() => {});
+		}
+		if (!ctx.signal.aborted && !call.writableEnded) call.end();
 	}
 }
 
-function overloadMessage(err: unknown): string {
-	if (err instanceof SemaphoreExhaustedError) {
-		return `rpc: server overloaded — ${err.message}`;
+/**
+ * Builds the handler context. The signal aborts when the caller cancels or
+ * the deadline passes; dispose() removes the listeners once the call is done.
+ */
+function handlerContext(
+	call: SurfaceCall,
+	req: CallRequest,
+	peer: PeerIdentity,
+): { ctx: RpcHandlerContext; dispose: () => void } {
+	const controller = new AbortController();
+	const cancel = () =>
+		controller.abort(new Error("rpc: cancelled by the caller"));
+	if (call.cancelled) cancel();
+	call.once("cancelled", cancel);
+	const rawDeadline = call.getDeadline();
+	const deadline =
+		rawDeadline instanceof Date
+			? rawDeadline.getTime()
+			: Number.isFinite(rawDeadline)
+				? Number(rawDeadline)
+				: null;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	if (deadline !== null) {
+		timer = setTimeout(
+			() => controller.abort(new Error("rpc: deadline exceeded")),
+			Math.max(0, deadline - Date.now()),
+		);
+		timer.unref?.();
 	}
-	return `rpc: server overloaded — ${(err as Error).message}`;
+	const caller =
+		peer.kind === "service"
+			? { serviceId: peer.serviceId, instanceId: peer.instanceId }
+			: peer.kind === "runtime" && req.callerService
+				? { serviceId: req.callerService, instanceId: "" }
+				: null;
+	return {
+		ctx: {
+			signal: controller.signal,
+			deadline,
+			requestId: req.requestId,
+			idempotencyKey: req.idempotencyKey,
+			caller,
+		},
+		dispose: () => {
+			call.off("cancelled", cancel);
+			if (timer) clearTimeout(timer);
+		},
+	};
+}
+
+// inboundTraceContext parses the caller's trace context, or mints a fresh
+// root when it is missing or malformed.
+function inboundTraceContext(req: CallRequest): TraceContext {
+	return parseXSbTrace(req.xSbTrace) ?? mintRootContext();
+}
+
+// writeChunk pushes a chunk unless the call is already gone. Returns false
+// when grpc-js wants the producer to pause.
+function writeChunk(
+	call: grpc.ServerWritableStream<CallRequest, StreamChunk>,
+	chunk: StreamChunk,
+): boolean {
+	if (call.writableEnded || call.destroyed) return true;
+	return call.write(chunk);
+}
+
+function waitForDrain(
+	call: grpc.ServerWritableStream<CallRequest, StreamChunk>,
+	signal: AbortSignal,
+): Promise<void> {
+	if (signal.aborted) return Promise.resolve();
+	return new Promise<void>((resolve) => {
+		const done = () => {
+			call.off("drain", done);
+			call.off("close", done);
+			call.off("error", done);
+			signal.removeEventListener("abort", done);
+			resolve();
+		};
+		call.once("drain", done);
+		call.once("close", done);
+		call.once("error", done);
+		signal.addEventListener("abort", done, { once: true });
+	});
 }

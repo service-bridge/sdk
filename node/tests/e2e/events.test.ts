@@ -16,6 +16,7 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { ServiceBridge } from "../../src/connection/service-bridge";
+import { ValidationError } from "../../src/errors";
 import { InvalidEventNameError } from "../../src/events/errors";
 import type {
 	DlqEntry,
@@ -46,12 +47,14 @@ type DlqPage = { entries: DlqEntry[]; nextCursor: string };
 // depends on, spelled out instead of cast to `any`. DLQ inspection has no
 // public API; see the note on listDlq() below.
 type EventsClientHolder = {
-	_eventsClient?: {
-		listDlq(
-			req: ListDlqRequest,
-			cb: (err: Error | null, res?: DlqPage) => void,
-		): void;
-	};
+	channels?: {
+		events: {
+			listDlq(
+				req: ListDlqRequest,
+				cb: (err: Error | null, res?: DlqPage) => void,
+			): void;
+		};
+	} | null;
 };
 
 // Reads the runtime URL + the per-domain key for a role straight from env, the
@@ -69,9 +72,8 @@ function keyForRole(role: Role): { url: string; key: string } {
 	return { url, key };
 }
 
-// Builds an extra dedicated instance under a role key, with a private outbox dir
-// so it never shares SQLite with another instance.
-function extraInstance(role: Role, tag: string): ServiceBridge {
+// Builds an extra dedicated instance under a role key.
+function extraInstance(role: Role): ServiceBridge {
 	const { url, key } = keyForRole(role);
 	return new ServiceBridge(url, key, {
 		reconnectIntervalMs: 500,
@@ -79,7 +81,6 @@ function extraInstance(role: Role, tag: string): ServiceBridge {
 		certRefreshLeadMs: 60_000,
 		certRefreshJitterMs: 0,
 		advertise: { host: "127.0.0.1", port: 0 },
-		dataDir: `./.servicebridge-e2e/events-${tag}-${Date.now()}`,
 	});
 }
 
@@ -101,10 +102,13 @@ describe("events", () => {
 		const received: Order[] = [];
 
 		const subscriber = track(dedicated("second"));
-		subscriber.event.define(name, V1_SCHEMA);
-		subscriber.event.handle(name, async (p) => {
-			received.push(p as Order);
-		});
+		subscriber.event.handle(
+			name,
+			async (p) => {
+				received.push(p as Order);
+			},
+			{ schema: V1_SCHEMA },
+		);
 		await connect(subscriber);
 
 		const publisher = track(dedicated("primary"));
@@ -146,22 +150,22 @@ describe("events", () => {
 		expect(elapsed).toBeLessThan(500);
 	}, 15_000);
 
-	test("publish with wrong field type throws before any outbox insert", async () => {
+	test("publish with a wrong field type is a ValidationError, nothing is sent", async () => {
 		const name = uniqueName("events.invalid-type");
 
 		const publisher = track(dedicated("primary"));
 		publisher.event.define(name, V1_SCHEMA);
 		await connect(publisher);
 
-		// orderId must be a string; a number triggers protobufjs type.verify()
-		// synchronously inside publish(), before any outbox INSERT or network.
+		// orderId must be a string; the schema rejects the payload before
+		// anything is queued or sent.
 		await expect(
 			publisher.event.publish(name, {
 				orderId: 42,
 				amount: 10,
 				currency: "USD",
 			}),
-		).rejects.toThrow(/string|verify|invalid|orderId/i);
+		).rejects.toBeInstanceOf(ValidationError);
 	}, 15_000);
 
 	test("invalid event names are rejected synchronously and one valid edge name is accepted", async () => {
@@ -207,14 +211,20 @@ describe("events", () => {
 		const receivedB: Order[] = [];
 
 		const subscriber = track(dedicated("second"));
-		subscriber.event.define(nameA, V1_SCHEMA);
-		subscriber.event.define(nameB, V1_SCHEMA);
-		subscriber.event.handle(nameA, async (p) => {
-			receivedA.push(p as Order);
-		});
-		subscriber.event.handle(nameB, async (p) => {
-			receivedB.push(p as Order);
-		});
+		subscriber.event.handle(
+			nameA,
+			async (p) => {
+				receivedA.push(p as Order);
+			},
+			{ schema: V1_SCHEMA },
+		);
+		subscriber.event.handle(
+			nameB,
+			async (p) => {
+				receivedB.push(p as Order);
+			},
+			{ schema: V1_SCHEMA },
+		);
 		// Note: subscriber NEVER declares a handler for nameUnsub.
 		await connect(subscriber);
 
@@ -266,14 +276,20 @@ describe("events", () => {
 		const receivedWild: Order[] = [];
 
 		const subscriber = track(dedicated("second"));
-		subscriber.event.define(exactName, V1_SCHEMA);
-		subscriber.event.define(wildcard, V1_SCHEMA);
-		subscriber.event.handle(exactName, async (p) => {
-			receivedExact.push(p as Order);
-		});
-		subscriber.event.handle(wildcard, async (p) => {
-			receivedWild.push(p as Order);
-		});
+		subscriber.event.handle(
+			exactName,
+			async (p) => {
+				receivedExact.push(p as Order);
+			},
+			{ schema: V1_SCHEMA },
+		);
+		subscriber.event.handle(
+			wildcard,
+			async (p) => {
+				receivedWild.push(p as Order);
+			},
+			{ schema: V1_SCHEMA },
+		);
 		await connect(subscriber);
 
 		const publisher = track(dedicated("primary"));
@@ -286,69 +302,45 @@ describe("events", () => {
 			currency: "EUR",
 		});
 
+		// The delivery names both matched patterns; each handler runs once.
 		await waitFor(
-			() => receivedExact.length > 0 || receivedWild.length > 0,
+			() => receivedExact.length > 0 && receivedWild.length > 0,
 			12_000,
-			"at least one handler received",
+			"both handlers received",
 		);
-
-		const all = [...receivedExact, ...receivedWild];
-		expect(all.length).toBeGreaterThanOrEqual(1);
-		for (const item of all) {
-			expect(item.orderId).toBe("fanout-wc-1");
-		}
+		await sleep(500);
+		expect(receivedExact.map((o) => o.orderId)).toEqual(["fanout-wc-1"]);
+		expect(receivedWild.map((o) => o.orderId)).toEqual(["fanout-wc-1"]);
 	}, 35_000);
 
-	test("two handlers on the same exact name both fire per delivery and across deliveries", async () => {
-		const name = uniqueName("events.multi");
-		const h1: Order[] = [];
-		const h2: Order[] = [];
+	test("a subscription filter delivers only matching events (decision 7)", async () => {
+		const name = uniqueName("events.filter");
+		const received: Order[] = [];
 
 		const subscriber = track(dedicated("second"));
-		subscriber.event.define(name, V1_SCHEMA);
-		subscriber.event.handle(name, async (p) => {
-			h1.push(p as Order);
-		});
-		subscriber.event.handle(name, async (p) => {
-			h2.push(p as Order);
-		});
+		subscriber.event.handle(
+			name,
+			async (p) => {
+				received.push(p as Order);
+			},
+			{ schema: V1_SCHEMA, filter: { "$.currency": "EUR" } },
+		);
 		await connect(subscriber);
 
 		const publisher = track(dedicated("primary"));
 		publisher.event.define(name, V1_SCHEMA);
 		await connect(publisher);
 
-		await publisher.event.publish(name, {
-			orderId: "multi-a",
-			amount: 10,
-			currency: "USD",
-		});
-
-		await waitFor(
-			() => h1.length >= 1 && h2.length >= 1,
-			12_000,
-			"both handlers fired once",
-		);
-		expect(h1).toHaveLength(1);
-		expect(h2).toHaveLength(1);
-		expect(h1[0]!.orderId).toBe("multi-a");
-		expect(h2[0]!.orderId).toBe("multi-a");
-
-		await publisher.event.publish(name, {
-			orderId: "multi-b",
-			amount: 20,
-			currency: "USD",
-		});
-
-		await waitFor(
-			() => h1.length >= 2 && h2.length >= 2,
-			15_000,
-			"both handlers fired twice",
-		);
-		expect(h1).toHaveLength(2);
-		expect(h2).toHaveLength(2);
-		expect(h1.map((r) => r.orderId).sort()).toEqual(["multi-a", "multi-b"]);
-		expect(h2.map((r) => r.orderId).sort()).toEqual(["multi-a", "multi-b"]);
+		for (const [orderId, currency] of [
+			["f-usd", "USD"],
+			["f-eur", "EUR"],
+			["f-gbp", "GBP"],
+		]) {
+			await publisher.event.publish(name, { orderId, amount: 1, currency });
+		}
+		await waitFor(() => received.length > 0, 12_000, "filtered delivery");
+		await sleep(1_000);
+		expect(received.map((o) => o.orderId)).toEqual(["f-eur"]);
 	}, 35_000);
 
 	test("partitionKey enforces per-partition FIFO including interleaved partitions", async () => {
@@ -357,14 +349,17 @@ describe("events", () => {
 		const interleaved: Array<{ orderId: string; partition: string }> = [];
 
 		const subscriber = track(dedicated("second"));
-		subscriber.event.define(name, V1_SCHEMA);
-		subscriber.event.handle(name, async (p) => {
-			const o = p as Order;
-			single.push(o.orderId);
-			if (o.currency === "A" || o.currency === "B") {
-				interleaved.push({ orderId: o.orderId, partition: o.currency });
-			}
-		});
+		subscriber.event.handle(
+			name,
+			async (p) => {
+				const o = p as Order;
+				single.push(o.orderId);
+				if (o.currency === "A" || o.currency === "B") {
+					interleaved.push({ orderId: o.orderId, partition: o.currency });
+				}
+			},
+			{ schema: V1_SCHEMA },
+		);
 		await connect(subscriber);
 
 		const publisher = track(dedicated("primary"));
@@ -428,10 +423,13 @@ describe("events", () => {
 		const received: Order[] = [];
 
 		const subscriber = track(dedicated("second"));
-		subscriber.event.define(name, V1_SCHEMA);
-		subscriber.event.handle(name, async (p) => {
-			received.push(p as Order);
-		});
+		subscriber.event.handle(
+			name,
+			async (p) => {
+				received.push(p as Order);
+			},
+			{ schema: V1_SCHEMA },
+		);
 		await connect(subscriber);
 
 		const publisher = track(dedicated("primary"));
@@ -457,10 +455,13 @@ describe("events", () => {
 		const received: Array<{ orderId: string }> = [];
 
 		const subscriber = track(dedicated("second"));
-		subscriber.event.define(name, V1_SCHEMA);
-		subscriber.event.handle(name, async (p) => {
-			received.push(p as { orderId: string });
-		});
+		subscriber.event.handle(
+			name,
+			async (p) => {
+				received.push(p as { orderId: string });
+			},
+			{ schema: V1_SCHEMA },
+		);
 		await connect(subscriber);
 
 		const publisher = track(dedicated("primary"));
@@ -511,19 +512,22 @@ describe("events", () => {
 		let processedCount = 0;
 
 		const subscriber = track(dedicated("second"));
-		subscriber.event.define(name, V1_SCHEMA);
-		subscriber.event.handle(name, async (p) => {
-			invocations++;
-			const key = (p as Order).orderId;
-			if (invocations === 1) {
-				// Transient failure → Nack → runtime reschedules with backoff.
-				throw new Error("transient failure — please retry");
-			}
-			// Idempotency guard: business effect fires at most once per key.
-			if (processedKeys.has(key)) return;
-			processedKeys.add(key);
-			processedCount++;
-		});
+		subscriber.event.handle(
+			name,
+			async (p) => {
+				invocations++;
+				const key = (p as Order).orderId;
+				if (invocations === 1) {
+					// Transient failure → Nack → runtime reschedules with backoff.
+					throw new Error("transient failure — please retry");
+				}
+				// Idempotency guard: business effect fires at most once per key.
+				if (processedKeys.has(key)) return;
+				processedKeys.add(key);
+				processedCount++;
+			},
+			{ schema: V1_SCHEMA },
+		);
 		await connect(subscriber);
 
 		const publisher = track(dedicated("primary"));
@@ -557,17 +561,20 @@ describe("events", () => {
 		const HANG_MS = 35_000;
 
 		const subscriber = track(dedicated("second"));
-		subscriber.event.define(name, V1_SCHEMA);
-		subscriber.event.handle(name, async (p) => {
-			invocationCount++;
-			if (invocationCount === 1) {
-				// Hang past the visibility window → runtime reclaims and re-queues.
-				// The late Ack on the old deliveryId is silently ignored.
-				await sleep(HANG_MS);
-				return;
-			}
-			received.push(p as { orderId: string });
-		});
+		subscriber.event.handle(
+			name,
+			async (p) => {
+				invocationCount++;
+				if (invocationCount === 1) {
+					// Hang past the visibility window → runtime reclaims and re-queues.
+					// The late Ack on the old deliveryId is silently ignored.
+					await sleep(HANG_MS);
+					return;
+				}
+				received.push(p as { orderId: string });
+			},
+			{ schema: V1_SCHEMA },
+		);
 		await connect(subscriber);
 
 		const publisher = track(dedicated("primary"));
@@ -598,11 +605,16 @@ describe("events", () => {
 		let invocationCount = 0;
 
 		const subscriber = track(dedicated("second"));
-		subscriber.event.define(name, V1_SCHEMA);
-		subscriber.event.handle(name, async () => {
-			invocationCount++;
-			throw new Error(`dlq-test: always-failing (attempt ${invocationCount})`);
-		});
+		subscriber.event.handle(
+			name,
+			async () => {
+				invocationCount++;
+				throw new Error(
+					`dlq-test: always-failing (attempt ${invocationCount})`,
+				);
+			},
+			{ schema: V1_SCHEMA },
+		);
 		await connect(subscriber);
 
 		// The publisher creates the event; the subscriber owns its failed delivery.
@@ -622,7 +634,7 @@ describe("events", () => {
 		// the exact private surface it depends on stays visible and typechecked,
 		// and it breaks loudly if that surface ever moves.
 		function listDlq(sb: ServiceBridge, req: ListDlqRequest): Promise<DlqPage> {
-			const client = (sb as unknown as EventsClientHolder)._eventsClient;
+			const client = (sb as unknown as EventsClientHolder).channels?.events;
 			if (!client) {
 				throw new Error("eventsClient not ready — call start() first");
 			}
@@ -662,10 +674,13 @@ describe("events", () => {
 		const received: Array<{ orderId: string }> = [];
 
 		const subscriber = track(dedicated("second"));
-		subscriber.event.define(name, V1_SCHEMA);
-		subscriber.event.handle(name, async (p) => {
-			received.push(p as { orderId: string });
-		});
+		subscriber.event.handle(
+			name,
+			async (p) => {
+				received.push(p as { orderId: string });
+			},
+			{ schema: V1_SCHEMA },
+		);
 		await connect(subscriber);
 
 		const publisher = track(dedicated("primary"));
@@ -690,7 +705,7 @@ describe("events", () => {
 
 		// Second distinct SDK instance under the SAME identity (primary key) →
 		// dedup is scoped by publisherSvcId, so it still applies across instances.
-		const publisher2 = track(extraInstance("primary", "idem-pub2"));
+		const publisher2 = track(extraInstance("primary"));
 		publisher2.event.define(name, V1_SCHEMA);
 		await connect(publisher2);
 		await publisher2.event.publish(
@@ -719,10 +734,13 @@ describe("events", () => {
 
 		const received: Order[] = [];
 		const subscriber = track(dedicated("second"));
-		subscriber.event.define(name, V1_SCHEMA);
-		subscriber.event.handle(name, async (p) => {
-			received.push(p as Order);
-		});
+		subscriber.event.handle(
+			name,
+			async (p) => {
+				received.push(p as Order);
+			},
+			{ schema: V1_SCHEMA },
+		);
 		await connect(subscriber);
 
 		// PublisherA: v1 schema. start() must not be rejected by the registry.
@@ -732,7 +750,7 @@ describe("events", () => {
 
 		// PublisherB: v2 schema, a SECOND instance under the same primary key →
 		// distinct (service_id, instance_id, method_name, contract_hash) row.
-		const publisherB = track(extraInstance("primary", "schema-pubB"));
+		const publisherB = track(extraInstance("primary"));
 		publisherB.event.define(name, V2_SCHEMA);
 		await connect(publisherB);
 
@@ -767,10 +785,13 @@ describe("events", () => {
 		const received: Array<{ orderId: string }> = [];
 
 		const subscriber = track(dedicated("second"));
-		subscriber.event.define(name, V1_SCHEMA);
-		subscriber.event.handle(name, async (p) => {
-			received.push(p as { orderId: string });
-		});
+		subscriber.event.handle(
+			name,
+			async (p) => {
+				received.push(p as { orderId: string });
+			},
+			{ schema: V1_SCHEMA },
+		);
 		await connect(subscriber);
 		expect(subscriber.identity()!.serviceId).toBeTruthy();
 

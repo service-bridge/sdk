@@ -8,6 +8,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/service-bridge/sdk/go/internal/connection"
 	pb "github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1"
 	"github.com/service-bridge/sdk/go/internal/stream"
 )
@@ -115,6 +116,10 @@ type Change struct {
 	RemovedInstances []*pb.ServiceInstanceInfo
 	AddedPeers       []string
 	RemovedPeers     []string
+	// RevokedServices and RevokedInstances are the revocations this frame
+	// announced. Their direct channels are closed at once.
+	RevokedServices  []string
+	RevokedInstances []string
 	// Policy is non-nil when a fresh evaluation arrived. It always comes whole.
 	Policy *pb.PolicyEvaluation
 	// Capture is non-nil when the pushed telemetry authority changed.
@@ -182,6 +187,13 @@ type Cache struct {
 
 	policy  *pb.PolicyEvaluation
 	capture CaptureState
+
+	// ready is set by the first snapshot: before it there is no policy at all.
+	ready bool
+	// revokedServices lasts until an instance of the service shows up again;
+	// revokedInstances lasts for the life of the process.
+	revokedServices  map[string]struct{}
+	revokedInstances map[string]struct{}
 }
 
 // NewCache builds an empty cache holding the fail-safe capture state.
@@ -196,6 +208,50 @@ func NewCache() *Cache {
 		eventSubs:   make(map[eventSubKey]*pb.EventSubscriptionDescriptor),
 		outgoing:    make(map[outgoingKey]*pb.OutgoingCallDescriptor),
 		capture:     DefaultCaptureState(),
+
+		revokedServices:  make(map[string]struct{}),
+		revokedInstances: make(map[string]struct{}),
+	}
+}
+
+// Ready reports whether the first snapshot has been applied.
+func (c *Cache) Ready() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.ready
+}
+
+// Revoked reports whether the runtime revoked the service or the instance.
+func (c *Cache) Revoked(serviceID, instanceID string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if _, ok := c.revokedServices[serviceID]; ok && serviceID != "" {
+		return true
+	}
+	_, ok := c.revokedInstances[instanceID]
+	return ok && instanceID != ""
+}
+
+// RevokedSets copies the current revocations.
+func (c *Cache) RevokedSets() (services, instances map[string]struct{}) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	services = make(map[string]struct{}, len(c.revokedServices))
+	for k := range c.revokedServices {
+		services[k] = struct{}{}
+	}
+	instances = make(map[string]struct{}, len(c.revokedInstances))
+	for k := range c.revokedInstances {
+		instances[k] = struct{}{}
+	}
+	return services, instances
+}
+
+// unrevoke lifts a service revocation once one of its instances is announced
+// again: the operator restored access and the service re-registered.
+func (c *Cache) unrevoke(instances []*pb.ServiceInstanceInfo) {
+	for _, inst := range instances {
+		delete(c.revokedServices, inst.GetServiceId())
 	}
 }
 
@@ -476,6 +532,8 @@ func (c *Cache) ApplySnapshot(s *pb.RegistrySnapshot) Change {
 		change.Capture = &capture
 	}
 
+	c.unrevoke(s.GetInstances())
+	c.ready = true
 	c.rebuild(dt)
 	return change
 }
@@ -504,6 +562,15 @@ func (c *Cache) ApplyUpdate(u *pb.RegistryUpdate) Change {
 	for _, inst := range u.GetAddedInstances() {
 		c.putInstance(inst, dt)
 	}
+	c.unrevoke(u.GetAddedInstances())
+	for _, id := range u.GetRevokedServices() {
+		c.revokedServices[id] = struct{}{}
+	}
+	for _, id := range u.GetRevokedInstances() {
+		c.revokedInstances[id] = struct{}{}
+	}
+	change.RevokedServices = u.GetRevokedServices()
+	change.RevokedInstances = u.GetRevokedInstances()
 	for _, inst := range u.GetRemovedInstances() {
 		if old, ok := c.dropInstance(inst.GetInstanceId(), dt); ok {
 			change.RemovedInstances = append(change.RemovedInstances, old)
@@ -590,6 +657,10 @@ type WatchConfig struct {
 	OnPolicyWarnings func(warnings []*pb.PolicyViolation)
 	// OnError reports stream failures. The watch reconnects regardless.
 	OnError func(err error)
+	// OnTerminal reports a failure no reconnect can fix — the runtime refused
+	// the registration itself (a malformed subscription filter, a protocol it
+	// does not speak, a revoked identity). The watch has stopped when it runs.
+	OnTerminal func(err error)
 	// Backoff pins the reconnect ladder. Zero value falls back to the default.
 	Backoff stream.Backoff
 	// Logger defaults to slog.Default().
@@ -603,8 +674,14 @@ type Watch struct {
 	sup    *stream.Supervisor[*pb.RegistryEvent, pb.Registry_RegisterAndWatchClient]
 	logger *slog.Logger
 
-	ready     chan struct{}
-	readyOnce sync.Once
+	// state guards readiness: fresh is true while the current stream has
+	// applied its snapshot, snaps counts snapshots, termErr is the terminal
+	// failure, and notify is closed and replaced on every change of the three.
+	state   sync.Mutex
+	fresh   bool
+	snaps   uint64
+	termErr error
+	notify  chan struct{}
 
 	// Touched only from the supervisor goroutine, which runs OnData serially.
 	curStream        pb.Registry_RegisterAndWatchClient
@@ -627,16 +704,18 @@ func NewWatch(cfg WatchConfig) (*Watch, error) {
 		cfg:    cfg,
 		cache:  NewCache(),
 		logger: cfg.Logger,
-		ready:  make(chan struct{}),
+		notify: make(chan struct{}),
 	}
 
 	sup, err := stream.NewSupervisor(stream.Config[*pb.RegistryEvent, pb.Registry_RegisterAndWatchClient]{
-		Name:    "registry.watch",
-		Open:    w.open,
-		OnData:  w.onData,
-		OnError: w.reportError,
-		Backoff: cfg.Backoff,
-		Logger:  cfg.Logger,
+		Name:       "registry.watch",
+		Open:       w.open,
+		OnData:     w.onData,
+		OnError:    w.reportError,
+		Terminal:   connection.IsTerminal,
+		OnTerminal: w.terminate,
+		Backoff:    cfg.Backoff,
+		Logger:     cfg.Logger,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("registry: new watch: %w", err)
@@ -663,18 +742,63 @@ func (w *Watch) Stop() { w.sup.Stop() }
 // certificate rotation and after a declaration changes post-start.
 func (w *Watch) Restart() { w.sup.Restart() }
 
-// Ready blocks until the first snapshot lands, i.e. until registration is
-// confirmed and the cache is usable.
+// Ready blocks until the current registry stream has applied its snapshot,
+// i.e. until registration is confirmed and the cache is current. It fails at
+// once when the watch ended terminally.
 func (w *Watch) Ready(ctx context.Context) error {
-	select {
-	case <-w.ready:
-		return nil
-	case <-ctx.Done():
-		return fmt.Errorf("registry: watch: ready: %w", ctx.Err())
+	return w.await(ctx, func() bool { return w.fresh })
+}
+
+// Reregister reopens the stream with a freshly built RegisterRequest and waits
+// until the runtime confirmed it with a new snapshot.
+func (w *Watch) Reregister(ctx context.Context) error {
+	w.state.Lock()
+	before := w.snaps
+	w.state.Unlock()
+	w.Restart()
+	return w.await(ctx, func() bool { return w.snaps > before })
+}
+
+func (w *Watch) await(ctx context.Context, done func() bool) error {
+	for {
+		w.state.Lock()
+		if w.termErr != nil {
+			err := w.termErr
+			w.state.Unlock()
+			return fmt.Errorf("registry: watch: %w", err)
+		}
+		if done() {
+			w.state.Unlock()
+			return nil
+		}
+		ch := w.notify
+		w.state.Unlock()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return fmt.Errorf("registry: watch: ready: %w", ctx.Err())
+		}
+	}
+}
+
+// change updates the readiness state under its lock and wakes every waiter.
+func (w *Watch) change(fn func()) {
+	w.state.Lock()
+	fn()
+	close(w.notify)
+	w.notify = make(chan struct{})
+	w.state.Unlock()
+}
+
+func (w *Watch) terminate(err error) {
+	w.change(func() { w.termErr = err })
+	if w.cfg.OnTerminal != nil {
+		w.cfg.OnTerminal(err)
 	}
 }
 
 func (w *Watch) open(ctx context.Context) (pb.Registry_RegisterAndWatchClient, error) {
+	w.change(func() { w.fresh = false })
 	client, err := w.cfg.Clients.RegistryClient(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("registry: watch: registry client: %w", err)
@@ -696,7 +820,10 @@ func (w *Watch) onData(_ context.Context, evt *pb.RegistryEvent, st pb.Registry_
 	case *pb.RegistryEvent_Snapshot:
 		w.awaitingSnapshot = false
 		change := w.cache.ApplySnapshot(kind.Snapshot)
-		w.readyOnce.Do(func() { close(w.ready) })
+		w.change(func() {
+			w.fresh = true
+			w.snaps++
+		})
 		w.emit(change)
 	case *pb.RegistryEvent_Update:
 		if w.awaitingSnapshot {

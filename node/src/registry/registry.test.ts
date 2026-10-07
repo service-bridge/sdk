@@ -1,7 +1,16 @@
 import { describe, expect, it } from "bun:test";
 import { join } from "node:path";
 import { MethodType } from "../pb/servicebridge/v1/registry";
+import type { RpcHandlerContext } from "../rpc/dispatch-port";
 import { Handle, Registry } from "./registry";
+
+const CTX: RpcHandlerContext = {
+	signal: new AbortController().signal,
+	deadline: null,
+	requestId: "r",
+	idempotencyKey: "",
+	caller: null,
+};
 
 const protoFile = join(
 	import.meta.dir,
@@ -54,23 +63,68 @@ describe("Handle.rpc", () => {
 		const reqBytes = pair.input.encode({ userId: "u-1", amount: 5 });
 
 		const port = h.asDispatchPort();
-		const result = await port.dispatchUnary("charge", reqBytes);
+		const result = await port.dispatchUnary("charge", reqBytes, CTX);
 		expect(result.errorCode ?? "").toBe("");
-		const decoded = pair.output.decode(result.payload) as Record<
-			string,
-			unknown
-		>;
+		const decoded = pair.output.decode(
+			result.payload ?? new Uint8Array(),
+		) as Record<string, unknown>;
 		expect(decoded.transactionId).toBe("tx-u-1");
 		expect(decoded.ok).toBe(true);
 	});
 
-	it("dispatchUnary: unknown method returns NOT_FOUND", async () => {
+	it("dispatchUnary: unknown method is a NOT_FOUND refusal", async () => {
 		const h = new Handle();
 		await h.finalize();
 		const result = await h
 			.asDispatchPort()
-			.dispatchUnary("missing", new Uint8Array());
-		expect(result.errorCode).toBe("NOT_FOUND");
+			.dispatchUnary("missing", new Uint8Array(), CTX);
+		expect(result.status).toBe(5);
+		expect(result.errorCode).toBeUndefined();
+	});
+
+	it("dispatchUnary: an undecodable request is an INVALID_ARGUMENT refusal", async () => {
+		const h = new Handle();
+		h.rpc("charge", () => ({}), {
+			schema: { protoFile, input: "ChargeRequest", output: "ChargeResponse" },
+		});
+		await h.finalize();
+		const result = await h
+			.asDispatchPort()
+			.dispatchUnary("charge", new Uint8Array([0xff, 0xff, 0xff]), CTX);
+		expect(result.status).toBe(3);
+	});
+
+	it("dispatchUnary: a HandlerError keeps its business code, the handler sees ctx", async () => {
+		const { HandlerError } = await import("../errors");
+		const h = new Handle();
+		let seen: RpcHandlerContext | undefined;
+		h.rpc(
+			"charge",
+			(_req, ctx) => {
+				seen = ctx;
+				throw new HandlerError("OUT_OF_STOCK", "none left");
+			},
+			{
+				schema: { protoFile, input: "ChargeRequest", output: "ChargeResponse" },
+			},
+		);
+		await h.finalize();
+		const { buildSchemaPair } = await import("../serde/serializer");
+		const pair = await buildSchemaPair({
+			protoFile,
+			input: "ChargeRequest",
+			output: "ChargeResponse",
+		});
+		const result = await h
+			.asDispatchPort()
+			.dispatchUnary(
+				"charge",
+				pair.input.encode({ userId: "u", amount: 1 }),
+				CTX,
+			);
+		expect(result.errorCode).toBe("OUT_OF_STOCK");
+		expect(result.errorMessage).toBe("none left");
+		expect(seen).toBe(CTX);
 	});
 
 	it("dispatchUnary: handler throw maps to INTERNAL", async () => {
@@ -94,7 +148,9 @@ describe("Handle.rpc", () => {
 		});
 		const reqBytes = pair.input.encode({ userId: "u", amount: 1 });
 
-		const result = await h.asDispatchPort().dispatchUnary("oops", reqBytes);
+		const result = await h
+			.asDispatchPort()
+			.dispatchUnary("oops", reqBytes, CTX);
 		expect(result.errorCode).toBe("INTERNAL");
 		expect(result.errorMessage).toContain("boom");
 	});
@@ -149,7 +205,7 @@ describe("Handle — hot-path lookups are indexed, not scanned", () => {
 
 		const port = h.asDispatchPort();
 		const didScan = trapScan(h._entries);
-		const result = await port.dispatchUnary("charge", reqBytes);
+		const result = await port.dispatchUnary("charge", reqBytes, CTX);
 		expect(result.errorCode ?? "").toBe("");
 		expect(port.captureMode("charge")).toBe("errors");
 		expect(didScan()).toBe(false);
@@ -157,7 +213,12 @@ describe("Handle — hot-path lookups are indexed, not scanned", () => {
 
 	it("getPublishedEvent resolves without scanning _published", async () => {
 		const h = new Handle();
-		for (let i = 0; i < 20; i++) h._declarePublishedEventForTests(`noise.${i}`);
+		for (let i = 0; i < 20; i++)
+			h.publishEvent(`noise.${i}`, {
+				protoFile,
+				input: "ChargeRequest",
+				output: "ChargeResponse",
+			});
 		h.publishEvent("payments.failed", {
 			protoFile,
 			input: "ChargeRequest",
@@ -172,33 +233,26 @@ describe("Handle — hot-path lookups are indexed, not scanned", () => {
 		expect(didScan()).toBe(false);
 	});
 
-	it("eventHandlers returns the fan-out set for a pattern in registration order", () => {
+	it("subscription resolves one handler per pattern; a duplicate pattern is refused", () => {
 		const h = new Handle();
-		const seen: string[] = [];
-		h.event("order.created", () => {
-			seen.push("first");
-		});
-		h.event("order.created", () => {
-			seen.push("second");
-		});
-		h.event("order.shipped", () => {});
+		const fn = () => {};
+		h.event("order.created", fn);
+		h.event("order.*", () => {}, { filter: { "$.region": "eu" } });
+		expect(h.subscription("order.created")?.fn).toBe(fn);
+		expect(h.subscription("order.*")?.filter).toBe('{"$.region":"eu"}');
+		expect(h.subscription("order.shipped")).toBeUndefined();
+		expect(() => h.event("order.created", () => {})).toThrow(
+			/already has a handler/,
+		);
+		expect(() => h.event("Bad Pattern", () => {})).toThrow(/invalid pattern/);
+	});
 
-		const handlers = h.eventHandlers("order.created");
-		expect(handlers).toHaveLength(2);
-		for (const fn of handlers)
-			fn(
-				{},
-				{
-					attempt: 1,
-					eventId: "e",
-					deliveryId: "d",
-					leaseToken: "t",
-					signal: new AbortController().signal,
-				},
-			);
-		expect(seen).toEqual(["first", "second"]);
-		expect(h.eventHandlers("order.shipped")).toHaveLength(1);
-		expect(h.eventHandlers("unknown")).toHaveLength(0);
+	it("a subscription never lands in published", () => {
+		const r = new Registry();
+		r._handle.event("order.created", () => {}, {
+			schema: { protoFile, input: "ChargeRequest", output: "ChargeResponse" },
+		});
+		expect(r.buildRegisterRequest().published).toHaveLength(0);
 	});
 });
 
@@ -259,28 +313,36 @@ describe("Handle.workflow", () => {
 // integrations in src/http/{express,fastify,hono}/.
 
 // ── Handle.publishEvent (registry surface for sb.event.define) ───────────────
-//
-// _declarePublishedEventForTests bypasses async .proto loading — schemaJson
-// and contractHash stay empty. Tests that exercise the full Protobuf path
-// live in src/events/domain.test.ts with a real .proto fixture.
 
-describe("Handle.publishEvent (test-only declarations)", () => {
-	it("declared event appears in published list with empty schemaJson", () => {
+describe("Handle.publishEvent", () => {
+	it("a declared event appears in published with its schema and hash", async () => {
 		const r = new Registry();
-		r._handle._declarePublishedEventForTests("payments.failed");
+		r._handle.publishEvent("payments.failed", {
+			protoFile,
+			input: "ChargeRequest",
+			output: "ChargeResponse",
+		});
+		await r._handle.finalize();
 		const req = r.buildRegisterRequest();
 		expect(req.published).toHaveLength(1);
 		expect(req.published[0]!.name).toBe("payments.failed");
-		expect(req.published[0]!.schemaJson.length).toBe(0);
-		expect(req.published[0]!.contractHash).toBe("");
+		expect(req.published[0]!.schemaJson.length).toBeGreaterThan(0);
+		expect(req.published[0]!.contractHash.length).toBeGreaterThan(0);
 	});
 
-	it("duplicate test declaration is a no-op", () => {
+	it("re-declaring with the same spec object is a no-op, another spec is refused", () => {
 		const r = new Registry();
-		r._handle._declarePublishedEventForTests("payments.success");
-		r._handle._declarePublishedEventForTests("payments.success");
-		const req = r.buildRegisterRequest();
-		expect(req.published).toHaveLength(1);
+		const spec = {
+			protoFile,
+			input: "ChargeRequest",
+			output: "ChargeResponse",
+		};
+		r._handle.publishEvent("payments.success", spec);
+		r._handle.publishEvent("payments.success", spec);
+		expect(r.buildRegisterRequest().published).toHaveLength(1);
+		expect(() =>
+			r._handle.publishEvent("payments.success", { ...spec }),
+		).toThrow(/different schema/);
 	});
 });
 
@@ -341,12 +403,16 @@ describe("Registry.buildRegisterRequest eventSubscriptions", () => {
 		expect(req.eventSubscriptions[0]!.pattern).toBe("payment.charged");
 	});
 
-	it("multiple event handlers produce separate subscriptions", () => {
+	it("multiple patterns produce separate subscriptions with their filters", () => {
 		const r = new Registry();
 		r._handle.event("order.created", () => {});
-		r._handle.event("order.shipped", () => {});
+		r._handle.event("order.shipped", () => {}, { filter: { "$.n": 1 } });
 		const req = r.buildRegisterRequest();
 		expect(req.eventSubscriptions).toHaveLength(2);
+		expect(req.eventSubscriptions[1]).toEqual({
+			pattern: "order.shipped",
+			filter: '{"$.n":1}',
+		});
 		const patterns = req.eventSubscriptions.map((s) => s.pattern);
 		expect(patterns).toContain("order.created");
 		expect(patterns).toContain("order.shipped");
@@ -354,8 +420,17 @@ describe("Registry.buildRegisterRequest eventSubscriptions", () => {
 
 	it("no event handlers — eventSubscriptions is empty", () => {
 		const r = new Registry();
-		r._handle._declareForTests("charge");
+		r.service("other", { rpc: ["charge"] });
 		const req = r.buildRegisterRequest();
 		expect(req.eventSubscriptions).toHaveLength(0);
+	});
+});
+
+describe("Registry.buildRegisterRequest handshake", () => {
+	it("carries the protocol version, language and SDK version", () => {
+		const req = new Registry().buildRegisterRequest();
+		expect(req.protocolVersion).toBe(1);
+		expect(req.sdkLanguage).toBe("node");
+		expect(req.sdkVersion).toMatch(/^\d+\.\d+\.\d+/);
 	});
 });

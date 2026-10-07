@@ -1,24 +1,13 @@
-// events-lifecycle.test.ts — restart / reconnect / pattern-change / SB_DATA_DIR.
+// events-lifecycle.test.ts — restart / reconnect / pattern-change.
 //
 // These tests need a subscriber DOWN during publish, a subscriber re-registered
-// with a CHANGED pattern, or a publisher pointed at a private SQLite outbox dir.
-// A permanently-connected warm pool client (one per role) cannot give any of
-// that, so every party here is a DEDICATED instance built directly from the
-// per-domain role key, registering its handlers/schema BEFORE connect() and
-// stopped in afterEach.
-//
-// SB_DATA_DIR isolation: the publisher-restart and inflight-recovery tests share
-// one SQLite outbox dir across two sequential instances. The dir is passed via
-// the ServiceBridge `dataDir` constructor option — NEVER process.env.SB_DATA_DIR
-// (a global env mutation would corrupt the pool's per-(shard,role) outbox and
-// race parallel shards).
+// with a CHANGED pattern, or successive publisher instances. A permanently
+// connected warm pool client (one per role) cannot give any of that, so every
+// party here is a DEDICATED instance built directly from the per-domain role
+// key, registering its handlers/schema BEFORE connect() and stopped in afterEach.
 
 import { afterEach, describe, expect, test } from "bun:test";
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
 import { ServiceBridge } from "../../src/connection/service-bridge";
-import { Storage } from "../../src/sqlite/storage";
 import {
 	connect,
 	ORDER_EVENT_PROTO,
@@ -45,9 +34,8 @@ function keyForRole(role: Role): { url: string; key: string } {
 	return { url, key };
 }
 
-// Builds a dedicated, UNSTARTED instance under a role key. `dataDir` is explicit
-// so restart tests can share one outbox dir across sequential instances.
-function instance(role: Role, dataDir: string): ServiceBridge {
+// Builds a dedicated, UNSTARTED instance under a role key.
+function instance(role: Role): ServiceBridge {
 	const { url, key } = keyForRole(role);
 	return new ServiceBridge(url, key, {
 		reconnectIntervalMs: 500,
@@ -55,36 +43,20 @@ function instance(role: Role, dataDir: string): ServiceBridge {
 		certRefreshLeadMs: 60_000,
 		certRefreshJitterMs: 0,
 		advertise: { host: "127.0.0.1", port: 0 },
-		dataDir,
 	});
 }
 
 describe("events-lifecycle", () => {
 	const clients: ServiceBridge[] = [];
-	const tmpDirs: string[] = [];
 
 	function track<T extends ServiceBridge>(sb: T): T {
 		clients.push(sb);
 		return sb;
 	}
 
-	function tmpDir(prefix: string): string {
-		const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-		tmpDirs.push(dir);
-		return dir;
-	}
-
-	function privateDataDir(tag: string): string {
-		return `./.servicebridge-e2e/events-lifecycle-${tag}-${Date.now()}`;
-	}
-
 	afterEach(async () => {
 		await Promise.allSettled(clients.map((c) => c.stop()));
 		clients.length = 0;
-		for (const dir of tmpDirs) {
-			fs.rmSync(dir, { recursive: true, force: true });
-		}
-		tmpDirs.length = 0;
 	});
 
 	test("subscriber restart re-registers its pattern and receives subsequent events", async () => {
@@ -93,14 +65,17 @@ describe("events-lifecycle", () => {
 		const receivedBySecond: Order[] = [];
 
 		// Phase 1: first subscriber instance.
-		const subscriber1 = track(instance("second", privateDataDir("sub1")));
-		subscriber1.event.define(name, V1_SCHEMA);
-		subscriber1.event.handle(name, async (p) => {
-			receivedByFirst.push(p as Order);
-		});
+		const subscriber1 = track(instance("second"));
+		subscriber1.event.handle(
+			name,
+			async (p) => {
+				receivedByFirst.push(p as Order);
+			},
+			{ schema: V1_SCHEMA },
+		);
 		await connect(subscriber1);
 
-		const publisher = track(instance("primary", privateDataDir("pub")));
+		const publisher = track(instance("primary"));
 		publisher.event.define(name, V1_SCHEMA);
 		await connect(publisher);
 
@@ -124,11 +99,14 @@ describe("events-lifecycle", () => {
 		await subscriber1.stop();
 
 		// Phase 2: second subscriber instance, same key, fresh registration.
-		const subscriber2 = track(instance("second", privateDataDir("sub2")));
-		subscriber2.event.define(name, V1_SCHEMA);
-		subscriber2.event.handle(name, async (p) => {
-			receivedBySecond.push(p as Order);
-		});
+		const subscriber2 = track(instance("second"));
+		subscriber2.event.handle(
+			name,
+			async (p) => {
+				receivedBySecond.push(p as Order);
+			},
+			{ schema: V1_SCHEMA },
+		);
 		await connect(subscriber2);
 
 		const { eventId: secondId } = await publisher.event.publish(name, {
@@ -158,11 +136,14 @@ describe("events-lifecycle", () => {
 		const received: Array<{ orderId: string }> = [];
 
 		// Phase 1: connect a subscriber so the subscription row exists, then stop.
-		const subscriber1 = track(instance("second", privateDataDir("off-sub1")));
-		subscriber1.event.define(name, V1_SCHEMA);
-		subscriber1.event.handle(name, async (p) => {
-			received.push(p as { orderId: string });
-		});
+		const subscriber1 = track(instance("second"));
+		subscriber1.event.handle(
+			name,
+			async (p) => {
+				received.push(p as { orderId: string });
+			},
+			{ schema: V1_SCHEMA },
+		);
 		await connect(subscriber1);
 		// Let the subscription stream register, then take the subscriber down.
 		await sleep(500);
@@ -170,7 +151,7 @@ describe("events-lifecycle", () => {
 		await sleep(300);
 
 		// Phase 2: publish the whole burst while the subscriber is offline.
-		const publisher = track(instance("primary", privateDataDir("off-pub")));
+		const publisher = track(instance("primary"));
 		publisher.event.define(name, V1_SCHEMA);
 		await connect(publisher);
 
@@ -188,11 +169,14 @@ describe("events-lifecycle", () => {
 		await sleep(2_000);
 
 		// Phase 3: fresh subscriber instance (same key) drains the backlog.
-		const subscriber2 = track(instance("second", privateDataDir("off-sub2")));
-		subscriber2.event.define(name, V1_SCHEMA);
-		subscriber2.event.handle(name, async (p) => {
-			received.push(p as { orderId: string });
-		});
+		const subscriber2 = track(instance("second"));
+		subscriber2.event.handle(
+			name,
+			async (p) => {
+				received.push(p as { orderId: string });
+			},
+			{ schema: V1_SCHEMA },
+		);
 		await connect(subscriber2);
 
 		await waitFor(
@@ -217,14 +201,17 @@ describe("events-lifecycle", () => {
 		let v2Invocations = 0;
 
 		// Phase 1: subscriber handles foo.<suffix>.
-		const subscriberV1 = track(instance("second", privateDataDir("pc-sub1")));
-		subscriberV1.event.define(fooName, V1_SCHEMA);
-		subscriberV1.event.handle(fooName, async (p) => {
-			v1Received.push(p);
-		});
+		const subscriberV1 = track(instance("second"));
+		subscriberV1.event.handle(
+			fooName,
+			async (p) => {
+				v1Received.push(p);
+			},
+			{ schema: V1_SCHEMA },
+		);
 		await connect(subscriberV1);
 
-		const publisher = track(instance("primary", privateDataDir("pc-pub")));
+		const publisher = track(instance("primary"));
 		publisher.event.define(fooName, V1_SCHEMA);
 		await connect(publisher);
 
@@ -243,11 +230,14 @@ describe("events-lifecycle", () => {
 		// Register sends the new subscription set → Replace() moves the orphaned
 		// foo.* deliveries to DLQ (last_error='orphaned_pattern'); they never reach
 		// the baz handler.
-		const subscriberV2 = track(instance("second", privateDataDir("pc-sub2")));
-		subscriberV2.event.define(bazPattern, V1_SCHEMA);
-		subscriberV2.event.handle(bazPattern, async () => {
-			v2Invocations++;
-		});
+		const subscriberV2 = track(instance("second"));
+		subscriberV2.event.handle(
+			bazPattern,
+			async () => {
+				v2Invocations++;
+			},
+			{ schema: V1_SCHEMA },
+		);
 		await connect(subscriberV2);
 
 		// Generous window: confirm no orphaned foo delivery reaches the baz handler.
@@ -255,24 +245,23 @@ describe("events-lifecycle", () => {
 		expect(v2Invocations).toBe(0);
 	}, 40_000);
 
-	test("publisher restart across a shared SB_DATA_DIR delivers all events from both instances", async () => {
+	test("events published by successive publisher instances are all delivered", async () => {
 		const name = uniqueName("events.restart-pub");
 		const received: Order[] = [];
 
 		// Subscriber first so the pattern is registered before any publish.
-		const subscriber = track(instance("second", privateDataDir("rp-sub")));
-		subscriber.event.define(name, V1_SCHEMA);
-		subscriber.event.handle(name, async (p) => {
-			received.push(p as Order);
-		});
+		const subscriber = track(instance("second"));
+		subscriber.event.handle(
+			name,
+			async (p) => {
+				received.push(p as Order);
+			},
+			{ schema: V1_SCHEMA },
+		);
 		await connect(subscriber);
 
-		// Both publisher instances share one private outbox dir via the dataDir
-		// option (never the env var).
-		const sharedDir = tmpDir("sb-restart-pub-");
-
 		// Phase 1: first publisher instance.
-		const publisher1 = track(instance("primary", sharedDir));
+		const publisher1 = track(instance("primary"));
 		publisher1.event.define(name, V1_SCHEMA);
 		await connect(publisher1);
 
@@ -295,8 +284,8 @@ describe("events-lifecycle", () => {
 		await waitFor(() => received.length >= 3, 15_000, "first 3 events");
 		await publisher1.stop();
 
-		// Phase 2: second publisher instance on the SAME outbox dir.
-		const publisher2 = track(instance("primary", sharedDir));
+		// Phase 2: a second publisher instance of the same service.
+		const publisher2 = track(instance("primary"));
 		publisher2.event.define(name, V1_SCHEMA);
 		await connect(publisher2);
 
@@ -328,93 +317,5 @@ describe("events-lifecycle", () => {
 		const p2 = received.find((r) => r.orderId === "p2-order-1")!;
 		expect(p2.amount).toBeCloseTo(40);
 		expect(p2.currency).toBe("JPY");
-	}, 60_000);
-
-	test("inflight outbox row is reset to pending on start (crash recovery)", async () => {
-		const sharedDir = tmpDir("sb-inflight-recovery-");
-
-		// Pre-seed an 'inflight' outbox row via direct Storage.open() — simulating
-		// a publisher killed after the row went inflight but before the ACK.
-		const preStorage = Storage.open({ dataDir: sharedDir });
-		const CRASH_ROW_ID = "crash-sim-evt-001";
-		const CRASH_EVENT_NAME = "test.crash.event";
-		const syntheticPayload = new Uint8Array([
-			0x0a, 0x04, 0x74, 0x65, 0x73, 0x74,
-		]);
-		const nowMs = Date.now();
-		// Far-future next attempt so the drainer does not pick it up and DELETE it
-		// before our verify query runs.
-		const farFutureMs = nowMs + 24 * 60 * 60 * 1000;
-		preStorage
-			.prepare(
-				`INSERT INTO event_outbox
-						(id, name, payload, contract_hash, occurred_at_ms, enqueued_at_ms,
-						 next_attempt_at_ms, status)
-						VALUES (?, ?, ?, ?, ?, ?, ?, 'inflight')`,
-			)
-			.run(
-				CRASH_ROW_ID,
-				CRASH_EVENT_NAME,
-				syntheticPayload,
-				"deadbeefhash",
-				nowMs,
-				nowMs,
-				farFutureMs,
-			);
-		const inflightBefore = preStorage
-			.prepare(`SELECT COUNT(*) AS c FROM event_outbox WHERE status='inflight'`)
-			.get() as { c: number };
-		expect(inflightBefore.c).toBe(1);
-		preStorage.close();
-
-		// Subscriber for the bonus delivery assertion.
-		const name = uniqueName("events.inflight-recovery");
-		const receivedPayloads: Array<{ orderId: string }> = [];
-		const subscriber = track(instance("second", privateDataDir("ir-sub")));
-		subscriber.event.define(name, V1_SCHEMA);
-		subscriber.event.handle(name, async (p) => {
-			receivedPayloads.push(p as { orderId: string });
-		});
-		await connect(subscriber);
-
-		// Publisher opens the SAME outbox dir → Storage.open() runs
-		// UPDATE event_outbox SET status='pending' WHERE status='inflight'.
-		const publisher = track(instance("primary", sharedDir));
-		publisher.event.define(name, V1_SCHEMA);
-		await connect(publisher);
-
-		// Verify recovery via a direct Storage query (WAL → committed state visible).
-		const verifyStorage = Storage.open({ dataDir: sharedDir });
-		try {
-			const inflightAfter = verifyStorage
-				.prepare(
-					`SELECT COUNT(*) AS c FROM event_outbox WHERE status='inflight'`,
-				)
-				.get() as { c: number };
-			const pendingAfter = verifyStorage
-				.prepare(
-					`SELECT COUNT(*) AS c FROM event_outbox WHERE status='pending' AND id=?`,
-				)
-				.get(CRASH_ROW_ID) as { c: number };
-			expect(inflightAfter.c).toBe(0);
-			expect(pendingAfter.c).toBe(1);
-		} finally {
-			verifyStorage.close();
-		}
-
-		// Bonus: a fresh valid event still delivers after crash recovery.
-		const { eventId } = await publisher.event.publish(name, {
-			orderId: "recovery-order-1",
-			amount: 99,
-			currency: "USD",
-		});
-		expect(eventId).toMatch(UUID_RE);
-
-		await waitFor(
-			() => receivedPayloads.length > 0,
-			12_000,
-			"new event delivered after crash recovery",
-		);
-		expect(receivedPayloads[0]!.orderId).toBe("recovery-order-1");
 	}, 60_000);
 });

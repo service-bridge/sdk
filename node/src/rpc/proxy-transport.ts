@@ -1,161 +1,133 @@
-import {
-	type ChannelCredentials,
-	type ClientUnaryCall,
-	Metadata,
-} from "@grpc/grpc-js";
+import type { ChannelCredentials, ClientUnaryCall } from "@grpc/grpc-js";
+import { CLIENT_CHANNEL_OPTIONS } from "../connection/tls-material";
 import { type InvokeChunk, InvokeClient } from "../pb/servicebridge/v1/invoke";
-import { currentTraceContext } from "../telemetry/context";
-import { formatXSbTrace } from "../telemetry/wire-trace";
+import type { WireCall } from "./direct-transport";
+import {
+	asBuffer,
+	CallFailure,
+	currentTraceHeader,
+	grpcFailure,
+	handlerFailure,
+	traceMetadata,
+} from "./wire";
 
-// X_SB_TRACE_HEADER is the gRPC metadata key under which the runtime reads
-// the caller's trace context (ADR 0006 §3). Keep in sync with rpc/server.go.
-const X_SB_TRACE_HEADER = "x-sb-trace";
-
-// currentTraceHeader returns the X-SB-Trace wire value for the active ALS
-// trace context, or empty string when no context is in scope. Both the gRPC
-// metadata header and the CallRequest.xSbTrace body field carry it — kept
-// in sync with direct-transport for symmetric Invoke/Direct semantics.
-function currentTraceHeader(): string {
-	const ctx = currentTraceContext();
-	if (!ctx) return "";
-	return formatXSbTrace(ctx.traceId, ctx.parentOpId);
-}
-
-// buildTraceMetadata returns a Metadata with x-sb-trace set from the given
-// header value, or an empty Metadata when the header is empty.
-function buildTraceMetadata(header: string): Metadata {
-	const md = new Metadata();
-	if (header) {
-		md.set(X_SB_TRACE_HEADER, header);
-	}
-	return md;
-}
-
-// asBuffer reinterprets an already-owned Uint8Array as a Buffer without
-// copying. The generated stubs type wire bytes as Buffer, and Buffer.from(view)
-// copies — a second full copy of every request payload on every call.
-function asBuffer(bytes: Uint8Array): Buffer {
-	return Buffer.isBuffer(bytes)
-		? bytes
-		: Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-}
-
-// ProxyTransport routes outbound RPC calls through the runtime's Invoke service.
-// Reuses the SDK's mTLS credentials to the runtime — same URL and creds as the
-// Control/Registry streams. The caller-side contract hash is forwarded so the
-// runtime Resolver can filter target instances by it (ADR 0001).
+// ProxyTransport routes outbound RPC calls through the runtime's Invoke service
+// over the SDK's own mTLS channel to the runtime. The caller-side contract hash
+// is forwarded so the runtime resolver filters target instances by it
+// (ADR 0001).
 //
 // @internal — см. ./README.md
 export class ProxyTransport {
-	private client: InvokeClient;
+	private readonly client: InvokeClient;
 
 	constructor(runtimeAddr: string, creds: ChannelCredentials) {
-		this.client = new InvokeClient(runtimeAddr, creds);
+		this.client = new InvokeClient(runtimeAddr, creds, CLIENT_CHANNEL_OPTIONS);
 	}
 
 	close(): void {
 		this.client.close();
 	}
 
-	// callStream invokes Invoke.Stream and returns an AsyncIterable of payload
-	// bytes. Application errors (errorCode non-empty in a chunk) terminate the
-	// iterator with a thrown Error whose name is the errorCode.
 	async *callStream(
 		targetServiceId: string,
-		method: string,
-		payload: Uint8Array,
-		requestId: string,
-		idempotencyKey: string,
-		deadlineMs: number,
 		contractHash: Buffer,
-		signal?: AbortSignal,
+		call: WireCall,
 	): AsyncIterable<Uint8Array> {
-		signal?.throwIfAborted();
-		const deadline = new Date(Date.now() + deadlineMs);
+		call.signal?.throwIfAborted();
+		await this.ready(call);
 		const traceHeader = currentTraceHeader();
 		const stream = this.client.stream(
 			{
 				targetServiceId,
-				method,
-				payload: asBuffer(payload),
-				requestId,
-				idempotencyKey,
+				method: call.method,
+				payload: asBuffer(call.payload),
+				requestId: call.requestId,
+				idempotencyKey: call.idempotencyKey,
 				contractHash,
 				xSbTrace: traceHeader,
+				excludeInstanceIds: call.excludeInstanceIds ?? [],
 			},
-			buildTraceMetadata(traceHeader),
-			{ deadline },
+			traceMetadata(traceHeader),
+			{ deadline: call.deadline },
 		);
 		const abort = () => stream.cancel();
-		signal?.addEventListener("abort", abort, { once: true });
+		call.signal?.addEventListener("abort", abort, { once: true });
 		try {
 			for await (const chunk of stream as AsyncIterable<InvokeChunk>) {
-				if (chunk.errorCode) {
-					const err = new Error(chunk.errorMessage || chunk.errorCode);
-					err.name = chunk.errorCode;
-					throw err;
-				}
-				// The decoder already copied the chunk out of the wire buffer, so the
-				// payload is owned — handing it straight to the caller avoids a second
-				// full copy of every chunk.
+				if (chunk.errorCode)
+					throw handlerFailure(chunk.errorCode, chunk.errorMessage);
 				yield chunk.payload;
 			}
+		} catch (err) {
+			if (err instanceof CallFailure) throw err;
+			throw grpcFailure(`rpc ${call.method} via runtime`, err);
 		} finally {
-			signal?.removeEventListener("abort", abort);
+			call.signal?.removeEventListener("abort", abort);
 			stream.cancel?.();
 		}
 	}
 
-	// callUnary forwards a single Invoke.Unary call to the runtime and resolves
-	// with the response payload bytes. Application errors (callee handler threw)
-	// are returned as a rejected promise with name/message set from error_code.
-	callUnary(
+	async callUnary(
 		targetServiceId: string,
-		method: string,
-		payload: Uint8Array,
-		requestId: string,
-		idempotencyKey: string,
-		deadlineMs: number,
 		contractHash: Buffer,
-		signal?: AbortSignal,
+		call: WireCall,
 	): Promise<Uint8Array> {
+		call.signal?.throwIfAborted();
+		await this.ready(call);
+		const traceHeader = currentTraceHeader();
 		return new Promise((resolve, reject) => {
-			signal?.throwIfAborted();
-			let call: ClientUnaryCall | undefined;
-			const abort = () => {
-				call?.cancel();
-				reject(signal?.reason ?? new Error("rpc cancelled"));
-			};
-			signal?.addEventListener("abort", abort, { once: true });
-			const deadline = new Date(Date.now() + deadlineMs);
-			const traceHeader = currentTraceHeader();
-			call = this.client.unary(
+			let pending: ClientUnaryCall | undefined;
+			const abort = () => pending?.cancel();
+			call.signal?.addEventListener("abort", abort, { once: true });
+			pending = this.client.unary(
 				{
 					targetServiceId,
-					method,
-					payload: asBuffer(payload),
-					requestId,
-					idempotencyKey,
+					method: call.method,
+					payload: asBuffer(call.payload),
+					requestId: call.requestId,
+					idempotencyKey: call.idempotencyKey,
 					contractHash,
 					xSbTrace: traceHeader,
+					excludeInstanceIds: call.excludeInstanceIds ?? [],
 				},
-				buildTraceMetadata(traceHeader),
-				{ deadline },
+				traceMetadata(traceHeader),
+				{ deadline: call.deadline },
 				(err, resp) => {
-					signal?.removeEventListener("abort", abort);
+					call.signal?.removeEventListener("abort", abort);
 					if (err) {
-						reject(err);
+						reject(grpcFailure(`rpc ${call.method} via runtime`, err));
 						return;
 					}
 					if (resp.errorCode) {
-						const appErr = new Error(resp.errorMessage || resp.errorCode);
-						appErr.name = resp.errorCode;
-						reject(appErr);
+						reject(handlerFailure(resp.errorCode, resp.errorMessage));
 						return;
 					}
 					resolve(resp.payload);
 				},
 			);
+		});
+	}
+
+	// ready proves the channel to the runtime is up before the request is
+	// written; a failure here is pre-dispatch.
+	private ready(call: WireCall): Promise<void> {
+		return new Promise<void>((resolve, reject) => {
+			const abort = () =>
+				reject(
+					grpcFailure(`rpc ${call.method} via runtime`, {
+						code: 1,
+						details: "cancelled",
+					}),
+				);
+			call.signal?.addEventListener("abort", abort, { once: true });
+			this.client.waitForReady(call.deadline, (err) => {
+				call.signal?.removeEventListener("abort", abort);
+				if (err)
+					reject(
+						grpcFailure(`rpc ${call.method} via runtime: connect`, err, true),
+					);
+				else resolve();
+			});
 		});
 	}
 }

@@ -15,7 +15,6 @@
 interface AgentConfig {
 	url: string;
 	key: string;
-	dataDir: string;
 	protoFile: string;
 	// rpcMethod is the handler this agent serves. Empty registers none.
 	rpcMethod: string;
@@ -101,7 +100,6 @@ const sb = new ServiceBridge(config.url, config.key, {
 	reconnectAttempts: 3,
 	certRefreshLeadMs: 60 * 60 * 1000,
 	advertise: { host: "127.0.0.1", port: 0 },
-	dataDir: config.dataDir,
 });
 
 if (config.rpcMethod) {
@@ -130,15 +128,18 @@ for (const dep of config.deps) {
 	sb.service(dep.service, { rpc: dep.methods });
 }
 
+// A subscriber decodes with its own schema; only publishers declare events.
 for (const name of config.subscribeEvents) {
-	sb.event.define(name, EVENT_SCHEMA);
-	sb.event.handle(name, (payload: unknown) => {
-		emit({ type: "event", name, payload });
-	});
+	sb.event.handle(
+		name,
+		(payload: unknown) => {
+			emit({ type: "event", name, payload });
+		},
+		{ schema: EVENT_SCHEMA },
+	);
 }
 
 for (const name of config.publishEvents) {
-	if (config.subscribeEvents.includes(name)) continue;
 	sb.event.define(name, EVENT_SCHEMA);
 }
 

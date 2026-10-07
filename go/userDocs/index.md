@@ -17,11 +17,11 @@ go get github.com/service-bridge/sdk/go
 | [Introduction](./introduction.md) | Что такое ServiceBridge, что делает SDK и чего он не делает |
 | [Quickstart](./quickstart.md) | Два процесса, один вызов, пять минут |
 | [**RPC**](./rpc.md) | `sb.Handle` / `sb.HandleStream`, `sb.NewMethod`, `sb.Call`, `sb.Stream`, транспорт, ретраи, размыкатель, идемпотентность, маршрутизация по контракту |
-| [Events](./events.md) | `sb.DefineEvent`, `sb.PublishEvent`, `sb.SubscribeEvent`, локальный outbox, шаблоны подписок, гарантии доставки |
+| [Events](./events.md) | `sb.DefineEvent`, `sb.PublishEvent`, `sb.SubscribeEvent`, очередь публикаций, шаблоны и фильтры подписок, гарантии доставки |
 | [Workflows](./workflows.md) | `c.Workflow` — durable DAG: шаги, предикаты, компенсации, сигналы, replay |
 | [Jobs](./jobs.md) | `c.Job` — cron / interval / one-shot, лизы, ретраи, идемпотентность |
 | [Integrations](./integrations.md) | `sbhttp` и `sbgin`: свой HTTP-сервер в Service Map и в трейсе |
-| [Тестирование](./testing.md) | `sbtest` — юнит-тест обработчиков без сети и без рантайма |
+| [Тестирование](./testing.md) | `sbtest` — юнит-тест обработчиков на настоящем клиенте без сети и без рантайма |
 | [Access Policy](./access-policy.md) | Что видит SDK при ограничениях политики доступа |
 | [Operations](./operations.md) | Конструктор и опции, lifecycle, identity, телеметрия, ротация сертификатов, troubleshooting |
 | [API reference](./api-reference.md) | Компактный справочник публичных сигнатур |
@@ -41,6 +41,6 @@ go get github.com/service-bridge/sdk/go
 
 **«Какие значения по умолчанию у опций?»** → [Operations §1](./operations.md#1-конструктор-и-опции).
 
-**«Как юнит-тестировать обработчик без живого рантайма?»** → [Тестирование](./testing.md). Обязательно прочитать [§6 — чего двойник не делает](./testing.md#6-чего-двойник-не-воспроизводит).
+**«Как юнит-тестировать обработчик без живого рантайма?»** → [Тестирование](./testing.md). Обязательно прочитать [§7 — чего харнесс не воспроизводит](./testing.md#7-чего-харнесс-не-воспроизводит).
 
 **«В каких единицах время?»** → миллисекунды везде, кроме пяти полей workflow. [Operations §9](./operations.md#9-единицы-времени).

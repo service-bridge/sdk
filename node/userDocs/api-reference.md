@@ -11,16 +11,25 @@
 ```ts
 import {
   ServiceBridge,
-  ServiceBridgeError,   // база всех ошибок SDK
-  ConnectionError,      // сбой подключения; .code = gRPC status
-  RpcAccessDeniedError,
+  ServiceBridgeError,   // база всех ошибок SDK: .code, .retryable
+  ConfigurationError,   // CONFIG
+  StateError,           // STATE
+  ValidationError,      // VALIDATION
+  AccessDeniedError,    // ACCESS_DENIED
+  TimeoutError,         // TIMEOUT
+  NoLiveInstanceError,  // NO_LIVE_INSTANCE
+  HandlerError,         // HANDLER: ответ хендлера callee, .handlerCode
+  ConnectionError,      // CONNECTION: сбой control plane, .grpcCode
+  InvalidEventNameError,
   WorkflowAccessDeniedError,
   WorkflowNotFoundError,
   WorkflowTerminalError,
-  InvalidEventNameError,
-  OutboxFullError,
+  WorkflowValidationError,
+  JsonPathError,
   // типы
+  type ErrorCode,
   type ServiceBridgeOptions,
+  type Logger,
   type AdvertiseConfig,
   type CallOpts,
   type RetryOpts,
@@ -29,6 +38,12 @@ import {
   type MethodType,
   type ServiceDeps,
   type RpcHandlerOpts,
+  type RpcHandlerContext,
+  type RpcHandlerFn,
+  type RpcStreamHandlerFn,
+  type EventHandlerFn,
+  type EventHandlerOpts,
+  type EventHandlerContext,
   type WorkflowHandlerOpts,
   type SchemaSpec,
   type PublishOpts,
@@ -46,11 +61,14 @@ import {
   type ConnectedEvent,
   type ReconnectingEvent,
   type DisconnectedEvent,
+  type DrainingEvent,
   type PolicyViolationEvent,
 } from "service-bridge";
 ```
 
-HTTP-интеграции — отдельные subpath-импорты (`service-bridge/express`, `service-bridge/fastify`, `service-bridge/hono`), см. [Integrations](./integrations.md).
+HTTP-интеграции — отдельные subpath-импорты (`service-bridge/express`, `service-bridge/fastify`, `service-bridge/hono`), см. [Integrations](./integrations.md). Харнесс для юнит-тестов — `service-bridge/testing`, см. [Тестирование](./testing.md).
+
+Пакет работает на Node.js 22, 24, 26 и Bun ≥ 1.3.13 (интеграция Fastify — только Node).
 
 ## ServiceBridge
 
@@ -60,20 +78,25 @@ HTTP-интеграции — отдельные subpath-импорты (`servic
 
 ```ts
 new ServiceBridge(
-  url: string,                        // напр. "https://localhost:14445"
+  url: string,                        // "host:port", напр. "localhost:14445"
   key: string,                        // bootstrap service key
   options?: ServiceBridgeOptions,
 )
 ```
 
+Конструктор проверяет `url` (нужен `host:port`), ключ и числовые опции; неверное значение — `ConfigurationError` сразу.
+
 ### Lifecycle
 
 ```ts
-start(): Promise<void>
-stop(): Promise<void>
+start(): Promise<void>   // резолвится после Welcome и первого snapshot реестра (startTimeoutMs)
+ready(): Promise<void>   // текущая сессия жива и её snapshot применён
+stop(): Promise<void>    // упорядоченная остановка, идемпотентна
 ```
 
-Все объявления (`sb.service(...)`, `sb.rpc.handle(...)`, `sb.event.define(...)`, `sb.workflow.handle(...)`, `sb.job.handle(...)`, `sb.useSchema(...)`, `sb.client(...)`) должны выполняться **до** `start()` — они уходят в первый RegisterRequest. Исходящие вызовы (`sb.rpc.call`, `sb.stream`, `sb.event.publish`, `sb.workflow.start`) работают только после события `connected`.
+Все объявления (`sb.service(...)`, `sb.rpc.handle(...)`, `sb.event.define(...)`, `sb.event.handle(...)`, `sb.workflow.handle(...)`, `sb.job.handle(...)`, `sb.useSchema(...)`, `sb.client(...)`) выполняются **до** `start()` — они уходят в первый RegisterRequest. Исходящие вызовы (`sb.rpc.call`, `sb.stream`, `sb.event.publish`, `sb.workflow.start`) работают после того, как `start()` резолвился; вызов до этого — `StateError`.
+
+Если `start()` не дождался Welcome и snapshot за `startTimeoutMs`, или runtime ответил неустранимой ошибкой, бридж останавливается и `start()` бросает (`TimeoutError`, `ConnectionError`, `ConfigurationError`, `ValidationError`, `AccessDeniedError`). Повторный `start()` — `StateError`. Порядок `stop()` — [Operations §2](./operations.md#2-lifecycle-start--ready--stop).
 
 ### Identity & registry
 
@@ -154,36 +177,47 @@ sb.stream<Req, Chunk>(
 ): AsyncIterable<Chunk>
 ```
 
-Прерывание `for await`-цикла (break/return) закрывает gRPC-стрим, что доходит до callee. Retry к стримам не применяется (single-pick by design, ADR 0001).
+Прерывание `for await`-цикла (break/return) закрывает gRPC-стрим, что доходит до callee. Стримы не ретраятся.
 
 ### RPC handlers (`sb.rpc`)
 
 ```ts
 sb.rpc.handle<Req, Res>(
   name: string,
-  fn: (req: Req) => Promise<Res> | Res,
+  fn: (req: Req, ctx: RpcHandlerContext) => Promise<Res> | Res,
   opts: RpcHandlerOpts,                 // { schema: SchemaSpec; captureMode?: "all"|"errors"|"none" }
 ): void
 
 sb.rpc.handleStream<Req, Chunk>(
   name: string,
-  fn: (req: Req) => AsyncIterable<Chunk>,
+  fn: (req: Req, ctx: RpcHandlerContext) => AsyncIterable<Chunk>,
   opts: RpcHandlerOpts,
 ): void
+
+interface RpcHandlerContext {
+  signal: AbortSignal;          // отмена вызывающим или истёкший дедлайн
+  deadline: number | null;      // абсолютный дедлайн, unix-ms
+  requestId: string;
+  idempotencyKey: string;       // "" если вызывающий не задал
+  caller: { serviceId: string; instanceId: string } | null;  // instanceId "" при вызове через proxy
+}
 ```
 
-`schema` обязателен у каждого хендлера. `captureMode` может только сузить эффективный режим payload-capture, пушнутый runtime (порядок приватности `none < errors < all`), но не расширить.
+`schema` обязателен у каждого хендлера; второй хендлер на то же имя — `ValidationError`. `captureMode` может только сузить эффективный режим payload-capture, пушнутый runtime (порядок приватности `none < errors < all`), но не расширить.
 
-`sb.rpc.call` бросает `RpcAccessDeniedError` при denial политики (gRPC PERMISSION_DENIED) и эмитит `policy_violation`.
+Бизнес-ошибку хендлер бросает как `new HandlerError(code, message)` — вызывающий получит `HandlerError` с тем же `handlerCode`. Любая другая брошенная ошибка доходит до вызывающего как `HandlerError` с `handlerCode: "INTERNAL"`.
+
+`sb.rpc.call` при отказе политики бросает `AccessDeniedError` и эмитит `policy_violation`.
 
 ### Events (`sb.event`)
 
 ```ts
-sb.event.define(name: string, spec?: SchemaSpec): void
+sb.event.define(name: string, spec: SchemaSpec): void
 
 sb.event.handle(
-  pattern: string,
-  fn: (payload: unknown) => Promise<void> | void,
+  pattern: string,                     // имя или AMQP-шаблон: "order.*", "order.#"
+  fn: (payload: unknown, ctx: EventHandlerContext) => Promise<void> | void,
+  opts?: EventHandlerOpts,             // { schema?: SchemaSpec; filter?: Record<string, unknown> }
 ): void
 
 sb.event.publish<T>(
@@ -193,15 +227,33 @@ sb.event.publish<T>(
 ): Promise<{ eventId: string }>
 ```
 
-`define` объявляет публикуемое событие; `spec` — тот же `SchemaSpec`, что у RPC-хендлеров (`.proto` или `.schema.json`). Без `spec` событие публикуется как непроверяемый JSON. Имя события — точки-разделённые сегменты из `[a-z0-9_-]`; нарушение бросает `InvalidEventNameError`. Если outbox переполнен — `OutboxFullError`.
+`define` объявляет публикуемое событие; `spec` — тот же `SchemaSpec`, что у RPC-хендлеров (`.proto` или `.schema.json`). Публикация события без `define` — `StateError`. Имя события — точки-разделённые сегменты из `[a-z0-9_-]`; нарушение — `InvalidEventNameError`.
+
+`handle` — подписка, одна на шаблон в процессе (дубль — `ValidationError`). Подписчик не вызывает `define`: payload декодирует `opts.schema`, без неё хендлер получает сырые байты (`Uint8Array`). `opts.filter` — объект `{"$.path": literal}`, все условия — равенства; вычисляет runtime.
+
+```ts
+interface EventHandlerContext {
+  eventId: string;
+  eventName: string;            // конкретное имя, под которым событие опубликовано
+  attempt: number;
+  deliveryId: string;
+  leaseToken: string;
+  partitionKey: string;
+  headers: Record<string, string>;
+  occurredAtMs: number;
+  signal: AbortSignal;          // обрыв стрима доставки или остановка бриджа
+}
+```
+
+`publish` резолвится, когда runtime сохранил событие. Пока runtime недоступен, событие ждёт в очереди в памяти (`maxPendingPublishes`, по умолчанию 10000; переполнение — `QUEUE_FULL`) не дольше `publishTimeoutMs` (по умолчанию 30 с; истёк — `TimeoutError`).
 
 ```ts
 interface PublishOpts {
-  idempotencyKey?: string;
-  partitionKey?: string;
-  fireAndForget?: boolean;
+  idempotencyKey?: string;      // дедуп на runtime; повтор с тем же содержимым — успех с id исходного события
+  partitionKey?: string;        // FIFO в рамках ключа
+  fireAndForget?: boolean;      // резолв сразу после постановки в очередь; потеря при падении процесса
   headers?: Record<string, string>;
-  occurredAtMs?: number;        // unix-ms
+  occurredAtMs?: number;        // unix-ms, по умолчанию Date.now()
 }
 ```
 
@@ -238,6 +290,7 @@ Caller-side операции (`start`/`signal`/…) требуют заверш�
 sb.job.handle(name: string, opts: JobOpts, fn: (ctx: JobHandlerCtx) => Promise<void>): void
 
 interface JobOpts {
+  version: string;                                     // обязательна: версия исполняемого поведения
   trigger: Trigger;                                    // ровно один из cron|delayed|interval
   catchup?: "skip" | "fire_once" | "fire_all";
   overlap?:  "skip" | "allow" | "buffer_one";
@@ -271,11 +324,12 @@ interface JobHandlerCtx {
 ```ts
 sb.on("connected",       (e: ConnectedEvent)       => void): this
 sb.on("reconnecting",    (e: ReconnectingEvent)    => void): this
+sb.on("draining",        (e: DrainingEvent)        => void): this
 sb.on("disconnected",    (e: DisconnectedEvent)    => void): this
 sb.on("policy_violation",(e: PolicyViolationEvent) => void): this
 ```
 
-`on` возвращает сам `sb` (чейнится). Метода `off` нет — слушатели живут до конца жизни объекта.
+`on` возвращает сам `sb` (чейнится). Метода `off` нет — слушатели живут до конца жизни объекта. Исключение в слушателе логируется и не влияет ни на бридж, ни на других слушателей.
 
 ## Types
 
@@ -283,15 +337,29 @@ sb.on("policy_violation",(e: PolicyViolationEvent) => void): this
 
 ```ts
 interface ServiceBridgeOptions {
-  reconnectIntervalMs?: number;        // default 3000
-  reconnectAttempts?: number;          // default 3 (0 = unlimited)
+  reconnectIntervalMs?: number;        // плоская задержка; без неё — лестница 1s,5s,15s,30s,60s ±20%
+  reconnectAttempts?: number;          // default 0 = без лимита; считаются подряд идущие неудачи
   advertise?: AdvertiseConfig | false; // default: undefined → "127.0.0.1" на свободном порту (+warning)
-  callDefaults?: CallOpts;             // дефолты для каждого sb.rpc.call / sb.stream
-  failOnPolicyViolation?: boolean;     // default false — иначе warning при нарушении политики делает start() → disconnected
-  dataDir?: string;                    // default "./.servicebridge" — каталог SQLite-outbox
-  maxOutboxRows?: number;              // default 100000 — потолок event-outbox до back-pressure
-  eventsDrainerBatch?: number;         // default 50 — строк за тик дренера событий
-  eventsMaxInFlight?: number;          // default 32 — параллельных inbound-событий
+  callDefaults?: CallOpts;             // дефолты для sb.rpc.call, sb.stream и typed-клиентов
+  failOnPolicyViolation?: boolean;     // default false; true — warning политики останавливает бридж
+  publishTimeoutMs?: number;           // default 30000 — сколько publish ждёт ACK runtime
+  maxPendingPublishes?: number;        // default 10000 — очередь publish до QUEUE_FULL
+  eventsMaxInFlight?: number;          // default 32 — параллельных inbound-доставок
+  rpcMaxConcurrentCalls?: number;      // default 256 — одновременных inbound-хендлеров
+  rpcMaxQueuedCalls?: number;          // default = rpcMaxConcurrentCalls — очередь до RESOURCE_EXHAUSTED
+  startTimeoutMs?: number;             // default 30000 — дедлайн start()
+  stopTimeoutMs?: number;              // default 10000 — дедлайн дренажа в stop()
+  logger?: Logger;                     // диагностика SDK; default — warn/error в консоль
+  telemetry?: {
+    onDrop?: (info: { serverDrops: number; ringDrops: number; backpressureLevel: number }) => void;
+  };
+}
+
+interface Logger {
+  debug(message: string, attrs?: Record<string, unknown>): void;
+  info(message: string, attrs?: Record<string, unknown>): void;
+  warn(message: string, attrs?: Record<string, unknown>): void;
+  error(message: string, attrs?: Record<string, unknown>): void;
 }
 
 interface AdvertiseConfig {
@@ -304,15 +372,18 @@ interface AdvertiseConfig {
 
 Telemetry on/off и payload cap задаются в UI рантайма (Settings → Telemetry), а не в конструкторе. Настройки `telemetry.enable` и `telemetry.payload_max_bytes` пушатся в SDK через поля `CaptureModes.telemetry_enabled` / `CaptureModes.payload_max_bytes` в registry snapshot. Fail-safe до первого снапшота: transport включён, cap = 65536 байт.
 
+Режим захвата payload по каналам тоже пушит runtime (по умолчанию `errors`; до первого снапшота — `none`). SDK передаёт payload как есть, маскирование секретов делает runtime при приёме.
+
 ### CallOpts
 
 ```ts
 interface CallOpts {
-  timeout?: string;                          // "500ms" | "10s" | "2m" — default "30s"
-  requestId?: string;                        // авто UUID v4 если не задан
-  idempotencyKey?: string;                   // НЕ авто — задайте, чтобы включить runtime-side dedup (ADR 0001)
+  signal?: AbortSignal;                      // отмена: ServiceBridgeError с кодом CANCELLED
+  timeout?: string;                          // "500ms" | "10s" | "2m" — default "30s", на весь логический вызов
+  requestId?: string;                        // авто UUID, если не задан
+  idempotencyKey?: string;                   // уходит callee (ctx.idempotencyKey) и в дедуп runtime proxy
   transport?: "direct" | "proxy" | "auto";   // default "auto"
-  retry?: Partial<RetryOpts>;
+  retry?: Partial<RetryOpts>;                // только для pre-dispatch отказов
 }
 
 interface RetryOpts {
@@ -324,7 +395,9 @@ interface RetryOpts {
 }
 ```
 
-`transport`: `direct` — caller → callee по mTLS (ошибка, если у callee нет call_endpoint); `proxy` — через runtime Invoke; `auto` — direct если endpoint известен, иначе proxy. `idempotencyKey` опциональный: без него INTERNAL/ABORTED/UNKNOWN-ошибки считаются non-retryable.
+`transport`: `direct` — caller → callee по mTLS, никогда не через runtime; `proxy` — всегда через runtime `Invoke`; `auto` — direct к выбранному инстансу, а после отказа, доказанно случившегося до отправки, следующая попытка идёт через proxy.
+
+SDK повторяет вызов только при отказе, который доказанно произошёл до запуска хендлера: нет кандидата, канал к callee не стал готов в пределах дедлайна, или статус с трейлером `x-sb-not-dispatched`. `idempotencyKey` не делает отправленный вызов повторяемым. Подробнее — [RPC §6](./rpc.md#6-resilience-lb-cb-retry).
 
 ### Identity
 
@@ -363,6 +436,7 @@ interface ConnectedEvent {
   sessionId: string;
   serviceId: string;
   serviceName: string;
+  runtimeVersion: string;
 }
 
 interface ReconnectingEvent {
@@ -371,9 +445,13 @@ interface ReconnectingEvent {
   reason: string;
 }
 
+interface DrainingEvent {
+  reason: string;        // runtime объявил остановку; reconnect последует сам
+}
+
 interface DisconnectedEvent {
-  reason: string;        // "exhausted" | "drain: ..." | "policy ..." | текст ошибки
-  error?: ConnectionError;
+  reason: string;        // текст ошибки, из-за которой бридж остановился окончательно
+  error?: ServiceBridgeError;
 }
 
 interface PolicyViolationEvent {
@@ -437,34 +515,56 @@ import { attachHono } from "service-bridge/hono";
 
 ### Testing
 
-In-memory двойник `sb.rpc` + `sb.event` для юнит-тестов, без сети и без живого рантайма. Полный гайд — [Тестирование](./testing.md).
+`createTestHarness()` — настоящий `ServiceBridge`, запущенный на in-memory runtime: хендлеры регистрируются обычным API, вызовы проходят через продакшен-код (схемы, маппинг ошибок, Publisher, Subscriber). Полный гайд — [Тестирование](./testing.md).
 
 ```ts
 import {
   createTestHarness,
+  matchPattern,
+  TEST_IDENTITY,
   type TestHarness,
-  TestRpcDomain,
-  type RpcCallRecord,
-  type RpcMockResponder,
-  TestEventDomain,
-  type PublishedEventRecord,
-  type EventDeliveryResult,
+  type InvokeOpts,
+  type Responder,
+  type CallRecord,
+  type PublishedRecord,
+  type DeliverOpts,
+  type DeliveryResult,
 } from "service-bridge/testing";
 ```
 
-## ServiceBridgeError / ConnectionError
+## Ошибки
+
+Каждая ошибка SDK — `ServiceBridgeError`:
 
 ```ts
-class ServiceBridgeError extends Error {}   // база всех ошибок SDK
-
-class ConnectionError extends ServiceBridgeError {
-  readonly code: number;   // gRPC status code; -1 если код не распознан
-  // name всегда "ConnectionError"; message = "<scope>: <cause>"
+class ServiceBridgeError extends Error {
+  readonly code: ErrorCode;
+  readonly retryable: boolean;   // code ∈ { CONNECTION, NO_LIVE_INSTANCE, OVERLOADED, QUEUE_FULL }
+  // cause — исходная ошибка, если была
 }
+
+type ErrorCode =
+  | "CONFIG" | "STATE" | "CONNECTION" | "TIMEOUT" | "CANCELLED" | "ACCESS_DENIED"
+  | "NOT_FOUND" | "VALIDATION" | "CONFLICT" | "TERMINAL" | "NO_LIVE_INSTANCE"
+  | "OVERLOADED" | "QUEUE_FULL" | "INVALID_EVENT_NAME" | "HANDLER" | "INTERNAL";
 ```
 
-`ServiceBridgeError` — общий предок: `catch (e) { if (e instanceof ServiceBridgeError) … }` ловит любую ошибку SDK, включая те, что появятся в следующих релизах. `ConnectionError` — конкретный сбой подключения или провижининга, единственный, кто несёт числовой `.code`.
+| Класс | `code` | Когда |
+|---|---|---|
+| `ConfigurationError` | `CONFIG` | Неверная опция, ключ, URL, таймаут; нет схемы вызывающего. |
+| `StateError` | `STATE` | Операция не в той фазе: вызов до `start()`, повторный `start()`, publish незадекларированного события. |
+| `ValidationError` | `VALIDATION` | Невалидная декларация или payload, пойманные локально; отказ runtime `INVALID_ARGUMENT`/`FAILED_PRECONDITION`/`OUT_OF_RANGE`. |
+| `AccessDeniedError` | `ACCESS_DENIED` | Отказ политики доступа или отозванный пир. |
+| `TimeoutError` | `TIMEOUT` | Дедлайн истёк; исход на стороне callee неизвестен. |
+| `NoLiveInstanceError` | `NO_LIVE_INSTANCE` | Некуда отправить вызов: нет инстанса с совпадающим контрактом, нет endpoint, все в circuit-open. |
+| `HandlerError` | `HANDLER` | Ответ хендлера callee; `handlerCode` — бизнес-код или `"INTERNAL"`; `remote: true` у полученной вызовом. |
+| `ConnectionError` | `CONNECTION` | Сбой control plane (provision, сессия, реестр, сертификат); `grpcCode` — статус runtime или `-1`. |
+| `InvalidEventNameError` | `INVALID_EVENT_NAME` | Имя события не проходит `^[a-z0-9_-]+(\.[a-z0-9_-]+)*$`. |
+| `WorkflowAccessDeniedError` / `WorkflowNotFoundError` / `WorkflowTerminalError` | `ACCESS_DENIED` / `NOT_FOUND` / `TERMINAL` | См. [Workflows](./workflows.md). |
+| `WorkflowValidationError` / `JsonPathError` | `VALIDATION` | Невалидный граф workflow / выражение `$.`. |
 
-Не-retryable коды: `UNAUTHENTICATED`, `PERMISSION_DENIED`, `NOT_FOUND`, `INVALID_ARGUMENT` — всё остальное (включая `-1`) считается транзиентным и ведёт к reconnect. Подробности про codes и retry: [RPC §9 Ошибки](./rpc.md#9-ошибки), [RPC §6 Retry](./rpc.md#6-resilience-lb-cb-retry).
+Коды без отдельного класса (`CANCELLED`, `NOT_FOUND`, `CONFLICT`, `OVERLOADED`, `QUEUE_FULL`, `INTERNAL`) приходят как `ServiceBridgeError` — различайте по `err.code`. `TIMEOUT` не входит в retryable: исход неизвестен, повтор безопасен только с ключом идемпотентности.
+
+Как gRPC-статусы отображаются в коды и что делать с каждым — [RPC §9](./rpc.md#9-ошибки).
 
 → Дальше: [References](./references.md)

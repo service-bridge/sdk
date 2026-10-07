@@ -8,10 +8,11 @@ Cron, delayed, and interval jobs driven by the runtime. The runtime fires the jo
 sb.job.handle(name: string, opts: JobOpts, fn: (ctx: JobHandlerCtx) => Promise<void>): void
 ```
 
-Register before `await sb.start()`. Names must be unique per service (duplicate throws).
+Register before `await sb.start()`. Registering the same name with the same options twice throws `ValidationError`; the same name with a different `version` registers another version.
 
 ```ts
 interface JobOpts {
+  version: string;             // required — names the handler's immutable behaviour; change it whenever the handler changes
   trigger: Trigger;            // required — exactly one shape below
   catchup?: CatchupPolicy;     // "skip" (default) | "fire_once" | "fire_all"
   overlap?: OverlapPolicy;     // "skip" (default) | "allow" | "buffer_one"
@@ -46,6 +47,10 @@ interface JobHandlerCtx {
 
 **Idempotency:** a tick may be delivered more than once (retry, failover). Dedup on `ctx.idempotencyKey` (e.g. a DB unique constraint or `SET NX`), never on `ctx.attempt`. Respect `ctx.signal` for long jobs.
 
+**Versions:** executions already assigned under a version are dispatched only to instances that registered exactly that version and schedule options. Keep the old version registered under the same name until its executions finish; an instance without the version fails them as non-retryable `unsupported_version`.
+
+**Failures:** a throw is retried per the job's retry policy unless the error has `retryable === false`. Every SDK error carries `retryable`, so rethrowing e.g. a `HandlerError` or `TimeoutError` from a nested call ends the execution without retry — wrap it in a plain `Error` if it should be retried.
+
 ## Policies
 
 - `catchup` — after the runtime was down across scheduled ticks: `skip` (ignore them), `fire_once` (one catch-up run), `fire_all` (replay all missed, capped by runtime budget).
@@ -61,6 +66,7 @@ sb.service("billing", { rpc: ["Reconcile"] }); // declare the downstream call
 sb.job.handle(
   "nightly-reconcile",
   {
+    version: "1",
     trigger: { cron: "0 2 * * *", tz: "Europe/Moscow" },  // 02:00 Moscow daily
     catchup: "fire_once",
     overlap: "skip",
@@ -81,7 +87,7 @@ await sb.start();
 ```ts
 sb.job.handle(
   "send-reminder",
-  { trigger: { delayed: { at: Date.now() + 60_000 } }, maxAttempts: 2 },
+  { version: "1", trigger: { delayed: { at: Date.now() + 60_000 } }, maxAttempts: 2 },
   async (ctx) => { await sendReminder(ctx.idempotencyKey); },
 );
 await sb.start();

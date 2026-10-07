@@ -29,7 +29,9 @@ func ok(http.ResponseWriter, *http.Request) {}
 func TestRequestEmitsExactlyOneHandleOperation(t *testing.T) {
 	integ, rt := newIntegration(t, telemetry.ModeNone)
 
-	serve(integ, httptest.NewRequest(http.MethodGet, "/users/42", nil), ok)
+	mux := sbhttp.NewMux()
+	mux.HandleFunc("GET /users/{id}", ok)
+	integ.Middleware(mux).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/users/42?x=1", nil))
 
 	start, end := startEnd(t, rt)
 	if start.GetChannel() != pb.Channel_HTTP {
@@ -41,14 +43,69 @@ func TestRequestEmitsExactlyOneHandleOperation(t *testing.T) {
 	if start.GetStatus() != pb.Status_PENDING {
 		t.Errorf("START status: got %v, want PENDING", start.GetStatus())
 	}
-	// The runtime turns the first slash back into a space to match the declared
-	// route name, so the path keeps its own leading slash.
-	if want := "http.handle:GET//users/42"; start.GetSubject() != want {
+	// The subject names the route template, never the raw path: the runtime
+	// turns the first slash back into a space to match the declared route.
+	if want := "http.handle:GET//users/{id}"; start.GetSubject() != want {
 		t.Errorf("subject: got %q, want %q", start.GetSubject(), want)
+	}
+	if want := `{"method":"GET","route":"/users/{id}"}`; string(start.GetMetaJson()) != want {
+		t.Errorf("START meta: got %s, want %s", start.GetMetaJson(), want)
+	}
+	if want := "GET /users/{id}"; start.GetBusinessKey() != want {
+		t.Errorf("business key: got %q, want %q (no path, no query)", start.GetBusinessKey(), want)
 	}
 	if end.GetStatus() != pb.Status_SUCCESS {
 		t.Errorf("END status: got %v, want SUCCESS", end.GetStatus())
 	}
+	if want := `{"status":200}`; string(end.GetMetaJson()) != want {
+		t.Errorf("END meta: got %s, want %s", end.GetMetaJson(), want)
+	}
+}
+
+func TestRouteTemplateIsFoundForEveryRouter(t *testing.T) {
+	t.Run("plain ServeMux", func(t *testing.T) {
+		integ, rt := newIntegration(t, telemetry.ModeNone)
+		mux := http.NewServeMux()
+		mux.HandleFunc("POST /orders/{id}/items", ok)
+		integ.Middleware(mux).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/orders/9/items", nil))
+		start, _ := startEnd(t, rt)
+		if want := "http.handle:POST//orders/{id}/items"; start.GetSubject() != want {
+			t.Errorf("subject %q, want %q", start.GetSubject(), want)
+		}
+	})
+	t.Run("middleware inside the mux reads r.Pattern", func(t *testing.T) {
+		integ, rt := newIntegration(t, telemetry.ModeNone)
+		mux := http.NewServeMux()
+		mux.Handle("GET /items/{sku}", integ.Middleware(http.HandlerFunc(ok)))
+		mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/items/a1", nil))
+		start, _ := startEnd(t, rt)
+		if want := "http.handle:GET//items/{sku}"; start.GetSubject() != want {
+			t.Errorf("subject %q, want %q", start.GetSubject(), want)
+		}
+	})
+	t.Run("no route matched", func(t *testing.T) {
+		integ, rt := newIntegration(t, telemetry.ModeNone)
+		mux := sbhttp.NewMux()
+		mux.HandleFunc("GET /users/{id}", ok)
+		w := httptest.NewRecorder()
+		integ.Middleware(mux).ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/nope", nil))
+		start, end := startEnd(t, rt)
+		if want := "http.handle:GET/*"; start.GetSubject() != want {
+			t.Errorf("subject %q, want %q", start.GetSubject(), want)
+		}
+		if want := `{"status":404}`; string(end.GetMetaJson()) != want {
+			t.Errorf("END meta %s, want %s", end.GetMetaJson(), want)
+		}
+	})
+	t.Run("resolver", func(t *testing.T) {
+		integ, rt := newIntegrationWithLimit(t, telemetry.ModeNone, int32(telemetry.DefaultPayloadMaxBytes),
+			sbhttp.WithRouteResolver(func(*http.Request) string { return "/custom/{x}" }))
+		serve(integ, httptest.NewRequest(http.MethodGet, "/custom/1", nil), ok)
+		start, _ := startEnd(t, rt)
+		if want := "http.handle:GET//custom/{x}"; start.GetSubject() != want {
+			t.Errorf("subject %q, want %q", start.GetSubject(), want)
+		}
+	})
 }
 
 func TestStatusCodeMapsOntoOperationStatus(t *testing.T) {
@@ -130,19 +187,37 @@ func TestBusinessKeyPrefersIdempotencyHeader(t *testing.T) {
 	}
 }
 
-func TestBusinessKeyFallsBackToMethodAndPath(t *testing.T) {
+func TestBusinessKeyFallsBackToMethodAndRoute(t *testing.T) {
 	integ, rt := newIntegration(t, telemetry.ModeNone)
 
-	serve(integ, httptest.NewRequest(http.MethodPost, "/orders", nil), ok)
+	mux := sbhttp.NewMux()
+	mux.HandleFunc("POST /orders/{id}", ok)
+	integ.Middleware(mux).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/orders/7?debug=1", nil))
 
 	start, _ := startEnd(t, rt)
-	if want := "POST /orders"; start.GetBusinessKey() != want {
+	if want := "POST /orders/{id}"; start.GetBusinessKey() != want {
 		t.Errorf("business key: got %q, want %q", start.GetBusinessKey(), want)
 	}
 }
 
-func TestIncomingTraceHeaderIsAdopted(t *testing.T) {
+// A public edge must not let clients graft requests into arbitrary traces:
+// without WithTrustTraceHeader the header is ignored.
+func TestIncomingTraceHeaderIsIgnoredByDefault(t *testing.T) {
 	integ, rt := newIntegration(t, telemetry.ModeNone)
+
+	incoming := telemetry.TraceContext{TraceID: uuid.New(), ParentOpID: uuid.New()}
+	r := httptest.NewRequest(http.MethodGet, "/x", nil)
+	r.Header.Set(telemetry.HeaderName, telemetry.FormatHeader(incoming))
+	serve(integ, r, ok)
+
+	start, _ := startEnd(t, rt)
+	if start.GetTraceId() == incoming.TraceID.String() || start.GetParentOpId() != "" {
+		t.Errorf("an untrusted header was adopted: trace %q parent %q", start.GetTraceId(), start.GetParentOpId())
+	}
+}
+
+func TestIncomingTraceHeaderIsAdoptedWhenTrusted(t *testing.T) {
+	integ, rt := newIntegrationWithLimit(t, telemetry.ModeNone, int32(telemetry.DefaultPayloadMaxBytes), sbhttp.WithTrustTraceHeader())
 
 	incoming := telemetry.TraceContext{TraceID: uuid.New(), ParentOpID: uuid.New()}
 	r := httptest.NewRequest(http.MethodGet, "/x", nil)
@@ -159,7 +234,7 @@ func TestIncomingTraceHeaderIsAdopted(t *testing.T) {
 }
 
 func TestMalformedTraceHeaderStartsNewRoot(t *testing.T) {
-	integ, rt := newIntegration(t, telemetry.ModeNone)
+	integ, rt := newIntegrationWithLimit(t, telemetry.ModeNone, int32(telemetry.DefaultPayloadMaxBytes), sbhttp.WithTrustTraceHeader())
 
 	r := httptest.NewRequest(http.MethodGet, "/x", nil)
 	r.Header.Set(telemetry.HeaderName, "not-a-trace")

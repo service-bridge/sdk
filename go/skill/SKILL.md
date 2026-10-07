@@ -17,19 +17,20 @@ Module path is **`github.com/service-bridge/sdk/go`**; the package it declares i
 sb.Handle(c, name, fn)                sb.Call[Req, Resp](ctx, c, service, method, req)
 sb.HandleStream(c, name, fn)          sb.Stream[Req, Chunk](ctx, c, service, method, req)
 sb.DefineEvent[T](c, name)            sb.PublishEvent[T](ctx, c, name, payload)
-sb.SubscribeEvent[T](c, name, fn)     sb.NewMethod[Req, Resp](serviceClient, method)
-sb.SubscribeEventRaw(c, name, fn)     sb.NewClient(c, service)
+sb.SubscribeEvent[T](c, pattern, fn)  sb.NewMethod[Req, Resp](serviceClient, method)
+sb.SubscribeEventRaw(c, pattern, fn)  sb.NewClient(c, service)
+sb.CallInfoFromContext(ctx)           sb.DeliveryFromContext(ctx)
 ```
 
-Everything that needs no type parameter stayed a method: `c.Job.Handle`, `c.Workflow.Start`, `c.Telemetry.StartOp`, `c.Identity()`, `c.ServiceMap()`, `c.Start(ctx)`, `c.Stop(ctx)`.
+Everything that needs no type parameter stayed a method: `c.Job.Handle`, `c.Workflow.Start`, `c.Telemetry.StartOp`, `c.Identity()`, `c.ServiceMap()`, `c.Start(ctx)`, `c.Ready(ctx)`, `c.Stop(ctx)`.
 
 **2. Declare before `Start`, act after `Start`.**
 
 1. `sb.New(url, key, opts...)` — no I/O; every bad bound fails here with `CodeConfig`.
 2. Declare: `sb.Handle`, `sb.HandleStream`, `sb.NewMethod`, `sb.DefineEvent`, `sb.SubscribeEvent`, `c.Job.Handle`, `c.Workflow.Handle`, `c.Service`, HTTP route publication.
-3. `c.Start(ctx)` — seals declarations, provisions mTLS, registers, waits for the first registry snapshot.
+3. `c.Start(ctx)` — seals declarations, provisions mTLS, registers, waits for the runtime's `Welcome` and the first registry snapshot (30 s at most).
 4. Act: `.Call`, `.Publish`, `c.Workflow.Start`.
-5. `c.Stop(ctx)` — idempotent teardown.
+5. `c.Stop(ctx)` — drain, wait for in-flight work, flush the publish queue, flush telemetry, close. Idempotent.
 
 Declaring after `Start` returns `CodeState`. Publishing before `Start` returns `CodeState`.
 
@@ -41,8 +42,10 @@ Declaring after `Start` returns `CodeState`. Publishing before `Start` returns `
 - **Schemas come from generated protobuf types.** There is no `.proto` file to point the SDK at and no "register the schema" step. `sb.Handle` and `sb.NewMethod` derive the schema and the contract hash from their type parameters.
 - **A service that serves RPC needs an address:** `sb.WithAdvertise(host, port)`. The default is `127.0.0.1` and it is advertised as-is, so a container without it is unreachable. A pure caller uses `sb.WithCallerOnly()`.
 - **Event and job handlers must be idempotent.** Delivery is at-least-once. For jobs, dedup on `exec.IdempotencyKey`, **never** on `exec.Attempt`.
-- **A state-changing call needs `sb.WithIdempotencyKey(k)` to survive a timeout.** Without it, `DeadlineExceeded` is not retried — deliberately.
-- **The default transport is `sb.TransportDirect`.** There is no `auto` transport in Go.
+- **The SDK retries a call only when it can prove the handler never ran** (no candidate, channel not ready before the request was written, or a refusal carrying the not-dispatched proof). A timeout is `CodeTimeout` with an unknown outcome and is never retried; `sb.WithIdempotencyKey(k)` hands the callee a dedup key (it reads it from `sb.CallInfoFromContext`) but does not widen what the SDK retries.
+- **The default transport is `sb.TransportAuto`**: direct to the picked instance, falling back to the runtime proxy for the next attempt when the direct path failed before the request was sent. `sb.TransportDirect` never proxies; `sb.TransportProxy` always does.
+- **A handler answers a business failure with `&sb.HandlerError{Code, Message}`.** The caller gets `CodeHandler` and reaches the same `*sb.HandlerError` with `errors.As`. Any other error, and a panic, reaches the caller with code `INTERNAL`.
+- **`PublishEvent` returns once the runtime stored the event.** Unacknowledged events wait in a bounded in-memory queue (`CodeQueueFull`, `sb.WithMaxPendingPublishes`) for at most `sb.WithPublishTimeout` (`CodeTimeout`). Nothing is written to disk.
 - **Teardown is `c.Stop(ctx)`.** There is no `Close()`.
 - **Every SDK error is `*sb.Error`.** Match with `errors.Is(err, sb.ErrX)` or `errors.As(err, &sbErr)` and switch on `sbErr.Code`.
 
@@ -52,7 +55,7 @@ Declaring after `Start` returns `CodeState`. Publishing before `Start` returns `
 go get github.com/service-bridge/sdk/go
 ```
 
-Requires Go 1.24+, and a running runtime (gRPC control plane on `:14445`, dashboard on `:14444`):
+Requires Go 1.26.6+, and a running runtime (gRPC control plane on `:14445`, dashboard on `:14444`):
 
 ```sh
 bash <(curl -fsSL https://servicebridge.dev/install.sh)
@@ -72,7 +75,7 @@ bash <(curl -fsSL https://servicebridge.dev/install.sh)
 | Unit-test a handler with no runtime | `sbtest` | [reference/testing.md](reference/testing.md) |
 | Constructor options, defaults, errors, telemetry | `sb.New` options | [reference/configuration.md](reference/configuration.md) |
 
-Read the matching reference file before writing code for a domain — each has exact signatures, real defaults and a complete compilable program.
+Read the matching reference file before writing code for a domain — each has exact signatures, real defaults and a complete example program.
 
 ## The canonical smoke test: two services, one call
 
@@ -199,19 +202,28 @@ func Call(ctx context.Context, m *sb.Method[*paymentpb.ChargeRequest, *paymentpb
 
 	switch {
 	case errors.Is(err, sb.ErrNoLiveInstance):
-		// nothing serves this contract: wrong message shape, no advertise, or all shedding
+		// nothing serves this contract: wrong message shape, no advertise, or every breaker open
 	case errors.Is(err, sb.ErrAccessDenied):
 		// the access policy refused
 	case errors.Is(err, sb.ErrHandler):
 		// the callee answered with a failure — not a transport fault, do not retry
+		var he *sb.HandlerError
+		if errors.As(err, &he) && he.Code == "OUT_OF_STOCK" {
+			// the callee's own business code
+		}
+	case errors.Is(err, sb.ErrTimeout):
+		// outcome unknown: repeat only if the callee dedups on an idempotency key
 	case errors.Is(err, sb.ErrState):
 		// wrong lifecycle phase: declared after Start, or the client is stopped
+	}
+	if sbErr != nil && sbErr.Retryable() {
+		// transient and nothing was done: safe to try again later
 	}
 	return err
 }
 ```
 
-Codes: `CodeConfig`, `CodeState`, `CodeConnection`, `CodeAccessDenied`, `CodeNotFound`, `CodeValidation`, `CodeTerminal`, `CodeOutboxFull`, `CodeNoLiveInstance`, `CodeInvalidEventName`, `CodeHandler`, `CodeInternal`. Each has a sentinel: `sb.ErrConfig`, `sb.ErrState`, and so on.
+Codes: `CodeConfig`, `CodeState`, `CodeConnection`, `CodeTimeout`, `CodeCancelled`, `CodeAccessDenied`, `CodeNotFound`, `CodeValidation`, `CodeConflict`, `CodeTerminal`, `CodeNoLiveInstance`, `CodeOverloaded`, `CodeQueueFull`, `CodeInvalidEventName`, `CodeHandler`, `CodeInternal`. Each has a sentinel: `sb.ErrConfig`, `sb.ErrState`, and so on. `(*sb.Error).Retryable()` is true exactly for `CONNECTION`, `NO_LIVE_INSTANCE`, `OVERLOADED` and `QUEUE_FULL`; `TIMEOUT` is not retryable.
 
 ## Units of time
 

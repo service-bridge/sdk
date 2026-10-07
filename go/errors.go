@@ -1,60 +1,65 @@
 package servicebridge
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/service-bridge/sdk/go/internal/connection"
 	"github.com/service-bridge/sdk/go/internal/events"
-	"github.com/service-bridge/sdk/go/internal/outbox"
+	jobi "github.com/service-bridge/sdk/go/internal/job"
 	"github.com/service-bridge/sdk/go/internal/registry"
 	"github.com/service-bridge/sdk/go/internal/rpc"
 	"github.com/service-bridge/sdk/go/internal/serde"
 	wfi "github.com/service-bridge/sdk/go/internal/workflow"
 )
 
-// Code classifies a failure. It is the single axis callers switch on.
+// Code classifies a failure. It is the single axis callers switch on, and the
+// same strings name the same conditions in every ServiceBridge SDK.
 type Code string
 
 const (
 	// CodeConfig marks a configuration the SDK refuses to run with. It never
-	// reaches the reconnect ladder: a bad bound is not a network condition and
-	// no amount of retrying fixes it.
+	// reaches the reconnect ladder: a bad bound is not a network condition.
 	CodeConfig Code = "CONFIG"
-	// CodeState marks an operation attempted in the wrong lifecycle phase —
-	// declaring a handler after Start, calling before Start, using a stopped
-	// client.
+	// CodeState marks an operation attempted in the wrong lifecycle phase.
 	CodeState Code = "STATE"
-	// CodeConnection marks a control-plane failure: provisioning, the session,
-	// or a stream that will not open.
+	// CodeConnection marks a failure to reach the runtime or the callee.
 	CodeConnection Code = "CONNECTION"
-	// CodeAccessDenied marks a refusal by the mesh access policy.
+	// CodeTimeout marks a deadline that passed with the outcome unknown.
+	CodeTimeout Code = "TIMEOUT"
+	// CodeCancelled marks an operation its caller cancelled.
+	CodeCancelled Code = "CANCELLED"
+	// CodeAccessDenied marks a refusal by the access policy or of the identity.
 	CodeAccessDenied Code = "ACCESS_DENIED"
 	// CodeNotFound marks a name the mesh has no definition for.
 	CodeNotFound Code = "NOT_FOUND"
-	// CodeValidation marks a declaration or an argument the runtime would
-	// reject, caught locally where it was written.
+	// CodeValidation marks a declaration or an argument that is refused.
 	CodeValidation Code = "VALIDATION"
+	// CodeConflict marks an identity already used with other content.
+	CodeConflict Code = "CONFLICT"
 	// CodeTerminal marks a workflow run that has already finished.
 	CodeTerminal Code = "TERMINAL"
-	// CodeOutboxFull marks a local event buffer at its cap.
-	CodeOutboxFull Code = "OUTBOX_FULL"
-	// CodeNoLiveInstance marks a call with nowhere to go: nothing publishes the
-	// contract, nothing advertises an address, or everything is shedding.
+	// CodeNoLiveInstance marks a call with nowhere to go.
 	CodeNoLiveInstance Code = "NO_LIVE_INSTANCE"
-	// CodeInvalidEventName marks a name the runtime's event grammar rejects.
+	// CodeOverloaded marks a callee or runtime shedding load.
+	CodeOverloaded Code = "OVERLOADED"
+	// CodeQueueFull marks the publish queue at its cap.
+	CodeQueueFull Code = "QUEUE_FULL"
+	// CodeInvalidEventName marks a name the event grammar rejects.
 	CodeInvalidEventName Code = "INVALID_EVENT_NAME"
-	// CodeHandler marks a failure the callee's handler returned. It is an
-	// answer, not a transport condition, and repeating it changes nothing.
+	// CodeHandler marks a failure the callee's handler answered with. The
+	// handler's own code is on the *HandlerError reachable with errors.As.
 	CodeHandler Code = "HANDLER"
 	// CodeInternal marks everything else.
 	CodeInternal Code = "INTERNAL"
 )
 
 // Error is the only error type this SDK returns, so errors.As against it is
-// exhaustive by construction. The taxonomy lives in Code rather than in a
-// family of unrelated types: with seven unrelated classes the only way to catch
-// "an SDK error" is to name all seven, and the eighth one added later is caught
-// by nobody.
+// exhaustive by construction.
 type Error struct {
 	Code Code
 	Op   string
@@ -62,18 +67,28 @@ type Error struct {
 	Err  error
 }
 
+// HandlerError is a business failure. Returned from a handler, its Code
+// travels to the caller as the answer's error code; on the caller side it is
+// what errors.As reaches inside an *Error with CodeHandler. Any other error a
+// handler returns — and a panic — reaches the caller as code "INTERNAL".
+type HandlerError = rpc.HandlerError
+
 // Sentinels for errors.Is. They carry a Code only — matching ignores Op, Msg
 // and the wrapped cause.
 var (
 	ErrConfig           = &Error{Code: CodeConfig}
 	ErrState            = &Error{Code: CodeState}
 	ErrConnection       = &Error{Code: CodeConnection}
+	ErrTimeout          = &Error{Code: CodeTimeout}
+	ErrCancelled        = &Error{Code: CodeCancelled}
 	ErrAccessDenied     = &Error{Code: CodeAccessDenied}
 	ErrNotFound         = &Error{Code: CodeNotFound}
 	ErrValidation       = &Error{Code: CodeValidation}
+	ErrConflict         = &Error{Code: CodeConflict}
 	ErrTerminal         = &Error{Code: CodeTerminal}
-	ErrOutboxFull       = &Error{Code: CodeOutboxFull}
 	ErrNoLiveInstance   = &Error{Code: CodeNoLiveInstance}
+	ErrOverloaded       = &Error{Code: CodeOverloaded}
+	ErrQueueFull        = &Error{Code: CodeQueueFull}
 	ErrInvalidEventName = &Error{Code: CodeInvalidEventName}
 	ErrHandler          = &Error{Code: CodeHandler}
 	ErrInternal         = &Error{Code: CodeInternal}
@@ -106,21 +121,30 @@ func (e *Error) Is(target error) bool {
 	return t.Code == e.Code
 }
 
+// Retryable reports whether repeating the operation may succeed without
+// risking a duplicate effect: the condition is transient and nothing was done.
+// TIMEOUT is not retryable — the outcome is unknown, so a repeat is safe only
+// with an idempotency key, which is the caller's decision.
+func (e *Error) Retryable() bool {
+	switch e.Code {
+	case CodeConnection, CodeNoLiveInstance, CodeOverloaded, CodeQueueFull:
+		return true
+	default:
+		return false
+	}
+}
+
 func newError(code Code, op, msg string, cause error) *Error {
 	return &Error{Code: code, Op: op, Msg: msg, Err: cause}
 }
 
-// configError is the one failure New reports, and it is deliberately its own
-// code: the Node SDK classified a bad bound by gRPC status, got "unknown" and
-// reconnected forever with a message about provisioning.
 func configError(op, msg string) *Error {
 	return newError(CodeConfig, op, msg, nil)
 }
 
 // wrap classifies an error raised inside the SDK and presents it as the one
-// public type. Classification is by sentinel rather than by message, so a
-// reworded error in an internal package cannot silently change what callers
-// see.
+// public type. Classification is by sentinel and by gRPC status, never by
+// message text.
 func wrap(op string, err error) error {
 	if err == nil {
 		return nil
@@ -133,72 +157,142 @@ func wrap(op string, err error) error {
 }
 
 func classify(err error) Code {
-	switch {
-	case errors.Is(err, rpc.ErrNoCandidates),
-		errors.Is(err, rpc.ErrNoEndpoint),
-		errors.Is(err, rpc.ErrAllUnavailable):
-		return CodeNoLiveInstance
-
-	case errors.Is(err, rpc.ErrAcceptanceDenied),
-		errors.Is(err, wfi.ErrAccessDenied):
-		return CodeAccessDenied
-
-	case errors.Is(err, wfi.ErrWorkflowNotFound):
-		return CodeNotFound
-
-	case errors.Is(err, wfi.ErrRunTerminal):
-		return CodeTerminal
-
-	case errors.Is(err, outbox.ErrFull), errors.Is(err, events.ErrOutboxFull):
-		return CodeOutboxFull
-
-	case errors.Is(err, events.ErrInvalidName):
-		return CodeInvalidEventName
-
-	case errors.Is(err, rpc.ErrServerConfig),
-		errors.Is(err, rpc.ErrInvalidConfig),
-		errors.Is(err, events.ErrInvalidConfig),
-		errors.Is(err, wfi.ErrInvalidConfig),
-		errors.Is(err, outbox.ErrInvalidConfig),
-		errors.Is(err, serde.ErrNotProto):
-		return CodeConfig
-
-	case errors.Is(err, rpc.ErrDecode),
-		errors.Is(err, rpc.ErrEmptyMethod),
-		errors.Is(err, rpc.ErrNoFunc),
-		errors.Is(err, rpc.ErrDuplicate),
-		errors.Is(err, serde.ErrTreeShape),
-		errors.Is(err, registry.ErrSchemaConflict),
-		isValidation(err):
-		return CodeValidation
-
-	case errors.Is(err, rpc.ErrSealed),
-		errors.Is(err, outbox.ErrClosed),
-		errors.Is(err, rpc.ErrServerClosed),
-		errors.Is(err, rpc.ErrDirectClosed):
-		return CodeState
-
-	case errors.Is(err, rpc.ErrNoLease),
-		errors.Is(err, wfi.ErrNoIdentity),
-		errors.Is(err, wfi.ErrLeaseLost):
-		return CodeConnection
+	if code, ok := classifySentinel(err); ok {
+		return code
 	}
-
 	var handlerErr *rpc.HandlerError
 	if errors.As(err, &handlerErr) {
 		return CodeHandler
 	}
+	if st, ok := status.FromError(err); ok {
+		return codeOfStatus(st.Code())
+	}
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return CodeTimeout
+	case errors.Is(err, context.Canceled):
+		return CodeCancelled
+	}
 	var validation *wfi.ValidationError
-	if errors.As(err, &validation) {
+	var pathErr *wfi.PathError
+	if errors.As(err, &validation) || errors.As(err, &pathErr) {
 		return CodeValidation
 	}
 	return CodeInternal
 }
 
-// isValidation covers the declaration errors the registry and the job layer
-// raise. They all mean the same thing to a caller: the thing you wrote would be
-// refused by the runtime, and it was caught where you wrote it.
-func isValidation(err error) bool {
-	var pathErr *wfi.PathError
-	return errors.As(err, &pathErr)
+func classifySentinel(err error) (Code, bool) {
+	switch {
+	case errors.Is(err, rpc.ErrNoCandidates),
+		errors.Is(err, rpc.ErrNoEndpoint),
+		errors.Is(err, rpc.ErrAllUnavailable):
+		return CodeNoLiveInstance, true
+
+	case errors.Is(err, rpc.ErrPeerUnreachable),
+		errors.Is(err, rpc.ErrNoLease),
+		errors.Is(err, events.ErrStopped),
+		errors.Is(err, wfi.ErrNoIdentity),
+		errors.Is(err, wfi.ErrLeaseLost):
+		return CodeConnection, true
+
+	case errors.Is(err, events.ErrNotSent),
+		errors.Is(err, events.ErrOutcomeUnknown):
+		return CodeTimeout, true
+
+	case errors.Is(err, rpc.ErrAcceptanceDenied),
+		errors.Is(err, events.ErrForbidden),
+		errors.Is(err, wfi.ErrAccessDenied):
+		return CodeAccessDenied, true
+
+	case errors.Is(err, wfi.ErrWorkflowNotFound):
+		return CodeNotFound, true
+
+	case errors.Is(err, wfi.ErrRunTerminal):
+		return CodeTerminal, true
+
+	case errors.Is(err, events.ErrQueueFull):
+		return CodeQueueFull, true
+
+	case errors.Is(err, events.ErrConflict):
+		return CodeConflict, true
+
+	case errors.Is(err, events.ErrInvalidName):
+		return CodeInvalidEventName, true
+
+	case errors.Is(err, connection.ErrProtocol),
+		errors.Is(err, rpc.ErrServerConfig),
+		errors.Is(err, rpc.ErrInvalidConfig),
+		errors.Is(err, events.ErrInvalidConfig),
+		errors.Is(err, wfi.ErrInvalidConfig),
+		errors.Is(err, serde.ErrNotProto):
+		return CodeConfig, true
+
+	case errors.Is(err, rpc.ErrDecode),
+		errors.Is(err, rpc.ErrEmptyMethod),
+		errors.Is(err, rpc.ErrNoFunc),
+		errors.Is(err, rpc.ErrDuplicate),
+		errors.Is(err, events.ErrDuplicatePattern),
+		errors.Is(err, serde.ErrTreeShape),
+		errors.Is(err, registry.ErrSchemaConflict),
+		isJobDeclaration(err):
+		return CodeValidation, true
+
+	case errors.Is(err, rpc.ErrSealed),
+		errors.Is(err, rpc.ErrServerClosed),
+		errors.Is(err, rpc.ErrDirectClosed):
+		return CodeState, true
+	}
+	return "", false
+}
+
+// isJobDeclaration covers the reasons a job declaration is refused where it is
+// written.
+func isJobDeclaration(err error) bool {
+	for _, s := range []error{
+		jobi.ErrVersion, jobi.ErrNoTrigger, jobi.ErrCronFieldCount, jobi.ErrCronExpr, jobi.ErrCronTZ,
+		jobi.ErrInterval, jobi.ErrRunAt, jobi.ErrCatchupPolicy, jobi.ErrOverlapPolicy, jobi.ErrDepKind,
+		jobi.ErrDepTarget, jobi.ErrRetryInitial, jobi.ErrNegativeLimit, jobi.ErrEmptyName,
+		jobi.ErrNoHandler, jobi.ErrDuplicateName,
+	} {
+		if errors.Is(err, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// codeOfStatus maps a gRPC status the far side answered with onto the error
+// model. The table is the same in every ServiceBridge SDK.
+func codeOfStatus(c codes.Code) Code {
+	switch c {
+	case codes.Canceled:
+		return CodeCancelled
+	case codes.InvalidArgument, codes.FailedPrecondition, codes.OutOfRange:
+		return CodeValidation
+	case codes.DeadlineExceeded:
+		return CodeTimeout
+	case codes.NotFound, codes.Unimplemented:
+		return CodeNotFound
+	case codes.AlreadyExists:
+		return CodeConflict
+	case codes.PermissionDenied, codes.Unauthenticated:
+		return CodeAccessDenied
+	case codes.ResourceExhausted:
+		return CodeOverloaded
+	case codes.Unavailable:
+		return CodeConnection
+	default:
+		// Unknown, Aborted, Internal, DataLoss.
+		return CodeInternal
+	}
+}
+
+// NonRetryable marks a job handler failure the runtime must not retry: the
+// execution goes to the dead-letter queue at once instead of burning every
+// remaining attempt on input that will never work.
+func NonRetryable(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %w", jobi.ErrPermanent, err)
 }

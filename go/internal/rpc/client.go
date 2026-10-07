@@ -12,7 +12,6 @@ import (
 	pb "github.com/service-bridge/sdk/go/internal/pb/servicebridge/v1"
 	"github.com/service-bridge/sdk/go/internal/telemetry"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // The three ways candidate selection fails. They are separate sentinels because
@@ -33,11 +32,9 @@ var (
 	ErrAllUnavailable = errors.New("rpc: every candidate is unhealthy or circuit-open")
 )
 
-// SelectionError explains why no instance could be chosen.
-//
-// It reports itself as Unavailable so the retry ladder treats it as "the call
-// never happened" (ADR-0001 §4): a callee redeploy at the caller's contract
-// version then heals the call without the caller seeing an error.
+// SelectionError explains why no instance could be chosen. It is pre-dispatch
+// proof by construction — nothing was sent — so the ladder retries it, and a
+// callee redeploy at the caller's contract version heals the call in place.
 type SelectionError struct {
 	Service      string
 	Method       string
@@ -54,14 +51,11 @@ func (e *SelectionError) Error() string {
 
 func (e *SelectionError) Unwrap() error { return e.Reason }
 
-// GRPCStatus makes the selection failure classify as Unavailable.
-func (e *SelectionError) GRPCStatus() *status.Status {
-	return status.New(codes.Unavailable, e.Error())
-}
-
-// HandlerError is a business failure the callee returned in error_code /
-// error_message. It carries no gRPC status on purpose: the handler ran and
-// decided, so it is neither retryable nor a circuit-breaker fault.
+// HandlerError is a business failure a handler decided on. Returned from a
+// handler, its Code travels as error_code; on the caller side the error_code
+// of the answer comes back as one. It carries no gRPC status on purpose: the
+// handler ran and decided, so it is neither retryable nor a circuit-breaker
+// fault.
 type HandlerError struct {
 	Code    string
 	Message string
@@ -69,9 +63,9 @@ type HandlerError struct {
 
 func (e *HandlerError) Error() string {
 	if e.Message == "" {
-		return "rpc: handler error " + e.Code
+		return e.Code
 	}
-	return "rpc: handler error " + e.Code + ": " + e.Message
+	return e.Code + ": " + e.Message
 }
 
 func handlerError(code, message string) error {
@@ -85,14 +79,18 @@ var errStreamClosed = errors.New("rpc: stream closed by caller")
 type Transport uint8
 
 const (
-	// TransportDirect dials the callee instance over mTLS. The SDK picks the
-	// instance, so load balancing and the circuit breaker apply.
-	TransportDirect Transport = iota
+	// TransportAuto dials the picked instance directly and falls back to the
+	// proxy for the next attempt when the direct path fails before dispatch.
+	TransportAuto Transport = iota
+	// TransportDirect dials the callee instance over mTLS and never proxies.
+	// The SDK picks the instance, so load balancing and the circuit breaker
+	// apply.
+	TransportDirect
 	// TransportProxy goes through the runtime, which resolves the instance
-	// itself and owns the idempotency claim. Because the SDK does not choose
-	// the instance, it records neither breaker outcomes nor in-flight load
-	// against one — attributing a proxied failure to a locally picked instance
-	// would shed traffic from a pod that never saw the call.
+	// itself. Because the SDK does not choose the instance, it records neither
+	// breaker outcomes nor in-flight load against one — attributing a proxied
+	// failure to a locally picked instance would shed traffic from a pod that
+	// never saw the call.
 	TransportProxy
 )
 
@@ -103,6 +101,9 @@ type CandidateSource interface {
 	// (ADR-0001 §4) — a call must never widen it.
 	Candidates(service, method, contractHash string) []*pb.MethodDescriptor
 	Instance(instanceID string) (*pb.ServiceInstanceInfo, bool)
+	// Revoked reports whether the runtime revoked the service or the instance.
+	// A revoked candidate is never picked.
+	Revoked(serviceID, instanceID string) bool
 }
 
 // ClientConfig wires the outbound call path.
@@ -114,15 +115,10 @@ type ClientConfig struct {
 	Breaker  *Breaker
 	Recorder *telemetry.Recorder
 	Retry    RetryPolicy
-	// Transport is the dispatch path. Direct by default.
-	Transport Transport
 	// HealthHintTTLMs bounds trust in the runtime's unhealthy hint.
 	HealthHintTTLMs int64
-	// CallerService is this service's name, echoed to the callee on the direct
-	// path so it can attribute the call without a registry lookup.
-	CallerService string
-	Now           func() int64
-	Logger        *slog.Logger
+	Now             func() int64
+	Logger          *slog.Logger
 }
 
 // Client is the outbound RPC path: candidate selection, balancing, breaking,
@@ -135,15 +131,13 @@ type Client struct {
 	breaker   *Breaker
 	recorder  *telemetry.Recorder
 	retry     RetryPolicy
-	transport Transport
 	hintTTLMs int64
-	caller    string
 	now       func() int64
 	log       *slog.Logger
 }
 
-// NewClient builds the outbound path. The transport the config selects must be
-// present; the other one is optional.
+// NewClient builds the outbound path. Both transports are required: the
+// transport is chosen per call, and auto may use either within one call.
 func NewClient(cfg ClientConfig) (*Client, error) {
 	if cfg.Registry == nil {
 		return nil, fmt.Errorf("rpc: new client: no candidate source: %w", ErrInvalidConfig)
@@ -151,17 +145,8 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if cfg.Recorder == nil {
 		return nil, fmt.Errorf("rpc: new client: no telemetry recorder: %w", ErrInvalidConfig)
 	}
-	switch cfg.Transport {
-	case TransportDirect:
-		if cfg.Direct == nil {
-			return nil, fmt.Errorf("rpc: new client: direct transport selected but absent: %w", ErrInvalidConfig)
-		}
-	case TransportProxy:
-		if cfg.Proxy == nil {
-			return nil, fmt.Errorf("rpc: new client: proxy transport selected but absent: %w", ErrInvalidConfig)
-		}
-	default:
-		return nil, fmt.Errorf("rpc: new client: unknown transport %d: %w", cfg.Transport, ErrInvalidConfig)
+	if cfg.Direct == nil || cfg.Proxy == nil {
+		return nil, fmt.Errorf("rpc: new client: both transports are required: %w", ErrInvalidConfig)
 	}
 
 	c := &Client{
@@ -172,9 +157,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		breaker:   cfg.Breaker,
 		recorder:  cfg.Recorder,
 		retry:     cfg.Retry.normalized(),
-		transport: cfg.Transport,
 		hintTTLMs: cfg.HealthHintTTLMs,
-		caller:    cfg.CallerService,
 		now:       cfg.Now,
 		log:       cfg.Logger,
 	}
@@ -208,26 +191,31 @@ type Request struct {
 	// a correlation/dedup key; it does not authorize ambiguous retries.
 	IdempotencyKey string
 	BusinessKey    string
+	// Transport is the dispatch path of this call.
+	Transport Transport
 }
-
-func (r Request) idempotent() bool { return r.IdempotencyKey != "" }
 
 func (r Request) subject() string { return "rpc.call:" + r.Service + "/" + r.Method }
 
 // Unary runs one logical call to completion, retrying on the same telemetry
-// operation until the ladder is exhausted.
+// operation while the failure is a proven pre-dispatch one and the attempt
+// budget lasts.
 func (c *Client) Unary(ctx context.Context, req Request) ([]byte, error) {
 	var op *telemetry.Op
 	callCtx := ctx
 	var lastErr error
+	viaProxy := req.Transport == TransportProxy
+	// unreachable names the instances the direct path failed to reach; the
+	// proxy is asked to try them last.
+	var unreachable []string
 
 	for attempt := 0; attempt < c.retry.MaxAttempts; attempt++ {
-		res, selErr := c.reserve(c.candidates(req), req)
+		res, selErr := c.reserve(c.candidates(req), req, viaProxy)
 		if selErr != nil {
 			lastErr = selErr
 			// A retry re-runs selection: an instance leaving the open state or
 			// a callee finishing its redeploy heals the call in place.
-			if !c.wait(ctx, op, attempt, selErr, req) {
+			if !c.wait(ctx, attempt, selErr) {
 				break
 			}
 			continue
@@ -237,7 +225,7 @@ func (c *Client) Unary(ctx context.Context, req Request) ([]byte, error) {
 			var err error
 			// Started only now: before a candidate exists the peer and the
 			// via_proxy flag would both be guesses.
-			callCtx, op, err = c.startOp(ctx, req, res.target)
+			callCtx, op, err = c.startOp(ctx, req, res.target, viaProxy)
 			if err != nil {
 				res.settle(nil)
 				return nil, err
@@ -245,8 +233,9 @@ func (c *Client) Unary(ctx context.Context, req Request) ([]byte, error) {
 			op.CaptureIn(req.Payload, req.ContractHash)
 		}
 		op.SetAttempt(int32(attempt))
+		op.SetPeerInstance(peerInstance(res.target, viaProxy))
 
-		payload, err := c.dispatch(callCtx, req, res.target, op)
+		payload, err := c.dispatch(callCtx, req, res.target, op, viaProxy, unreachable)
 		res.settle(err)
 		if err == nil {
 			op.End(pb.Status_SUCCESS, "")
@@ -254,7 +243,18 @@ func (c *Client) Unary(ctx context.Context, req Request) ([]byte, error) {
 		}
 
 		lastErr = err
-		if !c.wait(ctx, op, attempt, err, req) {
+		if req.Transport == TransportAuto && !viaProxy && directPreDispatch(err) {
+			// The direct path to this callee is broken before dispatch; the
+			// runtime may still reach it. Switch now, no backoff: the failure
+			// was the path's, not the callee's.
+			viaProxy = true
+			unreachable = append(unreachable, res.target.InstanceID)
+			if attempt < c.retry.MaxAttempts-1 {
+				continue
+			}
+			break
+		}
+		if !c.wait(ctx, attempt, err) {
 			break
 		}
 	}
@@ -267,24 +267,24 @@ func (c *Client) Unary(ctx context.Context, req Request) ([]byte, error) {
 
 // Stream opens a server-side stream. It is never retried — not mid-stream,
 // where a repeat would re-deliver chunks the caller already consumed, and not
-// on the connect phase either, because a retry that only covers connect is a
-// hidden mode nobody can reason about from the outside.
+// on the open either: one rule for every stream is easier to reason about than
+// a retry that covers only part of it. Transport auto picks the direct path
+// when the instance advertises an endpoint, exactly like a unary call.
 func (c *Client) Stream(ctx context.Context, req Request) (*Stream, error) {
-	cands := c.candidates(req)
-
-	res, selErr := c.reserve(cands, req)
+	viaProxy := req.Transport == TransportProxy
+	res, selErr := c.reserve(c.candidates(req), req, viaProxy)
 	if selErr != nil {
 		return nil, selErr
 	}
 
-	callCtx, op, err := c.startOp(ctx, req, res.target)
+	callCtx, op, err := c.startOp(ctx, req, res.target, viaProxy)
 	if err != nil {
 		res.settle(nil)
 		return nil, err
 	}
 	op.CaptureIn(req.Payload, req.ContractHash)
 
-	st, err := c.openStream(callCtx, req, res.target, op)
+	st, err := c.openStream(callCtx, req, res.target, op, viaProxy)
 	if err != nil {
 		res.settle(err)
 		op.End(statusOf(err), err.Error())
@@ -310,20 +310,16 @@ func (c *Client) Stream(ctx context.Context, req Request) (*Stream, error) {
 }
 
 // wait decides whether another attempt is worth making and pays the backoff.
-func (c *Client) wait(ctx context.Context, op *telemetry.Op, attempt int, err error, req Request) bool {
+// Only a proven pre-dispatch failure qualifies: anything else may follow a
+// committed effect.
+func (c *Client) wait(ctx context.Context, attempt int, err error) bool {
 	if attempt >= c.retry.MaxAttempts-1 {
 		return false
 	}
-	if !Retryable(err, req.idempotent()) {
+	if !PreDispatch(err) {
 		return false
 	}
-	if serr := sleepMs(ctx, c.retry.BackoffMs(attempt)); serr != nil {
-		if op != nil {
-			op.SetAttempt(int32(attempt))
-		}
-		return false
-	}
-	return true
+	return sleepMs(ctx, c.retry.BackoffMs(attempt)) == nil
 }
 
 // reservation holds what a dispatch borrowed: the balancer's in-flight slot and
@@ -342,23 +338,25 @@ func (r reservation) settle(err error) {
 	}
 }
 
-func (c *Client) reserve(cands []Candidate, req Request) (reservation, error) {
+func (c *Client) reserve(cands []Candidate, req Request, viaProxy bool) (reservation, error) {
 	now := c.now()
 	healthy := func(cand Candidate) bool { return Healthy(cand, now, c.hintTTLMs) }
 
-	if c.transport == TransportProxy {
-		eligible, stats := Eligible(cands, healthy)
+	if viaProxy {
+		eligible, _ := Eligible(cands, healthy)
 		if len(eligible) == 0 {
-			return reservation{}, c.selectionError(req, stats)
+			// Fail open: the health hint never empties the set on its own.
+			var stats PickStats
+			eligible, stats = Eligible(cands, nil)
+			if len(eligible) == 0 {
+				return reservation{}, c.selectionError(req, stats)
+			}
 		}
 		// The target only carries the service UUID and the telemetry peer; the
 		// runtime resolves the instance that actually serves the call.
 		return reservation{target: eligible[0]}, nil
 	}
 
-	allows := func(cand Candidate) bool {
-		return healthy(cand) && c.breaker.Allows(cand.Key())
-	}
 	var ticket *BreakerTicket
 	acquire := func(cand Candidate) bool {
 		t, ok := c.breaker.Acquire(cand.Key())
@@ -369,7 +367,16 @@ func (c *Client) reserve(cands []Candidate, req Request) (reservation, error) {
 		return true
 	}
 
+	allows := func(cand Candidate) bool {
+		return healthy(cand) && c.breaker.Allows(cand.Key())
+	}
 	target, stats, ok := c.balancer.Pick(cands, allows, acquire)
+	if !ok {
+		// Fail open: if the health hint excluded every candidate the breaker
+		// would admit, pick among them anyway. A stale or wrong hint must not
+		// black-hole a callee the local breaker still trusts.
+		target, stats, ok = c.balancer.Pick(cands, func(cand Candidate) bool { return c.breaker.Allows(cand.Key()) }, acquire)
+	}
 	if !ok {
 		return reservation{}, c.selectionError(req, stats)
 	}
@@ -407,6 +414,9 @@ func (c *Client) candidates(req Request) []Candidate {
 		if _, dup := seen[id]; dup {
 			continue
 		}
+		if c.registry.Revoked(d.GetServiceId(), id) {
+			continue
+		}
 		seen[id] = struct{}{}
 		cand := Candidate{
 			ServiceID:   d.GetServiceId(),
@@ -422,27 +432,37 @@ func (c *Client) candidates(req Request) []Candidate {
 	return out
 }
 
-func (c *Client) startOp(ctx context.Context, req Request, target Candidate) (context.Context, *telemetry.Op, error) {
+func (c *Client) startOp(ctx context.Context, req Request, target Candidate, viaProxy bool) (context.Context, *telemetry.Op, error) {
 	meta, err := json.Marshal(callMeta{
 		Method:         req.Method,
-		ViaProxy:       c.transport == TransportProxy,
+		ViaProxy:       viaProxy,
 		IdempotencyKey: req.IdempotencyKey,
 	})
 	if err != nil {
 		return ctx, nil, fmt.Errorf("rpc: start call operation: encode meta: %w", err)
 	}
 	callCtx, op, err := c.recorder.Start(ctx, telemetry.OpSpec{
-		Channel:       pb.Channel_RPC,
-		Kind:          telemetry.OpKindRPCCall,
-		Subject:       req.subject(),
-		PeerServiceID: target.ServiceID,
-		BusinessKey:   req.BusinessKey,
-		MetaJSON:      meta,
+		Channel:        pb.Channel_RPC,
+		Kind:           telemetry.OpKindRPCCall,
+		Subject:        req.subject(),
+		PeerServiceID:  target.ServiceID,
+		PeerInstanceID: peerInstance(target, viaProxy),
+		BusinessKey:    req.BusinessKey,
+		MetaJSON:       meta,
 	})
 	if err != nil {
 		return ctx, nil, fmt.Errorf("rpc: start call operation: %w", err)
 	}
 	return callCtx, op, nil
+}
+
+// peerInstance is the callee instance an RPC.CALL reports: known on the direct
+// path, picked by the runtime on the proxy path.
+func peerInstance(target Candidate, viaProxy bool) string {
+	if viaProxy {
+		return ""
+	}
+	return target.InstanceID
 }
 
 type callMeta struct {
@@ -461,13 +481,13 @@ func trace(ctx context.Context) (context.Context, string) {
 	return telemetry.InjectMetadata(ctx, tc), telemetry.FormatHeader(tc)
 }
 
-func (c *Client) dispatch(ctx context.Context, req Request, target Candidate, op *telemetry.Op) ([]byte, error) {
+func (c *Client) dispatch(ctx context.Context, req Request, target Candidate, op *telemetry.Op, viaProxy bool, exclude []string) ([]byte, error) {
 	mdCtx, header := trace(ctx)
 
 	var payload []byte
 	var err error
-	if c.transport == TransportProxy {
-		payload, err = c.proxy.Unary(mdCtx, c.invokeRequest(req, target, op, header))
+	if viaProxy {
+		payload, err = c.proxy.Unary(mdCtx, c.invokeRequest(req, target, op, header, exclude))
 	} else {
 		payload, err = c.direct.Unary(mdCtx, target, c.callRequest(req, op, header))
 	}
@@ -478,11 +498,11 @@ func (c *Client) dispatch(ctx context.Context, req Request, target Candidate, op
 	return payload, nil
 }
 
-func (c *Client) openStream(ctx context.Context, req Request, target Candidate, op *telemetry.Op) (*Stream, error) {
+func (c *Client) openStream(ctx context.Context, req Request, target Candidate, op *telemetry.Op, viaProxy bool) (*Stream, error) {
 	mdCtx, header := trace(ctx)
 
-	if c.transport == TransportProxy {
-		return c.proxy.Stream(mdCtx, c.invokeRequest(req, target, op, header))
+	if viaProxy {
+		return c.proxy.Stream(mdCtx, c.invokeRequest(req, target, op, header, nil))
 	}
 	return c.direct.Stream(mdCtx, target, c.callRequest(req, op, header))
 }
@@ -494,14 +514,13 @@ func (c *Client) callRequest(req Request, op *telemetry.Op, header string) *pb.C
 	return &pb.CallRequest{
 		Method:         req.Method,
 		Payload:        req.Payload,
-		CallerService:  c.caller,
 		RequestId:      op.ID().String(),
 		IdempotencyKey: req.IdempotencyKey,
 		XSbTrace:       header,
 	}
 }
 
-func (c *Client) invokeRequest(req Request, target Candidate, op *telemetry.Op, header string) *pb.InvokeRequest {
+func (c *Client) invokeRequest(req Request, target Candidate, op *telemetry.Op, header string, exclude []string) *pb.InvokeRequest {
 	return &pb.InvokeRequest{
 		TargetServiceId: target.ServiceID,
 		Method:          req.Method,
@@ -510,6 +529,9 @@ func (c *Client) invokeRequest(req Request, target Candidate, op *telemetry.Op, 
 		IdempotencyKey:  req.IdempotencyKey,
 		XSbTrace:        header,
 		ContractHash:    EncodeContractHash(req.ContractHash),
+		// The runtime tries these last: the direct path just failed to reach
+		// them before anything was sent.
+		ExcludeInstanceIds: exclude,
 	}
 }
 
@@ -533,7 +555,9 @@ type Stream struct {
 	err   error
 }
 
-func newStream(recv func() ([]byte, error), stop func()) *Stream {
+// NewStream builds a stream over a chunk source and its teardown. The
+// transports use it, and so does the in-memory transport of the test harness.
+func NewStream(recv func() ([]byte, error), stop func()) *Stream {
 	return &Stream{recv: recv, stop: stop}
 }
 

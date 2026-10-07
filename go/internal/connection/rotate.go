@@ -23,9 +23,10 @@ type ControlRefresher struct{}
 // Refresh sends a fresh CSR down the current channel and assembles the next
 // lease from the answer.
 //
-// The runtime answers with a NEW instanceID under the same serviceID. That is
-// what makes the overlap safe: the old and the new session are distinguishable,
-// so closing the old one cannot mark the new one disconnected.
+// The instance identity is stable across a renewal: only the TLS material
+// changes. A leaf naming another instance would leave the control session, the
+// registrations and the data-plane streams on one identity and every new
+// connection on another, so it is refused and the renewal retried.
 func (ControlRefresher) Refresh(ctx context.Context, conn grpc.ClientConnInterface, prev Lease) (Lease, error) {
 	const op = "refresh certificate"
 
@@ -56,19 +57,19 @@ func (ControlRefresher) Refresh(ctx context.Context, conn grpc.ClientConnInterfa
 		return Lease{}, newError(KindRotate, op,
 			"instance_id "+got+" contradicts the SPIFFE SAN "+id.InstanceID, nil)
 	}
-	if id.InstanceID == prev.Identity.InstanceID {
+	if id.InstanceID != prev.Identity.InstanceID {
 		return Lease{}, newError(KindRotate, op,
-			"renewed leaf reuses instanceID "+id.InstanceID+": the overlapping sessions would be indistinguishable", nil)
+			"renewed leaf names instance "+id.InstanceID+", the session runs as "+prev.Identity.InstanceID, nil)
 	}
 
 	return Lease{
-		Identity:    id,
-		ServiceName: prev.ServiceName,
-		CertDER:     resp.GetCertDer(),
-		CAChainDER:  resp.GetCaChainDer(),
-		PrivateKey:  priv,
-		TLSCert:     tlsCert,
-		NotAfter:    time.UnixMilli(resp.GetNotAfterUnixMs()).UTC(),
+		Identity:       id,
+		ServiceName:    prev.ServiceName,
+		CertDER:        resp.GetCertDer(),
+		CAChainDER:     resp.GetCaChainDer(),
+		PrivateKey:     priv,
+		TLSCert:        tlsCert,
+		NotAfterUnixMs: resp.GetNotAfterUnixMs(),
 	}, nil
 }
 
@@ -84,17 +85,16 @@ func leafIdentity(leaf *x509.Certificate) (Identity, error) {
 	return ParseSPIFFE(leaf.URIs[0].String())
 }
 
-// rotateOnce renews the certificate with an overlap: the new session must be
-// welcomed before the old one is closed. It reports false when the lifecycle
-// must stop.
+// rotateOnce renews the certificate in place. It reports false when the
+// lifecycle must stop.
 //
-// On failure nothing was swapped — connect closed the channels it opened and
-// left the current session serving — so the renewal simply retries on the
-// ladder while the old certificate is still valid.
-func (l *Lifecycle) rotateOnce(ctx context.Context, cur *session, timer *time.Timer, attempt *int) bool {
+// Nothing is rebuilt: the renewed leaf is published to the credential holders
+// and every TLS configuration reads it on its next handshake. The control
+// session is not reopened — the runtime treats a second Control.Open of the
+// same instance as a replacement and aborts the first one.
+func (l *Lifecycle) rotateOnce(ctx context.Context, cur *session, timer *time.Timer) bool {
 	err := l.rotate(ctx, cur)
 	if err == nil {
-		*attempt = 0
 		l.armRotation(timer)
 		return true
 	}
@@ -105,30 +105,32 @@ func (l *Lifecycle) rotateOnce(ctx context.Context, cur *session, timer *time.Ti
 		l.giveUp(ctx, err)
 		return false
 	}
-
-	delay := l.cfg.Backoff.Delay(*attempt)
-	*attempt++
 	l.cfg.Logger.Warn("connection: rotation failed, staying on the current certificate",
-		"attempt", *attempt, "delay_ms", delay.Milliseconds(), "error", err)
-	resetTimer(timer, delay)
+		"retry_in_ms", l.cfg.RotateRetry.Milliseconds(), "error", err)
+	resetTimer(timer, l.cfg.RotateRetry)
 	return true
 }
 
 func (l *Lifecycle) rotate(ctx context.Context, cur *session) error {
 	const op = "rotate certificate"
 
-	lease, err := l.cfg.Refresher.Refresh(ctx, cur.conn, cur.lease)
+	prev, ok := l.cachedLease()
+	if !ok {
+		return newError(KindRotate, op, "no lease to renew", nil)
+	}
+	lease, err := l.cfg.Refresher.Refresh(ctx, cur.conn, prev)
 	if err != nil {
 		return err
 	}
-
-	// The renewed session is opened by the one connect path, so it inherits
-	// supervision, credential publication and the lease cache. A rotation that
-	// built its own path is how a rotated session ends up unsupervised: it dies
-	// in silence and the service never reconnects.
-	if err := l.connect(ctx, ctx, func(context.Context) (Lease, error) { return lease, nil }); err != nil {
-		return newError(KindRotate, op, "open the renewed session", err)
+	l.mu.Lock()
+	l.st.lease = lease
+	l.mu.Unlock()
+	l.cert.Store(&lease.TLSCert)
+	if err := l.cfg.Credentials.Update(ctx, l.credentials(lease)); err != nil {
+		return newError(KindRotate, op, "publish the renewed leaf", err)
 	}
+	l.cfg.Logger.Info("connection: certificate renewed",
+		"instance_id", lease.Identity.InstanceID, "not_after_unix_ms", lease.NotAfterUnixMs)
 	return nil
 }
 
@@ -141,7 +143,7 @@ func (l *Lifecycle) armRotation(timer *time.Timer) {
 	}
 	delay := l.rotateDelay(lease)
 	l.cfg.Logger.Debug("connection: renewal scheduled",
-		"delay_ms", delay.Milliseconds(), "not_after", lease.NotAfter)
+		"delay_ms", delay.Milliseconds(), "not_after_unix_ms", lease.NotAfterUnixMs)
 	resetTimer(timer, delay)
 }
 
@@ -150,7 +152,8 @@ func (l *Lifecycle) armRotation(timer *time.Timer) {
 // renew in the same second and the runtime meets the whole fleet at once.
 func (l *Lifecycle) rotateDelay(lease Lease) time.Duration {
 	jitter := time.Duration(l.cfg.Random() * float64(l.cfg.RotateJitter))
-	delay := lease.NotAfter.Add(-l.cfg.RotateLead).Add(-jitter).Sub(l.cfg.Now())
+	renewAt := time.UnixMilli(lease.NotAfterUnixMs).Add(-l.cfg.RotateLead).Add(-jitter)
+	delay := renewAt.Sub(l.cfg.Now())
 	if delay < l.cfg.MinRotateDelay {
 		return l.cfg.MinRotateDelay
 	}

@@ -3,7 +3,7 @@
 TypeScript SDK для [ServiceBridge runtime](https://github.com/servicebridge2/runtime).
 
 ```sh
-bun add service-bridge    # или npm install / yarn add
+npm i service-bridge    # или bun add service-bridge
 ```
 
 ## Документация — по доменам
@@ -18,10 +18,10 @@ bun add service-bridge    # или npm install / yarn add
 | [Events](./events.md) | `event.handle` + `event.define` + `event.publish` + delivery semantics |
 | [Workflows](./workflows.md) | `sb.workflow.handle` — durable DAG-шаги с persistent state, compensation, replay |
 | [Jobs](./jobs.md) | `sb.job.handle` — cron / delayed / interval с at-least-once + heartbeat + DST |
-| [Тестирование](./testing.md) | `service-bridge/testing` — юнит-тест RPC/event-хендлеров без сети и без живого рантайма |
+| [Тестирование](./testing.md) | `service-bridge/testing` — настоящий `ServiceBridge` на in-memory runtime: юнит-тест RPC/event-хендлеров без сети |
 | [Integrations](./integrations.md) | HTTP-фреймворки: Express / Fastify / Hono. Service Map для существующих REST API |
 | [Access Policy](./access-policy.md) | Гранулярные политики: capabilities, egress, acceptance. Default-allow |
-| [Operations](./operations.md) | lifecycle, identity, advertise, mTLS, ротация, env, troubleshooting |
+| [Operations](./operations.md) | опции, lifecycle (start / ready / stop), события, logger, identity, advertise, mTLS, ротация, troubleshooting |
 | [API reference](./api-reference.md) | Компактный справочник публичных типов |
 | [References](./references.md) | ADR и internal docs |
 
@@ -31,7 +31,7 @@ bun add service-bridge    # или npm install / yarn add
 
 **«Как вызвать чужой RPC?»** → [RPC §3](./rpc.md#3-исходящие-вызовы).
 
-**«Почему я получаю ошибку X?»** → [Operations §8 Troubleshooting](./operations.md#8-troubleshooting) + [RPC §9 Ошибки](./rpc.md#9-ошибки). `PermissionDenied` при старте → [Access Policy](./access-policy.md).
+**«Почему я получаю ошибку X?»** → [Operations §8 Troubleshooting](./operations.md#8-troubleshooting) + [RPC §9 Ошибки](./rpc.md#9-ошибки). `AccessDeniedError` при старте → [Access Policy](./access-policy.md). Все коды ошибок — [API reference](./api-reference.md#ошибки).
 
 **«Какие env-переменные?»** → [Operations §7](./operations.md#7-environment-variables).
 
