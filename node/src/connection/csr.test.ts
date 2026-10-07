@@ -30,6 +30,9 @@ describe("buildCsr", () => {
 						"-verify",
 						"-noout",
 						"-subject",
+						// One subject format for LibreSSL and OpenSSL 3 (which spaces "CN = x" by default).
+						"-nameopt",
+						"RFC2253",
 					],
 					{ stdio: ["ignore", "pipe", "pipe"] },
 				).toString();
