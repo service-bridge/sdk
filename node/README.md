@@ -132,7 +132,7 @@ ServiceBridge collapses those gaps into one runtime. Your service talks to a sin
 | Problem | Without ServiceBridge | With ServiceBridge |
 |---|---|---|
 | Service-to-service calls | gRPC/HTTP plumbing + a mesh for mTLS + retries | `sb.rpc.call("svc", "Method", req)` — mTLS, LB, retries, breakers built in |
-| Reliable async messaging | Stand up and operate a broker | `sb.event.publish(...)` — durable outbox, at-least-once, fan-out, DLQ |
+| Reliable async messaging | Stand up and operate a broker | `sb.event.publish(...)` — stored in PostgreSQL before it returns, at-least-once, filters, fan-out, DLQ |
 | Multi-step business processes | A separate workflow engine to learn and host | `sb.workflow.handle(...)` — durable DAGs with compensation and replay |
 | Scheduled work | A cron box or a job scheduler service | `sb.job.handle(...)` — cron / interval / delay, leased and retried |
 | Knowing what happened | Wire up tracing + metrics + logs across N tools | Every hop is traced, measured and logged automatically |
@@ -286,7 +286,7 @@ Designed to run up to 1000 services against a single runtime.
 | You'd otherwise reach for | ServiceBridge gives you |
 |---|---|
 | Istio / Linkerd (mesh, mTLS) | mTLS identity + routing + policy, no sidecars |
-| RabbitMQ / Kafka / NATS | Durable events with outbox, fan-out, retries, DLQ |
+| RabbitMQ / Kafka / NATS | Durable events with filters, fan-out, retries, DLQ |
 | Temporal / Cadence | Durable workflows with compensation, signals, replay |
 | A cron service / Quartz | Leased, retried scheduled jobs |
 | Jaeger / Tempo + Prometheus + Loki | Tracing, metrics and logs, correlated out of the box |
@@ -305,10 +305,16 @@ The bridge exposes four domains (`sb.rpc`, `sb.event`, `sb.job`, `sb.workflow`) 
 `sb.rpc` is request/response: register handlers, call other services.
 
 ```ts
-// Unary handler: (req) => res
+import { HandlerError } from "service-bridge";
+
+// Unary handler: (req, ctx) => res
 sb.rpc.handle<ChargeRequest, ChargeReply>(
   "Charge",
-  async (req) => ({ ok: req.amount > 0 }),
+  async (req, ctx) => {
+    // ctx: { signal, deadline, requestId, idempotencyKey, caller }
+    if (req.amount <= 0) throw new HandlerError("INVALID_AMOUNT", "amount must be positive");
+    return { ok: true };
+  },
   { schema: { protoFile: "./payment.proto" } },
 );
 
@@ -339,37 +345,48 @@ const res2 = await sb.rpc.call("payment-svc", "Charge",
 |---|---|---|---|
 | `timeout` | `string` | `"30s"` | Deadline, e.g. `"500ms"`, `"10s"`, `"2m"`. |
 | `requestId` | `string` | random UUID v4 | Correlation id carried to the callee. |
-| `transport` | `"direct" \| "proxy" \| "auto"` | `"auto"` | `direct` = caller→callee mTLS; `proxy` = via the runtime; `auto` = direct when an endpoint is known. |
-| `idempotencyKey` | `string` | none | Proxy correlation/cache key; does not prove business idempotency. |
+| `transport` | `"direct" \| "proxy" \| "auto"` | `"auto"` | `direct` = caller→callee mTLS; `proxy` = via the runtime; `auto` = direct to the picked instance, falling back to the runtime when the direct attempt failed before dispatch. |
+| `idempotencyKey` | `string` | none | Handed to the callee as `ctx.idempotencyKey` and to the runtime proxy's dedup. |
+| `signal` | `AbortSignal` | none | Cancels the call. The remote side may already have acted. |
 | `retry` | `Partial<RetryOpts>` | exp. backoff | `{ maxAttempts: 3, baseDelayMs: 200, factor: 2, maxDelayMs: 5000, jitter: 0.3 }`. Set `maxAttempts: 1` to disable. |
 
-Dispatched RPC failures are never automatically replayed, even with an idempotencyKey. Only proven local pre-dispatch failures may retry. Keys provide proxy correlation/cache; atomic business deduplication belongs with the effect. Contract hashes route schema-compatible peers.
+The SDK retries only failures proven to happen before dispatch: no live candidate, a channel that never became ready, or a callee that refused the call before running the handler. A call that reached a handler is never repeated automatically, with or without an idempotency key. Streams are never retried. Contract hashes route schema-compatible peers.
+
+A handler's `HandlerError` reaches the caller as a `HandlerError` with the same `handlerCode` and message. Any other thrown error reaches the caller with `handlerCode: "INTERNAL"`.
 
 ### Events
 
-Durable, at-least-once publish/subscribe. Events hit a local SQLite outbox first, then drain to the runtime, so a publish survives a transient disconnect.
+Durable, at-least-once publish/subscribe. `publish` resolves once the runtime has stored the event in PostgreSQL. While the runtime is unreachable, events wait in a bounded in-memory queue (`maxPendingPublishes`, default 10 000) for up to `publishTimeoutMs` (default 30 s), then fail with `TIMEOUT`. A full queue fails at once with `QUEUE_FULL`. The queue does not survive a process crash.
 
 ```ts
-// Declare what you publish (same file-based SchemaSpec as RPC).
-sb.event.define("order.placed", { protoFile: "./events.proto", input: "OrderPlaced" });
+const SCHEMA = { protoFile: "./events.proto", input: "OrderPlaced" };
 
-// Subscribe — exact name or wildcard ("order.*", "order.#").
-sb.event.handle("order.placed", async (payload) => {
-  await fulfil(payload);
-});
+// Declare what you publish (same file-based SchemaSpec as RPC).
+sb.event.define("order.placed", SCHEMA);
+
+// Subscribe — exact name or wildcard ("order.*", "order.#"). The subscriber
+// decodes with its own schema; the runtime evaluates the filter on the payload.
+sb.event.handle(
+  "order.*",
+  async (payload, ctx) => {
+    // ctx: { eventId, eventName, attempt, partitionKey, headers, occurredAtMs, signal, ... }
+    await fulfil(payload);
+  },
+  { schema: SCHEMA, filter: { "$.currency": "EUR" } },
+);
 
 await sb.start();
 
 const { eventId } = await sb.event.publish("order.placed", { orderId: "o-1", total: 4200 });
 ```
 
-Event names must match `^[a-z0-9_-]+(\.[a-z0-9_-]+)*$` (invalid → `InvalidEventNameError`). A full outbox throws `OutboxFullError`.
+Event names must match `^[a-z0-9_-]+(\.[a-z0-9_-]+)*$` (invalid → `InvalidEventNameError`). A process has one handler per pattern; an event that matches several patterns runs each of their handlers once, as matched by the runtime. A filter is a JSON object of `{"$.path": literal}` equalities.
 
 | `PublishOpts` | Type | Description |
 |---|---|---|
-| `idempotencyKey` | `string` | Dedup key for at-least-once delivery. |
-| `partitionKey` | `string` | Orders delivery within a partition. |
-| `fireAndForget` | `boolean` | Skip the durable wait for the publish ack. |
+| `idempotencyKey` | `string` | Runtime-side dedup: a repeat with the same content succeeds and returns the original `eventId`; different content fails with `CONFLICT`. |
+| `partitionKey` | `string` | Subscribers see events sharing a key in publication order. |
+| `fireAndForget` | `boolean` | Resolve right after enqueueing. Delivery failures are logged, and a process crash loses events still in the queue. `QUEUE_FULL` is still thrown. |
 | `headers` | `Record<string, string>` | Custom envelope headers. |
 | `occurredAtMs` | `number` | Event time (unix-ms); defaults to now. |
 
@@ -476,7 +493,9 @@ sb.telemetry.histogram("reprice_ms", "ms").observe(12.5);
 
 `startOp()` on its own only emits the span. It does **not** open a trace scope, so calls made after it keep the parent that was already active and end up beside your span instead of inside it. Use it alone only when the span outlives a single block (start here, `.end()` on a later callback); otherwise use `.run()`.
 
-Anything emitted before `start()` buffers in an in-memory ring and drains once connected.
+Anything emitted before `start()` buffers in an in-memory ring and drains once connected. Dropped telemetry (a full ring, or the runtime shedding load) is counted in `sb_sdk_telemetry_dropped_total` and passed to `telemetry.onDrop`.
+
+Payload capture is set by the runtime: `errors` by default, so payloads are stored for failed operations only. The runtime masks payloads on ingest; the SDK sends them as they are.
 
 ### HTTP
 
@@ -542,6 +561,8 @@ Bun.serve({ port: 3000, fetch: app.fetch });
 
 `attachExpress`/`attachHono` take `{ port, host? }`; `sbFastify` reads the bound address itself. Host defaults to the bound socket, falling back to `127.0.0.1`. Attaching before `start()` is safe — the endpoint rides along in the first registration.
 
+Spans are named by route template (`http.handle:POST/orders/:id`); a request that matched no route uses `*`. The integrations add no perimeter protection. An incoming `X-SB-Trace` header is ignored unless you pass `trustTraceHeader: true`, which only makes sense behind a gateway that sets the header itself.
+
 ---
 
 ## Configuration
@@ -553,14 +574,19 @@ All configuration lives on the `ServiceBridge` constructor — `new ServiceBridg
 | `advertise` | `{ host, port } \| false` | `127.0.0.1` on a free port (with a warning) | Inbound RPC server address. Pass `{ host, port }` in containers / k8s; `false` for caller-only instances that never serve RPC. |
 | `callDefaults` | `CallOpts` | `{}` | Default `CallOpts` merged under every `sb.rpc.call()` / `sb.stream()`. |
 | `failOnPolicyViolation` | `boolean` | `false` | When `true`, any policy warning at registration makes `start()` surface a `disconnected` event and stop. Otherwise warnings are logged and emitted as `policy_violation`. |
-| `dataDir` | `string` | `"./.servicebridge"` | Directory for the local SQLite event outbox. |
-| `maxOutboxRows` | `number` | `100000` | Outbox rows before `publish` back-pressures with `OutboxFullError`. |
-| `eventsDrainerBatch` | `number` | `50` | Outbox rows drained to the runtime per tick. |
+| `maxPendingPublishes` | `number` | `10000` | Publishes waiting for the runtime before `publish` fails with `QUEUE_FULL`. |
+| `publishTimeoutMs` | `number` | `30000` | How long `publish` waits for the runtime to store the event before `TIMEOUT`. |
 | `eventsMaxInFlight` | `number` | `32` | In-flight window advertised to the runtime on subscribe. |
 | `rpcMaxConcurrentCalls` | `number` | `256` | Inbound RPC handlers running at once. |
 | `rpcMaxQueuedCalls` | `number` | = concurrency | Admission queue depth; past it callers get `RESOURCE_EXHAUSTED` rather than piling up. |
 | `reconnectIntervalMs` | `number` | jittered ladder | Fixed delay between reconnect attempts. Unset means the ladder `[1s, 5s, 15s, 30s, 60s]` ±20%. |
-| `reconnectAttempts` | `number` | `3` | Reconnect attempts before giving up. `0` = unlimited. |
+| `reconnectAttempts` | `number` | `0` | Consecutive failed reconnects before giving up. `0` = unlimited. |
+| `startTimeoutMs` | `number` | `30000` | `start()` deadline: the runtime's Welcome and the first registry snapshot. |
+| `stopTimeoutMs` | `number` | `10000` | `stop()` deadline for in-flight work and queued publishes. |
+| `logger` | `Logger` | warn/error to the console | Sink of the SDK's own diagnostics: `{ debug, info, warn, error }(message, attrs?)`. |
+| `telemetry.onDrop` | `(drop) => void` | none | Called with the telemetry dropped since the previous report. |
+
+`url` must be `host:port` and `key` a valid service key; otherwise the constructor throws `ConfigurationError`.
 
 Telemetry is not configured here. Whether it runs at all, the payload capture mode per channel and the payload size cap are pushed by the runtime and changed from its dashboard — read the current verdict with `sb.telemetry.enabled()` and `sb.telemetry.captureModeForChannel(...)`.
 
@@ -568,8 +594,7 @@ Telemetry is not configured here. Whether it runs at all, the payload capture mo
 const sb = new ServiceBridge("localhost:14445", KEY, {
   advertise: { host: process.env.POD_IP!, port: 50051 },
   callDefaults: { timeout: "10s" },
-  reconnectAttempts: 0,
-  dataDir: "/var/lib/myservice/sb",
+  logger: myLogger,
 });
 ```
 
@@ -583,54 +608,82 @@ sb.rpc.handle("Ship", shipHandler, { schema: { protoFile: "./ship.proto" } }); /
 
 sb.on("connected",      ({ serviceName }) => console.log(`connected as ${serviceName}`));
 sb.on("reconnecting",   ({ attempt, reason }) => console.warn(`reconnecting #${attempt}: ${reason}`));
+sb.on("draining",       ({ reason }) => console.info(`runtime restarting: ${reason}`));
 sb.on("disconnected",   ({ reason }) => console.error(`disconnected: ${reason}`));
 sb.on("policy_violation", (v) => console.warn(`policy: ${v.declaration} ${v.value} — ${v.reason}`));
 
-await sb.start();
+await sb.start(); // resolves once connected and the first registry snapshot is applied
 
 process.on("SIGTERM", async () => { await sb.stop(); process.exit(0); });
 ```
+
+`start()` throws when the runtime does not answer within `startTimeoutMs`, or at once on a terminal refusal (rejected key, protocol mismatch). After a connection loss the SDK reconnects on its own; `await sb.ready()` waits for the next live session. Before a restart the runtime sends `Drain`: the SDK emits `draining` and reconnects when the stream ends. Instances and services the runtime revokes are dropped from routing at once, and their inbound calls are refused.
+
+`stop()` withdraws the instance's endpoint and stops taking new calls, deliveries and jobs, waits for in-flight work up to `stopTimeoutMs`, flushes queued publishes (leftovers fail with `CONNECTION`), flushes telemetry, then closes every connection.
 
 ---
 
 ## Error handling
 
-Typed errors are exported from the package root, so you can `catch` precisely:
+Every error the SDK throws is a `ServiceBridgeError` with a `code` and a `retryable` flag. The codes are the same strings in the Go SDK.
 
 ```ts
-import {
-  RpcAccessDeniedError,
-  WorkflowAccessDeniedError,
-  InvalidEventNameError,
-  OutboxFullError,
-  ServiceBridgeError,
-} from "service-bridge";
+import { HandlerError, ServiceBridgeError } from "service-bridge";
 
 try {
   await payment.Charge({ userId: "u-1", amount: 100 });
 } catch (err) {
-  if (err instanceof RpcAccessDeniedError) {
-    // denied by access policy: { serviceName, methodName, reason }
-  } else if (err instanceof ServiceBridgeError) {
-    // any other failure raised by the SDK
+  if (err instanceof HandlerError) {
+    // the callee's answer: err.handlerCode, e.g. "CARD_DECLINED" or "INTERNAL"
+  } else if (err instanceof ServiceBridgeError && err.retryable) {
+    // nothing happened on the far side; trying again later may succeed
   }
 }
 ```
 
-Every error below extends `ServiceBridgeError`, so one `instanceof` separates an SDK failure from an application one — and an error added in a later release will not slip past that check.
+| `code` | Retryable | Meaning | Class |
+|---|---|---|---|
+| `CONFIG` | no | An option or key the SDK refuses to run with. | `ConfigurationError` |
+| `STATE` | no | Called in the wrong lifecycle phase (e.g. before `start()`). | `StateError` |
+| `CONNECTION` | yes | The runtime or the callee could not be reached. | `ConnectionError` |
+| `TIMEOUT` | no | The deadline passed; the outcome is unknown. | `TimeoutError` |
+| `CANCELLED` | no | Cancelled by the caller's `signal`. | — |
+| `ACCESS_DENIED` | no | Refused by the access policy, or the peer is revoked. Also emits `policy_violation`. | `AccessDeniedError` |
+| `NOT_FOUND` | no | The name is unknown to the mesh. | `WorkflowNotFoundError` for workflows |
+| `VALIDATION` | no | A declaration or argument that would be refused. | `ValidationError` |
+| `CONFLICT` | no | An idempotency key already used with other content. | — |
+| `TERMINAL` | no | The workflow run already finished. | `WorkflowTerminalError` |
+| `NO_LIVE_INSTANCE` | yes | No instance can serve the call. | `NoLiveInstanceError` |
+| `OVERLOADED` | yes | The callee or runtime is shedding load. | — |
+| `QUEUE_FULL` | yes | The publish queue is at `maxPendingPublishes`. | — |
+| `INVALID_EVENT_NAME` | no | The event name fails the naming rule. | `InvalidEventNameError` |
+| `HANDLER` | no | The callee's handler failed; see `handlerCode`. | `HandlerError` |
+| `INTERNAL` | no | Anything else. | — |
 
-| Error | Thrown when |
-|---|---|
-| `ConnectionError` | Connection / provisioning failure; carries a typed `.code` (retryable ones drive auto-reconnect). |
-| `RpcAccessDeniedError` | An RPC call is denied by access policy. Also fires a `policy_violation` event. |
-| `NoLiveInstanceError` | No callee instance matches the caller's contract hash, or every one is shed by the breaker. |
-| `WorkflowAccessDeniedError` | A workflow `start()` is denied by access policy. |
-| `WorkflowNotFoundError` | Starting a workflow name the runtime doesn't know. |
-| `WorkflowTerminalError` | Signalling/cancelling a run that already finished. |
-| `WorkflowValidationError` | `workflow.handle()` is given a graph that fails validation. |
-| `JsonPathError` | A `$.` expression in a workflow step is malformed. |
-| `InvalidEventNameError` | Publishing/defining an event whose name fails the naming rule. |
-| `OutboxFullError` | The local event outbox is at `maxOutboxRows` (back-pressure). |
+`TIMEOUT` is not retryable because the call may have run. Repeat it only when the operation is idempotent on the callee's side.
+
+---
+
+## Testing
+
+`service-bridge/testing` runs your handlers against a real `ServiceBridge` on an in-memory runtime, with no network. Requests are encoded with your schemas, errors take the caller's form, and publishes go through the real publisher.
+
+```ts
+import { createTestHarness } from "service-bridge/testing";
+
+const h = createTestHarness();
+await h.sb.client("fraud-svc", "./shop.proto", { methods: ["Check"] });
+h.sb.event.define("payment.charged", { protoFile: "./shop.proto", input: "PaymentCharged" });
+h.sb.rpc.handle("Charge", chargeHandler, { schema: { protoFile: "./shop.proto", method: "Charge" } });
+await h.start();
+h.respond("fraud-svc", "Check", () => ({ blocked: false }));
+
+const reply = await h.invoke("Charge", { userId: "u-1", amount: 100 });
+expect(h.published().map((e) => e.name)).toEqual(["payment.charged"]);
+await h.stop();
+```
+
+`h.deliver(name, payload)` runs your event handlers the way the runtime routes them. Access policy, subscription filters, delivery retries, jobs and workflows need a live runtime. The Go SDK has the same harness as `sbtest`.
 
 ---
 
@@ -642,7 +695,7 @@ Every error below extends `ServiceBridgeError`, so one `instanceof` separates an
 
 **How do I scale horizontally?** Run as many SDK instances as you like; the runtime load-balances RPC across live instances and fails over automatically. The runtime itself is a single source of truth backed by PostgreSQL.
 
-**What happens on a transient disconnect?** Published events sit in the local SQLite outbox and drain when the connection returns. The SDK auto-reconnects (configurable) and rotates certs with overlap so live instances don't drop traffic.
+**What happens on a transient disconnect?** The SDK reconnects on its own. Pending `publish` calls wait in memory, up to `publishTimeoutMs`, and resolve once the runtime has stored the event. Certificates are renewed before expiry without closing live connections.
 
 **Where do I see traces, metrics and the DLQ?** In the runtime dashboard on `:14444`. Tracing, metrics and the dead-letter queue are operated there.
 
@@ -666,4 +719,4 @@ Licensed under the **MIT License** — see [LICENSE](./LICENSE). Free for any us
 
 Release tags run complete CI on the exact tagged commit before npm publication, including packed consumer checks on Node 22/24/26 and Bun. Service-key rotation revokes existing credentials: deploy a new bootstrap key and restart; repeated reconnect with the revoked key cannot recover.
 
-Each client instance needs exclusive ownership of its outbox directory; do not share it between live instances. The local SQLite insert is durable publication intent, but it is not atomic with a transaction in an external business database. Applications needing that atomic boundary must persist business changes and publication intent together in their own transaction, then relay the intent.
+`publish` is not atomic with a transaction in your business database. When a business change and its event must commit together, store the event intent in the same transaction and publish it afterwards from a relay.

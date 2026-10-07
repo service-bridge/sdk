@@ -12,7 +12,7 @@ Node SDK, TypeScript SDK, Go SDK, Python SDK, Istio alternative, Consul alternat
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Website](https://img.shields.io/badge/site-servicebridge.dev-0b0b0b.svg)](https://servicebridge.dev)
 
-**One self-hosted Go runtime plus PostgreSQL that replaces a whole microservices stack.** Service mesh, message broker, workflow engine, job scheduler, tracing backend, mTLS PKIcollapsed into a single binary. RPC, durable events, workflows, jobs and streaming over mTLS gRPC, with observability built in. Zero sidecars.
+**One self-hosted Go runtime plus PostgreSQL that replaces a whole microservices stack.** Service mesh, message broker, workflow engine, job scheduler, tracing backend, mTLS PKI — collapsed into a single binary. RPC, durable events, workflows, jobs and streaming over mTLS gRPC, with observability built in. Zero sidecars.
 
 Your services declare what they handle and what they call. The runtime takes over transport, delivery, orchestration, policy and observability — no proxy on the data path, no separate infrastructure to run, secure and correlate.
 
@@ -42,8 +42,8 @@ This repo holds the official SDKs. **Pick your language in the [table below](#sd
 
 One runtime, every inter-service primitive:
 
-- **Direct RPC** — request/response and server-side streaming over mTLS gRPC, caller-to-callee with no proxy hop. Load balancing, retries, idempotency and circuit breakers built in.
-- **Durable events** — at-least-once publish/subscribe with a local outbox, wildcard topics, fan-out delivery, retries and a dead-letter queue. No broker.
+- **Direct RPC** — request/response and server-side streaming over mTLS gRPC, caller-to-callee with no proxy hop. Load balancing, retries of calls that never reached a handler, idempotency keys and circuit breakers built in.
+- **Durable events** — at-least-once publish/subscribe: `publish` returns once the event is stored in PostgreSQL. Wildcard topics, filters evaluated by the runtime, fan-out delivery, retries and a dead-letter queue. No broker.
 - **Workflows** — durable DAGs with compensation (sagas), signals and replay. State persists in PostgreSQL and survives restarts.
 - **Jobs** — cron, interval and one-shot scheduled work with leasing, catchup and retries. No external scheduler.
 - **Streaming** — server-side streaming RPC for LLM token output, progress feeds and live logs. Break the loop and the stream tears down end to end.
@@ -60,7 +60,7 @@ Microservices rarely fail in the business logic. They fail in the gaps between s
 | You'd otherwise run | ServiceBridge gives you |
 |---|---|
 | Istio / Linkerd / Envoy | mTLS identity, routing and policy, zero sidecars |
-| RabbitMQ / Kafka / NATS | Durable events with outbox, fan-out, retries, DLQ |
+| RabbitMQ / Kafka / NATS | Durable events with filters, fan-out, retries, DLQ |
 | Temporal / Cadence / Step Functions | Durable workflows with compensation, signals, replay |
 | A cron service / Quartz / Bull | Leased, retried cron and one-shot jobs |
 | Jaeger / Tempo + Prometheus + Loki | Tracing, metrics and logs, correlated out of the box |
@@ -87,9 +87,30 @@ The gin integration is a second module, which keeps gin out of the dependency gr
 go get github.com/service-bridge/sdk/go/sbgin
 ```
 
-Both modules live under `go/` rather than at the repository root, so their release tags carry that path prefix — `go/v0.1.0` and `go/sbgin/v0.1.0`.
+Both modules live under `go/` rather than at the repository root, so their release tags carry that path prefix — `go/v0.2.0` and `go/sbgin/v0.2.0`.
 
 Each SDK directory holds its own README with install instructions, a quick start and the full API reference.
+
+## Behaviour parity
+
+The Node and Go SDKs behave the same way on everything below. Only the syntax differs between languages. Shared conformance scenarios ([`conformance/`](./conformance)) run every pairing (Go→Go, Go→Node, Node→Go, Node→Node) against a live runtime. Shared vectors pin the bytes both SDKs hash: [`contract-hash-vectors.json`](./contract-hash-vectors.json) and [`job-canonical-vectors.json`](./job-canonical-vectors.json).
+
+| Area | Behaviour | Node | Go |
+|---|---|---|---|
+| Errors | One error type with a `code`. `CONNECTION`, `NO_LIVE_INSTANCE`, `OVERLOADED` and `QUEUE_FULL` are retryable. `TIMEOUT` is not: the outcome is unknown. | `ServiceBridgeError` `.code` `.retryable` | `*sb.Error` `.Code` `.Retryable()` |
+| Business errors | The handler's code and message reach the caller. Any other failure reaches the caller as `INTERNAL`, and so does a rethrown error from a nested call. | `throw new HandlerError(code, msg)` | `return &sb.HandlerError{Code, Message}` |
+| Call defaults | Timeout 30 s. Transport `auto` (direct, falling back to the runtime proxy before dispatch). 3 attempts, backoff 200 ms ×2 up to 5 s, jitter 0.3. | `callDefaults` | `WithCallDefaults`, `DefaultCallTimeout` |
+| Retries | Only failures proven to happen before dispatch: no candidate, a channel that never became ready, or a callee answer marked not-dispatched. Streams are never retried. | same | same |
+| Handler context | Deadline, caller service and instance, request id, idempotency key, cancellation. | `(req, ctx)` | `sb.CallInfoFromContext(ctx)` |
+| Inbound limits | 256 concurrent calls and 256 queued per instance. | `rpcMaxConcurrentCalls`, `rpcMaxQueuedCalls` | `WithInboundLimits` |
+| Publish | Returns once the runtime stored the event. A bounded in-memory queue (10 000) holds events for up to 30 s while the runtime is unreachable. A duplicate is a success with the original id. `fireAndForget` returns after enqueueing. | `maxPendingPublishes`, `publishTimeoutMs` | `WithMaxPendingPublishes`, `WithPublishTimeout` |
+| Subscribe | One handler per pattern. Handlers run for the patterns the runtime matched. The filter `{"$.path": literal}` is evaluated by the runtime. At most 32 deliveries in flight, serial per partition key. | `sb.event.handle(p, fn, {schema, filter})` | `SubscribeEvent(c, p, fn, WithFilter(...))` |
+| Lifecycle | `start` waits for Welcome and the first registry snapshot (30 s). Reconnect is unlimited, on a 1/5/15/30/60 s ladder ±20 %. `Drain` triggers a reconnect. Revoked services and instances are cut off. | `start`, `ready`, `on(...)` | `Start`, `Ready`, `On*` |
+| Stop | Withdraw the endpoint and stop taking work, wait for in-flight work (10 s), flush publishes, flush telemetry and wait for the ack (2 s), close. | `stopTimeoutMs` | `DefaultStopTimeout` |
+| Certificates | Renewed 30 min before expiry (±5 min) without reopening streams or channels. The instance id does not change. | same | same |
+| Telemetry | Drops are reported to the runtime as `sb_sdk_telemetry_dropped_total` and passed to a callback. The runtime captures payloads on `errors` by default and masks them on ingest. | `telemetry.onDrop` | `WithTelemetryDropHandler` |
+| HTTP | No perimeter protection in the integrations. Subjects use route templates. A client's `X-SB-Trace` is ignored unless trusted explicitly. | `trustTraceHeader` | `sbhttp.WithTrustTraceHeader` |
+| Testing | An in-memory harness drives a real client: invoke handlers, answer outbound calls, record publishes, deliver events. | `createTestHarness()` | `sbtest.New(t)` |
 
 ## Protocol contract
 
